@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { memo, useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { toast } from 'sonner'
@@ -56,8 +56,13 @@ import { languageToArtifactKind, CODE_ARTIFACT_MIN_LINES } from './ArtifactPanel
  *             split, Save & regenerate silently no-ops when onEdit
  *             disappears under the user.
  *   - children: extra nodes (e.g. ToolCall cards) rendered under the content
+ *
+ * Wrapped in `React.memo` (see export at the bottom) so a `setMessages`
+ * call in ChatView — fired on every tool event and delta — only re-renders
+ * the rows whose props actually changed. Without this, a long transcript
+ * pays the full markdown/render cost on every SSE tick.
  */
-export default function Message({
+function Message({
   role,
   content,
   images,
@@ -407,3 +412,5 @@ function UserImageStrip({ names }) {
     </div>
   )
 }
+
+export default memo(Message)

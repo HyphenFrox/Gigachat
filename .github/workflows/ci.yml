@@ -33,10 +33,10 @@ jobs:
         python-version: ["3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -53,9 +53,10 @@ jobs:
           python -m pip install -r backend/requirements.txt
 
       - name: Run smoke tests
-        # `-m smoke` matches the marker defined in pytest.ini and
-        # applied via module-level `pytestmark` on every test file.
-        # The `--strict-markers` option in pytest.ini ensures a typo
-        # in the marker would fail loudly rather than silently skip
-        # the whole suite.
-        run: pytest -m smoke
+        # `-m smoke` matches the marker defined in pytest.ini. Run with
+        # `-v` for per-test output and `--tb=short` so a failing test is
+        # immediately traceable from the CI log without needing to
+        # re-run with --verbose. Exit-first (`-x`) stops the run on the
+        # first failure; seeing one fresh failure is more useful than
+        # ten cascading ones.
+        run: pytest -m smoke -v --tb=short -x

@@ -439,6 +439,15 @@ def init() -> None:
                 FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_queued_conv ON queued_inputs(conversation_id, created_at);
+            -- Sidebar sort: list_conversations + the outer search_conversations
+            -- ORDER BY both sort by (pinned DESC, updated_at DESC). A composite
+            -- (pinned, updated_at) index lets SQLite walk the B-tree in reverse
+            -- and skip the sort entirely. `pinned` and `updated_at` are
+            -- post-migration columns on existing DBs, but the ALTER TABLEs
+            -- above run first in the same init() call so both columns always
+            -- exist by the time this index is created.
+            CREATE INDEX IF NOT EXISTS idx_conversations_sort
+                ON conversations(pinned, updated_at);
             """
         )
 

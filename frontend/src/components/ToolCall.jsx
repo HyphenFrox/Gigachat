@@ -1,5 +1,17 @@
-import React, { useMemo, useState } from 'react'
-import ReactDiffViewer, { DiffMethod } from 'react-diff-viewer-continued'
+import React, { lazy, memo, Suspense, useMemo, useState } from 'react'
+// react-diff-viewer-continued is ~50KB gzipped and only needed when the
+// user expands a pending write_file / edit_file approval card. Load it on
+// demand so it doesn't ship in the main bundle. We wrap the default export
+// in a small component that reads `DiffMethod` from the same module — this
+// keeps both the component and the enum inside the lazy chunk instead of
+// pulling the enum into the main bundle.
+const LazyDiffViewer = lazy(() =>
+  import('react-diff-viewer-continued').then((mod) => ({
+    default: (props) => (
+      <mod.default compareMethod={mod.DiffMethod.WORDS} {...props} />
+    ),
+  })),
+)
 import {
   Terminal,
   TerminalSquare,
@@ -92,7 +104,7 @@ const TOOL_ICONS = {
  *                (filename only; served by /api/screenshots/<name>).
  *   - onApprove / onReject: called when manual-mode buttons are clicked
  */
-export default function ToolCall({
+function ToolCall({
   call,
   status,
   result,
@@ -400,14 +412,22 @@ function DiffBlock({ preview }) {
 
       {hasSplit ? (
         <div className="max-h-96 overflow-auto">
-          <ReactDiffViewer
-            oldValue={preview.before}
-            newValue={preview.after}
-            splitView={splitView}
-            useDarkTheme
-            compareMethod={DiffMethod.WORDS}
-            styles={DIFF_DARK_STYLES}
-          />
+          <Suspense
+            fallback={
+              <div className="flex items-center justify-center gap-2 p-4 text-[11px] text-muted-foreground">
+                <Loader2 className="size-3 animate-spin" />
+                Loading diff viewer…
+              </div>
+            }
+          >
+            <LazyDiffViewer
+              oldValue={preview.before}
+              newValue={preview.after}
+              splitView={splitView}
+              useDarkTheme
+              styles={DIFF_DARK_STYLES}
+            />
+          </Suspense>
         </div>
       ) : (
         <UnifiedFallback diff={preview.diff || ''} />
@@ -612,3 +632,13 @@ function SubagentRow({ subagent }) {
     </div>
   )
 }
+
+/**
+ * Wrap the default export in React.memo so a card that hasn't changed doesn't
+ * re-render when a sibling tool call updates. ChatView mounts one <ToolCall>
+ * per call id; as streaming progresses and `toolStates` mutates, only the
+ * rows whose props actually change should re-render. Shallow prop equality is
+ * sufficient because ChatView rebuilds object references (call, result,
+ * subagents) only when their underlying fields change.
+ */
+export default memo(ToolCall)
