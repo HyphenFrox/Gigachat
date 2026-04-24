@@ -114,11 +114,24 @@ def _clip(s: str) -> str:
     return f"{head}\n\n... [output truncated, {len(s) - MAX_OUTPUT_CHARS} chars omitted] ...\n\n{tail}"
 
 
-def _resolve(cwd: str, path: str) -> Path:
-    """Resolve `path` relative to `cwd` unless it's already absolute."""
+def _resolve(cwd: str, path: str, conv_id: str | None = None) -> Path:
+    """Resolve `path` relative to the effective shell directory.
+
+    When `conv_id` is provided AND bash has `cd`-ed somewhere inside the
+    workspace during this conversation, relative paths resolve against that
+    directory instead of the original `cwd`. This keeps the model's mental
+    model consistent — if it ran `cd stock-tracker` in bash, then
+    `write_file("src/App.jsx", ...)` lands inside `stock-tracker/src/`, not
+    back at the workspace root.
+
+    Absolute paths always win over both. Passing `conv_id=None` preserves the
+    old "always relative to `cwd`" behaviour — used by tests / callers that
+    don't want the bash-cwd behaviour to leak in.
+    """
     p = Path(path)
     if not p.is_absolute():
-        p = Path(cwd) / p
+        base = _effective_bash_cwd(cwd, conv_id) if conv_id else cwd
+        p = Path(base) / p
     return p.resolve()
 
 
@@ -751,7 +764,7 @@ async def read_file(
     first guard.
     """
     try:
-        p = _resolve(cwd, path)
+        p = _resolve(cwd, path, conv_id)
         if not p.exists():
             return {"ok": False, "output": "", "error": f"file not found: {p}"}
         if p.is_dir():
@@ -783,7 +796,7 @@ async def write_file(
     nothing to have read.
     """
     try:
-        p = _resolve(cwd, path)
+        p = _resolve(cwd, path, conv_id)
         if p.exists() and p.is_file():
             guard = _require_prior_read(conv_id, p)
             if guard:
@@ -804,10 +817,15 @@ async def write_file(
         return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
 
 
-async def list_dir(cwd: str, path: str = ".") -> dict:
-    """List entries in a directory as `type  size  name` lines."""
+async def list_dir(cwd: str, path: str = ".", conv_id: str | None = None) -> dict:
+    """List entries in a directory as `type  size  name` lines.
+
+    `conv_id` lets relative `path` values follow wherever bash `cd`-ed to
+    in this conversation — so `list_dir({"path": "."})` after a
+    `cd stock-tracker` lists the project dir, not the workspace root.
+    """
     try:
-        p = _resolve(cwd, path)
+        p = _resolve(cwd, path, conv_id)
         if not p.exists():
             return {"ok": False, "output": "", "error": f"not found: {p}"}
         if not p.is_dir():
@@ -3233,7 +3251,7 @@ async def edit_file(
                 "output": "",
                 "error": "old_string and new_string are identical — nothing to do",
             }
-        p = _resolve(cwd, path)
+        p = _resolve(cwd, path, conv_id)
         if not p.exists():
             return {"ok": False, "output": "", "error": f"file not found: {p}"}
         if p.is_dir():
@@ -3379,6 +3397,7 @@ async def grep_tool(
     case_insensitive: bool = False,
     output_mode: str = "files_with_matches",
     head_limit: int = 100,
+    conv_id: str | None = None,
 ) -> dict:
     """Search files for a regex, preferring ripgrep when available.
 
@@ -3386,11 +3405,14 @@ async def grep_tool(
       - "files_with_matches" (default): unique list of paths that contain a hit
       - "content": lines with filename:lineno prefix
       - "count": one `path:N` per file
+
+    `conv_id` lets relative `path` values follow wherever bash `cd`-ed to
+    in this conversation — same policy as `read_file` / `write_file`.
     """
     if not pattern:
         return {"ok": False, "output": "", "error": "empty pattern"}
     hl = max(1, min(int(head_limit or 100), 2000))
-    base = _resolve(cwd, path)
+    base = _resolve(cwd, path, conv_id)
     if not base.exists():
         return {"ok": False, "output": "", "error": f"path not found: {base}"}
     om = output_mode if output_mode in {"files_with_matches", "content", "count"} else "files_with_matches"
@@ -3434,16 +3456,19 @@ async def grep_tool(
         return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
 
 
-async def glob_tool(cwd: str, pattern: str, path: str = ".") -> dict:
+async def glob_tool(cwd: str, pattern: str, path: str = ".", conv_id: str | None = None) -> dict:
     """Find files by pathname pattern. Supports `**` for recursive match.
 
     Results are sorted by modification time (newest first) to surface
     recently-edited files — useful when the model is trying to locate the
     file it just changed without re-reading the entire tree.
+
+    `conv_id` lets relative `path` values follow wherever bash `cd`-ed to
+    in this conversation — same policy as `read_file` / `write_file`.
     """
     if not pattern:
         return {"ok": False, "output": "", "error": "empty pattern"}
-    base = _resolve(cwd, path)
+    base = _resolve(cwd, path, conv_id)
     if not base.exists():
         return {"ok": False, "output": "", "error": f"path not found: {base}"}
     try:
@@ -10036,7 +10061,7 @@ async def dispatch(
         if name == "write_file":
             # Checkpoint the existing file (if any) before overwriting.
             try:
-                resolved = _resolve(cwd, args.get("path", ""))
+                resolved = _resolve(cwd, args.get("path", ""), conv_id)
                 if resolved.is_file():
                     _checkpoint_file(conv_id, resolved, resolved.read_bytes())
             except Exception:
@@ -10061,9 +10086,14 @@ async def dispatch(
             # emits `{"path": ""}` — a common pattern when it wants "current
             # directory". Normalize to "." so the call resolves to `cwd`
             # instead of the filesystem root.
-            return await fn(cwd, args.get("path") or ".")
+            return await fn(cwd, args.get("path") or ".", conv_id=conv_id)
         if name == "glob":
-            return await fn(cwd, args.get("pattern", ""), args.get("path") or ".")
+            return await fn(
+                cwd,
+                args.get("pattern", ""),
+                args.get("path") or ".",
+                conv_id=conv_id,
+            )
         if name == "grep":
             return await fn(
                 cwd,
@@ -10073,6 +10103,7 @@ async def dispatch(
                 bool(args.get("case_insensitive", False)),
                 args.get("output_mode", "files_with_matches"),
                 int(args.get("head_limit", 100)),
+                conv_id=conv_id,
             )
         if name == "clipboard_read":
             return await fn()
