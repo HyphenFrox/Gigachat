@@ -1,0 +1,185 @@
+// =============================================================================
+// index.scss — global styles, Tailwind entry point, and shadcn theme tokens.
+//
+// Using SCSS (not plain CSS) gives us nesting and variables for the small
+// bits of custom styling around Tailwind. The @tailwind directives still
+// work inside .scss — PostCSS runs first.
+// =============================================================================
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+// ----- shadcn/ui theme tokens ------------------------------------------------
+// HSL triplets (no `hsl()` wrapper) because tailwind.config.js wraps them.
+// To retheme the app, edit a variable here and the whole color system follows.
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+    --primary: 240 5.9% 10%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 240 5.9% 10%;
+    --radius: 0.75rem;
+  }
+
+  .dark {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 5.5%;
+    --card-foreground: 0 0% 98%;
+    --popover: 240 10% 5.5%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 0 0% 98%;
+    --primary-foreground: 240 5.9% 10%;
+    --secondary: 240 3.7% 15.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 3.7% 15.9%;
+    --muted-foreground: 240 5% 64.9%;
+    --accent: 240 3.7% 15.9%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 3.7% 15.9%;
+    --input: 240 3.7% 15.9%;
+    --ring: 240 4.9% 83.9%;
+  }
+}
+
+// ----- base element styles ---------------------------------------------------
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html, body, #root {
+    height: 100%;
+    // Anti-aliased font rendering — matches the crisp look of native macOS/Win apps.
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    // Disable tap-highlight on mobile for the native-app feel CLAUDE.md asks for.
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    // Prevent pull-to-refresh from closing the SSE stream on mobile.
+    overscroll-behavior-y: none;
+  }
+
+  .font-mono, code, pre, kbd {
+    font-family: "JetBrains Mono", "Fira Code", Menlo, Monaco, Consolas, "Courier New", monospace;
+  }
+}
+
+// ----- custom scrollbar ------------------------------------------------------
+// Webkit-only. Firefox uses `scrollbar-color` below — both kept in sync.
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 5px;
+
+  &:hover {
+    background: hsl(var(--muted-foreground) / 0.4);
+  }
+}
+* {
+  scrollbar-color: hsl(var(--border)) transparent;
+  scrollbar-width: thin;
+}
+
+// ----- markdown output styling ----------------------------------------------
+// react-markdown produces plain elements; scope styles to `.prose-chat` so
+// they don't leak into form inputs / tool-call cards that also contain text.
+.prose-chat {
+  h1 { @apply text-xl font-semibold mt-4 mb-2; }
+  h2 { @apply text-lg font-semibold mt-4 mb-2; }
+  h3 { @apply text-base font-semibold mt-3 mb-1.5; }
+  p { @apply my-2 leading-relaxed; }
+  ul { @apply list-disc ml-6 my-2; }
+  ol { @apply list-decimal ml-6 my-2; }
+  li { @apply my-1; }
+  a { @apply text-blue-400 underline underline-offset-2; }
+  code { @apply px-1 py-0.5 rounded bg-secondary text-secondary-foreground text-[0.85em]; }
+  pre {
+    @apply my-3 p-3 rounded-md bg-secondary overflow-x-auto;
+    code { @apply p-0 bg-transparent text-[0.85em]; }
+  }
+  blockquote { @apply border-l-2 border-muted-foreground pl-3 italic text-muted-foreground; }
+  table { @apply my-3 border-collapse; }
+  th, td { @apply border border-border px-2 py-1; }
+  hr { @apply my-4 border-border; }
+}
+
+// ----- tiny helpers ----------------------------------------------------------
+// Pulsing dot used next to "streaming" / "waiting" labels.
+.pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse-scale 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse-scale {
+  0%, 100% { transform: scale(0.7); opacity: 0.4; }
+  50%      { transform: scale(1);   opacity: 1; }
+}
+
+// Line-clamp utility for conversation titles that are too long for the sidebar.
+.clamp-1 {
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+// Two-line clamp for semantic-search snippets in the sidebar.
+.clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+// ----- drag-over highlight on the composer ----------------------------------
+// Soft amber ring appears briefly when the user drags a file over the chat
+// composer, signalling that dropping will attach the image. Uses an inset
+// shadow rather than box-shadow so it doesn't re-flow neighbouring elements.
+.drag-over {
+  box-shadow: inset 0 0 0 2px hsl(var(--primary) / 0.55);
+  transition: box-shadow 120ms ease-in-out;
+}
+
+// ----- awaiting-approval highlight ------------------------------------------
+// Adds a subtle breathing glow to awaiting-approval tool cards so the user
+// sees them as soon as the agent pauses for input, even when scrolling a
+// long thread.
+@keyframes approval-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 hsl(38 92% 60% / 0.35); }
+  50%      { box-shadow: 0 0 0 6px hsl(38 92% 60% / 0); }
+}
+.await-approval-ring {
+  animation: approval-pulse 2s ease-in-out infinite;
+}

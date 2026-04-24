@@ -1,0 +1,61 @@
+# Continuous integration — smoke-tier test run on every push / PR.
+#
+# Philosophy: the smoke tier is everything fast + offline + platform-agnostic.
+# If it goes red, something obvious regressed and should block the merge.
+# Deep / Windows-only tests live behind the `deep` and `windows` markers
+# and are intentionally NOT run here — they need Ollama / UIA / a real desktop
+# and belong in a nightly or manual job.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-flight runs on the same branch so a rapid push train doesn't
+# pile up work; the latest SHA is the only one that matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Smoke tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Test against the versions that mirror realistic user setups. 3.11
+        # is the minimum we actually support (uses PEP 604 `X | None`
+        # annotations and Python 3.12 `asyncio` semantics are backward-
+        # compatible).
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install runtime + test deps
+        # Install everything from requirements.txt — pytest + pytest-asyncio
+        # live there alongside the real backend deps (see the marker block
+        # at the bottom of that file). The Windows-only deps
+        # (uiautomation, winsdk) are conditional via environment markers,
+        # so pip quietly skips them on Linux.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt
+
+      - name: Run smoke tests
+        # `-m smoke` matches the marker defined in pytest.ini and
+        # applied via module-level `pytestmark` on every test file.
+        # The `--strict-markers` option in pytest.ini ensures a typo
+        # in the marker would fail loudly rather than silently skip
+        # the whole suite.
+        run: pytest -m smoke

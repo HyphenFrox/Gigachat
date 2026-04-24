@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Favicon points at the brand logo via Vite's `/src/` resolver. The
+         dev server serves it directly; the production build replaces this
+         href with the hashed asset URL during `vite build`. -->
+    <link rel="icon" type="image/jpeg" href="/src/assets/gigachat-logo.jpg" />
+    <!-- PWA manifest + apple-touch icon wiring. Vite copies everything under
+         frontend/public/ into dist/ verbatim, so these paths resolve in both
+         dev and prod without any build-time substitution. -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+    <meta name="theme-color" content="#0b0b0f" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Gigachat</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

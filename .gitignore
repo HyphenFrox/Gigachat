@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+
+# App data (SQLite DB, user conversations)
+data/
+
+# SQLite artifacts anywhere in the tree (stray dev DBs, WAL/SHM sidecars).
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets — belt and braces on top of data/ being ignored.
+.env
+.env.*
+*.pem
+*.key
+auth.json
+auth_secret.key
+vapid.json
+
+# Claude Code local state
+.claude/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

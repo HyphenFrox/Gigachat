@@ -1,0 +1,3294 @@
+"""FastAPI app serving the chat UI and agent over SSE.
+
+Routes:
+  GET  /                       - static index.html
+  GET  /static/*               - other static assets
+  GET  /api/models             - list installed Ollama models
+  GET  /api/conversations      - list conversations
+  POST /api/conversations      - create
+  GET  /api/conversations/{id} - fetch meta + messages
+  PATCH /api/conversations/{id} - update title/model/auto_approve/cwd
+  DELETE /api/conversations/{id}
+  POST /api/conversations/{id}/messages  - SSE stream of the agent turn
+                                           Optional `images` list in body is
+                                           attached to the user message as
+                                           multimodal input.
+  POST /api/conversations/{id}/approve   - approve/reject a pending tool call
+                                           (the original /messages stream is
+                                           still blocked and resumes on its
+                                           own once the approval is submitted)
+  POST /api/conversations/{id}/uploads   - accept a pasted image (multipart)
+                                           and return the saved filename so
+                                           the frontend can reference it in
+                                           the next /messages request
+  POST /api/conversations/{id}/restore/{stamp}
+                                         - roll files back to a checkpoint
+                                           snapshot taken before a write/edit
+  GET  /api/screenshots/{name}           - serve a computer-use screenshot
+  GET  /api/uploads/{name}               - serve a user-uploaded image
+  GET  /api/memories                     - list global (cross-conversation) memories
+  POST /api/memories                     - add a new global memory
+  PATCH /api/memories/{mid}              - edit content/topic of a global memory
+  DELETE /api/memories/{mid}             - remove a global memory
+  GET  /api/secrets                      - list stored secrets (metadata only)
+  GET  /api/secrets/{sid}                - reveal one secret (value + metadata)
+  POST /api/secrets                      - store a new secret
+  PATCH /api/secrets/{sid}               - update a secret's value/name/description
+  DELETE /api/secrets/{sid}              - delete a secret
+  GET  /api/conversations/{cid}/memory   - read the per-conversation memory file
+  PUT  /api/conversations/{cid}/memory   - replace the per-conversation memory file
+  DELETE /api/conversations/{cid}/memory - clear the per-conversation memory file
+  GET  /api/conversations/{cid}/pinned   - list pinned messages in a conversation
+  GET  /api/conversations/{cid}/usage    - cumulative-usage breakdown + budget
+  DELETE /api/conversations/{cid}/messages/{mid} - delete one message
+  GET  /api/auth/status                  - is a password required / am I logged in
+  POST /api/auth/login                   - exchange password for a session cookie
+  POST /api/auth/logout                  - clear the session cookie
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import secrets
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+# ---------------------------------------------------------------------------
+# Force the Windows Proactor event loop BEFORE anything else imports asyncio.
+#
+# On Windows, Python 3.8+ defaults to ProactorEventLoop which supports
+# asyncio subprocesses (what our `bash` / `bash_bg` tools need). But some
+# versions/configurations of uvicorn call WindowsSelectorEventLoopPolicy on
+# startup, which leaves `asyncio.create_subprocess_shell()` raising a bare
+# NotImplementedError — breaking every tool that shells out. Setting the
+# Proactor policy explicitly here guarantees it, regardless of how the
+# server was launched.
+# ---------------------------------------------------------------------------
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        # If the platform exposes an unexpected policy name (e.g. on some
+        # Python builds) fall back to the default rather than crashing.
+        pass
+
+import httpx
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from . import agent, auth, db, mcp, ollama_runtime, push, sysdetect, tools
+
+ROOT = Path(__file__).resolve().parent.parent
+# In production, the frontend is built to `frontend/dist` by Vite.
+# In development, `npm run dev` serves the frontend itself on :5173 and
+# proxies /api/* to us — the static-serving routes below are a no-op.
+FRONTEND_DIST = ROOT / "frontend" / "dist"
+FRONTEND_SRC = ROOT / "frontend"
+FRONTEND = FRONTEND_DIST if FRONTEND_DIST.exists() else FRONTEND_SRC
+
+# Hard cap on a single pasted image: 10 MB is plenty for a full-screen PNG
+# at 1440p and keeps a stray multi-hundred-MB paste from blowing up RAM.
+UPLOAD_MAX_BYTES = 10 * 1024 * 1024
+ALLOWED_UPLOAD_TYPES = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+# Document uploads — we extract plain text on the server and hand it back
+# to the UI, which prepends it to the next user message. No binary is sent
+# to the model, so these work with text-only chat models too.
+ALLOWED_DOCUMENT_TYPES = {
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    "text/csv": ".csv",
+}
+# Hard cap on extracted text inserted into a single message — keeps a huge
+# PDF from nuking the context window.
+DOCUMENT_EXTRACT_MAX_CHARS = 40000
+
+app = FastAPI(title="Gigachat")
+db.init()
+
+
+# ---------------------------------------------------------------------------
+# Access-control middleware
+#
+# In tailscale mode the server binds to 0.0.0.0 so the host machine can hit
+# itself via ``localhost`` *and* other tailnet peers can hit it via the
+# tailscale IP. That's a wider listener than we actually trust — someone on
+# the same LAN could also reach the port. This middleware closes that gap:
+# it inspects ``request.client.host`` and only admits requests from loopback
+# (the host machine) or the Tailscale CGNAT ranges. Everything else — LAN
+# IPs, random public sources — gets a flat 403.
+#
+# On top of that, every non-loopback request must also carry a valid session
+# cookie (or Bearer token). Loopback is implicitly trusted because if someone
+# can already execute code on the box, there's no boundary left to enforce.
+#
+# The login endpoint and static assets are public so the frontend can render
+# its password form before authenticating.
+# ---------------------------------------------------------------------------
+_AUTH_EXEMPT_PREFIXES = (
+    "/api/auth/",
+    "/static/",
+    "/assets/",
+    "/favicon",
+    "/manifest",
+    "/icons/",
+    "/sw.js",
+)
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        cfg = auth.get_config()
+        # Pure loopback deployment — no auth, no IP filtering. The OS
+        # already ensured only local processes can reach the socket.
+        if not auth.requires_password(cfg):
+            return await call_next(request)
+
+        client_host = request.client.host if request.client else None
+        is_loopback = auth.is_loopback(client_host)
+        public_mode = auth.is_public_mode(cfg)
+
+        # In public mode a TLS-terminating reverse proxy (cloudflared, Caddy,
+        # nginx) runs on the same host and forwards traffic from loopback.
+        # Every request therefore looks loopback to us — IP filtering is
+        # meaningless and auto-trusting loopback would hand anonymous
+        # sessions to the entire internet. So: skip the Tailscale allowlist,
+        # require the session token for every protected path.
+        if not public_mode:
+            is_tailnet = auth.is_tailscale_client(client_host)
+            # Tailscale mode: reject anything that didn't come in over the
+            # loopback interface or the tailnet. This is defence-in-depth on
+            # top of the Tailscale ACL model — the port is physically
+            # listening on 0.0.0.0 so a LAN peer *could* TCP-connect, but
+            # they'll get a 403 before any real handler runs.
+            if not (is_loopback or is_tailnet):
+                return JSONResponse(
+                    {"error": "forbidden"},
+                    status_code=403,
+                )
+
+        path = request.url.path
+        # The login page itself plus the static assets needed to render it
+        # are always public for allowed clients. Everything else under
+        # /api/* is gated, and so is the SPA entrypoint (the entrypoint is
+        # ``/``, and that's also the login page in the unauthenticated
+        # case, so we let it through — the frontend does the redirect).
+        if path == "/" or any(path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES):
+            return await call_next(request)
+        # Tailscale mode only: loopback on-host is trusted (the operator
+        # themselves or a local script). Public mode must NOT do this — all
+        # proxy traffic arrives over loopback so it would be a complete
+        # bypass of the password.
+        if is_loopback and not public_mode:
+            return await call_next(request)
+        token = request.cookies.get(auth.SESSION_COOKIE)
+        if not token:
+            # Also accept Bearer header for programmatic clients (curl,
+            # mobile app, Tailscale Funnel). Keeps the cookie path as the
+            # primary flow but doesn't force it.
+            header = request.headers.get("authorization", "")
+            if header.lower().startswith("bearer "):
+                token = header[7:].strip()
+        if auth.verify_token(token):
+            return await call_next(request)
+        return JSONResponse(
+            {"error": "authentication required", "requires_password": True},
+            status_code=401,
+        )
+
+
+app.add_middleware(AuthMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# Scheduled-tasks background daemon
+#
+# The `schedule_task` tool writes rows into the `scheduled_tasks` table with
+# a `next_run_at` timestamp. This coroutine, started at FastAPI startup and
+# run for the lifetime of the server, polls that table every SCHED_POLL_SEC
+# seconds and fires any due rows as standalone agent turns inside a fresh
+# conversation. One-shots are deleted after firing; recurring tasks have
+# their next_run_at bumped forward by `interval_seconds`.
+#
+# All work happens on the event loop — no threads — because the agent
+# already runs async end-to-end. A single failure (Ollama down, bad prompt)
+# is isolated to its own try/except so one broken task can't stall the
+# whole scheduler.
+# ---------------------------------------------------------------------------
+SCHED_POLL_SEC = 30
+_SCHED_TASK: asyncio.Task | None = None
+
+# Track cwds currently being indexed so two conversations pointed at the same
+# directory can share the single in-flight run instead of duplicating work.
+# Each entry is the absolute, resolved cwd; it's removed when the task
+# finishes. The dedup is advisory only — if we ever race and miss, the
+# per-file delete-before-insert in the indexer keeps the chunks clean.
+_CODEBASE_INDEX_INFLIGHT: set[str] = set()
+
+# Reference to the main event loop, captured at startup. Sync FastAPI
+# endpoints run on the threadpool — `asyncio.get_running_loop()` raises
+# there — so background work triggered by sync endpoints (like auto-index
+# on new-chat creation) needs this explicit handle to schedule onto the
+# real event loop via `run_coroutine_threadsafe`.
+_MAIN_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _kick_codebase_index(cwd: str | None) -> None:
+    """Fire-and-forget: schedule a background index of `cwd` if one isn't
+    already running and the current state is stale (never indexed or errored).
+
+    Called whenever a conversation's cwd is set or changed. Safe to call
+    liberally — the function is cheap when the index is already fresh, and
+    the inflight set prevents duplicate workers.
+
+    Swallows all exceptions: this is a best-effort UX feature, not a critical
+    path. Works from both async endpoints (running loop available) and sync
+    endpoints executed on FastAPI's threadpool (we fall back to the main
+    loop handle captured at startup). If neither is available — e.g. called
+    at import time before startup has fired — we silently drop.
+    """
+    if not cwd:
+        return
+    try:
+        root = str(Path(cwd).expanduser().resolve())
+    except Exception:
+        return
+    if root in _CODEBASE_INDEX_INFLIGHT:
+        return
+    existing = db.get_codebase_index(root)
+    # Only (re)index when we'd actually change something — skip if the row is
+    # fresh ('ready') to avoid re-embedding every time the user opens a chat.
+    if existing and existing["status"] in ("indexing", "ready"):
+        return
+
+    async def _run():
+        try:
+            from . import tools as _tools
+            await _tools._codebase_index_cwd_impl(root)
+        except Exception as e:
+            print(f"[codebase-index] {root!r} failed: {e}", file=sys.stderr)
+        finally:
+            _CODEBASE_INDEX_INFLIGHT.discard(root)
+
+    # Prefer the loop in the current thread (async endpoints); fall back to
+    # the main loop captured at startup for sync endpoints running on the
+    # threadpool. Without this fallback, sync endpoints like POST
+    # /api/conversations silently drop the index request.
+    try:
+        loop = asyncio.get_running_loop()
+        in_thread = False
+    except RuntimeError:
+        loop = _MAIN_LOOP
+        in_thread = True
+    if loop is None or loop.is_closed():
+        return
+
+    _CODEBASE_INDEX_INFLIGHT.add(root)
+    db.upsert_codebase_index(root, status="pending")
+
+    if in_thread:
+        asyncio.run_coroutine_threadsafe(_run(), loop)
+    else:
+        loop.create_task(_run())
+
+
+def _kick_docs_url_crawl(did: str | None) -> None:
+    """Fire-and-forget: schedule a BFS crawl + embed of `did`'s URL seed.
+
+    Mirrors `_kick_codebase_index` shape (loop-capture fallback for sync
+    endpoints; exception-swallowing; best-effort) but dispatches to
+    `_docs_url_crawl_impl` instead. The inflight set lives inside tools.py
+    so we only need to start the worker here.
+    """
+    if not did:
+        return
+    # Flip status to 'pending' immediately so the UI shows progress before
+    # the worker actually starts. The crawler itself will transition to
+    # 'crawling' once it begins.
+    try:
+        existing = db.get_doc_url(did)
+        if not existing:
+            return
+        if existing["status"] == "crawling":
+            # Let the inflight one finish; reindex endpoint can force a rerun.
+            return
+        db.update_doc_url(did, status="pending", error="")
+    except Exception:
+        return
+
+    async def _run():
+        try:
+            await tools._docs_url_crawl_impl(did)
+        except Exception as e:
+            print(f"[docs-url] {did!r} failed: {e}", file=sys.stderr)
+
+    try:
+        loop = asyncio.get_running_loop()
+        in_thread = False
+    except RuntimeError:
+        loop = _MAIN_LOOP
+        in_thread = True
+    if loop is None or loop.is_closed():
+        return
+    if in_thread:
+        asyncio.run_coroutine_threadsafe(_run(), loop)
+    else:
+        loop.create_task(_run())
+
+
+# Hard fallback when neither the user nor the auto-tuner has picked a model
+# yet — used at the very first startup before `auto_tune_models()` finishes.
+# Gemma 4 e4b is the mid-tier variant that fits on 8 GB+ VRAM hosts and is
+# our reference target for prompt/tool-call formatting.
+DEFAULT_CHAT_MODEL_FALLBACK = "gemma4:e4b"
+
+
+def _resolve_default_chat_model() -> str:
+    """Decide which model a new conversation should be created with.
+
+    Precedence:
+      1. User-chosen default from the settings table (Settings → Default model).
+      2. The auto-tuner's pick for this hardware (see ollama_runtime).
+      3. Hard fallback constant so we never hand back an empty string.
+    """
+    chosen = db.get_setting("default_chat_model")
+    if isinstance(chosen, str) and chosen.strip():
+        return chosen.strip()
+    rec = ollama_runtime.get_recommendation().get("chat_model")
+    if isinstance(rec, str) and rec.strip():
+        return rec.strip()
+    return DEFAULT_CHAT_MODEL_FALLBACK
+
+
+def _snippet(text: str, limit: int = 140) -> str:
+    """Collapse whitespace and clip to `limit` chars for a push preview."""
+    s = " ".join((text or "").split())
+    if len(s) <= limit:
+        return s
+    return s[: limit - 1].rstrip() + "…"
+
+
+async def _safe_push(payload: dict) -> None:
+    """Fire a push fan-out without letting an error take down the caller.
+
+    Runs the blocking pywebpush calls on a worker thread so the event loop
+    isn't held up by a slow push-service round-trip.
+    """
+    try:
+        await asyncio.to_thread(push.send_to_all, payload)
+    except Exception as e:
+        # Don't propagate — push is best-effort.
+        print(f"[push] send_to_all failed: {e!r}", file=sys.stderr)
+
+
+async def _run_scheduled_prompt(task: dict) -> None:
+    """Execute one scheduled row: drive the agent for one turn.
+
+    Two firing modes:
+
+    * Target conversation set (`task["target_conversation_id"]`) — this is a
+      `schedule_wakeup` row. We RESUME that existing conversation, append
+      the prompt as a user turn, and drive one agent iteration. The chat
+      stays in the sidebar where the user expects it.
+
+    * Target unset — classic `schedule_task` path. We create a new
+      conversation titled `Scheduled: <name>` so the unattended run shows
+      up as its own transcript.
+
+    When push notifications are enabled we fire one after the turn finishes
+    so the user can see the scheduled job landed even if the browser is closed.
+    """
+    conv_id: str | None = None
+    final_text = ""
+    kind = task.get("kind") or "task"
+    is_resume = bool(task.get("target_conversation_id"))  # wakeup or loop
+    try:
+        if is_resume:
+            # Resume mode — reuse the target conversation if it still exists.
+            # If the user deleted it in the meantime, drop silently (the row
+            # has already been removed by the caller, so no retry).
+            target = db.get_conversation(task["target_conversation_id"])
+            if not target:
+                print(
+                    f"[scheduler] {kind} target {task['target_conversation_id'][:8]} "
+                    "no longer exists; skipping",
+                    file=sys.stderr,
+                )
+                # Stop a loop that lost its target — otherwise we burn a push
+                # notification every tick forever.
+                if kind == "loop":
+                    db.cancel_loops_for_conversation(task["target_conversation_id"])
+                return
+            conv_id = target["id"]
+        else:
+            conv = db.create_conversation(
+                title=f"Scheduled: {task['name']}",
+                model=_resolve_default_chat_model(),
+                cwd=task["cwd"],
+                auto_approve=True,  # scheduled tasks fire unattended — no UI to click Approve
+            )
+            conv_id = conv["id"]
+        # Drain the agent turn. We sniff the last non-empty assistant text so
+        # the push preview shows something meaningful instead of just "done".
+        async for ev in agent.run_turn(conv_id, user_text=task["prompt"]):
+            if ev.get("type") == "assistant_message":
+                text = (ev.get("content") or "").strip()
+                if text:
+                    final_text = text
+    except Exception as e:
+        # Log to stderr so a crash is visible in the dev console but the
+        # loop keeps going.
+        print(f"[scheduler] task {task.get('name')!r} failed: {e}", file=sys.stderr)
+
+    # Fire a push notification regardless of task outcome — a silent failure
+    # is worse than a "task finished" ping that leads the user to investigate.
+    title_prefix = {
+        "loop": "loop tick",
+        "wakeup": "wakeup",
+        "task": "scheduled",
+    }.get(kind, "scheduled")
+    await _safe_push(
+        {
+            "title": f"Gigachat: {title_prefix} — {task.get('name') or 'continued'}",
+            "body": _snippet(final_text or "Scheduled run completed."),
+            "tag": f"sched-{task.get('id', '')}",
+            "conversation_id": conv_id,
+            "kind": kind,
+        }
+    )
+
+
+async def _scheduled_tasks_daemon() -> None:
+    """Forever-loop that fires due scheduled tasks. Started at app startup."""
+    import time
+    while True:
+        try:
+            now = time.time()
+            due = db.get_due_scheduled_tasks(now)
+            for task in due:
+                # Fire-and-forget: we don't await the agent here because a
+                # long-running scheduled job would block the scheduler for
+                # every subsequent task. Each run is its own background task.
+                asyncio.create_task(_run_scheduled_prompt(task))
+                if task.get("interval_seconds"):
+                    # Recurring — bump next_run_at; never lets next_run drift
+                    # into the past by more than one interval.
+                    nxt = now + int(task["interval_seconds"])
+                    db.update_scheduled_task_next_run(task["id"], nxt)
+                else:
+                    # One-shot — delete the row so it doesn't re-fire.
+                    db.delete_scheduled_task(task["id"])
+        except Exception as e:
+            print(f"[scheduler] daemon tick failed: {e}", file=sys.stderr)
+        await asyncio.sleep(SCHED_POLL_SEC)
+
+
+@app.on_event("startup")
+async def _configure_structured_logging() -> None:
+    """Install the JSON log formatter before any other startup hook runs.
+
+    Every hook below may emit log lines — we want them in the same
+    newline-delimited JSON shape as the `tool_call` events emitted by
+    `telemetry.timed_tool`, so aggregators (jq, grep, any log shipper)
+    see one format across the whole process.
+    """
+    from .telemetry import configure_logging
+    configure_logging()
+
+
+@app.on_event("startup")
+async def _capture_main_loop() -> None:
+    """Stash the main event loop so sync endpoints on the threadpool can
+    schedule background work via `run_coroutine_threadsafe`. Must run before
+    any sync endpoint might fire — `on_event("startup")` handlers execute
+    in the order registered, so declaring this here (early in the module)
+    is sufficient.
+    """
+    global _MAIN_LOOP
+    _MAIN_LOOP = asyncio.get_running_loop()
+
+
+@app.on_event("startup")
+async def _start_scheduler() -> None:
+    """Kick off the background scheduler once the event loop is running."""
+    global _SCHED_TASK
+    if _SCHED_TASK is None or _SCHED_TASK.done():
+        _SCHED_TASK = asyncio.create_task(_scheduled_tasks_daemon())
+
+
+_RETENTION_TASK: asyncio.Task | None = None
+
+
+@app.on_event("startup")
+async def _start_retention_sweeper() -> None:
+    """Kick off the disk-retention daemon.
+
+    Deletes expired checkpoints + orphaned memory files at a slow cadence
+    (see `retention.SWEEP_INTERVAL_SECONDS`). Started here so the first
+    sweep reclaims whatever leaked across the last process's lifetime.
+    The daemon's own exception handler keeps it alive across transient
+    filesystem errors.
+    """
+    global _RETENTION_TASK
+    if _RETENTION_TASK is not None and not _RETENTION_TASK.done():
+        return
+    from . import retention
+    from .tools import CHECKPOINT_DIR, MEMORY_DIR
+    _RETENTION_TASK = asyncio.create_task(
+        retention.sweep_daemon(CHECKPOINT_DIR, MEMORY_DIR)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stale-turn watchdog
+#
+# The startup resumer (see `_resume_interrupted_conversations` below) handles
+# the server-restart case — rows left at `state='running'` when the worker
+# was killed. This watchdog handles the mid-session case: an async-generator
+# cancellation path (client disconnect, uvicorn --reload tearing down the
+# worker without a clean shutdown hook, unhandled exception upstream of
+# `run_turn`'s finally) that bypasses the state-reset code. Without it, the
+# UI shows a perpetual "working..." spinner and the user can't send new
+# messages for that conversation.
+#
+# How it works:
+#   - `agent._ACTIVE_TURN_IDS` is a set of conv_ids currently being iterated
+#     in this worker's event loop. The `run_turn` wrapper registers on entry
+#     and removes on exit (in its finally).
+#   - This daemon periodically scans DB rows in `state='running'`. Any row
+#     whose id is NOT in the set — and whose last update is older than the
+#     grace period — is abandoned. We flip it to 'idle' so the user can
+#     continue.
+#   - The grace period avoids racing a turn that just set `state='running'`
+#     in the same tick the watchdog polled.
+# ---------------------------------------------------------------------------
+_STALE_WATCHDOG_TASK: asyncio.Task | None = None
+_STALE_POLL_SEC = 30
+_STALE_GRACE_SEC = 10  # leave fresh turns alone for at least this long
+
+
+async def _stale_turn_watchdog() -> None:
+    """Flip `state='running'` rows with no live turn back to `state='idle'`."""
+    while True:
+        try:
+            running = db.list_conversations_by_state("running")
+            now = time.time()
+            for conv in running:
+                cid = conv.get("id")
+                if not cid:
+                    continue
+                age = now - float(conv.get("updated_at") or 0)
+                # Grace period: the wrapper sets state='running' a hair before
+                # the caller starts iterating. Don't second-guess fresh turns.
+                if age < _STALE_GRACE_SEC:
+                    continue
+                if agent.is_turn_active(cid):
+                    continue
+                # Row says running, but no async generator in this worker is
+                # iterating for it — the turn is abandoned. Reset so the UI
+                # unblocks.
+                try:
+                    db.set_conversation_state(cid, "idle")
+                    print(
+                        f"[stale-watchdog] reset {cid!r} — DB said running "
+                        f"but no active turn (age={age:.0f}s)",
+                        file=sys.stderr,
+                    )
+                except Exception as e:
+                    print(
+                        f"[stale-watchdog] failed to reset {cid!r}: {e}",
+                        file=sys.stderr,
+                    )
+        except Exception as e:
+            # Don't let a transient DB hiccup kill the daemon.
+            print(f"[stale-watchdog] tick failed: {e}", file=sys.stderr)
+        await asyncio.sleep(_STALE_POLL_SEC)
+
+
+@app.on_event("startup")
+async def _start_stale_watchdog() -> None:
+    """Kick off the stale-turn watchdog."""
+    global _STALE_WATCHDOG_TASK
+    if _STALE_WATCHDOG_TASK is None or _STALE_WATCHDOG_TASK.done():
+        _STALE_WATCHDOG_TASK = asyncio.create_task(_stale_turn_watchdog())
+
+
+# ---------------------------------------------------------------------------
+# Crash-resilience: resume interrupted conversations on startup
+#
+# If the process died mid-turn (panic, kill -9, power loss, whatever), the
+# affected conversation rows are left with state='running' and any user
+# messages the composer queued are still sitting in `queued_inputs`. This
+# startup task finds those rows and fires a fresh `run_turn` for each one
+# so the agent picks up where it left off without the user having to re-send.
+#
+# Safety:
+#   - We only auto-resume conversations that look continuable (last visible
+#     message is a user message, OR there's at least one queued_inputs row).
+#     Conversations whose last message was already an assistant reply get
+#     reset to 'idle' without a new turn — nothing to resume.
+#   - We drop a system-note into history first so the user knows the turn
+#     was interrupted and is being retried.
+#   - Each resume runs as its own asyncio.Task so one broken conversation
+#     can't stall the others.
+# ---------------------------------------------------------------------------
+async def _resume_interrupted_conversations() -> None:
+    """Scan for conversations left mid-turn and relaunch their run_turn loops."""
+    try:
+        running = db.list_conversations_by_state("running")
+    except Exception as e:
+        print(f"[resume] list failed: {e}", file=sys.stderr)
+        return
+    if not running:
+        return
+    for conv in running:
+        try:
+            await _maybe_resume_one(conv)
+        except Exception as e:
+            print(
+                f"[resume] conversation {conv.get('id')!r} resume failed: {e}",
+                file=sys.stderr,
+            )
+
+
+# A turn whose most recent activity is older than this is considered stale —
+# the process may have died ages ago, the user moved on, or the turn was
+# abandoned during development reloads. Auto-resuming at that point just
+# revives conversations the user isn't thinking about anymore.
+_RESUME_STALENESS_SEC = 120
+
+
+async def _maybe_resume_one(conv: dict) -> None:
+    """Decide what to do with a single interrupted conversation.
+
+    Branches:
+      - Last visible message is assistant AND no queued inputs → nothing to
+        do; the turn actually completed, we just failed to mark state=idle.
+        Flip it to idle and move on.
+      - Activity is older than `_RESUME_STALENESS_SEC` → the turn wasn't
+        genuinely mid-flight at shutdown (or the user has long moved on).
+        Flip to idle without spawning a new turn.
+      - Last visible message is user, OR queued inputs exist, AND activity
+        is recent → resume with a system-note explaining the interruption.
+      - No messages at all → just flip to idle.
+    """
+    cid = conv["id"]
+    messages = db.list_messages(cid)
+    has_queued = db.has_queued_inputs(cid)
+
+    # Find the most recent user/assistant row — tool rows don't count for
+    # "was the user waiting for a reply".
+    last_visible = None
+    for m in reversed(messages):
+        if m.get("role") in ("user", "assistant"):
+            last_visible = m
+            break
+
+    needs_resume = has_queued or (last_visible and last_visible["role"] == "user")
+
+    if not needs_resume:
+        # Stale 'running' marker with nothing left to do. Reset quietly.
+        try:
+            db.set_conversation_state(cid, "idle")
+        except Exception:
+            pass
+        return
+
+    # Staleness gate: only resume if the turn was actually in-flight recently.
+    # We look at both the last message timestamp AND the conversation's
+    # updated_at so a queued-input row or a stale state flip doesn't skew it.
+    import time
+    now = time.time()
+    last_activity = 0.0
+    if last_visible:
+        last_activity = max(last_activity, float(last_visible.get("created_at") or 0))
+    if messages:
+        last_activity = max(
+            last_activity, float(messages[-1].get("created_at") or 0)
+        )
+    last_activity = max(last_activity, float(conv.get("updated_at") or 0))
+
+    if last_activity and (now - last_activity) > _RESUME_STALENESS_SEC:
+        # Running marker is stale — server was killed / reloaded long after
+        # the turn stopped being interesting. Don't auto-resume; the user
+        # can re-send if they actually want to continue.
+        try:
+            db.set_conversation_state(cid, "idle")
+        except Exception:
+            pass
+        return
+
+    # Post a breadcrumb so the user can tell the previous turn was interrupted.
+    # Persisting as a system summary keeps it in the model's context too.
+    try:
+        db.add_system_summary(
+            cid,
+            "[crash-resilience] The previous run was interrupted "
+            "(likely a server restart). Resuming the turn now — any queued "
+            "messages you sent just before the crash have been preserved.",
+        )
+    except Exception:
+        pass
+
+    # Spawn the resume as its own task so the startup path doesn't block.
+    asyncio.create_task(_drive_resumed_turn(cid))
+
+
+async def _drive_resumed_turn(cid: str) -> None:
+    """Run agent.run_turn() to completion for a resumed conversation.
+
+    Events are discarded — there's no live SSE consumer at server-restart
+    time. The work still matters: the model writes its reply to the DB, so
+    when the user reopens the conversation they see a completed turn.
+    """
+    try:
+        async for _ in agent.run_turn(cid, user_text=None, persist_user=False):
+            pass
+    except Exception as e:
+        print(f"[resume] turn for {cid!r} crashed again: {e}", file=sys.stderr)
+
+
+@app.on_event("startup")
+async def _start_resumer() -> None:
+    """Fire the interrupted-conversation resumer once after startup settles.
+
+    We delay by a couple seconds so Ollama auto-start has a chance to come
+    up first — a resumed turn that hits "model not reachable" is annoying.
+    """
+    async def _wait_and_resume():
+        await asyncio.sleep(3)
+        await _resume_interrupted_conversations()
+    asyncio.create_task(_wait_and_resume())
+
+
+@app.on_event("startup")
+async def _auto_start_ollama() -> None:
+    """Bring Ollama up automatically if the user hasn't already.
+
+    Best-effort: if Ollama isn't installed we log a hint and move on —
+    the existing "Ollama not reachable" toast in the UI is the right place
+    for the end-user notice. We do this BEFORE starting MCP so any MCP
+    servers that depend on Ollama (embeddings, small helpers) find it up.
+    """
+    try:
+        result = await ollama_runtime.ensure_running()
+        if not result.get("ok"):
+            print(
+                f"[ollama] auto-start skipped: {result.get('reason')}"
+                + (f" — {result.get('hint')}" if result.get("hint") else ""),
+                file=sys.stderr,
+            )
+    except Exception as e:
+        print(f"[ollama] auto-start crashed: {e}", file=sys.stderr)
+
+
+@app.on_event("startup")
+async def _auto_tune_ollama_models() -> None:
+    """Pick the best Gemma 4 variant for this hardware and pull it + the
+    embedding model if they're missing.
+
+    Spawned as a background task so uvicorn finishes startup immediately —
+    the multi-GB first-time download streams in the background while the UI
+    stays responsive. Progress is readable via /api/system/config.
+    """
+    asyncio.create_task(ollama_runtime.startup_autotune_background())
+
+
+@app.on_event("startup")
+async def _start_mcp() -> None:
+    """Spawn every enabled MCP server once the event loop is running.
+
+    Failures here never crash the app — a broken MCP server just means its
+    tools are missing from this session; the user can re-enable it after
+    fixing the config from the settings panel.
+    """
+    try:
+        await mcp.startup()
+    except Exception as e:
+        print(f"[mcp] startup failed: {e}", file=sys.stderr)
+
+
+@app.on_event("shutdown")
+async def _stop_scheduler() -> None:
+    """Cancel the scheduler so uvicorn can exit cleanly."""
+    global _SCHED_TASK
+    if _SCHED_TASK and not _SCHED_TASK.done():
+        _SCHED_TASK.cancel()
+        try:
+            await _SCHED_TASK
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@app.on_event("shutdown")
+async def _stop_stale_watchdog() -> None:
+    """Cancel the stale-turn watchdog so uvicorn can exit cleanly."""
+    global _STALE_WATCHDOG_TASK
+    if _STALE_WATCHDOG_TASK and not _STALE_WATCHDOG_TASK.done():
+        _STALE_WATCHDOG_TASK.cancel()
+        try:
+            await _STALE_WATCHDOG_TASK
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+@app.on_event("shutdown")
+async def _stop_mcp() -> None:
+    """Terminate every MCP subprocess before uvicorn exits."""
+    try:
+        await mcp.shutdown()
+    except Exception:
+        pass
+
+
+class CreateConversation(BaseModel):
+    """Body for POST /api/conversations.
+
+    `model` defaults to an empty string; the route handler substitutes the
+    resolved default (user preference → auto-tune recommendation → hardcoded
+    fallback) so a change in Settings takes effect immediately without
+    restarting any client that cached the old default.
+
+    `cwd` defaults to ``None`` so the handler can tell "client didn't
+    specify" from "client explicitly passed the project root". In public
+    mode an unspecified cwd is auto-assigned an isolated workspace folder
+    under ``data/workspaces/<conv_id>/`` so remote sessions don't stomp
+    on each other or the operator's main tree.
+    """
+
+    title: str = "New chat"
+    model: str = ""
+    cwd: str | None = None
+    auto_approve: bool = False
+    # Three-value permission mode: read_only | approve_edits | allow_all.
+    # When None, derived from auto_approve for backward compatibility with
+    # older API clients that still pass the bool.
+    permission_mode: str | None = None
+    # Free-text project label for sidebar grouping. None / empty means
+    # "ungrouped" (renders under the "No project" section). Normalized
+    # server-side to trim whitespace and cap at 80 chars.
+    project: str | None = None
+
+
+class UpdateConversation(BaseModel):
+    """Body for PATCH /api/conversations/{id}. All fields optional."""
+
+    title: str | None = None
+    model: str | None = None
+    cwd: str | None = None
+    auto_approve: bool | None = None
+    # Three-value permission mode. Validated in db.update_conversation — an
+    # unknown string is silently dropped so a hostile body can't smuggle
+    # arbitrary text into the column.
+    permission_mode: str | None = None
+    # Conversation-level pin — pinned conversations float to the top of the
+    # sidebar regardless of last-touched time. Independent of message-level
+    # pinning (which protects individual rows from auto-compaction).
+    pinned: bool | None = None
+    # Free-form labels stored as a JSON list. Accepts a list/tuple of
+    # strings; empty/whitespace-only entries are dropped at the DB layer.
+    tags: list[str] | None = None
+    # Free-text persona / system-prompt extension. An empty or
+    # whitespace-only string clears the override (stored as NULL); None
+    # means "don't touch". Capped at 4 KB in prompts.build_system_prompt
+    # so a runaway paste can't blow out the context window.
+    persona: str | None = None
+    # Soft budgets. 0 clears the cap (stored as NULL); None means "don't
+    # touch"; positive ints set a new ceiling. budget_turns counts
+    # assistant replies; budget_tokens is a rough char-count estimate that
+    # matches the header gauge.
+    budget_turns: int | None = None
+    budget_tokens: int | None = None
+    # Free-text project label for sidebar grouping. Empty/whitespace string
+    # clears the grouping (stored as NULL); None means "don't touch". The DB
+    # layer normalizes whitespace and caps length at 80 chars.
+    project: str | None = None
+
+
+class SendMessage(BaseModel):
+    """Body for POST /api/conversations/{id}/messages.
+
+    `images` — optional list of filenames previously returned by /uploads.
+    Only filenames (no path components) are accepted; the upload endpoint
+    enforces the filesystem shape.
+    """
+
+    content: str
+    images: list[str] | None = None
+
+
+class ApprovalDecision(BaseModel):
+    """Body for POST /api/conversations/{id}/approve."""
+
+    approval_id: str
+    approved: bool
+
+
+class QuestionAnswer(BaseModel):
+    """Body for POST /api/conversations/{id}/answer.
+
+    Resolves an AskUserQuestion pending prompt by carrying which option value
+    the user clicked. The frontend validates `value` matches one of the
+    emitted options before POSTing; the backend re-validates defensively.
+    """
+
+    answer_id: str
+    value: str
+
+
+class SpawnTaskOpen(BaseModel):
+    """Body for POST /api/side-tasks/{id}/open.
+
+    Optional — we can spin the new conversation off with the stored prompt
+    alone. The client may also override cwd/model here.
+    """
+
+    cwd: str | None = None
+    model: str | None = None
+
+
+class LoginBody(BaseModel):
+    """Body for POST /api/auth/login. The frontend sends the typed password."""
+
+    password: str
+
+
+@app.get("/api/auth/status")
+def api_auth_status(request: Request) -> dict:
+    """Tell the frontend whether it needs to show the login page.
+
+    Returns ``{requires_password, authenticated, host}``. ``host`` is the
+    *configured* bind address (not the resolved one) so an admin UI can
+    surface "you're exposed on Tailscale" without scraping ``tailscale ip``
+    on the client.
+
+    Loopback clients are implicitly authenticated — the middleware waives
+    the gate for them, and reporting ``authenticated: false`` here would
+    make the frontend show a login page the user can never need (every
+    subsequent API call would pass without the cookie anyway).
+    """
+    cfg = auth.get_config()
+    requires = auth.requires_password(cfg)
+    host_str = cfg.get("host", "127.0.0.1")
+    if not requires:
+        return {"requires_password": False, "authenticated": True, "host": host_str}
+    client_host = request.client.host if request.client else None
+    public_mode = auth.is_public_mode(cfg)
+    # Only trust loopback in tailscale mode. In public mode the reverse
+    # proxy delivers every request as loopback, so the same shortcut would
+    # hand anonymous sessions to the internet (mirrors the middleware).
+    if auth.is_loopback(client_host) and not public_mode:
+        return {"requires_password": True, "authenticated": True, "host": host_str}
+    token = request.cookies.get(auth.SESSION_COOKIE)
+    header = request.headers.get("authorization", "")
+    if not token and header.lower().startswith("bearer "):
+        token = header[7:].strip()
+    authed = auth.verify_token(token)
+    return {
+        "requires_password": True,
+        "authenticated": authed,
+        "host": host_str,
+    }
+
+
+# Simple in-memory login rate limiter — one counter, no per-IP keying because
+# in public mode the proxy delivers every request as 127.0.0.1 anyway. Resets
+# the count on a successful login so the common "wrong password, retype" case
+# doesn't lock the real user out. The lockout window only kicks in for public
+# mode where the endpoint is reachable from the internet; tailscale mode is
+# already gated at the network layer.
+_LOGIN_FAIL_COUNT = 0
+_LOGIN_LOCKED_UNTIL = 0.0
+_LOGIN_MAX_FAILS = 10
+_LOGIN_LOCKOUT_SEC = 60
+
+
+@app.post("/api/auth/login")
+def api_auth_login(body: LoginBody, response: Response) -> dict:
+    """Exchange a password for a signed session cookie.
+
+    Public mode adds a minimal rate limit: after 10 consecutive failed
+    attempts, further logins are refused for 60 seconds. At PBKDF2-200k's
+    ~100 ms per attempt this already caps throughput, but an internet-
+    exposed login form is worth the extra belt-and-braces against slow
+    credential stuffing. Tailscale mode skips the limiter because the
+    endpoint isn't reachable from outside the tailnet.
+    """
+    global _LOGIN_FAIL_COUNT, _LOGIN_LOCKED_UNTIL
+    cfg = auth.get_config()
+    if not auth.requires_password(cfg):
+        # Server isn't running in auth mode — login is a no-op success so
+        # the frontend flow stays uniform.
+        return {"ok": True, "authenticated": True}
+    if auth.is_public_mode(cfg):
+        now = time.time()
+        if now < _LOGIN_LOCKED_UNTIL:
+            retry_in = int(_LOGIN_LOCKED_UNTIL - now) + 1
+            raise HTTPException(
+                429,
+                f"too many failed logins; retry in {retry_in}s",
+            )
+    if not auth.check_password(body.password or ""):
+        if auth.is_public_mode(cfg):
+            _LOGIN_FAIL_COUNT += 1
+            if _LOGIN_FAIL_COUNT >= _LOGIN_MAX_FAILS:
+                _LOGIN_LOCKED_UNTIL = time.time() + _LOGIN_LOCKOUT_SEC
+                _LOGIN_FAIL_COUNT = 0
+        raise HTTPException(401, "invalid password")
+    # Success: reset the counter so a user who typo'd doesn't stay locked.
+    _LOGIN_FAIL_COUNT = 0
+    _LOGIN_LOCKED_UNTIL = 0.0
+    token = auth.make_token()
+    # HttpOnly + SameSite=Lax: the cookie is not JS-readable (no XSS to
+    # cookie-exfiltration path) and isn't sent on cross-site POSTs (no
+    # trivial CSRF). In LAN/Tailscale mode we deliberately skip ``Secure``
+    # because HTTP on the tailnet is the common case. In public mode the
+    # frontend is reached over the internet via a TLS-terminating proxy —
+    # flip Secure on so the cookie never leaks over a stray plaintext hop.
+    response.set_cookie(
+        auth.SESSION_COOKIE,
+        token,
+        max_age=auth.SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=auth.is_public_mode(cfg),
+        path="/",
+    )
+    return {"ok": True, "authenticated": True, "token": token}
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout(response: Response) -> dict:
+    """Clear the session cookie. Always succeeds — idempotent."""
+    response.delete_cookie(auth.SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+# In-memory cache of "does this model support tool calling?" — keyed by
+# model name. Ollama's /api/show returns the Go chat template; we look for
+# the `.Tools` action, which is how Ollama itself decides whether to allow
+# a `tools` field in /api/chat. Templates only change when a model is re-
+# pulled, so a 10-minute TTL is plenty while still eventually refreshing
+# if the user rebuilds a model locally with a tool-aware template.
+_MODEL_TOOL_CACHE: dict[str, tuple[float, bool]] = {}
+_MODEL_TOOL_CACHE_TTL = 600  # seconds
+
+
+async def _model_supports_tools(client: httpx.AsyncClient, name: str) -> bool:
+    """Return True iff the Ollama model advertises ``tools`` in ``capabilities``.
+
+    Ollama's /api/show response exposes a ``capabilities`` list that reflects
+    exactly what /api/chat will accept — "tools" is present iff function-
+    calling requests won't 400. This is more reliable than parsing the raw
+    chat template, because Ollama injects tool handling at runtime for
+    certain model families even when the surface template doesn't mention
+    ``.Tools`` explicitly.
+
+    Falls back to True on /api/show error so a transient hiccup doesn't
+    silently hide every model — the worst case is one 400 on the next chat
+    call, which now surfaces a clear "does not support tools" message.
+    """
+    import time as _t
+    now = _t.time()
+    cached = _MODEL_TOOL_CACHE.get(name)
+    if cached and now - cached[0] < _MODEL_TOOL_CACHE_TTL:
+        return cached[1]
+    try:
+        r = await client.post(
+            "http://localhost:11434/api/show",
+            json={"name": name},
+            timeout=5.0,
+        )
+        r.raise_for_status()
+        caps = r.json().get("capabilities") or []
+    except Exception:
+        # Don't cache failures — we'll retry next time.
+        return True
+    supports = "tools" in caps
+    _MODEL_TOOL_CACHE[name] = (now, supports)
+    return supports
+
+
+@app.get("/api/models")
+async def list_models(all: bool = False) -> dict:
+    """List installed Ollama models.
+
+    By default only returns models whose chat template supports tool calling
+    — pick-by-default is the whole point of the filter, and the agent loop
+    is useless without tools anyway. Pass ``?all=1`` to bypass the filter
+    (for debugging / curiosity).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get("http://localhost:11434/api/tags")
+            r.raise_for_status()
+            data = r.json()
+            names = [m["name"] for m in data.get("models", [])]
+            if all:
+                return {"models": names}
+            # Probe each model in parallel — the first call for a fresh set
+            # of models pays N×~30 ms; subsequent calls hit the TTL cache
+            # and are effectively free.
+            results = await asyncio.gather(
+                *[_model_supports_tools(c, n) for n in names],
+                return_exceptions=True,
+            )
+            filtered = [
+                n
+                for n, ok in zip(names, results)
+                if isinstance(ok, bool) and ok
+            ]
+        return {"models": filtered}
+    except Exception as e:
+        return {"models": [], "error": str(e)}
+
+
+@app.get("/api/models/{name:path}/capabilities")
+async def api_model_capabilities(name: str) -> dict:
+    """Return the Ollama capabilities list for one installed model.
+
+    Surfaces the raw `capabilities` array from /api/show — the frontend
+    uses this to decide whether the current chat model can consume image
+    attachments (`"vision"`), tools (`"tools"`), etc. Models without the
+    needed capability still run; the UI just surfaces a clear warning
+    before the user commits.
+
+    Returns a small shape that doesn't leak the full /api/show payload
+    — caps + a best-effort boolean per capability the UI cares about.
+    """
+    n = (name or "").strip()
+    if not n:
+        raise HTTPException(400, "model name required")
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.post(
+                "http://localhost:11434/api/show",
+                json={"name": n},
+                timeout=5.0,
+            )
+            r.raise_for_status()
+            caps = r.json().get("capabilities") or []
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(404, f"model {n!r} not found")
+        raise HTTPException(502, f"ollama error: {e}")
+    except Exception as e:
+        raise HTTPException(502, f"ollama unreachable: {e}")
+    caps_l = [c.lower() for c in caps if isinstance(c, str)]
+    return {
+        "model": n,
+        "capabilities": caps,
+        "vision": "vision" in caps_l,
+        "tools": "tools" in caps_l,
+    }
+
+
+@app.get("/api/system/config")
+def api_system_config() -> dict:
+    """Return the auto-detected host profile + the chosen context window.
+
+    The frontend's TokenUsage meter fetches this so its token-budget
+    denominator matches whatever the backend is actually feeding Ollama —
+    avoids the old bug where bumping NUM_CTX on the server silently left
+    the UI showing the wrong percentage.
+
+    Also surfaces the auto-tuner's recommendation so the settings UI can
+    show "we picked gemma4:e4b for your hardware" and render a live pull
+    progress indicator while the first-boot download runs.
+    """
+    info = sysdetect.detect_system()
+    rec = ollama_runtime.get_recommendation()
+    user_default = db.get_setting("default_chat_model")
+    return {
+        **info,
+        "num_ctx": agent.NUM_CTX,
+        "ollama_url": agent.OLLAMA_URL,
+        "recommended_chat_model": rec.get("chat_model"),
+        "recommended_embed_model": rec.get("embed_model"),
+        "model_pulling": bool(rec.get("pulling")),
+        "pull_status": rec.get("pull_status") or "",
+        "pull_error": rec.get("pull_error") or "",
+        "default_chat_model": (
+            user_default if isinstance(user_default, str) and user_default else None
+        ),
+        "effective_chat_model": _resolve_default_chat_model(),
+    }
+
+
+@app.post("/api/fs/pick-directory")
+async def api_pick_directory() -> dict:
+    """Open a native OS "browse for folder" dialog and return the chosen path.
+
+    Gigachat runs as a localhost app — frontend, backend, and user are all on
+    the same machine — so popping a native Tk dialog on the server IS a
+    native dialog from the user's perspective. This lets the workspace-folder
+    picker in ChatHeader offer a real Browse… button instead of forcing the
+    user to paste a path.
+
+    Security: the endpoint takes no input and returns only the user's chosen
+    path — the backend is not exposing any additional filesystem state. The
+    dialog runs on a worker thread so the event loop isn't blocked while the
+    user is choosing, and the existing CORS / localhost posture of the rest
+    of the API applies. If the user cancels, we return path=None.
+
+    We use Python's bundled Tkinter (no extra dependency). On a truly
+    headless machine Tk will fail to initialise; in that case we fall back
+    to returning {"ok": false, "error": ...} so the frontend can keep its
+    text input as the primary path-entry affordance.
+    """
+    def _show_dialog() -> dict:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except Exception as e:
+            return {"ok": False, "error": f"tkinter unavailable: {e}"}
+        try:
+            root = tk.Tk()
+            try:
+                root.withdraw()
+                # Bring the dialog to the front — without this, Windows
+                # sometimes hides it behind the browser.
+                root.attributes("-topmost", True)
+                path = filedialog.askdirectory(
+                    title="Pick working directory for this conversation",
+                    mustexist=True,
+                )
+            finally:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+            # askdirectory returns "" when the user cancels.
+            return {"ok": True, "path": path or None}
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    return await asyncio.to_thread(_show_dialog)
+
+
+@app.get("/api/fs/default-cwd")
+def api_default_cwd() -> dict:
+    """Return the directory Gigachat itself is running from.
+
+    Used by the Sidebar's new-chat dialog as the default workspace — if the
+    user doesn't explicitly pick one, "the folder the app lives in" is a
+    sensible zero-config choice that matches where their docs/notes are
+    likely to be when they're tinkering with Gigachat itself. The frontend
+    shows this as the pre-filled value; the user can overwrite or Browse for
+    a different path before creating the chat.
+    """
+    return {"cwd": str(ROOT)}
+
+
+@app.get("/api/conversations")
+def api_list() -> dict:
+    return {"conversations": db.list_conversations()}
+
+
+@app.get("/api/conversations/search")
+def api_search_conversations(q: str = "") -> dict:
+    """Substring-search across title, tags, and message content.
+
+    Empty query returns an empty list (so an empty search box doesn't
+    accidentally re-render the whole sidebar). Frontend should fall back to
+    `/api/conversations` for the default unfiltered view.
+    """
+    return {"conversations": db.search_conversations(q)}
+
+
+# Lower threshold than the internal RAG (agent.RECALL_MIN_SCORE = 0.45) because
+# the UI wants to surface MORE candidates for human inspection, not fewer.
+# Users can scroll past weak matches; they can't un-miss a hidden one.
+SEMANTIC_SEARCH_MIN_SCORE = 0.35
+SEMANTIC_SEARCH_MAX_HITS = 30
+
+
+@app.get("/api/conversations/semantic-search")
+async def api_semantic_search(q: str = "") -> dict:
+    """Cross-conversation semantic search over embedded messages.
+
+    Embeds the query via the same local model used for RAG, dot-products
+    against every stored message vector, and returns the top hits with their
+    conversation title + a content snippet so the sidebar can render a list
+    the user can click through to jump straight to the source message.
+    """
+    q = (q or "").strip()
+    if not q:
+        return {"hits": [], "indexed": 0, "total": 0}
+
+    q_vec = await agent._embed_text(q)
+    if not q_vec:
+        # Embedding model isn't installed or Ollama is offline. Degrade
+        # gracefully — the UI will show a toast explaining what to do.
+        embedded, total = db.count_embedded_vs_total()
+        return {
+            "hits": [],
+            "indexed": embedded,
+            "total": total,
+            "error": "embedding_unavailable",
+        }
+
+    rows = db.list_all_embeddings()
+    scored: list[tuple[str, str, float]] = []
+    for mid, cid, vec in rows:
+        if len(vec) != len(q_vec):
+            continue
+        score = agent._dot(q_vec, vec)
+        if score >= SEMANTIC_SEARCH_MIN_SCORE:
+            scored.append((mid, cid, score))
+
+    scored.sort(key=lambda t: t[2], reverse=True)
+    scored = scored[:SEMANTIC_SEARCH_MAX_HITS]
+
+    if not scored:
+        embedded, total = db.count_embedded_vs_total()
+        return {"hits": [], "indexed": embedded, "total": total}
+
+    # Fetch the actual message bodies + conversation titles in one shot.
+    msg_ids = [mid for mid, _, _ in scored]
+    messages = {m["id"]: m for m in db.get_messages_by_ids(msg_ids)}
+    conv_titles: dict[str, str] = {}
+    for _, cid, _ in scored:
+        if cid in conv_titles:
+            continue
+        conv = db.get_conversation(cid)
+        conv_titles[cid] = conv["title"] if conv else "(deleted)"
+
+    hits = []
+    for mid, cid, score in scored:
+        m = messages.get(mid)
+        if not m:
+            continue
+        snippet = (m.get("content") or "").strip().replace("\n", " ")
+        if len(snippet) > 280:
+            snippet = snippet[:280] + "…"
+        hits.append(
+            {
+                "message_id": mid,
+                "conversation_id": cid,
+                "conversation_title": conv_titles.get(cid, ""),
+                "role": m.get("role", ""),
+                "snippet": snippet,
+                "score": round(float(score), 4),
+                "created_at": m.get("created_at"),
+            }
+        )
+
+    embedded, total = db.count_embedded_vs_total()
+    return {"hits": hits, "indexed": embedded, "total": total}
+
+
+@app.post("/api/conversations/reindex")
+async def api_reindex_embeddings() -> dict:
+    """Backfill embeddings for any user/assistant messages that don't have one.
+
+    Safe to call repeatedly — rows already in `message_embeddings` are
+    skipped. Processes at most 500 messages per call so a huge backlog
+    doesn't hold the event loop hostage; the user can click again.
+    """
+    pending = db.list_unembedded_messages(limit=500)
+    indexed = 0
+    for m in pending:
+        vec = await agent._embed_text(m["content"] or "")
+        if vec:
+            db.save_embedding(m["id"], m["conversation_id"], vec)
+            indexed += 1
+    embedded, total = db.count_embedded_vs_total()
+    return {
+        "indexed_now": indexed,
+        "indexed": embedded,
+        "total": total,
+        "pending": max(0, total - embedded),
+    }
+
+
+@app.post("/api/conversations")
+def api_create(body: CreateConversation) -> dict:
+    # Empty model means "let the server pick" — resolve against the user's
+    # saved default first, then the auto-tuner's recommendation, then the
+    # hardcoded fallback. Explicit model passed by the client wins.
+    model = (body.model or "").strip() or _resolve_default_chat_model()
+    # cwd is mandatory — the UI prompts the user for a workspace on New
+    # Chat and there's no way to change it later, so we refuse to create
+    # a chat without one. Public-mode callers that want the isolated
+    # per-conversation workspace should POST /api/fs/default-workspace
+    # first to reserve a path. Validate the directory exists so a typo
+    # doesn't bake in a broken path the user can never fix.
+    raw_cwd = (body.cwd or "").strip()
+    if not raw_cwd:
+        raise HTTPException(400, "cwd is required — pick a working directory for the chat")
+    try:
+        resolved = Path(raw_cwd).expanduser().resolve()
+    except Exception:
+        raise HTTPException(400, "invalid cwd")
+    if not resolved.exists() or not resolved.is_dir():
+        raise HTTPException(400, f"cwd does not exist: {resolved}")
+    cwd = str(resolved)
+    conv = db.create_conversation(
+        title=body.title,
+        model=model,
+        cwd=cwd,
+        auto_approve=body.auto_approve,
+        permission_mode=body.permission_mode,
+        project=body.project,
+    )
+    # Kick off a background index of the cwd so codebase_search is ready by
+    # the time the first turn runs. No-op if already indexed / in flight.
+    _kick_codebase_index(conv.get("cwd"))
+    return {"conversation": conv}
+
+
+def _ensure_conversation_workspace(cid: str) -> str:
+    """Create (if missing) and return the isolated workspace for a chat.
+
+    Used in public mode so each conversation starts pointed at its own
+    ``data/workspaces/<cid>/`` directory instead of the Gigachat project
+    root. The folder is only created once — repeated calls are safe. We
+    never rm-rf this directory on conversation delete; remote users may
+    have put work in there that they still want to retrieve via the UI.
+    """
+    root = ROOT / "data" / "workspaces" / cid
+    root.mkdir(parents=True, exist_ok=True)
+    return str(root.resolve())
+
+
+@app.get("/api/conversations/{cid}")
+def api_get(cid: str) -> dict:
+    conv = db.get_conversation(cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    return {"conversation": conv, "messages": db.list_messages(cid)}
+
+
+@app.patch("/api/conversations/{cid}")
+def api_update(cid: str, body: UpdateConversation) -> dict:
+    updates: dict[str, Any] = {k: v for k, v in body.model_dump().items() if v is not None}
+    # cwd is immutable after creation — every tool call, checkpoint, and
+    # codebase-index row is keyed by it, so a mid-conversation swap would
+    # leave stale chunks in the index and orphan existing checkpoints.
+    # Reject explicitly so an old API client sees the policy rather than
+    # silently losing the field.
+    if "cwd" in updates:
+        raise HTTPException(400, "cwd is fixed for the life of a conversation")
+    conv = db.update_conversation(cid, **updates)
+    if not conv:
+        raise HTTPException(404, "not found")
+    return {"conversation": conv}
+
+
+@app.delete("/api/conversations/{cid}")
+def api_delete(cid: str) -> dict:
+    db.delete_conversation(cid)
+    # Drop any per-conversation in-memory state the tools module holds so
+    # a new conversation reusing the same id (unlikely, uuids are random)
+    # wouldn't inherit stale file-read tracking. This is tiny but avoids
+    # a slow memory leak over many deletes.
+    tools.clear_read_state_for_conversation(cid)
+    return {"ok": True}
+
+
+class PinMessage(BaseModel):
+    """Body for PATCH /api/conversations/{cid}/messages/{mid}."""
+
+    pinned: bool
+
+
+@app.patch("/api/conversations/{cid}/messages/{mid}")
+def api_pin_message(cid: str, mid: str, body: PinMessage) -> dict:
+    """Toggle the `pinned` flag on a single message.
+
+    Pinned messages survive the auto-compactor — use this when the user
+    marks something "do not forget" in the UI. The route is idempotent.
+    """
+    if not db.get_conversation(cid):
+        raise HTTPException(404, "conversation not found")
+    msg = db.set_message_pinned(mid, body.pinned)
+    if not msg or msg["conversation_id"] != cid:
+        raise HTTPException(404, "message not found")
+    return {"message": msg}
+
+
+@app.delete("/api/conversations/{cid}/messages/{mid}")
+def api_delete_message(cid: str, mid: str) -> dict:
+    """Permanently delete one message from a conversation.
+
+    Scoped to the given `cid` so a malicious client cannot delete a
+    neighbour's messages by guessing ids. 404 if the message isn't there
+    (or belongs to a different conversation) so the UI can distinguish
+    "already gone" from "never existed".
+    """
+    if not db.get_conversation(cid):
+        raise HTTPException(404, "conversation not found")
+    if not db.delete_message(cid, mid):
+        raise HTTPException(404, "message not found")
+    return {"ok": True}
+
+
+@app.get("/api/conversations/{cid}/pinned")
+def api_list_pinned(cid: str) -> dict:
+    """Return every pinned message in one conversation (oldest-first).
+
+    Separate endpoint from the full messages list so the ChatHeader →
+    Pinned viewer can refresh on demand without re-fetching the entire
+    transcript when a long conversation is open.
+    """
+    if not db.get_conversation(cid):
+        raise HTTPException(404, "conversation not found")
+    return {"messages": db.list_pinned_messages(cid)}
+
+
+# ---------------------------------------------------------------------------
+# Per-conversation memory file
+#
+# Each conversation can have an optional markdown memory file at
+# data/memory/<conv_id>.md. The agent writes to it via the `remember` tool;
+# the user can view / edit / clear it from the ChatHeader → Memory dialog.
+#
+# We deliberately cap writes at MEMORY_MAX_CHARS (the same limit the
+# `remember` tool enforces) to keep the system-prompt injection bounded.
+# ---------------------------------------------------------------------------
+class ConversationMemoryBody(BaseModel):
+    """Body for PUT /api/conversations/{cid}/memory."""
+
+    content: str
+
+
+@app.get("/api/conversations/{cid}/memory")
+def api_get_conv_memory(cid: str) -> dict:
+    """Return the raw contents of the per-conversation memory file.
+
+    Empty string when the file doesn't exist yet — that's a valid "no
+    notes" state, not an error.
+    """
+    if not db.get_conversation(cid):
+        raise HTTPException(404, "conversation not found")
+    path = tools.MEMORY_DIR / f"{cid}.md"
+    try:
+        text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    except Exception as e:
+        raise HTTPException(500, f"could not read memory file: {e}")
+    return {"content": text, "max_chars": tools.MEMORY_MAX_CHARS}
+
+
+@app.put("/api/conversations/{cid}/memory")
+def api_put_conv_memory(cid: str, body: ConversationMemoryBody) -> dict:
+    """Overwrite the per-conversation memory file.
+
+    Writes are capped at `tools.MEMORY_MAX_CHARS`; anything longer is
+    rejected with 400 so the user sees a clear error rather than silently
+    losing the tail. Directory is created on demand so a fresh install
+    doesn't need a bootstrap step.
+    """
+    if not db.get_conversation(cid):
+        raise HTTPException(404, "conversation not found")
+    text = body.content or ""
+    if len(text) > tools.MEMORY_MAX_CHARS:
+        raise HTTPException(
+            400,
+            f"memory content exceeds {tools.MEMORY_MAX_CHARS} chars "
+            f"(got {len(text)})",
+        )
+    try:
+        tools.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        # Bytes, not text — Windows text mode translates `\n` → `\r\n` and
+        # we want memory files byte-stable across read/write round-trips.
+        (tools.MEMORY_DIR / f"{cid}.md").write_bytes(text.encode("utf-8"))
+    except Exception as e:
+        raise HTTPException(500, f"could not write memory file: {e}")
+    return {"ok": True, "content": text}
+
+
+@app.delete("/api/conversations/{cid}/memory")
+def api_delete_conv_memory(cid: str) -> dict:
+    """Clear the per-conversation memory file by deleting it.
+
+    Idempotent — deleting a file that doesn't exist is a success case
+    (the end-state ‘no memory’ matches what the caller wanted).
+    """
+    if not db.get_conversation(cid):
+        raise HTTPException(404, "conversation not found")
+    path = tools.MEMORY_DIR / f"{cid}.md"
+    try:
+        if path.is_file():
+            path.unlink()
+    except Exception as e:
+        raise HTTPException(500, f"could not delete memory file: {e}")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Per-conversation usage / budget snapshot
+# ---------------------------------------------------------------------------
+@app.get("/api/conversations/{cid}/usage")
+def api_conv_usage(cid: str) -> dict:
+    """Return a cumulative-usage snapshot for the budget gauge.
+
+    Fields:
+      - assistant_turns: completed assistant replies so far.
+      - content_chars: sum of `content` lengths across every row.
+      - tokens_estimate: content_chars / CHARS_PER_TOKEN (matches the
+        header gauge's rough proxy).
+      - budget_turns / budget_tokens: the saved caps, or null when
+        unbounded. Echoed so the frontend can render the progress ring
+        without fetching the conversation meta separately.
+    """
+    conv = db.get_conversation(cid)
+    if not conv:
+        raise HTTPException(404, "conversation not found")
+    content_chars = db.conversation_content_chars(cid)
+    return {
+        "assistant_turns": db.count_assistant_turns(cid),
+        "content_chars": content_chars,
+        "tokens_estimate": content_chars // max(1, agent.CHARS_PER_TOKEN),
+        "budget_turns": conv.get("budget_turns"),
+        "budget_tokens": conv.get("budget_tokens"),
+    }
+
+
+def _sse(event: dict) -> str:
+    """Render a dict as one SSE `data:` record."""
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+def _safe_upload_name(name: str) -> str | None:
+    """Strip any path components and verify the filename shape.
+
+    Returns the basename if valid, or None if it looks traversy / empty.
+    """
+    base = Path(name).name
+    if not base or base in {".", ".."}:
+        return None
+    # Only accept filenames we would have produced ourselves — uuid hex +
+    # one of the allowed suffixes. This makes a traversal attack impossible.
+    stem, _, suffix = base.rpartition(".")
+    if not stem or not suffix:
+        return None
+    try:
+        int(stem, 16)
+    except ValueError:
+        return None
+    if f".{suffix.lower()}" not in ALLOWED_UPLOAD_TYPES.values():
+        return None
+    return base
+
+
+def _filter_safe_images(raw_names: list[str] | None) -> list[str]:
+    """Return only the upload filenames that pass our shape + traversal checks
+    AND actually exist inside `tools.UPLOAD_DIR`.
+
+    Centralized so every endpoint that accepts an `images` list (send, queue,
+    edit-and-regenerate) gets identical validation. Skips silently rather
+    than raising — a malformed/missing entry should drop the attachment, not
+    fail the whole request.
+    """
+    safe: list[str] = []
+    for raw in raw_names or []:
+        name = _safe_upload_name(str(raw))
+        if not name:
+            continue
+        path = (tools.UPLOAD_DIR / name).resolve()
+        try:
+            path.relative_to(tools.UPLOAD_DIR.resolve())
+        except ValueError:
+            continue
+        if path.is_file():
+            safe.append(name)
+    return safe
+
+
+@app.post("/api/conversations/{cid}/messages")
+async def api_send(cid: str, body: SendMessage):
+    """Open an SSE stream and run one agent turn.
+
+    Validates the optional `images` list against the upload directory so a
+    malicious client can't trick the backend into reading arbitrary files.
+    """
+    conv = db.get_conversation(cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+
+    safe_images = _filter_safe_images(body.images)
+
+    async def gen():
+        try:
+            async for evt in agent.run_turn(
+                cid,
+                user_text=body.content,
+                user_images=safe_images or None,
+            ):
+                yield _sse(evt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            yield _sse({"type": "error", "message": f"{type(e).__name__}: {e}"})
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/conversations/{cid}/stop")
+def api_stop_turn(cid: str) -> dict:
+    """Signal the active agent turn for this conversation to stop.
+
+    Sets an in-memory flag that the agent loop polls at well-defined
+    checkpoints (between Ollama stream chunks, before tool dispatch, at
+    the top of each iteration). Aborting the client's SSE fetch alone
+    isn't enough: if the server is mid-round-trip to Ollama when the
+    disconnect arrives, the local model keeps generating until it finishes
+    — which makes the Stop button feel broken. This endpoint short-circuits
+    that by making the loop notice and exit cleanly.
+    """
+    if not db.get_conversation(cid):
+        raise HTTPException(404, "not found")
+    agent.request_stop(cid)
+    return {"ok": True, "stopped": True}
+
+
+@app.post("/api/conversations/{cid}/queue")
+def api_queue_input(cid: str, body: SendMessage) -> dict:
+    """Append a follow-up user message to the in-flight turn's input queue.
+
+    The frontend hits this when the user sends another message while the
+    agent is still working on the previous one — the active `run_turn` loop
+    will pick it up between iterations and persist it as a real user row,
+    yielding a `user_message_added` SSE event so the transcript stays in
+    sync. No new SSE stream is opened — the existing one keeps the events.
+    """
+    if not db.get_conversation(cid):
+        raise HTTPException(404, "not found")
+    safe_images = _filter_safe_images(body.images)
+    queued = agent.enqueue_user_input(cid, body.content or "", safe_images or None)
+    if not queued:
+        # Empty payload (no text, no usable images). Treat as a 400 so the
+        # frontend can surface a toast rather than silently dropping it.
+        raise HTTPException(400, "empty message — nothing to queue")
+    return {"ok": True, "queued": True}
+
+
+@app.post("/api/conversations/{cid}/messages/{mid}/edit")
+async def api_edit_and_regenerate(cid: str, mid: str, body: SendMessage):
+    """Rewrite a user message in place, drop everything that came after it,
+    then run a fresh agent turn against the corrected history.
+
+    Only user-role messages are editable (enforced at the DB layer). The
+    response is an SSE stream identical in shape to /messages so the
+    frontend can reuse the same event handler.
+
+    Note: deletes are intentionally cascade-style — assistant replies, tool
+    calls, and tool results that depended on the now-rewritten prompt no
+    longer make sense, so we throw them away rather than leave the model
+    looking at contradictory history.
+    """
+    if not db.get_conversation(cid):
+        raise HTTPException(404, "not found")
+    safe_images = _filter_safe_images(body.images)
+
+    updated = db.update_user_message_content(mid, body.content or "")
+    if not updated or updated["conversation_id"] != cid:
+        raise HTTPException(404, "user message not found")
+    db.delete_messages_after(cid, mid)
+
+    async def gen():
+        try:
+            # persist_user=False because the user row already exists (we
+            # just rewrote it). Passing the text along still triggers the
+            # user_prompt_submit lifecycle hook so workflow integrations
+            # behave the same as a fresh send.
+            async for evt in agent.run_turn(
+                cid,
+                user_text=body.content or "",
+                user_images=safe_images or None,
+                persist_user=False,
+            ):
+                yield _sse(evt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            yield _sse({"type": "error", "message": f"{type(e).__name__}: {e}"})
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/conversations/{cid}/approve")
+def api_approve(cid: str, body: ApprovalDecision) -> dict:
+    """Resolve a pending tool-call approval. The SSE stream resumes on its own."""
+    ok = agent.submit_approval_decision(body.approval_id, body.approved)
+    return {"ok": ok}
+
+
+@app.post("/api/conversations/{cid}/answer")
+def api_answer(cid: str, body: QuestionAnswer) -> dict:
+    """Resolve a pending AskUserQuestion by relaying the clicked option value.
+
+    The agent loop yielded an `await_user_answer` event and is awaiting the
+    future stored in `_pending_answers[body.answer_id]`. Calling
+    `agent.resolve_answer` sets that future to `body.value`, which returns
+    control to the tool-call loop with `{"ok": True, "output": "user chose: …"}`.
+    """
+    val = (body.value or "").strip()
+    if not val:
+        raise HTTPException(400, "value required")
+    if len(val) > 500:
+        raise HTTPException(400, "value too long")
+    ok = agent.resolve_answer(body.answer_id, val)
+    return {"ok": ok}
+
+
+@app.post("/api/conversations/{cid}/execute-plan")
+def api_execute_plan(cid: str) -> dict:
+    """Switch a plan-mode conversation out of plan mode and enqueue the plan
+    as the next user turn for execution.
+
+    Flow:
+      1. Must be in `permission_mode = 'plan'` — reject with 409 otherwise so
+         the client knows the user double-clicked.
+      2. Grab the last assistant message (it contains the plan that ended
+         with `[PLAN READY]`).
+      3. Flip the conversation to `approve_edits` so writes resume the
+         normal approval flow.
+      4. Insert the plan as a queued_inputs row — next /send call will pick
+         it up as the user turn, exactly as if the user had pasted it.
+    """
+    conv = db.get_conversation(cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    if (conv.get("permission_mode") or "") != "plan":
+        raise HTTPException(409, "conversation is not in plan mode")
+    msgs = db.list_messages(cid)
+    last_assistant = next(
+        (m for m in reversed(msgs) if m["role"] == "assistant" and (m.get("content") or "").strip()),
+        None,
+    )
+    if not last_assistant:
+        raise HTTPException(409, "no plan message to execute — ask the agent to produce a plan first")
+    plan_body = (last_assistant["content"] or "").strip()
+    # Strip the sentinel so the replay reads as a clean instruction.
+    if plan_body.endswith("[PLAN READY]"):
+        plan_body = plan_body[: -len("[PLAN READY]")].rstrip()
+    replay = (
+        "Execute the plan above. You are no longer in plan mode — writes are "
+        "allowed (with approval where configured). Follow the plan step by "
+        "step, stop and ask if you need to deviate.\n\n"
+        "--- PLAN TO EXECUTE ---\n\n"
+        f"{plan_body}"
+    )
+    db.update_conversation(cid, permission_mode="approve_edits")
+    db.enqueue_user_input(cid, replay, None)
+    # Return the updated conversation row so the UI can flip the header
+    # permission-mode badge without a follow-up GET.
+    return {"ok": True, "queued": True, "conversation": db.get_conversation(cid)}
+
+
+# ---------------------------------------------------------------------------
+# Side tasks — surfaced as chips under the streaming assistant message.
+# ---------------------------------------------------------------------------
+@app.get("/api/conversations/{cid}/side-tasks")
+def api_list_side_tasks(cid: str) -> dict:
+    """Return pending side tasks for this conversation — powers the chip row."""
+    conv = db.get_conversation(cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    return {"side_tasks": db.list_pending_side_tasks(cid)}
+
+
+@app.post("/api/side-tasks/{sid}/open")
+def api_open_side_task(sid: str, body: SpawnTaskOpen) -> dict:
+    """User clicked Open on a side-task chip. Spin a new conversation with
+    the stored prompt, mark the row as opened, and return the new id so the
+    client can navigate there.
+    """
+    row = db.get_side_task(sid)
+    if not row:
+        raise HTTPException(404, "not found")
+    if row["status"] != "pending":
+        raise HTTPException(409, f"side task already {row['status']}")
+    source_conv = db.get_conversation(row["source_conversation_id"])
+    cwd = (body.cwd or (source_conv or {}).get("cwd") or str(Path.cwd()))
+    model = (body.model or (source_conv or {}).get("model") or _resolve_default_chat_model())
+    new_conv = db.create_conversation(
+        title=row["title"][:120],
+        model=model,
+        cwd=cwd,
+    )
+    db.mark_side_task_opened(sid, new_conv["id"])
+    db.enqueue_user_input(new_conv["id"], row["prompt"], None)
+    # Return the full conversation row so the UI can navigate + update the
+    # sidebar in one round-trip without a follow-up GET.
+    return {"ok": True, "conversation": db.get_conversation(new_conv["id"])}
+
+
+@app.post("/api/side-tasks/{sid}/dismiss")
+def api_dismiss_side_task(sid: str) -> dict:
+    """User clicked Dismiss. Transition the row to the terminal 'dismissed' state."""
+    row = db.get_side_task(sid)
+    if not row:
+        raise HTTPException(404, "not found")
+    updated = db.mark_side_task_dismissed(sid)
+    if not updated:
+        raise HTTPException(409, f"side task already {row['status']}")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Git worktrees — read-only listing; create/remove happens via agent tools.
+# ---------------------------------------------------------------------------
+@app.get("/api/conversations/{cid}/worktrees")
+def api_list_worktrees(cid: str) -> dict:
+    """List worktrees (active + removed, newest first) created in this conversation."""
+    conv = db.get_conversation(cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    return {"worktrees": db.list_worktrees_for_conversation(cid)}
+
+
+@app.post("/api/conversations/{cid}/uploads")
+async def api_upload(cid: str, file: UploadFile = File(...)) -> dict:
+    """Accept a user-pasted image OR document for the next chat turn.
+
+    Two flavours of upload are supported:
+
+    * **Images** (png/jpeg/webp/gif) — saved verbatim and returned as a
+      filename the client passes in the next message's `images` array. The
+      agent loop attaches them as multimodal input if the model supports it.
+    * **Documents** (pdf/txt/md/csv) — we extract UTF-8 text on the server
+      and return it alongside the filename. The UI prepends that text to
+      the user's next message so it reaches any model, even text-only ones.
+      The original file is still stored under `data/uploads/` for
+      auditability but the model never sees the binary.
+
+    Security:
+      - Content-Type must be in the image *or* document allowlist.
+      - Hard size cap enforced mid-stream so a gigabyte paste can't DOS us.
+      - The saved filename is `<random-hex><ext>`; the original client-
+        supplied filename is ignored entirely to avoid path traversal.
+    """
+    if not db.get_conversation(cid):
+        raise HTTPException(404, "not found")
+
+    ctype = (file.content_type or "").lower()
+    is_image = ctype in ALLOWED_UPLOAD_TYPES
+    is_document = ctype in ALLOWED_DOCUMENT_TYPES
+    if not (is_image or is_document):
+        raise HTTPException(415, f"unsupported content type: {ctype!r}")
+
+    tools.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = ALLOWED_UPLOAD_TYPES.get(ctype) or ALLOWED_DOCUMENT_TYPES[ctype]
+    # 16 bytes of hex = 32 chars, comfortably unguessable.
+    name = secrets.token_hex(16) + suffix
+    dest = tools.UPLOAD_DIR / name
+
+    total = 0
+    # Read in chunks so a huge paste doesn't balloon memory. UploadFile
+    # exposes a SpooledTemporaryFile-backed stream.
+    try:
+        with dest.open("wb") as fh:
+            while True:
+                chunk = await file.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > UPLOAD_MAX_BYTES:
+                    fh.close()
+                    try:
+                        dest.unlink()
+                    except Exception:
+                        pass
+                    raise HTTPException(
+                        413,
+                        f"upload too large (max {UPLOAD_MAX_BYTES // (1024 * 1024)} MB)",
+                    )
+                fh.write(chunk)
+    finally:
+        await file.close()
+
+    # Best-effort original filename for the UI chip — sanitized because the
+    # client controls it. We only ever echo it back, never treat it as a
+    # path.
+    original = (file.filename or "").strip() or None
+    if original:
+        # Drop anything that looks like a path separator or sneaky bytes.
+        original = original.replace("\\", "/").rsplit("/", 1)[-1]
+        original = "".join(ch for ch in original if ch.isprintable())[:120] or None
+
+    payload: dict = {
+        "name": name,
+        "size": total,
+        "content_type": ctype,
+        "original_name": original,
+        "kind": "image" if is_image else "document",
+    }
+    if is_document:
+        extracted = await asyncio.to_thread(_extract_document_text, dest, ctype)
+        payload.update(extracted)
+    return payload
+
+
+def _extract_document_text(path: Path, ctype: str) -> dict:
+    """Pull plain text out of an uploaded document.
+
+    Runs on a worker thread so PDF parsing doesn't stall the event loop.
+    Returns a dict shaped for merging into the upload response:
+
+        {
+            "extracted_text": str,  # UTF-8, already clipped to the cap
+            "truncated": bool,
+            "page_count": int (PDF only),
+            "extract_error": str (only set on failure),
+        }
+    """
+    try:
+        if ctype == "application/pdf":
+            # Reuse the tools-level helper so the two code paths can't
+            # diverge on how they handle PDFs.
+            r = tools._read_pdf_sync(str(path), pages=None)
+            if not r.get("ok"):
+                return {"extract_error": r.get("error") or "pdf parse failed"}
+            text = (r.get("output") or "").strip()
+            return {
+                "extracted_text": text[:DOCUMENT_EXTRACT_MAX_CHARS],
+                "truncated": len(text) > DOCUMENT_EXTRACT_MAX_CHARS,
+                "page_count": r.get("page_count"),
+            }
+        # text/plain, text/markdown, text/csv — read directly with a lenient
+        # decoder so UTF-8-ish files with stray bytes still come through.
+        raw = path.read_bytes()
+        text = raw.decode("utf-8", errors="replace")
+        return {
+            "extracted_text": text[:DOCUMENT_EXTRACT_MAX_CHARS],
+            "truncated": len(text) > DOCUMENT_EXTRACT_MAX_CHARS,
+        }
+    except Exception as e:
+        return {"extract_error": f"{type(e).__name__}: {e}"}
+
+
+@app.post("/api/conversations/{cid}/restore/{stamp}")
+def api_restore(cid: str, stamp: str) -> dict:
+    """Restore files snapshotted under a given checkpoint stamp."""
+    if not db.get_conversation(cid):
+        raise HTTPException(404, "not found")
+    # Defensive: the stamp we generate looks like 'YYYYMMDDTHHMMSS_xxxx';
+    # refuse anything with slashes or '..' to prevent path traversal.
+    if "/" in stamp or "\\" in stamp or ".." in stamp:
+        raise HTTPException(400, "invalid stamp")
+    result = tools.restore_checkpoint(cid, stamp)
+    if not result.get("ok"):
+        raise HTTPException(404, result.get("error", "checkpoint not found"))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle hooks CRUD
+#
+# Hooks are user-defined shell commands that fire at specific points in the
+# agent loop (see agent.py / tools.run_hooks). We expose a tiny REST surface
+# so the frontend settings page can list / create / edit / delete them.
+#
+# Security note: these endpoints are callable only by the local frontend
+# bound to localhost (uvicorn default). The commands themselves execute with
+# the user's privileges; the UI warns before accepting a new hook.
+# ---------------------------------------------------------------------------
+class HookBody(BaseModel):
+    """POST /api/hooks body. `event` must be one of db.HOOK_EVENTS."""
+
+    event: str
+    command: str
+    matcher: str | None = None
+    timeout_seconds: int = 10
+    enabled: bool = True
+
+
+class HookPatchBody(BaseModel):
+    """PATCH /api/hooks/{id} body. All fields optional for partial updates."""
+
+    event: str | None = None
+    command: str | None = None
+    matcher: str | None = None
+    timeout_seconds: int | None = None
+    enabled: bool | None = None
+
+
+@app.get("/api/hooks")
+def api_list_hooks() -> dict:
+    """Return every hook (enabled + disabled) newest-first."""
+    return {"hooks": db.list_hooks(), "events": sorted(db.HOOK_EVENTS)}
+
+
+@app.post("/api/hooks")
+def api_create_hook(body: HookBody) -> dict:
+    """Register a new lifecycle hook."""
+    try:
+        hid = db.create_hook(
+            event=body.event,
+            command=body.command,
+            matcher=body.matcher,
+            timeout_seconds=body.timeout_seconds,
+            enabled=body.enabled,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return db.get_hook(hid) or {}
+
+
+@app.patch("/api/hooks/{hid}")
+def api_update_hook(hid: str, body: HookPatchBody) -> dict:
+    """Patch fields on an existing hook. Ignores unset fields."""
+    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    try:
+        updated = db.update_hook(hid, **patch)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not updated:
+        raise HTTPException(404, "hook not found")
+    return updated
+
+
+@app.delete("/api/hooks/{hid}")
+def api_delete_hook(hid: str) -> dict:
+    """Remove a hook. 404 if no row was deleted."""
+    n = db.delete_hook(hid)
+    if not n:
+        raise HTTPException(404, "hook not found")
+    return {"ok": True, "deleted": hid}
+
+
+# ---------------------------------------------------------------------------
+# Scheduled-tasks CRUD
+#
+# The background daemon at the top of this file consumes `scheduled_tasks`
+# rows. This REST surface lets the UI list/create/delete them directly so
+# the user can manage schedules without going through the agent's
+# `schedule_task` tool. The `schedule_task` tool keeps working — both write
+# into the same table.
+#
+# The daemon fires any row whose `next_run_at` is in the past, so "run now"
+# is implemented client-side by simply creating a row with `run_at` set to
+# the current time.
+# ---------------------------------------------------------------------------
+class ScheduledTaskBody(BaseModel):
+    """Body for POST /api/scheduled-tasks.
+
+    Callers pass `run_at` as either:
+      - a unix timestamp (float, seconds since epoch), or
+      - an ISO-8601 string (the UI uses <input type="datetime-local">).
+
+    `interval_seconds` omitted / 0 / null means a one-shot. The minimum
+    recurrence is 60s to stop the scheduler from starving under a pathological
+    `interval: 1`.
+    """
+
+    name: str
+    prompt: str
+    run_at: str | float
+    interval_seconds: int | None = None
+    cwd: str | None = None
+
+
+def _parse_run_at(raw: str | float) -> float:
+    """Accept unix seconds OR ISO-8601 and return a unix timestamp."""
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw).strip()
+    if not s:
+        raise ValueError("run_at required")
+    # Plain-number string falls through to unix seconds.
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    # datetime.fromisoformat handles '2026-04-24T14:30' and with timezone.
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc).astimezone()  # treat as local
+        return dt.timestamp()
+    except Exception as e:
+        raise ValueError(f"invalid run_at {s!r}: {e}")
+
+
+@app.get("/api/scheduled-tasks")
+def api_list_scheduled_tasks() -> dict:
+    """List every pending scheduled task, soonest-first."""
+    return {"tasks": db.list_scheduled_tasks()}
+
+
+@app.post("/api/scheduled-tasks")
+def api_create_scheduled_task(body: ScheduledTaskBody) -> dict:
+    """Create a new scheduled task. Body validation mirrors the `schedule_task`
+    tool — see its docstring for field semantics."""
+    name = (body.name or "").strip()
+    prompt = (body.prompt or "").strip()
+    if not name or not prompt:
+        raise HTTPException(400, "name and prompt are required")
+    try:
+        run_at = _parse_run_at(body.run_at)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    interval = body.interval_seconds or None
+    if interval is not None:
+        if interval < 60:
+            raise HTTPException(400, "interval_seconds must be >= 60")
+    cwd = (body.cwd or str(ROOT)).strip() or str(ROOT)
+    tid = db.create_scheduled_task(
+        name=name,
+        prompt=prompt,
+        next_run_at=run_at,
+        interval_seconds=interval,
+        cwd=cwd,
+    )
+    # Return the full row so the client can render it without a follow-up GET.
+    for row in db.list_scheduled_tasks():
+        if row["id"] == tid:
+            return row
+    return {"id": tid}
+
+
+@app.delete("/api/scheduled-tasks/{tid}")
+def api_delete_scheduled_task(tid: str) -> dict:
+    """Cancel a pending scheduled task. Accepts short-id prefixes."""
+    n = db.cancel_scheduled_task(tid)
+    if not n:
+        raise HTTPException(404, "scheduled task not found")
+    return {"ok": True, "deleted": tid, "count": n}
+
+
+@app.get("/api/conversations/{cid}/loop")
+def api_get_conversation_loop(cid: str) -> dict:
+    """Return the active autonomous-loop row for this conversation, or null.
+
+    The frontend polls this on mount + after each agent turn so the loop
+    banner can appear / disappear without relying on an SSE event we'd
+    otherwise need to invent.
+    """
+    return {"loop": db.get_active_loop_for_conversation(cid)}
+
+
+@app.delete("/api/conversations/{cid}/loop")
+def api_stop_conversation_loop(cid: str) -> dict:
+    """Stop the autonomous loop on a conversation (user clicked Stop loop).
+
+    Idempotent — missing / already-stopped loops return `count: 0` rather
+    than 404, so the client doesn't need to distinguish "there was nothing
+    to stop" from "server error". Mirrors the behaviour of the
+    `stop_loop` tool the agent can call itself.
+    """
+    n = db.cancel_loops_for_conversation(cid)
+    return {"ok": True, "count": n}
+
+
+@app.get("/api/conversations/{cid}/codebase-index")
+def api_get_codebase_index(cid: str) -> dict:
+    """Return the codebase-index row for a conversation's cwd, or null.
+
+    The frontend shows a small chip next to the cwd so the user knows whether
+    the semantic index is ready, still building, or errored. Resolves the
+    cwd server-side so the UI never needs to do the expanduser/resolve dance.
+    """
+    conv = db.get_conversation(cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    try:
+        root = str(Path(conv["cwd"]).expanduser().resolve())
+    except Exception:
+        return {"index": None, "cwd": conv.get("cwd")}
+    return {"index": db.get_codebase_index(root), "cwd": root}
+
+
+@app.post("/api/conversations/{cid}/codebase-index/reindex")
+def api_reindex_codebase(cid: str) -> dict:
+    """Force a fresh background index of this conversation's cwd.
+
+    Flips the registry row to 'pending' (so the UI shows progress) and
+    enqueues the worker via the existing kick helper. Idempotent — if a
+    build is already in flight we just return its current state.
+    """
+    conv = db.get_conversation(cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    if not conv.get("cwd"):
+        raise HTTPException(400, "conversation has no cwd")
+    try:
+        root = str(Path(conv["cwd"]).expanduser().resolve())
+    except Exception:
+        raise HTTPException(400, "invalid cwd")
+    # Force a rebuild even if the row is already 'ready' — the kick helper
+    # otherwise short-circuits. We stomp the status so the next kick
+    # actually schedules work.
+    if root not in _CODEBASE_INDEX_INFLIGHT:
+        db.upsert_codebase_index(root, status="pending")
+    _kick_codebase_index(root)
+    return {"ok": True, "index": db.get_codebase_index(root), "cwd": root}
+
+
+@app.get("/api/conversations/{cid}/files/search")
+async def api_search_conversation_files(
+    cid: str, q: str = "", limit: int = 12
+) -> dict:
+    """Fuzzy-find files under the conversation's cwd for @-mention autocomplete.
+
+    Strategy:
+      * Always do a substring match against the set of files `_codebase_list_files`
+        would index (gitignore-aware when the cwd is a git repo) — cheap and
+        deterministic for the short filename queries the UI sends most often.
+      * If the query is long-form (>= 3 chars that aren't typical path chars)
+        AND the semantic index is ready, also fold in the top semantic hits.
+      * Results are capped and deduped by absolute path; relative paths are
+        returned so the UI can show compact labels.
+
+    Security: paths are scoped to the conversation's cwd; any result whose
+    absolute path escapes the cwd (symlink chicanery) is filtered out.
+    """
+    conv = db.get_conversation(cid)
+    if not conv:
+        raise HTTPException(404, "not found")
+    try:
+        root = Path(conv["cwd"]).expanduser().resolve()
+    except Exception:
+        raise HTTPException(400, "invalid cwd")
+    if not root.is_dir():
+        return {"files": [], "cwd": str(root)}
+
+    q = (q or "").strip()
+    lim = max(1, min(int(limit or 12), 50))
+
+    # ---- name-match pass (always-on) --------------------------------------
+    # Reuses the same file-discovery logic the indexer uses so @-mentions
+    # stay in lockstep with what the model already has indexed.
+    try:
+        candidates = tools._codebase_list_files(root)
+    except Exception:
+        candidates = []
+    ql = q.lower()
+
+    def _name_score(p: Path) -> float:
+        name = p.name.lower()
+        rel = str(p.relative_to(root)).lower() if p.is_relative_to(root) else name
+        if not ql:
+            return 1.0  # empty query — surface recent/any files
+        if name == ql:
+            return 100.0
+        if name.startswith(ql):
+            return 50.0 + (10.0 / max(1, len(name)))
+        if ql in name:
+            return 20.0 + (5.0 / max(1, len(name)))
+        if ql in rel:
+            return 5.0
+        return 0.0
+
+    scored: list[tuple[float, Path]] = []
+    for p in candidates:
+        s = _name_score(p)
+        if s > 0:
+            scored.append((s, p))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    seen: set[str] = set()
+    results: list[dict] = []
+    for _, p in scored:
+        if len(results) >= lim:
+            break
+        try:
+            abs_p = str(p.resolve())
+            if abs_p in seen:
+                continue
+            # Defensive — resolve() chases symlinks; ensure we still sit
+            # under the cwd after resolution.
+            if not Path(abs_p).is_relative_to(root):
+                continue
+            rel = str(p.relative_to(root)).replace("\\", "/")
+            seen.add(abs_p)
+            results.append({
+                "path": abs_p,
+                "rel_path": rel,
+                "name": p.name,
+                "source": "name",
+            })
+        except Exception:
+            continue
+
+    # ---- semantic pass (long-form queries only) ---------------------------
+    # Don't pay the embedding round-trip on 1-2 char queries — the user is
+    # almost certainly still typing a filename.
+    if len(q) >= 3 and not q.startswith("/") and "." not in q[-4:]:
+        idx = db.get_codebase_index(str(root))
+        if idx and idx.get("status") == "ready":
+            try:
+                sem = await tools.codebase_search(q, top_k=lim, cwd=str(root))
+            except Exception:
+                sem = {"ok": False}
+            # codebase_search returns a text-formatted `output`; parse out
+            # the paths the same way the agent does.
+            if sem.get("ok") and sem.get("output"):
+                import re as _re
+                for line in sem["output"].splitlines():
+                    m = _re.match(r"\[([\d.]+)\]\s+(\S+)\s+#\d+:\s*(.*)", line)
+                    if not m:
+                        continue
+                    rel = m.group(2).replace("\\", "/")
+                    snippet = m.group(3)[:140]
+                    abs_p = str((root / rel).resolve())
+                    if abs_p in seen:
+                        # already surfaced by name-match; just attach a
+                        # snippet so the UI can show why it matched.
+                        for r in results:
+                            if r["path"] == abs_p and "snippet" not in r:
+                                r["snippet"] = snippet
+                                break
+                        continue
+                    if not Path(abs_p).is_relative_to(root):
+                        continue
+                    seen.add(abs_p)
+                    results.append({
+                        "path": abs_p,
+                        "rel_path": rel,
+                        "name": Path(rel).name,
+                        "snippet": snippet,
+                        "source": "semantic",
+                    })
+                    if len(results) >= lim:
+                        break
+
+    return {"files": results[:lim], "cwd": str(root), "query": q}
+
+
+# ---------------------------------------------------------------------------
+# Docs URL indexing — crawl & embed public documentation sites so the agent
+# can ground answers on them. Thin REST over `db.*_doc_url` + the crawler
+# in tools._docs_url_crawl_impl. The Settings UI calls these endpoints to
+# manage the registry; searches are routed through the agent's `docs_search`
+# tool, not this surface.
+# ---------------------------------------------------------------------------
+class DocUrlBody(BaseModel):
+    """Body for POST /api/docs/urls — register a new URL to index.
+
+    `url` is required and must be http(s). The SSRF guard in the crawler
+    itself rejects private/loopback targets at fetch time; we don't
+    duplicate that check here so new schemes automatically pick up the
+    stricter backend rules.
+    """
+
+    url: str
+    title: str | None = None
+    max_pages: int | None = None
+    same_origin_only: bool | None = None
+
+
+@app.get("/api/docs/urls")
+def api_list_doc_urls() -> dict:
+    """Return every registered docs URL, most-recently-touched first."""
+    return {"urls": db.list_doc_urls()}
+
+
+@app.get("/api/docs/urls/{did}")
+def api_get_doc_url(did: str) -> dict:
+    """Return one URL row — used by the UI to poll crawl progress."""
+    row = db.get_doc_url(did)
+    if not row:
+        raise HTTPException(404, "not found")
+    return {"url": row}
+
+
+@app.post("/api/docs/urls")
+def api_create_doc_url(body: DocUrlBody) -> dict:
+    """Register a new URL and kick off the first crawl.
+
+    Idempotent on the seed URL: re-posting the same URL returns the
+    existing row unchanged (no re-crawl triggered — use the /reindex
+    endpoint for that).
+    """
+    u = (body.url or "").strip()
+    if not u:
+        raise HTTPException(400, "url is required")
+    # Sanity check — reject obvious bad schemes early so the UI surfaces a
+    # clean 400 instead of the crawler quietly failing later.
+    parsed = urlparse(u)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(400, "url must be http(s)")
+    if not (parsed.hostname or "").strip():
+        raise HTTPException(400, "url must include a hostname")
+
+    existing = db.get_doc_url_by_url(u)
+    if existing:
+        return {"url": existing, "created": False}
+
+    max_pages = body.max_pages if body.max_pages is not None else 20
+    same_origin = True if body.same_origin_only is None else bool(body.same_origin_only)
+    row = db.create_doc_url(
+        url=u,
+        title=body.title,
+        max_pages=max_pages,
+        same_origin_only=same_origin,
+    )
+    if not row:
+        raise HTTPException(500, "failed to create url row")
+    _kick_docs_url_crawl(row["id"])
+    return {"url": db.get_doc_url(row["id"]) or row, "created": True}
+
+
+@app.post("/api/docs/urls/{did}/reindex")
+def api_reindex_doc_url(did: str) -> dict:
+    """Force a fresh crawl of an existing seed.
+
+    Overwrites any cached chunks (the crawler wipes the path-prefix first)
+    so stale pages can be dropped by re-running the seed.
+    """
+    row = db.get_doc_url(did)
+    if not row:
+        raise HTTPException(404, "not found")
+    _kick_docs_url_crawl(did)
+    return {"url": db.get_doc_url(did) or row}
+
+
+@app.delete("/api/docs/urls/{did}")
+def api_delete_doc_url(did: str) -> dict:
+    """Drop a URL seed and every chunk crawled beneath it."""
+    row = db.get_doc_url(did)
+    if not row:
+        raise HTTPException(404, "not found")
+    db.delete_doc_url(did)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Global memories CRUD
+#
+# Global memories are short, durable notes that get injected into the system
+# prompt of EVERY conversation (including subagents). They live in their own
+# SQLite table — separate from per-conversation memory files — so the user
+# can curate "facts about me / how I like to work" once and have every chat
+# benefit. The agent can also write these via the `remember(scope="global")`
+# tool; this REST surface powers the Settings → Memories panel in the UI.
+# ---------------------------------------------------------------------------
+class MemoryBody(BaseModel):
+    """Body for POST /api/memories and PATCH /api/memories/{mid}.
+
+    For POST, `content` is required. For PATCH, both fields are optional —
+    omit a field to leave it unchanged. Sending `topic: ""` (empty string)
+    explicitly clears the topic.
+    """
+
+    content: str | None = None
+    topic: str | None = None
+
+
+@app.get("/api/memories")
+def api_list_memories() -> dict:
+    """Return every global memory, oldest-first.
+
+    Oldest-first matches the order in which the entries appear in the
+    injected system prompt, so what the user sees in Settings is exactly
+    what the model sees.
+    """
+    return {"memories": db.list_global_memories()}
+
+
+@app.post("/api/memories")
+def api_create_memory(body: MemoryBody) -> dict:
+    """Create a new global memory entry. `content` is required."""
+    if body.content is None:
+        raise HTTPException(400, "content is required")
+    try:
+        row = db.add_global_memory(body.content, body.topic)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"memory": row}
+
+
+@app.patch("/api/memories/{mid}")
+def api_update_memory(mid: str, body: MemoryBody) -> dict:
+    """Patch a global memory's content and/or topic in place."""
+    try:
+        row = db.update_global_memory(mid, content=body.content, topic=body.topic)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not row:
+        raise HTTPException(404, "memory not found")
+    return {"memory": row}
+
+
+@app.delete("/api/memories/{mid}")
+def api_delete_memory(mid: str) -> dict:
+    """Permanently remove one global memory entry. 404 if no row matched."""
+    n = db.delete_global_memory(mid)
+    if not n:
+        raise HTTPException(404, "memory not found")
+    return {"ok": True, "deleted": mid}
+
+
+# ---------------------------------------------------------------------------
+# Secrets (API tokens / credentials that the `http_request` tool can reference
+# via `{{secret:NAME}}` placeholders). Values never go out to the model in a
+# regular list call — the frontend asks for a single secret by id when the
+# user clicks "reveal". Writing a secret requires the full value; reading
+# metadata hides it.
+# ---------------------------------------------------------------------------
+class SecretCreate(BaseModel):
+    """Body for POST /api/secrets."""
+
+    name: str
+    value: str
+    description: str | None = None
+
+
+class SecretUpdate(BaseModel):
+    """Body for PATCH /api/secrets/{sid}. Omit a field to leave it unchanged."""
+
+    name: str | None = None
+    value: str | None = None
+    description: str | None = None
+
+
+@app.get("/api/secrets")
+def api_list_secrets() -> dict:
+    """List every stored secret's metadata — no values in the response."""
+    return {"secrets": db.list_secrets()}
+
+
+@app.get("/api/secrets/{sid}")
+def api_reveal_secret(sid: str) -> dict:
+    """Return one secret including its value. Used by the reveal button."""
+    row = db.get_secret(sid, include_value=True)
+    if not row:
+        raise HTTPException(404, "secret not found")
+    return {"secret": row}
+
+
+@app.post("/api/secrets")
+def api_create_secret(body: SecretCreate) -> dict:
+    """Create a new secret. Name + value required."""
+    try:
+        row = db.create_secret(
+            name=body.name,
+            value=body.value,
+            description=body.description,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    # Return metadata only; the caller already had the value.
+    row.pop("value", None)
+    return {"secret": row}
+
+
+@app.patch("/api/secrets/{sid}")
+def api_update_secret(sid: str, body: SecretUpdate) -> dict:
+    """Update a secret in place. Returns metadata only."""
+    try:
+        row = db.update_secret(
+            sid,
+            name=body.name,
+            value=body.value,
+            description=body.description,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not row:
+        raise HTTPException(404, "secret not found")
+    row.pop("value", None)
+    return {"secret": row}
+
+
+@app.delete("/api/secrets/{sid}")
+def api_delete_secret(sid: str) -> dict:
+    """Permanently remove a stored secret."""
+    n = db.delete_secret(sid)
+    if not n:
+        raise HTTPException(404, "secret not found")
+    return {"ok": True, "deleted": sid}
+
+
+# ---------------------------------------------------------------------------
+# User-defined tools CRUD
+#
+# Backs the Settings → Tools panel. Only the user (via this HTTP surface) can
+# create, edit, or delete user-defined tools — the LLM has no equivalent
+# tool-call route. This is a deliberate safety boundary so the model can't
+# mint new tools and extend its own privileges mid-conversation. Once created
+# the model CAN call the tool like any other; see tools.user_tool_schemas().
+# ---------------------------------------------------------------------------
+class UserToolBody(BaseModel):
+    """Body for POST /api/user-tools — maps 1:1 to tools.create_tool arguments."""
+
+    name: str
+    description: str
+    code: str
+    schema_: dict | None = Field(default=None, alias="schema")
+    deps: list[str] | None = None
+    category: str = "write"
+    timeout_seconds: int = 60
+
+    model_config = {"populate_by_name": True}
+
+
+class UserToolPatchBody(BaseModel):
+    """Body for PATCH /api/user-tools/{tid}. All fields optional."""
+
+    description: str | None = None
+    code: str | None = None
+    schema_: dict | None = Field(default=None, alias="schema")
+    deps: list[str] | None = None
+    category: str | None = None
+    timeout_seconds: int | None = None
+    enabled: bool | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+@app.get("/api/user-tools")
+def api_list_user_tools() -> dict:
+    """List every user-defined tool (enabled + disabled), newest-first."""
+    return {
+        "tools": db.list_user_tools(enabled_only=False),
+        "disabled": tools._utr.is_disabled(),
+    }
+
+
+@app.post("/api/user-tools")
+async def api_create_user_tool(body: UserToolBody) -> dict:
+    """Create a new user tool.
+
+    Returns the freshly-inserted row plus a short install log so the UI can
+    show pip output (and errors) in a toast. This is the only creation path —
+    the LLM cannot reach this route because there is no corresponding tool
+    schema exposed to it.
+    """
+    if tools._utr.is_disabled():
+        raise HTTPException(
+            403, "user tools are disabled via GIGACHAT_DISABLE_USER_TOOLS"
+        )
+    result = await tools.create_tool(
+        body.name,
+        body.description,
+        body.code,
+        body.schema_ or {},
+        body.deps or [],
+        body.category or "write",
+        int(body.timeout_seconds or 60),
+    )
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error") or "user tool creation failed")
+    # Re-fetch so the caller gets the full row (incl. timestamps) rather
+    # than the partial dict the helper returns.
+    row = db.get_user_tool_by_name(body.name.strip().lower()) or {}
+    return {"tool": row, "install_log": result.get("output", "")}
+
+
+@app.patch("/api/user-tools/{tid}")
+def api_update_user_tool(tid: str, body: UserToolPatchBody) -> dict:
+    """Patch fields on a user tool. Name is immutable (see db.update_user_tool).
+
+    Mirrors the hardening of POST: any `code` update is AST-validated (must
+    still define `def run(args)`) and any `deps` update passes through the
+    PEP 508 subset regex + blocklist. Unchanged fields are untouched.
+    """
+    patch = {}
+    dumped = body.model_dump(by_alias=False)
+    for k, v in dumped.items():
+        if v is None:
+            continue
+        # Pydantic rewrites `schema_` → `schema` for the DB layer.
+        if k == "schema_":
+            patch["schema"] = v
+        else:
+            patch[k] = v
+    # Same validation pass that POST runs — keeps the UI surface from smuggling
+    # syntactically-broken Python or hostile dep specs past the AST / PEP 508
+    # guards just by using PATCH instead of POST.
+    if "code" in patch:
+        try:
+            tools._validate_user_tool_code(patch["code"] or "")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    if "deps" in patch:
+        try:
+            patch["deps"] = tools._utr.validate_deps(patch["deps"] or [])
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    try:
+        updated = db.update_user_tool(tid, **patch)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not updated:
+        raise HTTPException(404, "user tool not found")
+    return updated
+
+
+@app.delete("/api/user-tools/{tid}")
+def api_delete_user_tool(tid: str) -> dict:
+    """Permanently remove a user tool. The venv + installed deps are untouched."""
+    n = db.delete_user_tool(tid)
+    if not n:
+        raise HTTPException(404, "user tool not found")
+    return {"ok": True, "deleted": tid}
+
+
+@app.get("/api/screenshots/{name}")
+def api_screenshot(name: str) -> FileResponse:
+    """Serve a saved computer-use screenshot to the browser.
+
+    Path traversal is blocked by forcing `name` through Path and requiring
+    the resolved file to live directly inside `tools.SCREENSHOT_DIR`.
+    """
+    safe_name = Path(name).name  # strip any ../ or nested paths
+    target = (tools.SCREENSHOT_DIR / safe_name).resolve()
+    try:
+        target.relative_to(tools.SCREENSHOT_DIR.resolve())
+    except ValueError:
+        raise HTTPException(400, "invalid screenshot path")
+    if not target.is_file():
+        raise HTTPException(404, "screenshot not found")
+    return FileResponse(target, media_type="image/png")
+
+
+@app.get("/api/uploads/{name}")
+def api_upload_read(name: str) -> FileResponse:
+    """Serve a user-uploaded image. Same hardening as /api/screenshots."""
+    safe_name = _safe_upload_name(name)
+    if not safe_name:
+        raise HTTPException(400, "invalid upload path")
+    target = (tools.UPLOAD_DIR / safe_name).resolve()
+    try:
+        target.relative_to(tools.UPLOAD_DIR.resolve())
+    except ValueError:
+        raise HTTPException(400, "invalid upload path")
+    if not target.is_file():
+        raise HTTPException(404, "upload not found")
+    # Guess the media type from the extension — we only ever wrote known ones.
+    suffix = target.suffix.lower()
+    media = next(
+        (k for k, v in ALLOWED_UPLOAD_TYPES.items() if v == suffix),
+        "application/octet-stream",
+    )
+    return FileResponse(target, media_type=media)
+
+
+# ---------------------------------------------------------------------------
+# Web Push subscription management.
+#
+# Flow:
+#   1. Browser registers the service worker and calls pushManager.subscribe()
+#      with the VAPID public key fetched from /api/push/vapid-key.
+#   2. The resulting {endpoint, keys} blob is POSTed to /api/push/subscribe.
+#   3. Later, when a scheduled task fires or a long agent turn finishes while
+#      the tab is hidden, backend/push.py fan-outs an encrypted payload to
+#      every saved subscription so the OS shows a native notification.
+# ---------------------------------------------------------------------------
+class PushKeys(BaseModel):
+    """Subscription keys as emitted by the browser's PushSubscription.toJSON()."""
+
+    p256dh: str
+    auth: str
+
+
+class PushSubscribeBody(BaseModel):
+    """Body for POST /api/push/subscribe.
+
+    Exactly mirrors the shape of `PushSubscription.toJSON()` in the browser,
+    with a best-effort `user_agent` tagged on so the settings UI can label
+    each registered device.
+    """
+
+    endpoint: str
+    keys: PushKeys
+    user_agent: str | None = None
+
+
+class PushUnsubscribeBody(BaseModel):
+    """Body for POST /api/push/unsubscribe — only the endpoint is needed."""
+
+    endpoint: str
+
+
+@app.get("/api/push/vapid-key")
+def api_push_vapid_key() -> dict:
+    """Public VAPID key for the browser's pushManager.subscribe() call.
+
+    Lazily generated on first call; subsequent calls return the same key so
+    previously-saved subscriptions remain valid across server restarts.
+    """
+    return {"public_key": push.vapid_public_key_b64url()}
+
+
+@app.post("/api/push/subscribe")
+def api_push_subscribe(body: PushSubscribeBody) -> dict:
+    """Persist a browser's push subscription.
+
+    Defensive:
+      - We reject obvious junk endpoints (non-https, >2KB) before touching the DB.
+      - Re-subscribing the same endpoint updates the keys in place — browsers
+        rotate their p256dh/auth pair periodically.
+    """
+    endpoint = body.endpoint.strip()
+    if not endpoint.startswith("https://") or len(endpoint) > 2048:
+        raise HTTPException(400, "invalid push endpoint")
+    db.upsert_push_subscription(
+        endpoint=endpoint,
+        p256dh=body.keys.p256dh,
+        auth=body.keys.auth,
+        user_agent=(body.user_agent or "")[:300] or None,
+    )
+    return {"ok": True, "count": db.count_push_subscriptions()}
+
+
+@app.post("/api/push/unsubscribe")
+def api_push_unsubscribe(body: PushUnsubscribeBody) -> dict:
+    """Remove a browser's subscription. Idempotent — deleting something we
+    don't have still returns ok=True so the UI can collapse retries."""
+    n = db.delete_push_subscription(body.endpoint)
+    return {"ok": True, "removed": n, "count": db.count_push_subscriptions()}
+
+
+@app.get("/api/push/status")
+def api_push_status() -> dict:
+    """Return the number of registered browsers so the settings panel can
+    render "Notifications enabled on 2 devices" without leaking endpoint URLs.
+    """
+    return {"count": db.count_push_subscriptions()}
+
+
+@app.post("/api/push/test")
+async def api_push_test() -> dict:
+    """Fire a test notification to every registered browser.
+
+    Useful for the settings panel's "Send test" button — lets the user
+    confirm their device is receiving pushes before relying on the feature.
+    """
+    result = await asyncio.to_thread(
+        push.send_to_all,
+        {
+            "title": "Gigachat",
+            "body": "Push notifications are working.",
+            "kind": "test",
+        },
+    )
+    return {"ok": True, **result}
+
+
+# ---------------------------------------------------------------------------
+# MCP (Model Context Protocol) server management.
+#
+# Each row in the `mcp_servers` table corresponds to one external process we
+# spawn over stdio. Tools advertised by those processes are merged into the
+# agent's TOOL_SCHEMAS at request time, namespaced under mcp__<name>__<tool>.
+#
+# The UI calls these routes to CRUD server configs; each write triggers a
+# `mcp.refresh_all()` so the running session map reconciles without a
+# server restart.
+# ---------------------------------------------------------------------------
+class MCPServerBody(BaseModel):
+    """Body for POST /api/mcp/servers and PATCH /api/mcp/servers/{id}.
+
+    All fields are optional on PATCH. `command` is the executable path or
+    name (resolved via PATH at spawn time); `args` is the CLI arg list;
+    `env` is merged on top of the parent process env (handy for passing
+    API keys to an MCP server without exporting them globally).
+    """
+
+    name: str | None = None
+    command: str | None = None
+    args: list[str] | None = None
+    env: dict[str, str] | None = None
+    enabled: bool | None = None
+
+
+def _mcp_live_status() -> dict[str, dict]:
+    """Return {server_name: {running, tools, error?}} for the UI.
+
+    Built from the in-memory session map, so a row that was configured but
+    failed to start still shows running=False plus an error hint.
+    """
+    out: dict[str, dict] = {}
+    for name, sess in list(mcp._sessions.items()):
+        out[name] = {
+            "running": sess.running,
+            "tools": [t["name"] for t in sess.tools],
+            "stderr_tail": sess.stderr_tail(),
+        }
+    return out
+
+
+@app.get("/api/mcp/servers")
+def api_mcp_list() -> dict:
+    """Enumerate every configured MCP server plus its live status."""
+    rows = db.list_mcp_servers()
+    status = _mcp_live_status()
+    for r in rows:
+        r["status"] = status.get(r["name"]) or {"running": False, "tools": []}
+    return {"servers": rows}
+
+
+@app.post("/api/mcp/servers")
+async def api_mcp_create(body: MCPServerBody) -> dict:
+    """Add a new MCP server configuration and try to bring it up.
+
+    The response includes the persisted row and the refresh report so the UI
+    can show "started: 3 tools" or "failed: <error>" immediately without a
+    follow-up poll.
+    """
+    if not body.name or not body.command:
+        raise HTTPException(400, "name and command are required")
+    try:
+        name = mcp.validate_server_name(body.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    cmd = body.command.strip()
+    if not cmd:
+        raise HTTPException(400, "command must not be empty")
+    try:
+        row = db.create_mcp_server(
+            name=name,
+            command=cmd,
+            args=body.args or [],
+            env=body.env or {},
+            enabled=bool(body.enabled) if body.enabled is not None else True,
+        )
+    except Exception as e:
+        raise HTTPException(400, f"failed to save: {e}")
+    report = await mcp.refresh_all()
+    return {"server": row, "report": report}
+
+
+@app.patch("/api/mcp/servers/{sid}")
+async def api_mcp_update(sid: str, body: MCPServerBody) -> dict:
+    """Partial update — any subset of name/command/args/env/enabled.
+
+    Restarts the backing session if the launch fingerprint changed (command,
+    args, or env), or stops it entirely when enabled=false.
+    """
+    patch: dict[str, Any] = {}
+    if body.name is not None:
+        try:
+            patch["name"] = mcp.validate_server_name(body.name)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    if body.command is not None:
+        patch["command"] = body.command.strip()
+        if not patch["command"]:
+            raise HTTPException(400, "command must not be empty")
+    if body.args is not None:
+        patch["args"] = body.args
+    if body.env is not None:
+        patch["env"] = body.env
+    if body.enabled is not None:
+        patch["enabled"] = bool(body.enabled)
+    row = db.update_mcp_server(sid, patch)
+    if row is None:
+        raise HTTPException(404, "MCP server not found")
+    # If the name changed, the old session (keyed on the previous name) would
+    # leak; stop_all + refresh_all guarantees the session map matches current DB.
+    report = await mcp.refresh_all()
+    return {"server": row, "report": report}
+
+
+@app.delete("/api/mcp/servers/{sid}")
+async def api_mcp_delete(sid: str) -> dict:
+    """Remove an MCP server configuration and stop its subprocess."""
+    row = db.get_mcp_server(sid)
+    if row is None:
+        raise HTTPException(404, "MCP server not found")
+    await mcp.stop_session(row["name"])
+    n = db.delete_mcp_server(sid)
+    return {"ok": True, "removed": n}
+
+
+@app.post("/api/mcp/refresh")
+async def api_mcp_refresh() -> dict:
+    """Force a reconcile pass. Useful after the user edits a server that
+    wasn't starting cleanly — they fix the command, hit Refresh, and see the
+    updated report without having to restart the whole backend."""
+    report = await mcp.refresh_all()
+    return {"ok": True, "report": report}
+
+
+# ---------------------------------------------------------------------------
+# User settings
+#
+# Small key/value store persisted in SQLite. The Settings UI uses it to keep
+# user preferences across restarts (e.g. which model new conversations should
+# default to). Keeping this route generic means a future preference doesn't
+# need a dedicated column or endpoint — just POST/PATCH a new key.
+# ---------------------------------------------------------------------------
+# Keys we expose to the UI. Any other key posted to PATCH is ignored so a
+# rogue request can't pollute the store with arbitrary entries.
+_ALLOWED_SETTING_KEYS = {"default_chat_model"}
+
+
+class SettingsPatch(BaseModel):
+    """Body for PATCH /api/settings. All fields optional.
+
+    Sending `default_chat_model: null` explicitly clears the user's
+    preference and lets the auto-tune recommendation take over again.
+    Sending an empty string is treated the same way.
+    """
+
+    default_chat_model: str | None = None
+
+
+@app.get("/api/settings")
+def api_settings_get() -> dict:
+    """Return every stored user setting plus the currently-effective default
+    model so the UI can render "Default: gemma4:e4b (auto-detected)" when the
+    user hasn't overridden it yet.
+    """
+    stored = db.get_all_settings()
+    return {
+        "settings": {k: stored.get(k) for k in _ALLOWED_SETTING_KEYS},
+        "effective_chat_model": _resolve_default_chat_model(),
+    }
+
+
+@app.patch("/api/settings")
+async def api_settings_patch(body: SettingsPatch) -> dict:
+    """Update one or more user settings.
+
+    We validate `default_chat_model` against the list of currently-installed
+    Ollama models so a typo can't leave the UI stuck creating conversations
+    against a model that doesn't exist on this machine. Clearing the value
+    (null or empty string) deletes the row and falls back to the auto-tune
+    recommendation.
+    """
+    fields = body.model_dump(exclude_unset=True)
+    if "default_chat_model" in fields:
+        raw = fields["default_chat_model"]
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            db.delete_setting("default_chat_model")
+        else:
+            candidate = raw.strip()
+            # Validate against the installed models — prevents a typo from
+            # creating conversations against a model Ollama can't load.
+            installed = await ollama_runtime.list_installed_models()
+            # Accept either the exact tag or the tag with an implicit ":latest"
+            # suffix — Ollama reports "gemma4:latest" but users often type "gemma4".
+            installed_norm = {m for m in installed}
+            installed_norm |= {m.split(":", 1)[0] for m in installed if ":" in m}
+            if candidate not in installed_norm:
+                raise HTTPException(
+                    400,
+                    f"model {candidate!r} is not installed — pull it first "
+                    "with `ollama pull <name>`",
+                )
+            db.set_setting("default_chat_model", candidate)
+    return {
+        "ok": True,
+        "settings": {
+            k: db.get_all_settings().get(k) for k in _ALLOWED_SETTING_KEYS
+        },
+        "effective_chat_model": _resolve_default_chat_model(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Static frontend (production mode).
+#
+# When `frontend/dist` exists (after `npm run build`), we serve it at "/".
+# The Vite build emits index.html plus an `assets/` directory; we mount the
+# whole dist folder so links like /assets/index-abc.js resolve correctly.
+# In development you should run `npm run dev` on :5173 instead.
+# ---------------------------------------------------------------------------
+@app.get("/")
+def index() -> FileResponse:
+    index_file = FRONTEND / "index.html"
+    if not index_file.exists():
+        raise HTTPException(
+            503,
+            "frontend not built — run `npm install && npm run build` in ./frontend, "
+            "or use `npm run dev` on port 5173 during development",
+        )
+    return FileResponse(index_file)
+
+
+# Mount /assets for Vite build artifacts (hashed JS/CSS).
+if (FRONTEND / "assets").exists():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(FRONTEND / "assets")),
+        name="assets",
+    )
+
+
+# ---------------------------------------------------------------------------
+# PWA asset routes — manifest and service worker.
+#
+# The service worker MUST be served from the root path (or above the scope it
+# intends to control), which means we can't nest it under /assets/. Vite
+# copies everything under `frontend/public/` to `frontend/dist/` verbatim at
+# build time, so in production these files live right next to index.html.
+# In dev, Vite's own server handles /sw.js and /manifest.webmanifest from the
+# `public/` folder directly — the endpoints below are a no-op on port 5173.
+#
+# `Service-Worker-Allowed: /` lets us register the worker with top-level
+# scope even if a proxy rewrote its path. Cache-Control: no-cache on sw.js
+# ensures browsers pick up a new service worker as soon as we ship one.
+# ---------------------------------------------------------------------------
+_PWA_ROOT_FILES: dict[str, tuple[str, dict[str, str]]] = {
+    "sw.js": (
+        "application/javascript",
+        {"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
+    ),
+    "manifest.webmanifest": ("application/manifest+json", {}),
+    "icon-192.png": ("image/png", {"Cache-Control": "public, max-age=86400"}),
+    "icon-512.png": ("image/png", {"Cache-Control": "public, max-age=86400"}),
+    "icon.svg": ("image/svg+xml", {"Cache-Control": "public, max-age=86400"}),
+}
+
+
+def _serve_pwa_file(name: str) -> FileResponse:
+    """Serve a PWA-adjacent asset from the active frontend directory.
+
+    Looks first in `FRONTEND/` (the dist folder in prod) and falls back to
+    `FRONTEND/public/` (dev-mode layout). Raises 404 if the file is missing
+    so the browser gets a clear signal rather than an HTML 200.
+    """
+    if name not in _PWA_ROOT_FILES:
+        raise HTTPException(404, "not found")
+    media_type, headers = _PWA_ROOT_FILES[name]
+    # Try dist/ first (production), then public/ (dev).
+    candidates = [FRONTEND / name, FRONTEND / "public" / name]
+    for path in candidates:
+        if path.is_file():
+            return FileResponse(path, media_type=media_type, headers=headers)
+    raise HTTPException(404, f"{name} not found")
+
+
+@app.get("/sw.js")
+def pwa_service_worker() -> FileResponse:
+    return _serve_pwa_file("sw.js")
+
+
+@app.get("/manifest.webmanifest")
+def pwa_manifest() -> FileResponse:
+    return _serve_pwa_file("manifest.webmanifest")
+
+
+@app.get("/icon-192.png")
+def pwa_icon_192() -> FileResponse:
+    return _serve_pwa_file("icon-192.png")
+
+
+@app.get("/icon-512.png")
+def pwa_icon_512() -> FileResponse:
+    return _serve_pwa_file("icon-512.png")
+
+
+@app.get("/icon.svg")
+def pwa_icon_svg() -> FileResponse:
+    return _serve_pwa_file("icon.svg")
