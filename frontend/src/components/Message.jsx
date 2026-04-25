@@ -110,17 +110,12 @@ function Message({
 
   function saveEdit() {
     const next = (draft || '').trim()
-    // Empty draft → just cancel, nothing to save. But surface "no change"
-    // explicitly so the user doesn't think Save is broken when their edit
-    // round-trip-trimmed back to the original (e.g. extra trailing space).
+    // Empty draft → cancel; an empty user prompt would just confuse the
+    // model. But unchanged text is FINE — "regenerate from the same
+    // prompt" is a valid action (the previous response was bad, try
+    // again). We deliberately do NOT bail on `next === content`; every
+    // mainstream chat UI lets you regenerate without editing.
     if (!next) {
-      cancelEdit()
-      return
-    }
-    if (next === content) {
-      toast.info('Nothing to regenerate', {
-        description: 'The edited text matches the original — make a change first.',
-      })
       cancelEdit()
       return
     }
