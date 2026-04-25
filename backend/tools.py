@@ -9311,6 +9311,215 @@ async def docker_pull(image: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Lazy tool loading: tool_search + tool_load
+# ---------------------------------------------------------------------------
+# Big tool palettes (this codebase ships ~70 built-in schemas, ~18 K tokens
+# stringified) eat into a small local model's context window every turn.
+# Anthropic's Claude UI exposes the same trade-off as a "Load tools when
+# needed" / "Tools always loaded" toggle. We always load on demand.
+#
+# Flow:
+#   1. The system prompt embeds a short manifest — name + 1-line summary
+#      per tool — so the model can see what's available without paying the
+#      full schema cost.
+#   2. The model picks one or more tools and calls
+#      `tool_load({"names": [...]})`. The agent loop reads the persisted
+#      set on the next iteration and includes those schemas in the
+#      `tools=[...]` payload to Ollama (or, for stub-template models, in
+#      the prompt-space adapter's XML block).
+#   3. From that point on, the model can call those tools natively. The
+#      set survives a backend restart so a long conversation doesn't have
+#      to re-load on every reboot.
+#
+# `tool_search(query)` is a fuzzy lookup against the manifest — case-
+# insensitive substring against the name + summary — so the model can
+# narrow down "I need to read a PDF" → `read_doc` without scanning the
+# whole list manually.
+
+
+def _full_manifest() -> list[dict]:
+    """Return [{name, summary, category}] for every loadable tool.
+
+    Sources merged: built-in schemas (`prompts.TOOL_SCHEMAS`), live MCP
+    server schemas, and user-defined Python tools. The meta-tools
+    themselves (`tool_search`, `tool_load`) are excluded — they're always
+    loaded so listing them in the manifest just adds noise.
+    """
+    from . import mcp as _mcp
+    from . import prompts as _prompts
+    seen: set[str] = set()
+    out: list[dict] = []
+    schemas = (
+        list(_prompts.TOOL_SCHEMAS)
+        + _mcp.tool_schemas_for_agent()
+        + user_tool_schemas()
+    )
+    for s in schemas:
+        fn = s.get("function") or {}
+        name = fn.get("name")
+        if not name or name in seen:
+            continue
+        if name in ("tool_search", "tool_load"):
+            continue
+        seen.add(name)
+        desc = (fn.get("description") or "").strip()
+        # First sentence — up to first '.', '\n', or 140 chars, whichever
+        # comes first. Keeps the manifest line dense but readable.
+        cut_idx = len(desc)
+        for stop in (". ", ".\n", "\n"):
+            i = desc.find(stop)
+            if i != -1 and i < cut_idx:
+                cut_idx = i
+        summary = desc[:cut_idx].strip()
+        if len(summary) > 140:
+            summary = summary[:137] + "..."
+        out.append({
+            "name": name,
+            "summary": summary or "(no description)",
+            "category": classify_tool(name),
+        })
+    out.sort(key=lambda x: x["name"])
+    return out
+
+
+async def tool_search(
+    query: str,
+    limit: int = 8,
+    conv_id: str | None = None,
+) -> dict:
+    """Fuzzy-search the tool manifest by name + summary.
+
+    Case-insensitive substring match — every word in `query` must appear
+    somewhere in the candidate's name or summary. Returns at most `limit`
+    matches, sorted with name-hits first, then summary-hits, then by
+    name. The returned entries include a `loaded` flag so the model can
+    skip a redundant `tool_load` if the schema is already available this
+    conversation.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return {"ok": False, "output": "", "error": "query is required"}
+    n = max(1, min(int(limit or 8), 30))
+    manifest = _full_manifest()
+    loaded: set[str] = set()
+    if conv_id:
+        try:
+            loaded = set(db.get_loaded_tools(conv_id))
+        except Exception:
+            loaded = set()
+    terms = [t for t in q.split() if t]
+    scored: list[tuple[int, dict]] = []
+    for entry in manifest:
+        name_l = entry["name"].lower()
+        summary_l = entry["summary"].lower()
+        if not all((t in name_l) or (t in summary_l) for t in terms):
+            continue
+        # Lower score sorts first.
+        score = 0 if any(t in name_l for t in terms) else 1
+        scored.append((score, entry))
+    scored.sort(key=lambda kv: (kv[0], kv[1]["name"]))
+    hits = []
+    for _score, entry in scored[:n]:
+        hits.append({
+            **entry,
+            "loaded": entry["name"] in loaded,
+        })
+    if not hits:
+        return {
+            "ok": True,
+            "output": f"No tools match {query!r}. Try fewer or broader terms.",
+        }
+    lines = [f"Found {len(hits)} matching tool(s):"]
+    for h in hits:
+        marker = " (loaded)" if h["loaded"] else ""
+        lines.append(f"  • {h['name']}{marker} — {h['summary']}")
+    lines.append("")
+    lines.append(
+        'Call tool_load({"names": ["..."]}) on the ones you want before '
+        "calling them."
+    )
+    return {"ok": True, "output": "\n".join(lines)}
+
+
+async def tool_load(
+    names: list[str] | str,
+    conv_id: str | None = None,
+) -> dict:
+    """Add tool schemas to the conversation's loaded set.
+
+    The next agent-loop iteration will include these schemas in the
+    `tools=[...]` payload sent to Ollama, so the model can call them
+    natively from that point on. Idempotent — re-loading an already-
+    loaded tool is reported as such. Unknown names are reported as
+    errors so the model can correct itself instead of silently calling
+    a non-existent tool.
+
+    Accepts either a list (canonical) or a single string (forgiving for
+    smaller models that sometimes pass a bare name).
+    """
+    if not conv_id:
+        return {
+            "ok": False,
+            "output": "",
+            "error": "tool_load requires a conversation context",
+        }
+    # Normalize input.
+    if isinstance(names, str):
+        names_list = [names]
+    elif isinstance(names, list):
+        names_list = [str(n) for n in names if n]
+    else:
+        return {
+            "ok": False,
+            "output": "",
+            "error": "names must be a list of tool names",
+        }
+    if not names_list:
+        return {
+            "ok": False,
+            "output": "",
+            "error": "names cannot be empty — pass at least one tool name",
+        }
+    manifest_names = {e["name"] for e in _full_manifest()}
+    already = set(db.get_loaded_tools(conv_id))
+    to_load: list[str] = []
+    unknown: list[str] = []
+    re_load: list[str] = []
+    for n in names_list:
+        if n not in manifest_names:
+            unknown.append(n)
+            continue
+        if n in already:
+            re_load.append(n)
+            continue
+        to_load.append(n)
+    new_set = db.add_loaded_tools(conv_id, to_load) if to_load else list(already)
+    lines: list[str] = []
+    if to_load:
+        lines.append(f"Loaded {len(to_load)} tool(s): {', '.join(to_load)}")
+    if re_load:
+        lines.append(
+            f"Already loaded ({len(re_load)}): {', '.join(re_load)}"
+        )
+    if unknown:
+        lines.append(
+            f"Unknown tool name(s) ({len(unknown)}): {', '.join(unknown)}. "
+            f"Use tool_search to find the right name."
+        )
+    lines.append(
+        f"Total loaded this conversation: {len(new_set)}."
+    )
+    if to_load:
+        lines.append("Schemas will be available on your next turn.")
+    return {
+        "ok": not unknown or bool(to_load or re_load),
+        "output": "\n".join(lines),
+        "loaded": list(new_set),
+        "unknown": unknown,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 TOOL_REGISTRY = {
@@ -9411,7 +9620,18 @@ TOOL_REGISTRY = {
     "docker_stop": docker_stop,
     "docker_list": docker_list,
     "docker_pull": docker_pull,
+    # lazy tool loading meta-tools — always available, never lazy
+    "tool_search": tool_search,
+    "tool_load": tool_load,
 }
+
+
+# Tools that are always loaded into every conversation's tool palette,
+# regardless of the lazy-load gate. Without these the model has no way to
+# discover or activate the rest of the toolbelt — they're the bootstrap
+# pair that the manifest section of the system prompt instructs the model
+# to use first.
+ALWAYS_LOADED_TOOLS: tuple[str, ...] = ("tool_search", "tool_load")
 
 
 # ---------------------------------------------------------------------------
@@ -9544,6 +9764,9 @@ TOOL_CATEGORIES: dict[str, str] = {
     "docker_pull": "write",
     "docker_logs": "read",
     "docker_list": "read",
+    # lazy tool loading meta-tools — pure bookkeeping, no external effects
+    "tool_search": "read",
+    "tool_load": "read",
 }
 
 
@@ -10196,6 +10419,17 @@ async def dispatch(
             return await fn(conv_id, args.get("content", ""), args.get("topic"))
         if name == "forget":
             return await fn(conv_id, args.get("pattern", ""))
+        if name == "tool_search":
+            return await fn(
+                args.get("query", ""),
+                int(args.get("limit", 8) or 8),
+                conv_id=conv_id,
+            )
+        if name == "tool_load":
+            return await fn(
+                args.get("names") or args.get("name") or [],
+                conv_id=conv_id,
+            )
         if name == "computer_drag":
             return await fn(
                 args.get("x1", 0),

@@ -1627,6 +1627,27 @@ async def _run_turn_impl(
             + tools.user_tool_schemas()
         )
 
+        # Lazy tool loading: cut the schemas list down to (always-loaded
+        # meta-tools + tools the model has explicitly loaded for this
+        # conversation via `tool_load`). The system prompt's manifest
+        # section already lists every tool's name + 1-liner so the model
+        # knows what's available; loading is what brings the full schema
+        # into the `tools=[...]` payload (or the adapter's prompt-space
+        # block). Big win on small-context local models — the default
+        # full payload is ~18 K tokens of schema, and most conversations
+        # only ever touch a handful of tools.
+        try:
+            loaded_set = set(db.get_loaded_tools(conversation_id))
+        except Exception:
+            loaded_set = set()
+        # Always include the meta-tools so the model can never lock
+        # itself out of further tool loads.
+        loaded_set.update(tools.ALWAYS_LOADED_TOOLS)
+        merged_schemas = [
+            s for s in merged_schemas
+            if (((s.get("function") or {}).get("name")) in loaded_set)
+        ]
+
         # Prompt-space tool adapter: some Ollama models advertise the
         # `tools` capability but ship a passthrough chat template
         # (`{{ .Prompt }}`) that never renders `.Tools`. The native
@@ -2510,6 +2531,12 @@ async def run_subagent(
     # the model can't accidentally fall through to a write call.
     if spec.get("forbid_writes"):
         forbidden = forbidden | _get_subagent_write_forbidden()
+    # Strip the lazy-load meta-tools from the subagent palette: subagents
+    # are short-lived and have no per-invocation persisted loaded-set, so
+    # `tool_search` / `tool_load` would just be dead schema noise. They
+    # always get their full palette upfront — fewer round-trips matters
+    # more than schema-prompt size for a 10-iteration sub-task.
+    forbidden = forbidden | set(tools.ALWAYS_LOADED_TOOLS)
     schemas = [s for s in TOOL_SCHEMAS if s.get("function", {}).get("name") not in forbidden]
     # Subagents inherit MCP + user-defined tools — they're how a delegate
     # task can e.g. query an external database or call a utility the parent

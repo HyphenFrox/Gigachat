@@ -405,6 +405,15 @@ def init() -> None:
             # they always resolve against `cwd` so the workspace root stays
             # stable no matter where the shell wandered.
             "ALTER TABLE conversations ADD COLUMN bash_cwd TEXT",
+            # Lazy tool-loading. JSON list of tool names whose full schemas
+            # are currently visible to the model in this conversation. Empty
+            # by default; the model uses `tool_load(["name", ...])` to add
+            # entries on demand. The agent loop filters the schemas list
+            # down to (meta-tools + this set) before each Ollama call, so
+            # the system-prompt + tools-payload stays small until tools are
+            # actually used. Survives restarts so a long conversation
+            # doesn't have to re-load everything after a backend bounce.
+            "ALTER TABLE conversations ADD COLUMN loaded_tools_json TEXT NOT NULL DEFAULT '[]'",
         ):
             try:
                 c.execute(ddl)
@@ -683,6 +692,71 @@ def set_bash_cwd(cid: str, path: str | None) -> None:
             "UPDATE conversations SET bash_cwd = ? WHERE id = ?",
             (path, cid),
         )
+
+
+def get_loaded_tools(cid: str) -> list[str]:
+    """Return the per-conversation set of tools the model has loaded.
+
+    Used by the lazy-tool-loading flow: the agent loop filters its
+    schemas list down to (meta-tools + this set) so the model's prompt
+    stays small until tools are actually requested via `tool_load`.
+
+    Empty list = no extra tools loaded yet (only the meta-tools are
+    visible). Order is preserved as best-effort but callers should treat
+    it as a set.
+    """
+    with _conn() as c:
+        row = c.execute(
+            "SELECT loaded_tools_json FROM conversations WHERE id = ?",
+            (cid,),
+        ).fetchone()
+    if not row:
+        return []
+    raw = row["loaded_tools_json"] or "[]"
+    try:
+        names = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(names, list):
+        return []
+    return [str(n) for n in names if isinstance(n, str)]
+
+
+def add_loaded_tools(cid: str, names: list[str]) -> list[str]:
+    """Mark `names` as loaded for the conversation.
+
+    Returns the new full set after the union. Idempotent — re-adding an
+    already-loaded name is a no-op. The caller is responsible for
+    validating that the names actually exist in the registry; this
+    function just tracks the bookkeeping.
+    """
+    if not names:
+        return get_loaded_tools(cid)
+    with _conn() as c:
+        row = c.execute(
+            "SELECT loaded_tools_json FROM conversations WHERE id = ?",
+            (cid,),
+        ).fetchone()
+        if not row:
+            return []
+        try:
+            current = json.loads(row["loaded_tools_json"] or "[]")
+            if not isinstance(current, list):
+                current = []
+        except Exception:
+            current = []
+        merged: list[str] = []
+        seen: set[str] = set()
+        for n in list(current) + list(names):
+            if not isinstance(n, str) or n in seen:
+                continue
+            seen.add(n)
+            merged.append(n)
+        c.execute(
+            "UPDATE conversations SET loaded_tools_json = ? WHERE id = ?",
+            (json.dumps(merged), cid),
+        )
+    return merged
 
 
 def list_conversations_by_state(state: str) -> list[dict]:

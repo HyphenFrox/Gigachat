@@ -191,6 +191,61 @@ def _load_agents_md(cwd: str) -> str:
     return "".join(body_parts)
 
 
+def _build_tool_manifest_section() -> str:
+    """Render a compact `name — summary` list of every loadable tool.
+
+    The model reads this from the system prompt and decides what to load
+    via `tool_load(names=[...])`. Cheap to inline because each entry is
+    just a name + first sentence of the description (~70 chars), so 70
+    tools cost ~5 KB / 1.2K tokens — about 1/15th of the full schema
+    payload.
+
+    Imported lazily so this module doesn't take a hard dep on tools.py
+    at import time (avoids the prompts → tools → prompts cycle).
+    """
+    try:
+        from . import tools as _tools_mod
+        manifest = _tools_mod._full_manifest()
+    except Exception:
+        return ""
+    if not manifest:
+        return ""
+    lines: list[str] = [
+        "## Available tools (lazy-loaded)",
+        "",
+        "Every tool's name and one-line summary is listed below, but the "
+        "FULL schemas (parameter shapes, required fields, defaults) are "
+        "NOT in your context yet. This keeps the prompt small. To USE a "
+        "tool you must first load it:",
+        "",
+        "  1. Pick the tool(s) you want from the list below.",
+        "  2. Call `tool_load({\"names\": [\"name1\", \"name2\"]})` to "
+        "add their schemas to your toolbelt.",
+        "  3. From your NEXT turn onward you can call those tools "
+        "directly. Already-loaded tools are reported as such, so loading "
+        "twice is safe.",
+        "",
+        "If the list is too long to scan, call "
+        "`tool_search({\"query\": \"...\"})` to fuzzy-match by description "
+        "(e.g. \"read a PDF\" → `read_doc`). Both meta-tools are always "
+        "loaded — you do not need to load them.",
+        "",
+        "Batch-load whatever you'll obviously need (read/write/bash for a "
+        "coding task; screenshot + click for a desktop task) on your "
+        "first action so you don't burn round-trips on incremental loads.",
+        "",
+    ]
+    # `tools.classify_tool` already returned read/write per entry; we
+    # don't surface that to the model in the manifest because the
+    # permission gate enforces it independently — exposing it here would
+    # invite the model to "try the read variant first" reasoning that
+    # the gate already handles.
+    for entry in manifest:
+        lines.append(f"  • {entry['name']} — {entry['summary']}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def build_system_prompt(
     cwd: str,
     conv_id: str | None = None,
@@ -228,6 +283,12 @@ def build_system_prompt(
     )
     parts = [
         base,
+        # Manifest of every loadable tool — name + 1-line summary per
+        # entry. The model uses this to decide what to `tool_load` rather
+        # than receiving 70+ full schemas (~18K tokens) on every turn.
+        # Cheap inline (~5 KB / 1.2K tokens), the savings come from the
+        # filtered tools=[...] payload in the agent loop.
+        _build_tool_manifest_section(),
         _load_agents_md(cwd),
         _tools.load_memory_for_prompt(conv_id),
         _tools.load_global_memory_for_prompt(),
@@ -311,6 +372,44 @@ def _with_reason(params: dict) -> dict:
 
 # Ollama passes these through to the model as native function-calling schemas.
 TOOL_SCHEMAS = [
+    # ----- lazy tool loading meta-tools (always loaded) -----
+    # These two are how the model discovers and activates the rest of the
+    # toolbelt. The system prompt embeds a name + 1-line summary manifest
+    # of every available tool; to USE one, the model calls tool_load with
+    # the names it wants, and the schemas appear in subsequent turns.
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_search",
+            "description": "Find a tool whose name or summary matches a query. Returns the matching tool names and one-line summaries plus a `loaded` flag. Use this when the manifest in the system prompt is too long to scan, or when you only know a description (\"read a PDF\" → `read_doc`).",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Words to match against tool names and summaries (case-insensitive, all words must match)."},
+                    "limit": {"type": "integer", "description": "Maximum hits to return (default 8, max 30)."},
+                },
+                "required": ["query"],
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_load",
+            "description": "Add tool schemas to your toolbelt for this conversation. Pass the exact names from the manifest (or from `tool_search`). Tools you load become callable on your NEXT turn — load everything you'll need in one batched call when possible. Already-loaded tools are reported as such, no harm done.",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Exact tool names to load (e.g. [\"read_file\", \"write_file\", \"bash\"]).",
+                    },
+                },
+                "required": ["names"],
+            }),
+        },
+    },
     # ----- file / shell -----
     {
         "type": "function",
