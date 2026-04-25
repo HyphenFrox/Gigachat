@@ -120,8 +120,8 @@ def _resolve(cwd: str, path: str, conv_id: str | None = None) -> Path:
     When `conv_id` is provided AND bash has `cd`-ed somewhere inside the
     workspace during this conversation, relative paths resolve against that
     directory instead of the original `cwd`. This keeps the model's mental
-    model consistent — if it ran `cd stock-tracker` in bash, then
-    `write_file("src/App.jsx", ...)` lands inside `stock-tracker/src/`, not
+    model consistent — if it ran `cd myapp` in bash, then
+    `write_file("src/App.jsx", ...)` lands inside `myapp/src/`, not
     back at the workspace root.
 
     Absolute paths always win over both. Passing `conv_id=None` preserves the
@@ -531,7 +531,7 @@ async def run_bash(
             "output": "",
             "error": (
                 "bash requires the `command` field, but you didn't pass one. "
-                "Example: `bash({\"command\": \"cd stock-tracker && ls\", "
+                "Example: `bash({\"command\": \"cd myapp && ls\", "
                 "\"reason\": \"...\"})`. The `reason` field on its own is not "
                 "enough — `command` carries the actual shell text to run."
             ),
@@ -831,7 +831,7 @@ async def list_dir(cwd: str, path: str = ".", conv_id: str | None = None) -> dic
 
     `conv_id` lets relative `path` values follow wherever bash `cd`-ed to
     in this conversation — so `list_dir({"path": "."})` after a
-    `cd stock-tracker` lists the project dir, not the workspace root.
+    `cd myapp` lists the project dir, not the workspace root.
     """
     try:
         p = _resolve(cwd, path, conv_id)
@@ -3655,7 +3655,7 @@ async def bash_bg(cwd: str, command: str, conv_id: str | None = None) -> dict:
             "output": "",
             "error": (
                 "bash requires the `command` field, but you didn't pass one. "
-                "Example: `bash({\"command\": \"cd stock-tracker && ls\", "
+                "Example: `bash({\"command\": \"cd myapp && ls\", "
                 "\"reason\": \"...\"})`. The `reason` field on its own is not "
                 "enough — `command` carries the actual shell text to run."
             ),

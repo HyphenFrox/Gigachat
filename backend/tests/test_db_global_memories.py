@@ -117,7 +117,7 @@ def test_delete_global_memories_matching_case_insensitive(isolated_db):
     """Substring delete is case-insensitive and returns the count removed."""
     db = isolated_db
     db.add_global_memory("user lives in Tokyo")
-    db.add_global_memory("user works on Money Maker")
+    db.add_global_memory("user works on backend services")
     db.add_global_memory("favourite IDE is VSCode")
 
     n = db.delete_global_memories_matching("USER")

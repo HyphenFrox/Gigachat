@@ -57,7 +57,7 @@ The agent uses Ollama's native function-calling — **any modern Ollama model wi
 
 `bash`, `bash_bg` (long-running background shells with `bash_output` / `kill_shell`), `read_file`, `write_file`, `edit_file` (surgical old→new replacement with ambiguity rejection + `replace_all`), `list_dir`, `grep` (ripgrep with Python fallback), `glob` (`**/*.py`-style matching), `python_exec` (short Python snippet in an isolated subprocess — stdlib-only, 30 s wall-clock, 20 000-char output cap).
 
-**File tools follow `bash`'s persisted cwd.** `bash` remembers where it `cd`'d to across calls, and after `cd stock-tracker`, `write_file({"path": "src/App.jsx", ...})` lands inside `stock-tracker/src/`, not back at the workspace root. Use absolute paths to bypass this when you need the workspace root explicitly.
+**File tools follow `bash`'s persisted cwd.** `bash` remembers where it `cd`'d to across calls, and after `cd myapp`, `write_file({"path": "src/App.jsx", ...})` lands inside `myapp/src/`, not back at the workspace root. Use absolute paths to bypass this when you need the workspace root explicitly.
 
 ### Documents
 

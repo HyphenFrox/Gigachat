@@ -1,10 +1,10 @@
 """Regression tests: file tools must follow wherever bash `cd`-ed to.
 
 Scenario that motivated the fix: user asks "scaffold a React app", model runs
-`npm create vite@latest stock-tracker …` then `cd stock-tracker && npm
-install`, then `write_file({"path": "src/App.jsx", …})`. Under the old
-behaviour, that last call wrote to `<workspace>/src/App.jsx` instead of
-`<workspace>/stock-tracker/src/App.jsx` because `_resolve` hard-coded the
+`npm create vite@latest myapp …` then `cd myapp && npm install`, then
+`write_file({"path": "src/App.jsx", …})`. Under the old behaviour, that
+last call wrote to `<workspace>/src/App.jsx` instead of
+`<workspace>/myapp/src/App.jsx` because `_resolve` hard-coded the
 conversation's original cwd. That diverged the model's mental model ("I
 cd'd, so relative paths follow") from the tool's actual behaviour, and
 every subsequent file operation landed at the wrong place.

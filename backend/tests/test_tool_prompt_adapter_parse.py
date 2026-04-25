@@ -181,14 +181,14 @@ def test_parser_unwraps_args_inside_args():
     the inner `args` dict has a single arg-aliased key."""
     text = (
         "<tool_call>\n"
-        '{"name": "bash", "args": {"args": {"command": "cd stock-dashboard", '
+        '{"name": "bash", "args": {"args": {"command": "cd myapp", '
         '"reason": "Change into the project dir."}}}\n'
         "</tool_call>\n"
     )
     _cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
     assert len(calls) == 1
     assert calls[0]["name"] == "bash"
-    assert calls[0]["args"]["command"] == "cd stock-dashboard"
+    assert calls[0]["args"]["command"] == "cd myapp"
     assert "args" not in calls[0]["args"], "should have unwrapped one level"
 
 
