@@ -1748,17 +1748,24 @@ async def _run_turn_impl(
                 yield {"type": "error", "message": f"ollama error: {e}"}
                 return
 
-            # Adapter-mode post-parse. In adapter mode the model emits
-            # tool calls as <tool_call>...</tool_call> tags inside its
-            # streamed text instead of via the structured `tool_calls`
-            # field. Scan the accumulated text, promote any valid calls
-            # into `tool_calls_buf` (so the downstream dispatch loop is
-            # unchanged), and strip the raw tags from the persisted
-            # assistant content so the user sees only prose. Malformed
-            # JSON inside a block is left in-place by the parser — the
-            # model sees its own mistake on the next turn and can fix
-            # it, rather than silently losing the call.
-            if adapter_mode and not tool_calls_buf and accumulated_text:
+            # Post-parse fallback. In adapter mode the model is *expected*
+            # to emit tool calls as <tool_call>...</tool_call> tags inside
+            # its streamed text. But some models that advertise native
+            # tool-calling support (gemma4:e4b, several smaller Qwens)
+            # still slip into the text-format every now and then —
+            # announcing the call in prose, then dumping JSON between
+            # `<tool_call>` tags, while leaving the structured channel
+            # empty. Without this fallback the user sees the announcement
+            # and then silence: the model "emits a tool but doesn't
+            # actually run it." Run the parser whenever the structured
+            # channel came up empty; it's a no-op (returns the text
+            # unchanged, no calls) when no recognised tags are present,
+            # so we don't pay a penalty on well-behaved models.
+            #
+            # Malformed JSON inside a block is left in-place by the
+            # parser — the model sees its own mistake on the next turn
+            # and can fix it, rather than silently losing the call.
+            if not tool_calls_buf and accumulated_text:
                 cleaned, parsed_calls = (
                     tool_prompt_adapter.parse_tool_calls_from_text(
                         accumulated_text,
@@ -1788,7 +1795,7 @@ async def _run_turn_impl(
                     has_closer = any(f"</{t}>" in lt for t in _tags)
                     if has_opener and not has_closer:
                         log.warning(
-                            "adapter: truncated tool_call detected (len=%d) — "
+                            "truncated tool_call detected (len=%d) — "
                             "triggering retry with shorter-payload nudge.",
                             len(accumulated_text),
                         )
