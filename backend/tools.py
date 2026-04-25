@@ -786,6 +786,97 @@ async def read_file(
         return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
 
 
+def _invalidate_codebase_chunks_for(written_path: Path, cwd: str | None) -> None:
+    """Drop any indexed chunks for `written_path` and schedule a re-embed.
+
+    Keeps `codebase_search` from returning pre-edit content for files
+    the agent just rewrote. Two-phase:
+
+      1. Synchronously delete the file's existing chunks (cheap SQL
+         DELETE) — `codebase_search` will simply return zero hits for
+         that file until the re-embed lands, vs. returning stale ones.
+      2. Schedule the re-embed in the background so the calling tool
+         doesn't wait on the embedding round-trip.
+
+    No-ops when there's no `ready` codebase index covering this file,
+    when the conversation has no cwd, or when the path falls outside
+    the indexed cwd. All exceptions are swallowed — staleness is a
+    UX issue, not a correctness one, and we don't want a flaky DB
+    pass to break write_file itself.
+    """
+    if not cwd:
+        return
+    try:
+        from . import db as _db
+        idx_root = str(Path(cwd).expanduser().resolve())
+        idx = _db.get_codebase_index(idx_root)
+        if not idx or idx.get("status") != "ready":
+            return
+        # Only invalidate when the written path actually falls under
+        # the indexed root. Otherwise we'd re-embed files outside the
+        # codebase index for no reason.
+        try:
+            written_path.resolve().relative_to(Path(idx_root))
+        except ValueError:
+            return
+        path_str = str(written_path.resolve())
+        _db.delete_doc_chunks_for(path_str)
+        # Background re-embed. Fire-and-forget — we don't await the
+        # result, the agent's next codebase_search picks up whatever
+        # has landed by then.
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_reembed_codebase_file(path_str, _DEFAULT_EMBED_MODEL))
+        except RuntimeError:
+            # No running loop (sync caller / test). Skip the re-embed;
+            # the chunks are already deleted so search returns no
+            # stale hits, and the next manual reindex will rebuild.
+            pass
+    except Exception:
+        pass
+
+
+async def _reembed_codebase_file(path_str: str, model: str) -> None:
+    """Re-embed a single file's contents into the doc-chunks store.
+
+    Mirrors the per-file inner loop of `_codebase_index_cwd_impl` but
+    scoped to one path. Chunks are deleted by the caller before this
+    runs so a partial failure here just leaves the file un-indexed
+    (recovers on next manual reindex).
+    """
+    import httpx
+    from . import db as _db
+    p = Path(path_str)
+    if not p.exists() or not p.is_file():
+        return
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return
+    if not text.strip():
+        return
+    chunks = _chunk_text(text, _DOC_INDEX_CHUNK_CHARS, _DOC_INDEX_CHUNK_OVERLAP)
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for ci, chunk in enumerate(chunks):
+                try:
+                    vec = await _ollama_embed(client, chunk, model)
+                except Exception:
+                    continue
+                try:
+                    _db.insert_doc_chunk(
+                        path=path_str, ordinal=ci, text=chunk,
+                        vector=vec, model=model,
+                    )
+                except Exception:
+                    continue
+    except Exception:
+        # Embedding outage / Ollama down — leave the file unindexed
+        # rather than failing the calling tool. Manual reindex
+        # recovers.
+        return
+
+
 async def write_file(
     cwd: str,
     path: str,
@@ -821,6 +912,11 @@ async def write_file(
         # Post-write, the model has effectively "seen" this file — any follow-
         # up edit in the same conversation can proceed without a re-read.
         _record_read(conv_id, p)
+        # Keep the codebase index honest: drop stale chunks and
+        # schedule a re-embed if this file is part of an active
+        # codebase index. No-op when the index isn't ready or the path
+        # falls outside the indexed cwd.
+        _invalidate_codebase_chunks_for(p, cwd)
         return {"ok": True, "output": f"wrote {len(content)} chars to {p}", "path": str(p)}
     except Exception as e:
         return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
@@ -3304,6 +3400,10 @@ async def edit_file(
         # stores CRLF). `write_bytes` keeps the round-trip byte-identical
         # for unchanged regions.
         p.write_bytes(new_text.encode("utf-8"))
+        # Keep the codebase index honest: same lazy-invalidate path as
+        # write_file. Drops stale chunks for this file and fires a
+        # background re-embed.
+        _invalidate_codebase_chunks_for(p, cwd)
         # Return a tiny unified diff so the model can see what actually changed
         # without needing a follow-up read_file.
         diff = _compact_diff(text, new_text, str(p))
