@@ -61,9 +61,21 @@ def test_edit_file_refused_without_prior_read(tmp_path: Path):
 
     assert res["ok"] is False
     err = (res.get("error") or "").lower()
-    assert "has not been read" in err
+    # Error speaks the existence fact plainly so the model doesn't
+    # misread the guard as a generic "policy" and fall back to bash
+    # heredocs.
+    assert "already exists" in err
     # Error must name `read_file` so the model knows the remediation.
     assert "read_file" in (res.get("error") or "")
+    # And must point at edit_file as the surgical alternative — the
+    # model otherwise tends to reach for the simplest tool it
+    # remembers (write_file again) rather than the right one.
+    assert "edit_file" in (res.get("error") or "")
+    # Real-world failure that motivated the rewrite: model fell back to
+    # `cat > file << EOF` heredocs after the guard fired, which silently
+    # mangled f-strings via bash variable expansion. The error now
+    # explicitly steers AWAY from that.
+    assert "heredoc" in err or "<< eof" in err
 
 
 def test_edit_file_allowed_after_read(tmp_path: Path):
@@ -119,7 +131,7 @@ def test_write_file_refused_when_overwriting_unread(tmp_path: Path):
         )
     )
     assert res["ok"] is False
-    assert "has not been read" in (res.get("error") or "").lower()
+    assert "already exists" in (res.get("error") or "").lower()
     # Untouched file — the refusal is total.
     assert target.read_text(encoding="utf-8") == "{}"
 
@@ -185,7 +197,7 @@ def test_read_in_conv_a_does_not_unlock_conv_b(tmp_path: Path):
         )
     )
     assert res["ok"] is False
-    assert "has not been read" in (res.get("error") or "").lower()
+    assert "already exists" in (res.get("error") or "").lower()
 
 
 def test_clear_read_state_drops_tracking(tmp_path: Path):
@@ -218,7 +230,7 @@ def test_clear_read_state_drops_tracking(tmp_path: Path):
         )
     )
     assert refused["ok"] is False
-    assert "has not been read" in (refused.get("error") or "").lower()
+    assert "already exists" in (refused.get("error") or "").lower()
 
 
 def test_dispatch_threads_conv_id_through_read_file(tmp_path: Path):

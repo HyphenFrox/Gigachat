@@ -737,8 +737,13 @@ def _require_prior_read(conv_id: str | None, path: Path) -> str | None:
     """Return a helpful error message if `path` must-be-read-first.
 
     Returns None when the guard is satisfied (or skipped because
-    `conv_id` is None, e.g. tests). The error string is phrased so the
-    model knows exactly which tool to call next.
+    `conv_id` is None, e.g. tests). Both call sites only invoke the
+    guard when the file already exists on disk, so the error speaks
+    that fact plainly and offers three concrete next-tool options —
+    earlier wording ("file has not been read in this conversation")
+    led models to misread it as a blanket policy and fall back to
+    `cat > file << EOF` heredocs, which silently break f-strings via
+    bash variable expansion.
     """
     if not conv_id:
         return None
@@ -747,10 +752,23 @@ def _require_prior_read(conv_id: str | None, path: Path) -> str | None:
         seen = _READ_FILES_BY_CONV.get(conv_id)
         if seen and key in seen:
             return None
+    try:
+        size = path.stat().st_size
+    except Exception:
+        size = None
+    size_clause = f" ({size} bytes)" if size is not None else ""
     return (
-        f"file has not been read in this conversation: {path}\n"
-        "Call `read_file` on this exact path first so the edit is based "
-        "on the file's actual contents, not assumed contents."
+        f"{path} already exists{size_clause} — refusing to overwrite blind so "
+        "you don't clobber content you haven't seen. Three options:\n"
+        "  • replace the whole file → call `read_file` on this exact path "
+        "first, then retry `write_file`.\n"
+        "  • change part of it → use `edit_file` with old_string/new_string; "
+        "no prior read needed.\n"
+        "  • create a NEW file alongside this one → change `path` to one that "
+        "doesn't exist yet.\n"
+        "Do NOT work around this by piping into the file via `bash` "
+        "(`cat > file << EOF`) — heredoc variable expansion silently mangles "
+        "Python f-strings and other shell-meta content."
     )
 
 
