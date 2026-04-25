@@ -30,6 +30,11 @@ vapid.json
 
 # Claude Code local state
 .claude/
+.claude-test/
+
+# Transient output from scripts/drive_real_conversation.py
+scripts/.last_conv_id
+scripts/.last_run.log
 
 # OS / editor
 .DS_Store
