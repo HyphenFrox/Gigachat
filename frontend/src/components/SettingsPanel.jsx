@@ -91,8 +91,18 @@ export default function SettingsPanel({ open, onClose }) {
           </DialogDescription>
         </DialogHeader>
 
-        {/* Tab bar — horizontal, icon + label, active tab gets an underline. */}
-        <div className="flex items-center gap-1 border-b border-border px-4 pt-1" role="tablist">
+        {/* Tab bar — horizontal, icon + label, active tab gets an underline.
+            With 8 tabs, the dialog's max width (sm:2xl, 672 px) plus 95vw on
+            phones isn't always enough to render every tab inline, so the row
+            scrolls horizontally instead of clipping the rightmost tabs.
+            `flex-shrink-0` on each tab keeps labels readable; `whitespace-
+            nowrap` stops "Schedules" from wrapping into two lines mid-tab.
+            `scrollbar-thin scrollbar-track-transparent` keeps the scrollbar
+            visually subtle, native-mobile-app style, while still discoverable. */}
+        <div
+          className="flex items-center gap-1 overflow-x-auto whitespace-nowrap border-b border-border px-4 pt-1 [scrollbar-width:thin]"
+          role="tablist"
+        >
           {TABS.map(({ id, label, Icon }) => (
             <button
               key={id}
@@ -101,7 +111,7 @@ export default function SettingsPanel({ open, onClose }) {
               aria-selected={tab === id}
               onClick={() => setTab(id)}
               className={cn(
-                'flex items-center gap-1.5 border-b-2 px-3 py-2 text-xs font-medium transition-colors -mb-px',
+                'flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-2 text-xs font-medium transition-colors -mb-px',
                 tab === id
                   ? 'border-primary text-foreground'
                   : 'border-transparent text-muted-foreground hover:text-foreground',
