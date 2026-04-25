@@ -126,3 +126,41 @@ def test_parser_repairs_missing_both_braces():
     assert len(calls) == 1
     assert calls[0]["name"] == "write_file"
     assert calls[0]["args"]["content"] == "hi"
+
+
+def test_parser_unwraps_double_wrapped_call():
+    """Real failure mode from gemma4:e4b: model emitted
+
+        {"name": "", "args": {"name": "read_file",
+                              "args": {"path": "tailwind.config.js"}}}
+
+    instead of just `{"name": "read_file", "args": {...}}`. The outer
+    object's `name` is empty so dispatch errors with `unknown tool: ''`
+    and the inner call vanishes. Unwrap one level when the outer name
+    is empty AND the inner args dict looks like a tool call."""
+    text = (
+        "<tool_call>\n"
+        '{"name": "", "args": {"name": "read_file", '
+        '"args": {"path": "tailwind.config.js"}}}\n'
+        "</tool_call>\n"
+    )
+    _cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "read_file"
+    assert calls[0]["args"]["path"] == "tailwind.config.js"
+
+
+def test_parser_does_not_unwrap_genuine_args_with_name_field():
+    """Don't be too eager unwrapping: if the OUTER name is filled
+    AND the inner args happens to have a `name` field (e.g. a real
+    tool call where `args.name` is meaningful), leave it alone."""
+    text = (
+        "<tool_call>\n"
+        '{"name": "click_element", "args": {"name": "Submit"}}\n'
+        "</tool_call>\n"
+    )
+    _cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "click_element"
+    # `args.name` survived — no double-unwrap.
+    assert calls[0]["args"] == {"name": "Submit"}

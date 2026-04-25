@@ -454,6 +454,23 @@ def _try_parse_tool_body(body: str) -> dict[str, Any] | None:
             except Exception:
                 parsed = None
     if isinstance(parsed, dict):
+        # Unwrap a common adapter-mode mistake: small models sometimes
+        # emit a nested `{"name": "", "args": {"name": "read_file",
+        # "args": {...}}}` because the prompt-rendered tool examples
+        # show the wrapper shape and the model doubles it. If the outer
+        # name is empty and the inner dict looks like a tool call,
+        # promote the inner one. Bounded — we only unwrap one level so
+        # we can't infinite-loop on pathological inputs.
+        if (
+            not (parsed.get("name") or parsed.get("tool") or parsed.get("tool_name"))
+            and isinstance(parsed.get("args"), dict)
+        ):
+            inner = parsed["args"]
+            if (
+                inner.get("name")
+                and ("args" in inner or "arguments" in inner or "parameters" in inner)
+            ):
+                parsed = inner
         name = (
             parsed.get("name")
             or parsed.get("tool")
