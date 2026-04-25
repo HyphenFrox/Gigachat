@@ -128,6 +128,15 @@ export default function ChatView({
   // a conversation switch (e.g. `send` awaiting an SSE stream) read this to
   // tell whether their results still apply to the chat the user is on.
   const currentIdRef = useRef(id)
+  // Re-attach poller. SSE is per-turn — when the connection dies (server
+  // reload, network blip, browser tab change while the agent kept going)
+  // there's no way to reopen the same stream. The agent loop keeps writing
+  // assistant + tool messages to the DB though, so we poll the conversation
+  // every couple seconds while its state is `running` and refresh the UI
+  // from the persisted history. Stops automatically when state flips to
+  // `idle` / `error`. Map keyed by conv id so the poller for chat A keeps
+  // ticking even when the user has switched to chat B.
+  const reattachPollersRef = useRef(new Map())
   useEffect(() => {
     currentIdRef.current = id
   }, [id])
@@ -177,6 +186,20 @@ export default function ChatView({
         setMessages(data.messages)
         setToolStates(buildToolStatesFromHistory(data.messages))
         setTodos(extractLatestTodos(data.messages))
+        // Conversation already running on load — most commonly because
+        // the crash-resilience resumer re-launched it before we
+        // attached, but also: opening a chat from the sidebar that's
+        // mid-turn in a different tab. We have no SSE for this turn,
+        // so start the reattach poller — it'll surface new messages
+        // as the agent produces them and stop itself when state goes
+        // back to idle.
+        if (
+          data.conversation?.state === 'running'
+          && !abortControllersRef.current.has(id)
+        ) {
+          setBusy(true)
+          startReattachPoller(id)
+        }
         // Hydrate live buffers from the per-conv ref map so an ongoing turn's
         // accumulated prose/reasoning survives chat switches. API history
         // only returns PERSISTED messages — any in-progress live chunk lives
@@ -216,6 +239,20 @@ export default function ChatView({
       cancelled = true
     }
   }, [id])
+
+  // Clean up every reattach poller on full unmount so we don't leak
+  // setInterval handles. Per-conv pollers are intentionally kept alive
+  // across chat switches (the user may navigate away from a chat that's
+  // still mid-resumed-turn and come back to find it up to date) — so we
+  // only sweep on unmount, not on every conv id change.
+  useEffect(() => {
+    return () => {
+      for (const handle of reattachPollersRef.current.values()) {
+        clearInterval(handle)
+      }
+      reattachPollersRef.current.clear()
+    }
+  }, [])
 
   // ----- auto-scroll bookkeeping -------------------------------------------
   // `nearBottomRef` tracks whether the user is pinned to the latest activity
@@ -444,6 +481,63 @@ export default function ChatView({
   // and-regenerate because that caller has ALREADY rewritten the existing
   // user row in place — appending another temp row would duplicate the
   // prompt visibly until the server refresh arrives.
+  // ----- reattach poller ----------------------------------------------------
+  // Spin up a 2.5 s poll that refreshes the conversation while its state is
+  // `running` but we don't have a live SSE connection (server reloaded,
+  // network blip, conversation was already mid-turn when we opened it,
+  // crash-resilience resumer kicked in). Stops automatically once state
+  // flips to idle/error. Idempotent — calling twice for the same conv is a
+  // no-op.
+  const stopReattachPoller = useCallback((cid) => {
+    const handle = reattachPollersRef.current.get(cid)
+    if (!handle) return
+    clearInterval(handle)
+    reattachPollersRef.current.delete(cid)
+  }, [])
+
+  const startReattachPoller = useCallback((cid) => {
+    if (!cid) return
+    if (reattachPollersRef.current.has(cid)) return  // already polling
+    let stopped = false
+    const tick = async () => {
+      if (stopped) return
+      try {
+        const fresh = await api.getConversation(cid)
+        // User switched away — don't push state into the visible chat,
+        // but keep polling so the buffer stays warm in case they return.
+        const isCurrent = currentIdRef.current === cid
+        if (isCurrent) {
+          setConv(fresh.conversation)
+          setMessages(fresh.messages)
+          setToolStates(buildToolStatesFromHistory(fresh.messages))
+        }
+        const st = fresh.conversation?.state
+        if (st !== 'running') {
+          stopped = true
+          stopReattachPoller(cid)
+          if (isCurrent) {
+            setBusy(false)
+            // Live buffers are partial-streamed prose that the server
+            // never persisted (the SSE that produced them died). The
+            // refreshed history is now the source of truth, so any
+            // partial buffer is stale — clear it.
+            setLiveContent('')
+            setLiveThinking('')
+            liveBuffersRef.current.delete(cid)
+          }
+        }
+      } catch {
+        /* transient — keep polling */
+      }
+    }
+    // Fire immediately, then on a 2.5 s cadence. The first tick gives the
+    // user near-instant feedback that we noticed the running state; the
+    // interval picks up subsequent message commits.
+    tick()
+    const handle = setInterval(tick, 2500)
+    reattachPollersRef.current.set(cid, handle)
+  }, [stopReattachPoller])
+
   const send = useCallback(
     async ({ newUserText, images, url, skipOptimistic = false } = {}) => {
       if (!conv) return
@@ -520,9 +614,13 @@ export default function ChatView({
         // is meant to prevent.
         const stillActive = conv?.id === currentIdRef.current
         if (stillActive) {
-          setBusy(false)
           setLiveContent('')
           setLiveThinking('')
+          // `setBusy(false)` is deferred until after we've checked the
+          // server's view of the conversation: if the SSE died (server
+          // reload, network blip) but the backend kept producing
+          // messages — i.e. state is still `running` — we want the busy
+          // indicator to stay up while the reattach poller catches up.
         }
         // The stream is over — drop the persistent buffer. If a final
         // `assistant_message` fired it's already gone; this clears the
@@ -537,6 +635,7 @@ export default function ChatView({
         if (!stillActive) return
         // Refresh conversation meta so updated_at ordering reflects this turn,
         // and the auto-title handler sees the persisted state.
+        let resumedRunning = false
         try {
           const fresh = await api.getConversation(conv.id)
           setConv(fresh.conversation)
@@ -544,8 +643,22 @@ export default function ChatView({
           setToolStates(buildToolStatesFromHistory(fresh.messages))
           onConversationUpdated?.(fresh.conversation)
           maybeAutoTitle(fresh.conversation, fresh.messages)
+          // The SSE loop ended but the server still says the turn is
+          // running — that's the "uvicorn reloaded mid-turn, the
+          // crash-resilience resumer kicked in, we missed the rest of
+          // the stream" case. Spin up the reattach poller so the
+          // browser can show new messages as they land in the DB.
+          resumedRunning = fresh.conversation?.state === 'running'
+          if (resumedRunning) {
+            startReattachPoller(conv.id)
+          } else {
+            setBusy(false)
+          }
         } catch {
-          /* non-fatal */
+          // Even on a refetch failure we can't know whether the server
+          // is still working, so be conservative and clear busy. The
+          // user can refresh to recover.
+          setBusy(false)
         }
         // Re-check the autonomous loop so the banner flips on/off when the
         // agent just called start_loop or stop_loop during this turn.
@@ -557,7 +670,7 @@ export default function ChatView({
         }
       }
     },
-    [conv, onConversationUpdated],
+    [conv, onConversationUpdated, startReattachPoller],
   )
 
   // Queue a follow-up message against the currently running turn. Unlike
