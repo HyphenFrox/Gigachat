@@ -132,10 +132,17 @@ def test_tool_load_idempotent(isolated_db, conv):
     _run(tools.tool_load(["read_file"], conv_id=cid))
     res = _run(tools.tool_load(["read_file", "bash"], conv_id=cid))
     out = res["output"]
-    # Already-loaded tools are reported as such; the new one is loaded.
+    # Already-loaded tools are reported as such; the new request brings
+    # in `bash` plus its bundle siblings (bash_bg, bash_output,
+    # kill_shell) since they share state via shell_id.
     assert "Already loaded" in out
-    assert "Loaded 1 tool(s): bash" in out
-    assert sorted(res["loaded"]) == ["bash", "read_file"]
+    assert "bash" in out
+    assert "read_file" in res["loaded"]
+    assert "bash" in res["loaded"]
+    # Bundle siblings come along for the ride.
+    assert "bash_bg" in res["loaded"]
+    assert "bash_output" in res["loaded"]
+    assert "kill_shell" in res["loaded"]
 
 
 def test_tool_load_unknown_name_reported(isolated_db, conv):
@@ -309,6 +316,85 @@ def test_dispatch_auto_load_skips_unknown_names(isolated_db, conv):
 
 
 # --- bash missing-command error message ----------------------------------
+
+
+# --- tool bundles --------------------------------------------------------
+
+
+def test_tool_load_pulls_shell_bundle(isolated_db, conv):
+    """Loading `bash` should also bring in `bash_bg`, `bash_output`,
+    `kill_shell` — they share state (the `shell_id`) and a model that
+    holds only `bash` can't recover when a long-running command needs
+    the background variant. This was the failure mode in conversation
+    0f2136d8: model loaded `bash`, hit a `npm run dev` step, had no
+    tool that fit, and punted to the user."""
+    cid = conv["id"]
+    res = _run(tools.tool_load(["bash"], conv_id=cid))
+    assert res["ok"] is True
+    loaded = set(isolated_db.get_loaded_tools(cid))
+    for member in ("bash", "bash_bg", "bash_output", "kill_shell"):
+        assert member in loaded, f"{member} should be in loaded set after tool_load(['bash'])"
+
+
+def test_bundle_expansion_is_symmetric(isolated_db, conv):
+    """Loading any member of a bundle pulls the whole bundle. Calling
+    `tool_load(['bash_output'])` first should still bring in `bash`
+    so the model can actually USE the shell_id it'd be polling."""
+    cid = conv["id"]
+    res = _run(tools.tool_load(["bash_output"], conv_id=cid))
+    assert res["ok"] is True
+    loaded = set(isolated_db.get_loaded_tools(cid))
+    for member in ("bash", "bash_bg", "bash_output", "kill_shell"):
+        assert member in loaded
+
+
+def test_dispatch_auto_load_pulls_bundle(isolated_db, conv):
+    """Same expansion in dispatch: when the model calls `bash`
+    directly (in adapter mode the parser accepts any name regardless
+    of loaded set), auto-load pulls the whole shell toolkit so a
+    follow-up `bash_bg` call has its schema visible the next turn."""
+    cid = conv["id"]
+    _run(tools.dispatch(
+        "bash",
+        {"command": "echo hi"},
+        cwd=str(__import__("pathlib").Path(__file__).parent),
+        conv_id=cid,
+    ))
+    loaded = set(isolated_db.get_loaded_tools(cid))
+    for member in ("bash", "bash_bg", "bash_output", "kill_shell"):
+        assert member in loaded
+
+
+def test_bundle_does_not_leak_unrelated_tools(isolated_db, conv):
+    """Loading `read_file` (which has no bundle) should NOT pull in
+    write_file or edit_file — bundling is reserved for state-sharing
+    toolkits, not "merely related" tools. Bloating the loaded set
+    with everything-related-to-X defeats lazy load."""
+    cid = conv["id"]
+    res = _run(tools.tool_load(["read_file"], conv_id=cid))
+    assert res["ok"] is True
+    loaded = set(isolated_db.get_loaded_tools(cid))
+    assert "read_file" in loaded
+    assert "write_file" not in loaded
+    assert "edit_file" not in loaded
+
+
+def test_bundle_expansion_preserves_order():
+    """The originally-requested name should lead the expanded list
+    so reporting in tool_load (which iterates in order) leads with
+    what the model asked for, with siblings appended after."""
+    expanded = tools._expand_with_bundles(["bash_output"])
+    assert expanded[0] == "bash_output"
+    assert set(expanded) == {"bash", "bash_bg", "bash_output", "kill_shell"}
+
+
+def test_bundle_expansion_is_idempotent():
+    """Passing an already-fully-expanded set in returns the same
+    members — no duplicates, no oscillation."""
+    full = ["bash", "bash_bg", "bash_output", "kill_shell"]
+    expanded = tools._expand_with_bundles(full)
+    assert set(expanded) == set(full)
+    assert len(expanded) == 4
 
 
 def test_bash_missing_command_returns_actionable_error():

@@ -51,8 +51,6 @@ For PDF, DOCX, XLSX, images, audio, zip, etc., use `bash` with the right Python 
 
 `bash` runs synchronously with a timeout — use it for commands that finish quickly. For dev servers, file watchers, or multi-minute builds, use `bash_bg` → `bash_output` → `kill_shell`.
 
-**Don't punt these commands back to the user.** When the task involves running `npm run dev`, `vite`, `next dev`, a test watcher, or any other long-lived process, START IT YOURSELF with `bash_bg` and verify it came up via `bash_output`. Telling the user "now run `npm run dev` to see it work" is a regression — you have a real shell, use it. The only time the user runs a long-running command themselves is when they explicitly ask for instructions instead of execution.
-
 ## Non-interactive shell usage
 
 `bash` runs without a TTY — any command that prompts for input will hang or be cancelled. ALWAYS pass flags that pick answers up front:

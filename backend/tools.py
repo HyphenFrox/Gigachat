@@ -9541,6 +9541,52 @@ async def docker_pull(image: str) -> dict:
 # whole list manually.
 
 
+# Tool bundles for lazy-load expansion. When the model calls
+# `tool_load(["X"])` (or dispatch auto-loads X on first use), every entry
+# in the bundle keyed by X also gets loaded. The criterion for bundling:
+# the tools share state that's only meaningful as a set — e.g. `bash_bg`
+# returns a `shell_id` that ONLY `bash_output` and `kill_shell` consume,
+# so loading `bash` without those is a footgun (the conversation gets
+# stuck the moment a long-running command is needed because the model
+# can't easily realize "oh I should also load bash_bg").
+#
+# We deliberately do NOT bundle merely-related tools (e.g. read_file +
+# write_file) because each can be used independently and bundling
+# would re-bloat the schemas list, defeating lazy load. Add an entry
+# here only when a real "missing companion → conversation wedges"
+# bug surfaces.
+#
+# Each value is the COMPLETE set to load when ANY key in it is touched —
+# we look up by member, so calling `tool_load(["bash_output"])` will
+# pull the full shell toolkit too. Keeps the load symmetric regardless
+# of which member the model happened to discover first.
+_TOOL_BUNDLES: list[set[str]] = [
+    {"bash", "bash_bg", "bash_output", "kill_shell"},
+]
+
+
+def _expand_with_bundles(names: list[str]) -> list[str]:
+    """Expand `names` to include every member of any bundle one of them
+    belongs to. Preserves first-seen order so the originally-requested
+    names lead, with bundle siblings appended after. Idempotent: passing
+    a fully-expanded set in returns it unchanged."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for n in names:
+        if not isinstance(n, str) or n in seen:
+            continue
+        out.append(n)
+        seen.add(n)
+        for bundle in _TOOL_BUNDLES:
+            if n in bundle:
+                for sibling in bundle:
+                    if sibling not in seen:
+                        out.append(sibling)
+                        seen.add(sibling)
+                break
+    return out
+
+
 def _full_manifest() -> list[dict]:
     """Return [{name, summary, category}] for every loadable tool.
 
@@ -9695,6 +9741,11 @@ async def tool_load(
             "output": "",
             "error": "names cannot be empty — pass at least one tool name",
         }
+    # Expand bundled tools so the model can't end up holding only half of
+    # a state-sharing toolkit. Bundle members are appended after the
+    # originally-requested names so reporting still leads with what the
+    # model asked for. See `_TOOL_BUNDLES` for the criterion.
+    names_list = _expand_with_bundles(names_list)
     manifest_names = {e["name"] for e in _full_manifest()}
     already = set(db.get_loaded_tools(conv_id))
     to_load: list[str] = []
@@ -10440,8 +10491,19 @@ async def dispatch(
         except Exception:
             already = set()
         if name not in already and name in TOOL_REGISTRY:
+            # Expand into the tool's bundle so the model gets the
+            # whole state-sharing toolkit at once, not just the
+            # specific member it happened to call. Without this, a
+            # `bash` call auto-loads only `bash` — but the moment the
+            # task needs a long-running command (`bash_bg`) or a
+            # poll on it (`bash_output`), the model has to know to
+            # `tool_load` again, and small models often don't.
+            bundle = _expand_with_bundles([name])
             try:
-                db.add_loaded_tools(conv_id, [name])
+                db.add_loaded_tools(
+                    conv_id,
+                    [n for n in bundle if n in TOOL_REGISTRY],
+                )
             except Exception:
                 pass
 
