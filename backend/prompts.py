@@ -103,7 +103,7 @@ Use `docker_run` when you need a runtime or binary the host doesn't have (Node, 
 
 - `remember(text, scope=..., topic?)` saves a fact that survives auto-compaction. Pick the NARROWEST scope that fits — broader scopes leak into more contexts:
   - `scope="conversation"` (default) — THIS chat only. In-flight decisions ("we decided to use approach X", "the user wants the dark variant").
-  - `scope="project"` — every chat with the same project label. Project-wide conventions ("this codebase uses pytest", "API tokens for staging are in 1Password entry X"). Refused if the chat has no project assigned.
+  - `scope="project"` — every chat working in the same directory (cwd). Project-wide conventions ("this codebase uses pytest", "API tokens for staging are in 1Password entry X", "the build script is at scripts/build.sh"). Two conversations pointed at the same repo automatically share this set; no extra setup needed.
   - `scope="global"` — every conversation, every project, forever. Durable user-wide facts ("user prefers SCSS", "user is on Windows + Git Bash"). Use sparingly — global memory is injected into every prompt, so noise here bloats every chat.
   Keep entries short and factual. `forget(pattern, scope=...)` removes stale entries from the matching scope.
 - `delegate(task=...)` hands a self-contained lookup or investigation to a subagent that returns a short summary. Good for multi-step surveys and scoped investigations; NOT for trivial one-shot calls or desktop work. The subagent has no memory of this chat — write the brief with all paths, constraints, and output format it needs.
@@ -298,16 +298,6 @@ def build_system_prompt(
         .replace("__SHELL__", shell)
         .replace("__CWD__", cwd)
     )
-    # Resolve the conversation's project label (if any) so we can pull
-    # in project-scoped memory. Conversations without a project just
-    # skip this section.
-    project_label: str | None = None
-    if conv_id:
-        try:
-            _conv = _tools.db.get_conversation(conv_id)
-            project_label = (_conv.get("project") if _conv else None) or None
-        except Exception:
-            project_label = None
     parts = [
         base,
         # Manifest of every loadable tool — name + 1-line summary per
@@ -320,12 +310,14 @@ def build_system_prompt(
         # heavier for small models (recency bias), so:
         #   1. AGENTS.md / CLAUDE.md   — version-controlled project rules
         #   2. per-conversation memory — in-flight decisions for THIS chat
-        #   3. project memory          — facts shared across this project
+        #   3. project memory          — facts shared across this cwd
+        #                                (every conversation pointed at
+        #                                the same directory sees them)
         #   4. global memory           — durable user-wide preferences
         # Persona (when set) goes AFTER all of these — see below.
         _load_agents_md(cwd),
         _tools.load_memory_for_prompt(conv_id),
-        _tools.load_project_memory_for_prompt(project_label),
+        _tools.load_project_memory_for_prompt(cwd),
         _tools.load_global_memory_for_prompt(),
     ]
     # Persona is intentionally terminal. It's the user's explicit "act like
@@ -909,7 +901,7 @@ TOOL_SCHEMAS = [
                     "scope": {
                         "type": "string",
                         "enum": ["conversation", "project", "global"],
-                        "description": "Where to store the note — pick the narrowest scope that fits. 'conversation' (default) = THIS chat only, in-flight decisions. 'project' = every chat with the same project label, project-wide conventions (refused if the chat has no project assigned). 'global' = every conversation everywhere, durable user-wide preferences.",
+                        "description": "Where to store the note — pick the narrowest scope that fits. 'conversation' (default) = THIS chat only, in-flight decisions. 'project' = every chat working in the same directory (cwd), project-wide conventions. 'global' = every conversation everywhere, durable user-wide preferences.",
                     },
                 },
                 "required": ["content"],
@@ -928,7 +920,7 @@ TOOL_SCHEMAS = [
                     "scope": {
                         "type": "string",
                         "enum": ["conversation", "project", "global"],
-                        "description": "Which memory store to prune — pass the same scope the entry was saved with. 'conversation' (default) = THIS chat. 'project' = the conversation's project label. 'global' = the cross-conversation store.",
+                        "description": "Which memory store to prune — pass the same scope the entry was saved with. 'conversation' (default) = THIS chat. 'project' = the conversation's working directory. 'global' = the cross-conversation store.",
                     },
                 },
                 "required": ["pattern"],

@@ -8253,14 +8253,14 @@ async def remember(
         ("we decided to use approach X for this refactor", "the user
         wants the dark variant of the icon"). Vanishes if the chat
         is deleted; never bleeds into other chats.
-      - `project` — every chat sharing the same `project` label.
-        Stored in the `project_memories` SQLite table keyed by the
-        conversation's project name. Best for project-wide rules
-        the AGENTS.md file doesn't already cover ("the lint config
-        is in .eslintrc.cjs at root", "API tokens for staging are in
-        1Password entry X"). Refused when the conversation has no
-        project assigned — set one via the chat header's "⋯ →
-        Project" first.
+      - `project` — every chat working in the same directory (cwd).
+        Two conversations pointed at the same repo automatically
+        share this set; no user-side configuration required. Best
+        for project-wide rules the AGENTS.md file doesn't already
+        cover ("the lint config is in .eslintrc.cjs at root", "API
+        tokens for staging are in 1Password entry X"). Stored in
+        the `project_memories` SQLite table keyed by the
+        conversation's cwd path.
       - `global` — every conversation, every project, forever.
         Stored in `global_memories`. Best for durable user-wide
         facts ("user prefers SCSS over CSS", "user is on Windows +
@@ -8297,7 +8297,7 @@ async def remember(
         except Exception as e:
             return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
 
-    # ----- Project path: lookup the conv's project label first ------------
+    # ----- Project path: keyed by the conversation's cwd ------------------
     if scope == "project":
         if not conv_id:
             return {
@@ -8313,22 +8313,24 @@ async def remember(
                 "ok": False, "output": "",
                 "error": "conversation not found",
             }
-        project = (conv.get("project") or "").strip()
-        if not project:
+        cwd = (conv.get("cwd") or "").strip()
+        if not cwd:
+            # Defensive — every conversation should have a cwd, but if
+            # one slips through (legacy / mid-migration row), refuse
+            # cleanly rather than silently writing under "".
             return {
                 "ok": False, "output": "",
                 "error": (
-                    "this conversation isn't part of a project — assign one "
-                    "via the chat header's '⋯ → Project' first, or use "
-                    "scope='conversation' to keep the fact local"
+                    "this conversation has no working directory set — "
+                    "use scope='conversation' to keep the fact local"
                 ),
             }
         try:
-            row = db.add_project_memory(project, content, topic)
+            row = db.add_project_memory(cwd, content, topic)
             return {
                 "ok": True,
                 "output": (
-                    f"remembered in project {project!r}: "
+                    f"remembered for project at {row['cwd']}: "
                     f"{row['content'][:120]}"
                 ),
             }
@@ -8408,7 +8410,7 @@ async def forget(
         except Exception as e:
             return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
 
-    # ----- Project path: SQL delete scoped to this conv's project label ---
+    # ----- Project path: SQL delete scoped to this conv's cwd -------------
     if scope == "project":
         if not conv_id:
             return {
@@ -8421,22 +8423,19 @@ async def forget(
             return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
         if not conv:
             return {"ok": False, "output": "", "error": "conversation not found"}
-        project = (conv.get("project") or "").strip()
-        if not project:
+        cwd = (conv.get("cwd") or "").strip()
+        if not cwd:
             return {
                 "ok": False, "output": "",
-                "error": (
-                    "this conversation isn't part of a project — nothing "
-                    "to delete in project scope"
-                ),
+                "error": "this conversation has no working directory set",
             }
         try:
-            n = db.delete_project_memories_matching(project, pattern)
+            n = db.delete_project_memories_matching(cwd, pattern)
             return {
                 "ok": True,
                 "output": (
                     f"forgot {n} project memor{'y' if n == 1 else 'ies'} "
-                    f"in {project!r} matching {pattern!r}"
+                    f"for cwd {cwd!r} matching {pattern!r}"
                 ),
             }
         except ValueError as e:
@@ -8490,22 +8489,24 @@ def load_memory_for_prompt(conv_id: str | None) -> str:
     )
 
 
-def load_project_memory_for_prompt(project: str | None) -> str:
-    """Return the project memory rows wrapped in a system-prompt section.
+def load_project_memory_for_prompt(cwd: str | None) -> str:
+    """Return the project memory rows for this cwd, wrapped in a
+    system-prompt section.
 
-    Called by `prompts.build_system_prompt` whenever the conversation
-    has a `project` label assigned. Returns "" for unlabelled
-    conversations or when the project's memory set is empty.
+    Called by `prompts.build_system_prompt` for every conversation —
+    `cwd` is mandatory on conversations, so the section is keyed
+    automatically with no user-side configuration. Returns "" when
+    the cwd has no associated memory rows yet.
 
     Memories are grouped by `topic` for readability — same shape as
     `load_global_memory_for_prompt` so the prompt visually distinguishes
     project from global only by section heading.
     """
-    p = (project or "").strip()
-    if not p:
+    key = (cwd or "").strip()
+    if not key:
         return ""
     try:
-        rows = db.list_project_memories(p)
+        rows = db.list_project_memories(key)
     except Exception:
         # DB hiccup — skip the section quietly. A missing memory block
         # is much better than a system prompt that fails to assemble.
@@ -8523,11 +8524,11 @@ def load_project_memory_for_prompt(project: str | None) -> str:
             body_parts.append(f"- {content}")
         body_parts.append("")
     return (
-        f"\n\n## Project memory — applies to every chat in project '{p}'\n\n"
+        f"\n\n## Project memory — applies to every chat in this directory\n\n"
         "The notes below are conventions and facts the user (or a "
-        "previous turn) has saved for THIS project specifically — every "
-        "conversation tagged with the same project label sees them. Treat "
-        "as authoritative for project-wide rules. To add or remove "
+        "previous turn) has saved for THIS working directory — every "
+        "conversation pointed at the same cwd sees them. Treat as "
+        "authoritative for project-wide rules. To add or remove "
         "project-scoped notes, use `remember(scope=\"project\", ...)` and "
         "`forget(scope=\"project\", ...)`.\n\n"
         + "\n".join(body_parts).rstrip()

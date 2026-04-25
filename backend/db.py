@@ -19,6 +19,7 @@ Migrations are intentionally additive (ADD COLUMN IF NOT EXISTS via a
 try/except) so upgrading an existing DB in-place doesn't require a wipe.
 """
 
+import os
 import sqlite3
 import json
 import re
@@ -170,25 +171,29 @@ def init() -> None:
                 ON global_memories(topic);
 
             -- Project memories: facts shared across every conversation
-            -- with the same `conversations.project` label. Sits between
-            -- global (user-wide) and conversation (per-chat) on the
-            -- specificity scale. Examples: "this codebase uses pytest,
-            -- not unittest", "the linter config is .eslintrc.cjs at
-            -- repo root", "API tokens for staging are in 1Password
-            -- entry X". The `project` field is the same free-text
-            -- string the user assigns via the conv "⋯" menu → Project,
-            -- so memories follow the label — moving a chat to a
-            -- different project shifts which memory set it sees.
+            -- working in the same directory. Keyed by the conversation's
+            -- `cwd` (its absolute working-directory path), so any two
+            -- chats pointed at the same repo automatically share the
+            -- same memory set without the user having to assign a
+            -- project label. Sits between global (user-wide) and
+            -- conversation (per-chat) on the specificity axis.
+            -- Examples: "this codebase uses pytest, not unittest", "the
+            -- linter config is .eslintrc.cjs at repo root", "API tokens
+            -- for staging are in 1Password entry X".
             CREATE TABLE IF NOT EXISTS project_memories (
                 id TEXT PRIMARY KEY,
-                project TEXT NOT NULL,
+                cwd TEXT NOT NULL,
                 content TEXT NOT NULL,
                 topic TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_project_memories_project
-                ON project_memories(project);
+            -- Note: the cwd index lives in the migration block below,
+            -- not here. On a DB that booted the legacy `project`-column
+            -- code first, the column rename hasn't run yet at this
+            -- point, so creating an index on `cwd` would fail with
+            -- "no such column". The migration handles both fresh and
+            -- legacy DBs uniformly.
 
             -- Web Push subscriptions — one row per browser/device the user has
             -- granted push permission on. `endpoint` is the unique push-service
@@ -458,6 +463,17 @@ def init() -> None:
             # fire in one conversation so a buggy hook can't loop forever.
             "ALTER TABLE hooks ADD COLUMN error_threshold INTEGER",
             "ALTER TABLE hooks ADD COLUMN max_fires_per_conv INTEGER",
+            # Re-key project_memories from the legacy `project` label to
+            # `cwd`. Originally shipped as project-label-keyed in the
+            # same release that shipped the third memory scope; we
+            # corrected to cwd-keyed before any users wrote rows. The
+            # rename keeps any in-flight test data intact, the index
+            # follows automatically in modern SQLite. New tables get
+            # the right shape from the CREATE TABLE above; this branch
+            # only fires for DBs that booted the older code first.
+            "ALTER TABLE project_memories RENAME COLUMN project TO cwd",
+            "DROP INDEX IF EXISTS idx_project_memories_project",
+            "CREATE INDEX IF NOT EXISTS idx_project_memories_cwd ON project_memories(cwd)",
         ):
             try:
                 c.execute(ddl)
@@ -2204,39 +2220,60 @@ def _row_to_global_memory(row: sqlite3.Row) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Project memories (per-project shared notes).
+# Project memories (per-cwd shared notes).
 #
 # Sit between `global_memories` (user-wide) and per-conversation memory
-# (per-chat). Keyed by `conversations.project` — the same free-text label
-# the user picks via the chat header's "⋯ → Project" dialog. Conversations
-# without a project label simply don't see any project memory section.
+# (per-chat). Keyed by the conversation's `cwd` — every chat working in
+# the same directory automatically shares the same memory set, with no
+# user-side configuration required. Move a chat's cwd and it sees a
+# different (or empty) project memory.
 # ---------------------------------------------------------------------------
 
 
-def list_project_memories(project: str) -> list[dict]:
-    """Return every memory tied to this project, oldest-first."""
-    p = (project or "").strip()
+def _normalize_project_cwd(cwd: str | None) -> str:
+    """Canonicalize a cwd path for project-memory lookups so two
+    conversations entered in slightly different forms still match.
+
+    Trims whitespace, removes trailing slashes (except for drive roots
+    like ``C:\\``), and lowercases on Windows where the FS is
+    case-insensitive — anywhere else, case is meaningful.
+    """
+    p = (cwd or "").strip()
     if not p:
+        return ""
+    # Strip a single trailing separator, but preserve `C:\` / `/` as
+    # those are roots in their own right.
+    if len(p) > 3 and p[-1] in ("/", "\\"):
+        p = p.rstrip("/\\")
+    if os.name == "nt":
+        p = p.lower()
+    return p
+
+
+def list_project_memories(cwd: str) -> list[dict]:
+    """Return every memory tied to this cwd, oldest-first."""
+    key = _normalize_project_cwd(cwd)
+    if not key:
         return []
     with _conn() as c:
         rows = c.execute(
-            "SELECT * FROM project_memories WHERE project = ? "
+            "SELECT * FROM project_memories WHERE cwd = ? "
             "ORDER BY created_at ASC",
-            (p,),
+            (key,),
         ).fetchall()
     return [_row_to_project_memory(r) for r in rows]
 
 
 def add_project_memory(
-    project: str, content: str, topic: str | None = None,
+    cwd: str, content: str, topic: str | None = None,
 ) -> dict:
     """Insert a project memory and return the row. Same length caps as
     global memory so a runaway agent can't blow up the prompt."""
-    p = (project or "").strip()
-    if not p:
-        raise ValueError("project is required")
-    if len(p) > 80:
-        raise ValueError("project label must be ≤ 80 chars")
+    key = _normalize_project_cwd(cwd)
+    if not key:
+        raise ValueError("cwd is required")
+    if len(key) > 1024:
+        raise ValueError("cwd path must be ≤ 1024 chars")
     body = (content or "").strip()
     if not body:
         raise ValueError("content is required")
@@ -2249,9 +2286,9 @@ def add_project_memory(
     now = time.time()
     with _conn() as c:
         c.execute(
-            "INSERT INTO project_memories (id, project, content, topic, "
+            "INSERT INTO project_memories (id, cwd, content, topic, "
             "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (mid, p, body, t, now, now),
+            (mid, key, body, t, now, now),
         )
         row = c.execute(
             "SELECT * FROM project_memories WHERE id = ?", (mid,),
@@ -2259,13 +2296,13 @@ def add_project_memory(
     return _row_to_project_memory(row)
 
 
-def delete_project_memories_matching(project: str, pattern: str) -> int:
+def delete_project_memories_matching(cwd: str, pattern: str) -> int:
     """Delete every project memory whose content contains `pattern`
-    (case-insensitive substring). Same SQL-LIKE-metachar escaping as
-    `delete_global_memories_matching`."""
-    p = (project or "").strip()
-    if not p:
-        raise ValueError("project is required")
+    (case-insensitive substring), scoped to the given cwd. Same SQL-
+    LIKE-metachar escaping as `delete_global_memories_matching`."""
+    key = _normalize_project_cwd(cwd)
+    if not key:
+        raise ValueError("cwd is required")
     needle = (pattern or "").strip()
     if not needle:
         raise ValueError("pattern is required")
@@ -2274,8 +2311,8 @@ def delete_project_memories_matching(project: str, pattern: str) -> int:
     with _conn() as c:
         cur = c.execute(
             "DELETE FROM project_memories "
-            "WHERE project = ? AND LOWER(content) LIKE LOWER(?) ESCAPE '\\'",
-            (p, like),
+            "WHERE cwd = ? AND LOWER(content) LIKE LOWER(?) ESCAPE '\\'",
+            (key, like),
         )
         return cur.rowcount or 0
 
@@ -2283,7 +2320,7 @@ def delete_project_memories_matching(project: str, pattern: str) -> int:
 def _row_to_project_memory(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
-        "project": row["project"],
+        "cwd": row["cwd"],
         "content": row["content"],
         "topic": row["topic"],
         "created_at": row["created_at"],
