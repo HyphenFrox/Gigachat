@@ -84,6 +84,33 @@ def test_tool_search_empty_query_errors():
     assert "query" in (res.get("error") or "").lower()
 
 
+def test_tool_search_no_results_points_at_primitives():
+    """Real failure mode from a hermes3:8b conversation: model called
+    tool_search('get current btc price'), got "No tools match X. Try
+    fewer or broader terms", and gave up — pivoted to a tutorial
+    response. The empty-result message wasn't actionable enough.
+
+    New behaviour: point the model at the universal toolkit
+    (write_file/read_file/edit_file/bash/python_exec) so it has a
+    concrete next step instead of an open-ended 'try broader terms'."""
+    res = _run(tools.tool_search("get current bitcoin price tool", limit=5))
+    assert res["ok"] is True
+    out = (res.get("output") or "")
+    # Negative result still leads.
+    assert "No tools match" in out
+    # And the response steers the model at concrete primitives rather
+    # than just telling it to try broader terms.
+    for primitive in ("write_file", "read_file", "edit_file", "bash"):
+        assert primitive in out, (
+            f"empty-search response should mention {primitive} as a "
+            f"primitive; got:\n{out}"
+        )
+    # Steers AWAY from the "write a tutorial" failure mode.
+    assert "tutorial" in out.lower() or "execute the task" in out.lower()
+    # Concrete tool_load call shape so the model can copy it.
+    assert "tool_load" in out
+
+
 def test_tool_search_excludes_meta_tools():
     """The manifest must not advertise tool_search / tool_load — the
     model shouldn't lazy-load the things that ARE the lazy-load

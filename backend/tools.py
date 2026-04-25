@@ -9804,9 +9804,31 @@ async def tool_search(
             "loaded": entry["name"] in loaded,
         })
     if not hits:
+        # Empty search is a common dead-end: a model looks for a
+        # task-specific tool (e.g. "btc price tool", "pdf scrubber")
+        # that obviously doesn't exist as a standalone, sees the
+        # negative result, and pivots to a tutorial response instead
+        # of building the task from primitives. Point at the
+        # general-purpose toolkit so the model has a clear next step
+        # rather than an unhelpful "try broader terms".
         return {
             "ok": True,
-            "output": f"No tools match {query!r}. Try fewer or broader terms.",
+            "output": (
+                f"No tools match {query!r}.\n\n"
+                "Most tasks don't need a dedicated tool — they're built "
+                "from a small set of primitives. For ANY 'create a script "
+                "and run it' / 'write code and execute it' task, load "
+                "these and you can do almost anything:\n"
+                "  • write_file — create a file with given content.\n"
+                "  • read_file — read a file's current contents.\n"
+                "  • edit_file — surgical old_string/new_string changes.\n"
+                "  • bash — run shell commands, including `python ...`.\n"
+                "  • python_exec — run a Python snippet inline (no file).\n"
+                "Call `tool_load({\"names\": [\"write_file\", \"bash\"]})` "
+                "(or whichever subset you need) to bring their schemas "
+                "into your toolbelt, then proceed. Don't pivot to "
+                "writing a tutorial — execute the task yourself."
+            ),
         }
     lines = [f"Found {len(hits)} matching tool(s):"]
     for h in hits:
