@@ -526,7 +526,16 @@ async def run_bash(
     way to recover from that.
     """
     if not command or not command.strip():
-        return {"ok": False, "output": "", "error": "empty command"}
+        return {
+            "ok": False,
+            "output": "",
+            "error": (
+                "bash requires the `command` field, but you didn't pass one. "
+                "Example: `bash({\"command\": \"cd stock-tracker && ls\", "
+                "\"reason\": \"...\"})`. The `reason` field on its own is not "
+                "enough — `command` carries the actual shell text to run."
+            ),
+        }
     effective_cwd = _effective_bash_cwd(cwd, conv_id)
     # Only wrap when we actually have bash AND a conversation to persist
     # the cwd against — otherwise the marker line would just be noise
@@ -3641,7 +3650,16 @@ async def bash_bg(cwd: str, command: str, conv_id: str | None = None) -> dict:
     outlive the turn, so there's no clean point to capture its final PWD.
     """
     if not command or not command.strip():
-        return {"ok": False, "output": "", "error": "empty command"}
+        return {
+            "ok": False,
+            "output": "",
+            "error": (
+                "bash requires the `command` field, but you didn't pass one. "
+                "Example: `bash({\"command\": \"cd stock-tracker && ls\", "
+                "\"reason\": \"...\"})`. The `reason` field on its own is not "
+                "enough — `command` carries the actual shell text to run."
+            ),
+        }
     effective_cwd = _effective_bash_cwd(cwd, conv_id)
     bash_exe = _bash_executable()
     env = _non_interactive_env()
@@ -9373,10 +9391,21 @@ def _full_manifest() -> list[dict]:
         summary = desc[:cut_idx].strip()
         if len(summary) > 140:
             summary = summary[:137] + "..."
+        # Required-field hint — without this the model has no way to
+        # know that `bash` needs a `command` field, `read_file` needs a
+        # `path`, etc. just from the manifest. In adapter mode (the
+        # parser accepts any tool name regardless of the loaded set)
+        # the model would then call the tool with only `reason` filled
+        # and get a stream of "empty command" errors. The hint is
+        # cheap (~30 chars per entry, ~2 KB total on 70 tools) and
+        # eliminates the "guess the field name" failure mode entirely.
+        params = fn.get("parameters") or {}
+        required = [r for r in (params.get("required") or []) if r != "reason"]
         out.append({
             "name": name,
             "summary": summary or "(no description)",
             "category": classify_tool(name),
+            "required": required,
         })
     out.sort(key=lambda x: x["name"])
     return out
@@ -10208,6 +10237,27 @@ async def dispatch(
     # invented names here (e.g. `google:search` → `web_search`). No-op when
     # `name` already resolves to an MCP / user tool / built-in.
     name, args = resolve_tool_alias(name, args or {})
+
+    # Auto-load on first call. The lazy-load filter only ships a small
+    # `tools=[...]` payload to the model — the rest are listed by name +
+    # 1-liner in the system prompt manifest. In adapter mode the model
+    # can still call any tool by name (the parser doesn't gate on the
+    # advertised set), so the FIRST call may go in with imperfect args
+    # because the schema wasn't visible. Auto-adding to the loaded set
+    # here means the NEXT turn carries the full schema, which clears
+    # every "I forgot a required field" repeat-failure pattern. Skipped
+    # for the meta-tools themselves (always loaded) and for unknown
+    # names (would just clutter the persisted set with garbage).
+    if conv_id and name not in ALWAYS_LOADED_TOOLS:
+        try:
+            already = set(db.get_loaded_tools(conv_id))
+        except Exception:
+            already = set()
+        if name not in already and name in TOOL_REGISTRY:
+            try:
+                db.add_loaded_tools(conv_id, [name])
+            except Exception:
+                pass
 
     # MCP tools live outside TOOL_REGISTRY — their names are namespaced
     # (`mcp__<server>__<tool>`) so we can route them without a registry

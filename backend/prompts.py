@@ -240,8 +240,21 @@ def _build_tool_manifest_section() -> str:
     # permission gate enforces it independently — exposing it here would
     # invite the model to "try the read variant first" reasoning that
     # the gate already handles.
+    #
+    # We DO surface the `required` field list per entry. Without it, the
+    # adapter-mode parser accepts any `<tool_call>` regardless of
+    # whether the schema was shipped, so the model can call e.g. `bash`
+    # by name without ever loading it — at which point it has no idea
+    # which fields are required and just fills `reason` (which lives on
+    # every schema). Listing the required field names here is enough to
+    # eliminate the "args={'reason': ...}, no command" failure mode
+    # without paying the full schema cost.
     for entry in manifest:
-        lines.append(f"  • {entry['name']} — {entry['summary']}")
+        line = f"  • {entry['name']} — {entry['summary']}"
+        req = entry.get("required") or []
+        if req:
+            line += f" · required: {', '.join(req)}"
+        lines.append(line)
     lines.append("")
     return "\n".join(lines)
 

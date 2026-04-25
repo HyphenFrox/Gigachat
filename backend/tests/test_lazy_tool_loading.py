@@ -217,3 +217,114 @@ def test_meta_tool_schemas_in_TOOL_SCHEMAS():
     }
     assert "tool_search" in names
     assert "tool_load" in names
+
+
+# --- required-field hints in the manifest --------------------------------
+
+
+def test_manifest_shows_required_fields():
+    """Without the required-field hint, adapter-mode models call tools
+    by name with only `reason` filled (because reason is on every
+    schema) and forget tool-specific required fields like `command` or
+    `path`. The manifest section must surface those names so the model
+    has enough info to make a correct first call without loading."""
+    sp = prompts.build_system_prompt("C:/tmp")
+    # Bash needs `command`. Without this hint, gemma4:e4b kept emitting
+    # `args={"reason": "..."}` and getting "empty command" errors.
+    assert "bash" in sp
+    bash_lines = [ln for ln in sp.splitlines() if " bash " in ln or "• bash —" in ln]
+    assert any("required: command" in ln for ln in bash_lines), (
+        f"expected `required: command` on the bash manifest line, got:\n"
+        + "\n".join(bash_lines)
+    )
+    # read_file needs `path`.
+    read_lines = [ln for ln in sp.splitlines() if "• read_file —" in ln]
+    assert any("required: path" in ln for ln in read_lines), (
+        f"expected `required: path` on the read_file manifest line, got:\n"
+        + "\n".join(read_lines)
+    )
+
+
+def test_manifest_excludes_reason_from_required():
+    """`reason` is a UX field added to every schema by `_with_reason`;
+    listing it on every manifest line would be noise. It should be
+    stripped before rendering."""
+    sp = prompts.build_system_prompt("C:/tmp")
+    bullet_lines = [ln for ln in sp.splitlines() if ln.lstrip().startswith("•")]
+    bullet_blob = "\n".join(bullet_lines)
+    # No bullet line should advertise `reason` as required.
+    assert "required: reason" not in bullet_blob
+    assert "required: reason," not in bullet_blob
+
+
+# --- auto-load on dispatch ------------------------------------------------
+
+
+def test_dispatch_auto_loads_tool_on_first_call(isolated_db, conv):
+    """Calling a tool that hasn't been explicitly loaded should add it
+    to the conversation's loaded set, so the NEXT turn carries the full
+    schema. Eliminates the "first call has wrong args because the
+    schema wasn't visible" failure mode in adapter mode."""
+    cid = conv["id"]
+    assert isolated_db.get_loaded_tools(cid) == []
+    # Dispatch any read-class tool. We use list_dir because it's
+    # synchronous, no external dependencies, and exercises the
+    # registry+conv_id path.
+    _run(tools.dispatch(
+        "list_dir",
+        {"path": "."},
+        cwd=str(__import__("pathlib").Path(__file__).parent),
+        conv_id=cid,
+    ))
+    # `list_dir` is now loaded for this conversation.
+    assert "list_dir" in isolated_db.get_loaded_tools(cid)
+
+
+def test_dispatch_auto_load_skips_meta_tools(isolated_db, conv):
+    """The two meta-tools are always-loaded; auto-loading them would
+    just clutter the persisted set and round-trip the DB pointlessly."""
+    cid = conv["id"]
+    _run(tools.dispatch(
+        "tool_search",
+        {"query": "read"},
+        cwd=".",
+        conv_id=cid,
+    ))
+    # tool_search ran, but it's NOT in the persisted loaded set.
+    assert "tool_search" not in isolated_db.get_loaded_tools(cid)
+
+
+def test_dispatch_auto_load_skips_unknown_names(isolated_db, conv):
+    """Unknown tool names should not pollute the loaded set — the
+    dispatcher returns a "did you mean" error and that's it."""
+    cid = conv["id"]
+    res = _run(tools.dispatch(
+        "definitely_not_a_real_tool",
+        {},
+        cwd=".",
+        conv_id=cid,
+    ))
+    assert res["ok"] is False
+    assert isolated_db.get_loaded_tools(cid) == []
+
+
+# --- bash missing-command error message ----------------------------------
+
+
+def test_bash_missing_command_returns_actionable_error():
+    """The previous error was just 'empty command' — too terse for
+    small adapter-mode models. They'd loop on the same mistake. The new
+    error explicitly names the missing field, gives an example, and
+    explains the difference vs `reason`."""
+    res = _run(tools.dispatch(
+        "bash",
+        {"reason": "trying to cd somewhere"},  # forgot `command`
+        cwd=".",
+        conv_id=None,
+    ))
+    assert res["ok"] is False
+    err = res.get("error") or ""
+    assert "command" in err.lower()
+    # Worth pinning the example shape — that's the bit the model
+    # actually copies from on retry.
+    assert "{" in err and "command" in err
