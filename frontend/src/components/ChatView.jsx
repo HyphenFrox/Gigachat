@@ -186,6 +186,22 @@ export default function ChatView({
         setMessages(data.messages)
         setToolStates(buildToolStatesFromHistory(data.messages))
         setTodos(extractLatestTodos(data.messages))
+        // Backfill a missing title on load. Catches conversations
+        // created before this fix shipped, conversations whose first
+        // turn never finished (so the per-turn auto-title path never
+        // ran), and any conversation a user opened from the sidebar
+        // that's still labelled "New chat" but has at least one user
+        // message.
+        if (data.conversation?.title === 'New chat') {
+          const firstUser = (data.messages || []).find(
+            (m) => m.role === 'user',
+          )
+          if (firstUser && firstUser.content) {
+            // Don't await — title update is best-effort and the rest
+            // of the load sequence shouldn't wait for it.
+            maybeAutoTitle(data.conversation, data.messages)
+          }
+        }
         // Conversation already running on load — most commonly because
         // the crash-resilience resumer re-launched it before we
         // attached, but also: opening a chat from the sidebar that's
@@ -1049,6 +1065,15 @@ export default function ChatView({
     if (documents.length) {
       const blocks = documents.map(formatDocumentBlock).join('\n\n')
       finalText = blocks + (text ? `\n\n${text}` : '')
+    }
+
+    // Set the conversation title from the first user message
+    // immediately — don't wait for the turn to finish. Slow models or
+    // a turn that wedges in `state=running` would otherwise leave the
+    // sidebar stuck on "New chat" forever, so titles need to land on
+    // submit, not on completion.
+    if (conv && finalText) {
+      maybeAutoTitle(conv, [{ role: 'user', content: finalText }])
     }
 
     setInput('')
