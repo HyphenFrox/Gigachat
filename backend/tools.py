@@ -8246,26 +8246,40 @@ async def remember(
 ) -> dict:
     """Save a fact to long-term memory.
 
-    Two scopes:
-      - `conversation` (default) — append to this conversation's memory file
-        at data/memory/<conv_id>.md. Visible only when the model is working
-        on this conversation. Best for in-flight context ("we decided to use
-        approach X for this refactor").
-      - `global` — insert a row into the SQLite `global_memories` table.
-        Visible to the model in EVERY conversation, present and future. Best
-        for durable user preferences and project-wide conventions ("user
-        prefers SCSS over CSS", "always run pytest, never unittest").
+    Three scopes — pick by how widely this fact applies:
 
-    `topic` is optional — for conv scope it groups bullets under a `## topic`
-    heading; for global scope it's stored in its own column for the Settings
-    UI to filter by.
+      - `conversation` (default) — THIS chat only. Per-chat scratchpad
+        at data/memory/<conv_id>.md. Best for in-flight decisions
+        ("we decided to use approach X for this refactor", "the user
+        wants the dark variant of the icon"). Vanishes if the chat
+        is deleted; never bleeds into other chats.
+      - `project` — every chat sharing the same `project` label.
+        Stored in the `project_memories` SQLite table keyed by the
+        conversation's project name. Best for project-wide rules
+        the AGENTS.md file doesn't already cover ("the lint config
+        is in .eslintrc.cjs at root", "API tokens for staging are in
+        1Password entry X"). Refused when the conversation has no
+        project assigned — set one via the chat header's "⋯ →
+        Project" first.
+      - `global` — every conversation, every project, forever.
+        Stored in `global_memories`. Best for durable user-wide
+        facts ("user prefers SCSS over CSS", "user is on Windows +
+        Git Bash, not Linux").
+
+    Pick the NARROWEST scope that fits — global memory is injected
+    into every system prompt the user ever runs, so noise here
+    bloats every conversation.
+
+    `topic` is optional — for conv scope it groups bullets under a
+    `## topic` heading; for project / global scope it's stored in
+    its own column for the Settings UI to filter by.
     """
     scope = (scope or "conversation").strip().lower()
-    if scope not in {"conversation", "global"}:
+    if scope not in {"conversation", "project", "global"}:
         return {
             "ok": False,
             "output": "",
-            "error": "scope must be 'conversation' or 'global'",
+            "error": "scope must be 'conversation', 'project', or 'global'",
         }
     if not content or not content.strip():
         return {"ok": False, "output": "", "error": "content is required"}
@@ -8277,6 +8291,46 @@ async def remember(
             return {
                 "ok": True,
                 "output": f"remembered globally: {row['content'][:120]}",
+            }
+        except ValueError as e:
+            return {"ok": False, "output": "", "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
+
+    # ----- Project path: lookup the conv's project label first ------------
+    if scope == "project":
+        if not conv_id:
+            return {
+                "ok": False, "output": "",
+                "error": "remember(scope='project') needs a conversation context",
+            }
+        try:
+            conv = db.get_conversation(conv_id)
+        except Exception as e:
+            return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
+        if not conv:
+            return {
+                "ok": False, "output": "",
+                "error": "conversation not found",
+            }
+        project = (conv.get("project") or "").strip()
+        if not project:
+            return {
+                "ok": False, "output": "",
+                "error": (
+                    "this conversation isn't part of a project — assign one "
+                    "via the chat header's '⋯ → Project' first, or use "
+                    "scope='conversation' to keep the fact local"
+                ),
+            }
+        try:
+            row = db.add_project_memory(project, content, topic)
+            return {
+                "ok": True,
+                "output": (
+                    f"remembered in project {project!r}: "
+                    f"{row['content'][:120]}"
+                ),
             }
         except ValueError as e:
             return {"ok": False, "output": "", "error": str(e)}
@@ -8329,16 +8383,17 @@ async def forget(
 ) -> dict:
     """Remove memory entries containing `pattern` (case-insensitive substring).
 
-    Same `scope` dichotomy as remember(): 'conversation' prunes lines from
-    the per-conv markdown file; 'global' deletes matching rows from the
-    SQLite `global_memories` table.
+    Same three scopes as `remember`: 'conversation' prunes lines from
+    the per-conv markdown file; 'project' deletes matching rows tied
+    to the conversation's project label; 'global' deletes matching
+    rows from the SQLite `global_memories` table.
     """
     scope = (scope or "conversation").strip().lower()
-    if scope not in {"conversation", "global"}:
+    if scope not in {"conversation", "project", "global"}:
         return {
             "ok": False,
             "output": "",
-            "error": "scope must be 'conversation' or 'global'",
+            "error": "scope must be 'conversation', 'project', or 'global'",
         }
     if not pattern or not pattern.strip():
         return {"ok": False, "output": "", "error": "pattern is required"}
@@ -8348,6 +8403,42 @@ async def forget(
         try:
             n = db.delete_global_memories_matching(pattern)
             return {"ok": True, "output": f"forgot {n} global memor{'y' if n == 1 else 'ies'} matching {pattern!r}"}
+        except ValueError as e:
+            return {"ok": False, "output": "", "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
+
+    # ----- Project path: SQL delete scoped to this conv's project label ---
+    if scope == "project":
+        if not conv_id:
+            return {
+                "ok": False, "output": "",
+                "error": "forget(scope='project') needs a conversation context",
+            }
+        try:
+            conv = db.get_conversation(conv_id)
+        except Exception as e:
+            return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
+        if not conv:
+            return {"ok": False, "output": "", "error": "conversation not found"}
+        project = (conv.get("project") or "").strip()
+        if not project:
+            return {
+                "ok": False, "output": "",
+                "error": (
+                    "this conversation isn't part of a project — nothing "
+                    "to delete in project scope"
+                ),
+            }
+        try:
+            n = db.delete_project_memories_matching(project, pattern)
+            return {
+                "ok": True,
+                "output": (
+                    f"forgot {n} project memor{'y' if n == 1 else 'ies'} "
+                    f"in {project!r} matching {pattern!r}"
+                ),
+            }
         except ValueError as e:
             return {"ok": False, "output": "", "error": str(e)}
         except Exception as e:
@@ -8395,6 +8486,51 @@ def load_memory_for_prompt(conv_id: str | None) -> str:
         "the work in flight. Use `remember(...)` to add new facts and "
         "`forget(...)` to remove ones that are no longer true.\n\n"
         + text
+        + "\n"
+    )
+
+
+def load_project_memory_for_prompt(project: str | None) -> str:
+    """Return the project memory rows wrapped in a system-prompt section.
+
+    Called by `prompts.build_system_prompt` whenever the conversation
+    has a `project` label assigned. Returns "" for unlabelled
+    conversations or when the project's memory set is empty.
+
+    Memories are grouped by `topic` for readability — same shape as
+    `load_global_memory_for_prompt` so the prompt visually distinguishes
+    project from global only by section heading.
+    """
+    p = (project or "").strip()
+    if not p:
+        return ""
+    try:
+        rows = db.list_project_memories(p)
+    except Exception:
+        # DB hiccup — skip the section quietly. A missing memory block
+        # is much better than a system prompt that fails to assemble.
+        return ""
+    if not rows:
+        return ""
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(r["topic"] or "General", []).append(r)
+    body_parts: list[str] = []
+    for topic, items in groups.items():
+        body_parts.append(f"### {topic}")
+        for it in items:
+            content = " ".join(it["content"].split())
+            body_parts.append(f"- {content}")
+        body_parts.append("")
+    return (
+        f"\n\n## Project memory — applies to every chat in project '{p}'\n\n"
+        "The notes below are conventions and facts the user (or a "
+        "previous turn) has saved for THIS project specifically — every "
+        "conversation tagged with the same project label sees them. Treat "
+        "as authoritative for project-wide rules. To add or remove "
+        "project-scoped notes, use `remember(scope=\"project\", ...)` and "
+        "`forget(scope=\"project\", ...)`.\n\n"
+        + "\n".join(body_parts).rstrip()
         + "\n"
     )
 
@@ -8457,7 +8593,14 @@ def load_global_memory_for_prompt() -> str:
 # so the UI treats creation like an approve-to-save operation, and we
 # hard-cap timeout (1-120s) + never log stdin contents to disk.
 # ---------------------------------------------------------------------------
-HOOK_EVENTS = {"pre_tool", "post_tool", "user_prompt_submit", "turn_done"}
+# Single source of truth for valid event names lives in db.HOOK_EVENTS —
+# importing it here as a module-level alias keeps `run_hooks(event=...)`
+# and the DB's `create_hook(event=...)` validator in lockstep when new
+# events are added (e.g. the `tool_error` / `consecutive_failures`
+# workflow events). Earlier code shipped a stale local set that quietly
+# rejected any event name added after this module was last touched.
+from .db import HOOK_EVENTS as _DB_HOOK_EVENTS
+HOOK_EVENTS = _DB_HOOK_EVENTS
 
 
 async def _run_single_hook(hook: dict, payload: dict) -> dict:

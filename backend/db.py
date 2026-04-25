@@ -169,6 +169,27 @@ def init() -> None:
             CREATE INDEX IF NOT EXISTS idx_global_memories_topic
                 ON global_memories(topic);
 
+            -- Project memories: facts shared across every conversation
+            -- with the same `conversations.project` label. Sits between
+            -- global (user-wide) and conversation (per-chat) on the
+            -- specificity scale. Examples: "this codebase uses pytest,
+            -- not unittest", "the linter config is .eslintrc.cjs at
+            -- repo root", "API tokens for staging are in 1Password
+            -- entry X". The `project` field is the same free-text
+            -- string the user assigns via the conv "⋯" menu → Project,
+            -- so memories follow the label — moving a chat to a
+            -- different project shifts which memory set it sees.
+            CREATE TABLE IF NOT EXISTS project_memories (
+                id TEXT PRIMARY KEY,
+                project TEXT NOT NULL,
+                content TEXT NOT NULL,
+                topic TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_project_memories_project
+                ON project_memories(project);
+
             -- Web Push subscriptions — one row per browser/device the user has
             -- granted push permission on. `endpoint` is the unique push-service
             -- URL the browser hands back during pushManager.subscribe(); we use
@@ -2175,6 +2196,94 @@ def delete_global_memories_matching(pattern: str) -> int:
 def _row_to_global_memory(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
+        "content": row["content"],
+        "topic": row["topic"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Project memories (per-project shared notes).
+#
+# Sit between `global_memories` (user-wide) and per-conversation memory
+# (per-chat). Keyed by `conversations.project` — the same free-text label
+# the user picks via the chat header's "⋯ → Project" dialog. Conversations
+# without a project label simply don't see any project memory section.
+# ---------------------------------------------------------------------------
+
+
+def list_project_memories(project: str) -> list[dict]:
+    """Return every memory tied to this project, oldest-first."""
+    p = (project or "").strip()
+    if not p:
+        return []
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM project_memories WHERE project = ? "
+            "ORDER BY created_at ASC",
+            (p,),
+        ).fetchall()
+    return [_row_to_project_memory(r) for r in rows]
+
+
+def add_project_memory(
+    project: str, content: str, topic: str | None = None,
+) -> dict:
+    """Insert a project memory and return the row. Same length caps as
+    global memory so a runaway agent can't blow up the prompt."""
+    p = (project or "").strip()
+    if not p:
+        raise ValueError("project is required")
+    if len(p) > 80:
+        raise ValueError("project label must be ≤ 80 chars")
+    body = (content or "").strip()
+    if not body:
+        raise ValueError("content is required")
+    if len(body) > 8000:
+        raise ValueError("memory body must be ≤ 8 KB")
+    t = (topic or "").strip() or None
+    if t and len(t) > 80:
+        raise ValueError("topic must be ≤ 80 chars")
+    mid = str(uuid.uuid4())
+    now = time.time()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO project_memories (id, project, content, topic, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (mid, p, body, t, now, now),
+        )
+        row = c.execute(
+            "SELECT * FROM project_memories WHERE id = ?", (mid,),
+        ).fetchone()
+    return _row_to_project_memory(row)
+
+
+def delete_project_memories_matching(project: str, pattern: str) -> int:
+    """Delete every project memory whose content contains `pattern`
+    (case-insensitive substring). Same SQL-LIKE-metachar escaping as
+    `delete_global_memories_matching`."""
+    p = (project or "").strip()
+    if not p:
+        raise ValueError("project is required")
+    needle = (pattern or "").strip()
+    if not needle:
+        raise ValueError("pattern is required")
+    escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like = f"%{escaped}%"
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM project_memories "
+            "WHERE project = ? AND LOWER(content) LIKE LOWER(?) ESCAPE '\\'",
+            (p, like),
+        )
+        return cur.rowcount or 0
+
+
+def _row_to_project_memory(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "project": row["project"],
         "content": row["content"],
         "topic": row["topic"],
         "created_at": row["created_at"],

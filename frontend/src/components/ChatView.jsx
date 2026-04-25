@@ -281,6 +281,16 @@ export default function ChatView({
   // before the wheel handler has a chance to set `userPinnedUpRef`.
   const lastUserGestureAtRef = useRef(0)
   const _GESTURE_GRACE_MS = 250
+  // Timestamp of the most recent PROGRAMMATIC scrollTop write. onScroll
+  // uses this to distinguish "user reached the bottom on their own"
+  // (legitimate signal to release the pin) from "we just auto-scrolled
+  // to the bottom on the user's behalf" (NOT a release signal — the
+  // user may have just wheeled up and the auto-scroll wiped their
+  // pin). Without this, every auto-scroll-to-bottom resets pin=false
+  // via onScroll's distanceFromBottom<4 branch, and the user's wheel
+  // gesture gets fought every time.
+  const lastProgScrollAtRef = useRef(0)
+  const _PROG_SCROLL_WINDOW_MS = 150
 
   // Update nearBottomRef whenever the user scrolls. Using a ref (not state)
   // so we don't cause a re-render on every wheel tick.
@@ -299,6 +309,18 @@ export default function ChatView({
       const top = el.scrollTop
       const distanceFromBottom = el.scrollHeight - top - el.clientHeight
       nearBottomRef.current = distanceFromBottom < 200
+      // If this scroll event was triggered by our own programmatic
+      // write (`el.scrollTop = el.scrollHeight` from the auto-scroll
+      // effects), skip the pin updates entirely — programmatic
+      // scrolls are not "the user did something", they're our own
+      // bookkeeping. Without this gate, an auto-scroll-to-bottom
+      // wipes the pin via the `distanceFromBottom < 4` branch, and
+      // the user's wheel-up gesture gets yanked back the next render.
+      const sinceProg = Date.now() - lastProgScrollAtRef.current
+      if (sinceProg < _PROG_SCROLL_WINDOW_MS) {
+        lastScrollTop = top
+        return
+      }
       // Any upward movement sets the pin. We keep the wheel/touch/key
       // handlers below as a belt-and-suspenders path (they fire BEFORE
       // the scroll lands so the pin is set atomically with the gesture),
@@ -393,6 +415,9 @@ export default function ChatView({
     if (!scroll || !content || typeof ResizeObserver === 'undefined') return
     const ro = new ResizeObserver(() => {
       if (_shouldAutoScroll()) {
+        // Stamp BEFORE the assignment so the scroll event the
+        // browser will fire next finds the marker in place.
+        lastProgScrollAtRef.current = Date.now()
         scroll.scrollTop = scroll.scrollHeight
       }
     })
@@ -419,6 +444,11 @@ export default function ChatView({
     const el = scrollRef.current
     if (!el) return
     if (_shouldAutoScroll()) {
+      // Mark as programmatic — see lastProgScrollAtRef comment for why
+      // onScroll needs to discriminate this from user-initiated
+      // scrolls (otherwise auto-scrolling to the bottom wipes the
+      // pin the user just set with a wheel-up gesture).
+      lastProgScrollAtRef.current = Date.now()
       el.scrollTop = el.scrollHeight
     }
   }, [messages, liveContent, liveThinking, toolStates, busy])
