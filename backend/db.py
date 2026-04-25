@@ -474,6 +474,24 @@ def init() -> None:
             "ALTER TABLE project_memories RENAME COLUMN project TO cwd",
             "DROP INDEX IF EXISTS idx_project_memories_project",
             "CREATE INDEX IF NOT EXISTS idx_project_memories_cwd ON project_memories(cwd)",
+            # Sidebar sort key. We used to order conversations by
+            # `updated_at`, which the agent itself bumps every time it
+            # commits an assistant or tool message — so a conversation
+            # that's been running tools in the background drifts to
+            # the top even when the user hasn't touched it. Tracking
+            # the last USER message timestamp separately makes the
+            # sidebar reflect "where the user has been talking" rather
+            # than "where any agent activity happened". Backfill below
+            # seeds the column from existing messages so post-migration
+            # ordering is sensible from the first render.
+            "ALTER TABLE conversations ADD COLUMN last_user_message_at REAL",
+            # Drop the old (pinned, updated_at) index so the schema
+            # block below can recreate it as (pinned,
+            # last_user_message_at, updated_at) — the new sort needs
+            # the extra column in the index to skip the sort step.
+            # CREATE INDEX IF NOT EXISTS would otherwise see the old
+            # index name and silently keep the wrong shape.
+            "DROP INDEX IF EXISTS idx_conversations_sort",
         ):
             try:
                 c.execute(ddl)
@@ -493,6 +511,25 @@ def init() -> None:
             c.execute(
                 "UPDATE conversations SET permission_mode = 'allow_all' WHERE auto_approve = 1"
             )
+        # Backfill last_user_message_at from the messages table so the
+        # sidebar sort is meaningful from first render after migration.
+        # Only touches rows where the column is currently NULL — running
+        # this on every startup would be cheap (sub-millisecond on small
+        # DBs) but stomp on conversations the user has just messaged in.
+        c.execute(
+            "UPDATE conversations SET last_user_message_at = ("
+            "  SELECT MAX(created_at) FROM messages "
+            "  WHERE messages.conversation_id = conversations.id "
+            "  AND messages.role = 'user'"
+            ") WHERE last_user_message_at IS NULL"
+        )
+        # Conversations with no user messages yet (just-created chats)
+        # fall back to created_at so they still get a sensible position
+        # in the list rather than sorting last forever.
+        c.execute(
+            "UPDATE conversations SET last_user_message_at = created_at "
+            "WHERE last_user_message_at IS NULL"
+        )
         # Persistent queue of user messages submitted while a turn was still
         # running. We used to keep this in-memory only, which meant queued
         # messages were dropped on process restart. Now they survive a crash
@@ -509,14 +546,15 @@ def init() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_queued_conv ON queued_inputs(conversation_id, created_at);
             -- Sidebar sort: list_conversations + the outer search_conversations
-            -- ORDER BY both sort by (pinned DESC, updated_at DESC). A composite
-            -- (pinned, updated_at) index lets SQLite walk the B-tree in reverse
-            -- and skip the sort entirely. `pinned` and `updated_at` are
-            -- post-migration columns on existing DBs, but the ALTER TABLEs
-            -- above run first in the same init() call so both columns always
-            -- exist by the time this index is created.
+            -- ORDER BY (pinned DESC, last_user_message_at DESC, updated_at
+            -- DESC). A composite index covering the sort columns lets
+            -- SQLite walk the B-tree in reverse and skip the sort entirely.
+            -- `pinned` and `last_user_message_at` are post-migration columns
+            -- on existing DBs, but the ALTER TABLEs above run first in the
+            -- same init() call so both columns always exist by the time
+            -- this index is created.
             CREATE INDEX IF NOT EXISTS idx_conversations_sort
-                ON conversations(pinned, updated_at);
+                ON conversations(pinned, last_user_message_at, updated_at);
             """
         )
 
@@ -566,7 +604,15 @@ def list_conversations() -> list[dict]:
     """Return all conversations, pinned first then most-recently-updated."""
     with _conn() as c:
         rows = c.execute(
-            "SELECT * FROM conversations ORDER BY pinned DESC, updated_at DESC"
+            # Sidebar sort. Primary key is `last_user_message_at` so a
+            # chat the user just messaged in floats to the top, even
+            # if a different conversation has been chugging through
+            # tool calls in the background. `updated_at` stays as the
+            # tie-breaker for brand-new chats that haven't received a
+            # user message yet (the migration backfills that column
+            # with `created_at` in those cases).
+            "SELECT * FROM conversations ORDER BY pinned DESC, "
+            "last_user_message_at DESC, updated_at DESC"
         ).fetchall()
     return [_row_to_conversation(r) for r in rows]
 
@@ -921,7 +967,22 @@ def add_message(
             "INSERT INTO messages (id, conversation_id, role, content, tool_calls, images, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (mid, cid, role, content, tc, imgs, now),
         )
-        c.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, cid))
+        # Always bump updated_at — keeps the existing crash-resilience
+        # / staleness signals correct. Bump last_user_message_at ONLY
+        # on user-role rows so the sidebar sort reflects "where the
+        # user has been talking" rather than "where any agent
+        # activity happened".
+        if role == "user":
+            c.execute(
+                "UPDATE conversations SET updated_at = ?, "
+                "last_user_message_at = ? WHERE id = ?",
+                (now, now, cid),
+            )
+        else:
+            c.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (now, cid),
+            )
     return {
         "id": mid,
         "conversation_id": cid,
@@ -1084,11 +1145,15 @@ def update_user_message_content(mid: str, content: str) -> dict | None:
         if cur.rowcount == 0:
             return None
         row = c.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone()
-        # Bump conversation updated_at so the sidebar reorders it to the top.
+        # Bump both updated_at AND last_user_message_at — editing a user
+        # message is itself a user action, so the sidebar should treat
+        # it like a fresh user message for sort purposes.
         if row:
+            now = time.time()
             c.execute(
-                "UPDATE conversations SET updated_at = ? WHERE id = ?",
-                (time.time(), row["conversation_id"]),
+                "UPDATE conversations SET updated_at = ?, "
+                "last_user_message_at = ? WHERE id = ?",
+                (now, now, row["conversation_id"]),
             )
     return _row_to_message(row) if row else None
 
