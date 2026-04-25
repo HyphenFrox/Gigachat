@@ -29,6 +29,11 @@ import { api } from '@/lib/api'
 export default function HooksSection() {
   const [hooks, setHooks] = useState([])
   const [events, setEvents] = useState([])
+  // Per-event timeout caps shipped from the backend so the form input
+  // can clamp before the round-trip rejects. Maps event name → max
+  // seconds. Falls back to 120 (the default cap) if the backend is
+  // older than this UI.
+  const [timeoutCaps, setTimeoutCaps] = useState({})
   const [loading, setLoading] = useState(false)
   const [adding, setAdding] = useState(false)
   const [draft, setDraft] = useState(null) // partial hook while the user types
@@ -37,9 +42,10 @@ export default function HooksSection() {
   const refresh = useCallback(async () => {
     setLoading(true)
     try {
-      const { hooks: rows, events: evs } = await api.listHooks()
+      const { hooks: rows, events: evs, timeout_caps } = await api.listHooks()
       setHooks(rows || [])
       setEvents(evs || [])
+      setTimeoutCaps(timeout_caps || {})
     } catch (e) {
       toast.error('Failed to load hooks', { description: e.message })
     } finally {
@@ -58,6 +64,8 @@ export default function HooksSection() {
       command: '',
       timeout_seconds: 10,
       enabled: true,
+      error_threshold: 3,
+      max_fires_per_conv: 5,
     })
     setAdding(true)
   }
@@ -76,6 +84,17 @@ export default function HooksSection() {
         matcher: (draft.matcher || '').trim() || null,
         timeout_seconds: Number(draft.timeout_seconds) || 10,
         enabled: !!draft.enabled,
+        // Only send error_threshold when relevant — sending it on
+        // events that ignore it is harmless but visually noisy in
+        // the DB.
+        error_threshold:
+          draft.event === 'consecutive_failures'
+            ? Number(draft.error_threshold) || 1
+            : null,
+        max_fires_per_conv:
+          draft.max_fires_per_conv === '' || draft.max_fires_per_conv == null
+            ? null
+            : Number(draft.max_fires_per_conv),
       })
       toast.success('Hook added')
       setAdding(false)
@@ -198,7 +217,7 @@ export default function HooksSection() {
               </div>
               <div>
                 <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  Tool matcher (optional — pre_tool / post_tool only)
+                  Tool matcher (optional — applies to pre_tool / post_tool / tool_error / consecutive_failures)
                 </label>
                 <Input
                   value={draft.matcher}
@@ -206,6 +225,27 @@ export default function HooksSection() {
                   placeholder="e.g. write_file — substring match on tool name"
                 />
               </div>
+              {/* error_threshold only matters for consecutive_failures —
+                  the agent loop reads this to decide when the streak is
+                  long enough to fire the hook. Hide for other events to
+                  reduce form noise. */}
+              {draft.event === 'consecutive_failures' && (
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    Fire after this many consecutive ok=False results from the same tool
+                  </label>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={draft.error_threshold}
+                    onChange={(e) =>
+                      setDraft({ ...draft, error_threshold: e.target.value })
+                    }
+                    className="h-8 w-24"
+                  />
+                </div>
+              )}
               <div>
                 <label className="mb-1 block text-xs font-medium text-muted-foreground">
                   Command
@@ -218,18 +258,39 @@ export default function HooksSection() {
                   rows={4}
                 />
               </div>
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-3">
                 <label className="flex items-center gap-2 text-xs">
-                  <span className="text-muted-foreground">Timeout (s)</span>
+                  <span className="text-muted-foreground">
+                    Timeout (s, max {timeoutCaps[draft.event] || 120})
+                  </span>
                   <Input
                     type="number"
                     min={1}
-                    max={120}
+                    max={timeoutCaps[draft.event] || 120}
                     value={draft.timeout_seconds}
                     onChange={(e) =>
                       setDraft({ ...draft, timeout_seconds: e.target.value })
                     }
-                    className="h-8 w-20"
+                    className="h-8 w-24"
+                  />
+                </label>
+                <label className="flex items-center gap-2 text-xs">
+                  <span className="text-muted-foreground">
+                    Max fires / conversation
+                  </span>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={1000}
+                    placeholder="∞"
+                    value={draft.max_fires_per_conv ?? ''}
+                    onChange={(e) =>
+                      setDraft({
+                        ...draft,
+                        max_fires_per_conv: e.target.value,
+                      })
+                    }
+                    className="h-8 w-24"
                   />
                 </label>
                 <label className="flex items-center gap-2 text-xs">
@@ -305,6 +366,16 @@ function HookRow({ hook, onToggle, onDelete }) {
           {hook.matcher && (
             <span className="rounded bg-muted px-2 py-0.5 text-muted-foreground">
               matches: {hook.matcher}
+            </span>
+          )}
+          {hook.event === 'consecutive_failures' && hook.error_threshold && (
+            <span className="rounded bg-muted px-2 py-0.5 text-muted-foreground">
+              after {hook.error_threshold} failures
+            </span>
+          )}
+          {hook.max_fires_per_conv != null && (
+            <span className="rounded bg-muted px-2 py-0.5 text-muted-foreground">
+              max {hook.max_fires_per_conv}/conv
             </span>
           )}
           <span className="text-muted-foreground">

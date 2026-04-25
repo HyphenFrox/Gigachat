@@ -8548,13 +8548,25 @@ def _hook_matches(hook: dict, tool_name: str | None) -> bool:
     return m in tool_name.lower()
 
 
-async def run_hooks(event: str, payload: dict, tool_name: str | None = None) -> list[dict]:
+async def run_hooks(
+    event: str,
+    payload: dict,
+    tool_name: str | None = None,
+    conv_id: str | None = None,
+) -> list[dict]:
     """Fire every enabled hook registered for `event`. Returns a list of
-    `{hook_id, command, output, ok, error}` dicts — one per hook that ran.
+    `{hook_id, command, output, ok, error, capped}` dicts — one per hook
+    that *would* have fired (capped ones are reported with `capped=True`
+    and no command output, so the caller / UI can show "this hook hit its
+    per-conversation cap" instead of silently dropping it).
 
     Used by agent.py at specific lifecycle points. Hook failures never
     propagate: they're captured into the return value so the agent can
     continue its turn regardless.
+
+    `conv_id` is required for cap enforcement on `max_fires_per_conv`. If
+    omitted (e.g. tests, ad-hoc calls outside the agent loop), the cap is
+    silently bypassed.
     """
     if event not in HOOK_EVENTS:
         return []
@@ -8567,7 +8579,36 @@ async def run_hooks(event: str, payload: dict, tool_name: str | None = None) -> 
     for h in hooks:
         if not _hook_matches(h, tool_name):
             continue
+        # Per-conversation fire cap. We check BEFORE running so a maxed
+        # hook doesn't pay the subprocess cost. Increment only AFTER a
+        # successful start so a failed cap-check (e.g. DB read error)
+        # doesn't double-bill.
+        cap = h.get("max_fires_per_conv")
+        if conv_id and cap is not None:
+            try:
+                seen = _db.get_hook_fire_count(h["id"], conv_id)
+            except Exception:
+                seen = 0
+            if seen >= cap:
+                results.append({
+                    "hook_id": h["id"],
+                    "command": h["command"],
+                    "event": event,
+                    "ok": False,
+                    "output": "",
+                    "error": (
+                        f"hook hit its per-conversation cap of {cap} fires; "
+                        "delete the hook or raise the cap to allow more."
+                    ),
+                    "capped": True,
+                })
+                continue
         res = await _run_single_hook(h, payload)
+        if conv_id:
+            try:
+                _db.incr_hook_fire(h["id"], conv_id)
+            except Exception:
+                pass
         results.append({
             "hook_id": h["id"],
             "command": h["command"],
@@ -8575,6 +8616,7 @@ async def run_hooks(event: str, payload: dict, tool_name: str | None = None) -> 
             "ok": bool(res.get("ok")),
             "output": res.get("output", ""),
             "error": res.get("error"),
+            "capped": False,
         })
     return results
 

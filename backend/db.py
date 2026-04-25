@@ -131,9 +131,22 @@ def init() -> None:
                 command TEXT NOT NULL,
                 timeout_seconds INTEGER NOT NULL DEFAULT 10,
                 enabled INTEGER NOT NULL DEFAULT 1,
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                error_threshold INTEGER,
+                max_fires_per_conv INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_hooks_event ON hooks(event, enabled);
+            -- Per-conversation fire counter — used to enforce
+            -- `hooks.max_fires_per_conv` so a buggy hook can't infinite-
+            -- loop. Persisted (vs. in-memory) so a backend restart
+            -- doesn't reset the counter and re-open the loop.
+            CREATE TABLE IF NOT EXISTS hook_fires (
+                hook_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                fire_count INTEGER NOT NULL DEFAULT 0,
+                last_fired_at REAL NOT NULL,
+                PRIMARY KEY (hook_id, conversation_id)
+            );
 
             -- Global memories: facts that should be visible to the model in
             -- EVERY conversation, not just the one where they were added.
@@ -414,6 +427,16 @@ def init() -> None:
             # actually used. Survives restarts so a long conversation
             # doesn't have to re-load everything after a backend bounce.
             "ALTER TABLE conversations ADD COLUMN loaded_tools_json TEXT NOT NULL DEFAULT '[]'",
+            # Workflow extension columns on `hooks`. The hooks table started
+            # life as a simple "fire shell on lifecycle event" pipe; these
+            # turn it into a general workflow trigger system without
+            # introducing a parallel table that would duplicate the CRUD
+            # surface. `error_threshold` is read by the
+            # `on_consecutive_failures` event (default 1 = "fire on first
+            # failure"); `max_fires_per_conv` caps how often a hook can
+            # fire in one conversation so a buggy hook can't loop forever.
+            "ALTER TABLE hooks ADD COLUMN error_threshold INTEGER",
+            "ALTER TABLE hooks ADD COLUMN max_fires_per_conv INTEGER",
         ):
             try:
                 c.execute(ddl)
@@ -1805,7 +1828,38 @@ def delete_doc_url(did: str) -> int:
 #   - Never deletes silently: the UI shows disabled hooks greyed-out, so the
 #     user always sees what would have fired.
 # ---------------------------------------------------------------------------
-HOOK_EVENTS = {"pre_tool", "post_tool", "user_prompt_submit", "turn_done"}
+HOOK_EVENTS = {
+    "pre_tool",
+    "post_tool",
+    "user_prompt_submit",
+    "turn_done",
+    # Fires when a tool call returns ok=False. Subset of post_tool —
+    # cleaner trigger for "lint after every successful write" vs.
+    # "diagnose after every failure" use cases without an in-hook
+    # `if .ok` check.
+    "tool_error",
+    # Fires after N consecutive ok=False results from the SAME tool name
+    # in the same conversation. N comes from `error_threshold` (default 1).
+    # Designed for the "model looped on the same broken call, ask Claude
+    # to step in" workflow.
+    "consecutive_failures",
+}
+
+# Event-specific timeout caps. Stateful diagnosis hooks (consecutive_failures
+# in particular, since a typical use is calling out to Claude Code or a
+# local linter that takes minutes) need much longer headroom than the
+# fire-and-forget post_tool hooks which the original 120 s cap was tuned
+# for. We still cap them — a hung diagnosis hook would wedge the turn.
+_HOOK_TIMEOUT_CAP_DEFAULT = 120
+_HOOK_TIMEOUT_CAPS = {
+    "tool_error": 900,
+    "consecutive_failures": 900,
+}
+
+
+def hook_timeout_cap(event: str) -> int:
+    """Return the maximum allowed `timeout_seconds` for a hook on this event."""
+    return _HOOK_TIMEOUT_CAPS.get(event, _HOOK_TIMEOUT_CAP_DEFAULT)
 
 
 def create_hook(
@@ -1815,6 +1869,8 @@ def create_hook(
     matcher: str | None = None,
     timeout_seconds: int = 10,
     enabled: bool = True,
+    error_threshold: int | None = None,
+    max_fires_per_conv: int | None = None,
 ) -> str:
     """Insert a new hook and return its id. Raises ValueError on bad input."""
     if event not in HOOK_EVENTS:
@@ -1822,15 +1878,26 @@ def create_hook(
     cmd = (command or "").strip()
     if not cmd:
         raise ValueError("command must not be empty")
-    # Clamp timeout so a runaway hook can't block the agent forever. 1..120s
-    # covers "quick linter" through "short test suite" without being abusable.
-    ts = max(1, min(int(timeout_seconds or 10), 120))
+    # Clamp timeout so a runaway hook can't block the agent forever. The
+    # ceiling is event-specific — diagnosis hooks need minutes.
+    ts = max(1, min(int(timeout_seconds or 10), hook_timeout_cap(event)))
+    # error_threshold: only meaningful for consecutive_failures. Clamp 1..50
+    # so a typo ("threshold = 999") doesn't accidentally disable the hook.
+    et = None
+    if error_threshold is not None:
+        et = max(1, min(int(error_threshold), 50))
+    # max_fires_per_conv: NULL means unlimited. Otherwise clamp 1..1000.
+    mfpc = None
+    if max_fires_per_conv is not None:
+        mfpc = max(1, min(int(max_fires_per_conv), 1000))
     hid = str(uuid.uuid4())
     with _conn() as c:
         c.execute(
-            "INSERT INTO hooks (id, event, matcher, command, timeout_seconds, enabled, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (hid, event, (matcher or None), cmd, ts, 1 if enabled else 0, time.time()),
+            "INSERT INTO hooks (id, event, matcher, command, timeout_seconds, "
+            "enabled, created_at, error_threshold, max_fires_per_conv) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (hid, event, (matcher or None), cmd, ts, 1 if enabled else 0,
+             time.time(), et, mfpc),
         )
     return hid
 
@@ -1856,22 +1923,35 @@ def get_hooks_for_event(event: str) -> list[dict]:
 
 def update_hook(id: str, **fields: Any) -> dict | None:
     """Patch allowed fields on a hook. Returns the refreshed row or None."""
-    allowed = {"event", "matcher", "command", "timeout_seconds", "enabled"}
+    allowed = {
+        "event", "matcher", "command", "timeout_seconds", "enabled",
+        "error_threshold", "max_fires_per_conv",
+    }
+    # We need the current event for the timeout-cap clamp when only
+    # `timeout_seconds` is being patched (the cap depends on event).
+    current = get_hook(id)
+    if not current:
+        return None
+    target_event = fields.get("event", current["event"])
+    if target_event not in HOOK_EVENTS:
+        raise ValueError(f"event must be one of {sorted(HOOK_EVENTS)}")
     sets: list[str] = []
     values: list[Any] = []
     for k, v in fields.items():
         if k not in allowed:
             continue
-        if k == "event" and v not in HOOK_EVENTS:
-            raise ValueError(f"event must be one of {sorted(HOOK_EVENTS)}")
         if k == "enabled":
             v = 1 if v else 0
-        if k == "timeout_seconds":
-            v = max(1, min(int(v or 10), 120))
+        elif k == "timeout_seconds":
+            v = max(1, min(int(v or 10), hook_timeout_cap(target_event)))
+        elif k == "error_threshold":
+            v = None if v in (None, "") else max(1, min(int(v), 50))
+        elif k == "max_fires_per_conv":
+            v = None if v in (None, "") else max(1, min(int(v), 1000))
         sets.append(f"{k} = ?")
         values.append(v)
     if not sets:
-        return get_hook(id)
+        return current
     values.append(id)
     with _conn() as c:
         c.execute(f"UPDATE hooks SET {', '.join(sets)} WHERE id = ?", values)
@@ -1893,6 +1973,10 @@ def delete_hook(id: str) -> int:
 
 
 def _row_to_hook(row: sqlite3.Row) -> dict:
+    # Some columns were added in a later migration — using row[col] would
+    # KeyError on rows from a DB that hasn't been migrated yet. Accessing
+    # via .keys() is the cheap defensive check.
+    cols = row.keys() if hasattr(row, "keys") else []
     return {
         "id": row["id"],
         "event": row["event"],
@@ -1901,7 +1985,55 @@ def _row_to_hook(row: sqlite3.Row) -> dict:
         "timeout_seconds": row["timeout_seconds"],
         "enabled": bool(row["enabled"]),
         "created_at": row["created_at"],
+        "error_threshold": row["error_threshold"] if "error_threshold" in cols else None,
+        "max_fires_per_conv": row["max_fires_per_conv"] if "max_fires_per_conv" in cols else None,
     }
+
+
+# --- Hook fire counter (per-conversation cap enforcement) -----------------
+
+
+def get_hook_fire_count(hook_id: str, conversation_id: str) -> int:
+    """Return how many times this hook has fired in this conversation."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT fire_count FROM hook_fires WHERE hook_id = ? AND conversation_id = ?",
+            (hook_id, conversation_id),
+        ).fetchone()
+    return int(row["fire_count"]) if row else 0
+
+
+def incr_hook_fire(hook_id: str, conversation_id: str) -> int:
+    """Atomic +1 on the (hook, conv) counter. Returns the new count."""
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO hook_fires (hook_id, conversation_id, fire_count, last_fired_at) "
+            "VALUES (?, ?, 1, ?) "
+            "ON CONFLICT(hook_id, conversation_id) DO UPDATE SET "
+            "fire_count = fire_count + 1, last_fired_at = excluded.last_fired_at",
+            (hook_id, conversation_id, time.time()),
+        )
+        row = c.execute(
+            "SELECT fire_count FROM hook_fires WHERE hook_id = ? AND conversation_id = ?",
+            (hook_id, conversation_id),
+        ).fetchone()
+    return int(row["fire_count"]) if row else 1
+
+
+def reset_hook_fires(hook_id: str | None = None, conversation_id: str | None = None) -> int:
+    """Clear fire counters. Both args optional — pass either or both as a
+    filter; pass neither to wipe everything (used by tests)."""
+    sql = "DELETE FROM hook_fires WHERE 1=1"
+    args: list[Any] = []
+    if hook_id is not None:
+        sql += " AND hook_id = ?"
+        args.append(hook_id)
+    if conversation_id is not None:
+        sql += " AND conversation_id = ?"
+        args.append(conversation_id)
+    with _conn() as c:
+        cur = c.execute(sql, args)
+        return cur.rowcount or 0
 
 
 # ---------------------------------------------------------------------------

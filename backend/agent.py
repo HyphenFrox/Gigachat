@@ -166,6 +166,24 @@ _stop_requests: set[str] = set()
 # observational.
 _SUBAGENT_PROGRESS_BUS: dict[str, asyncio.Queue] = {}
 
+# Per-conversation consecutive-failure tracker for the
+# `consecutive_failures` hook event. Maps conv_id → {tool_name → count}.
+# Process-local: resets on backend restart, which is fine because the
+# user-facing cap (`hooks.max_fires_per_conv`) is what bounds runaway
+# loops; this tracker is just the trigger.
+_CONSEC_FAILURES: dict[str, dict[str, int]] = {}
+
+
+def _bump_consec_failures(conv_id: str, tool_name: str, ok: bool) -> int:
+    """Update the consecutive-failure tally for (conv, tool). Returns the
+    NEW count after the update. Resets to 0 on success."""
+    bucket = _CONSEC_FAILURES.setdefault(conv_id, {})
+    if ok:
+        bucket[tool_name] = 0
+        return 0
+    bucket[tool_name] = bucket.get(tool_name, 0) + 1
+    return bucket[tool_name]
+
 
 def _register_subagent_bus(parent_conv_id: str) -> asyncio.Queue:
     """Create (or reuse) the progress queue for this parent conversation.
@@ -1487,6 +1505,7 @@ async def _run_turn_impl(
                     "cwd": conv["cwd"],
                     "user_text": user_text,
                 },
+                conv_id=conversation_id,
             )
         except Exception:
             prompt_hook_results = []
@@ -1916,6 +1935,7 @@ async def _run_turn_impl(
                         "cwd": conv["cwd"],
                         "final_text": accumulated_text,
                     },
+                    conv_id=conversation_id,
                 )
             except Exception:
                 done_hook_results = []
@@ -2101,6 +2121,7 @@ async def _run_turn_impl(
                         "tool_args": tc["args"],
                     },
                     tool_name=tc["name"],
+                    conv_id=conversation_id,
                 )
             except Exception:
                 pre_hook_results = []
@@ -2183,20 +2204,23 @@ async def _run_turn_impl(
             # -------- Lifecycle hook: post_tool -----------------------------
             # Output is appended to the tool result text the model sees, so a
             # hook can annotate (e.g. 'write_file changed 3 files').
+            tool_ok = bool(result.get("ok"))
+            tool_payload = {
+                "event": "post_tool",
+                "conversation_id": conversation_id,
+                "cwd": conv["cwd"],
+                "tool_name": tc["name"],
+                "tool_args": tc["args"],
+                "ok": tool_ok,
+                "output": result.get("output", ""),
+                "error": result.get("error"),
+            }
             try:
                 post_hook_results = await tools.run_hooks(
                     "post_tool",
-                    {
-                        "event": "post_tool",
-                        "conversation_id": conversation_id,
-                        "cwd": conv["cwd"],
-                        "tool_name": tc["name"],
-                        "tool_args": tc["args"],
-                        "ok": bool(result.get("ok")),
-                        "output": result.get("output", ""),
-                        "error": result.get("error"),
-                    },
+                    tool_payload,
                     tool_name=tc["name"],
+                    conv_id=conversation_id,
                 )
             except Exception:
                 post_hook_results = []
@@ -2222,6 +2246,119 @@ async def _run_turn_impl(
                 appended = (result.get("output") or "").rstrip()
                 separator = "\n\n" if appended else ""
                 result["output"] = appended + separator + "\n\n".join(hook_appendix_parts)
+
+            # -------- Workflow triggers: tool_error + consecutive_failures ---
+            # These fire AFTER post_tool because they're diagnostic-tier:
+            # the user wires them up to spot patterns the model can't fix
+            # itself ("agent looped on the same broken call 3 times → ask
+            # Claude to step in"). Their output is injected as a SEPARATE
+            # system-role message rather than appended to the tool result,
+            # so it lands in the next Ollama turn with higher prominence
+            # — the model knows this is a workflow signal, not just more
+            # tool output.
+            workflow_notes: list[str] = []
+            new_count = _bump_consec_failures(
+                conversation_id, tc["name"], tool_ok,
+            )
+            if not tool_ok:
+                # tool_error — fires on every failure (matcher applies).
+                try:
+                    err_hook_results = await tools.run_hooks(
+                        "tool_error",
+                        tool_payload,
+                        tool_name=tc["name"],
+                        conv_id=conversation_id,
+                    )
+                except Exception:
+                    err_hook_results = []
+                # consecutive_failures — fires when the streak hits the
+                # per-hook `error_threshold`. Multiple hooks can register
+                # on this event with different thresholds; we fire each
+                # one whose threshold is now met.
+                try:
+                    candidates = db.get_hooks_for_event("consecutive_failures")
+                except Exception:
+                    candidates = []
+                consec_hook_results: list[dict] = []
+                for hook_row in candidates:
+                    threshold = int(hook_row.get("error_threshold") or 1)
+                    if new_count < threshold:
+                        continue
+                    # Reuse the run_hooks cap + tracking machinery for
+                    # this single hook by calling it directly with a
+                    # narrowed event set. Easier: just enforce the cap
+                    # inline and run the single hook.
+                    cap = hook_row.get("max_fires_per_conv")
+                    if cap is not None:
+                        try:
+                            seen = db.get_hook_fire_count(
+                                hook_row["id"], conversation_id,
+                            )
+                        except Exception:
+                            seen = 0
+                        if seen >= cap:
+                            consec_hook_results.append({
+                                "hook_id": hook_row["id"],
+                                "command": hook_row["command"],
+                                "event": "consecutive_failures",
+                                "ok": False,
+                                "output": "",
+                                "error": (
+                                    f"hook hit its per-conversation cap "
+                                    f"of {cap} fires"
+                                ),
+                                "capped": True,
+                            })
+                            continue
+                    if not tools._hook_matches(hook_row, tc["name"]):
+                        continue
+                    payload = {
+                        **tool_payload,
+                        "event": "consecutive_failures",
+                        "consecutive_count": new_count,
+                        "threshold": threshold,
+                    }
+                    one = await tools._run_single_hook(hook_row, payload)
+                    try:
+                        db.incr_hook_fire(hook_row["id"], conversation_id)
+                    except Exception:
+                        pass
+                    consec_hook_results.append({
+                        "hook_id": hook_row["id"],
+                        "command": hook_row["command"],
+                        "event": "consecutive_failures",
+                        "ok": bool(one.get("ok")),
+                        "output": one.get("output", ""),
+                        "error": one.get("error"),
+                        "capped": False,
+                    })
+                for h in (err_hook_results + consec_hook_results):
+                    await tool_event_queue.put({
+                        "type": "hook_ran",
+                        "event": h.get("event"),
+                        "hook_id": h.get("hook_id"),
+                        "command": h.get("command"),
+                        "ok": h.get("ok"),
+                        "output": h.get("output", ""),
+                        "error": h.get("error"),
+                        "capped": h.get("capped"),
+                    })
+                    out = (h.get("output") or "").strip()
+                    if out:
+                        evt_label = h.get("event") or "workflow"
+                        workflow_notes.append(
+                            f"[{evt_label} hook `{h.get('command', '')}`]\n{out}"
+                        )
+            if workflow_notes:
+                # Persist as a system-role row so the model sees it on
+                # the next Ollama call and the note survives compaction.
+                # Higher prominence than post_tool appendix because
+                # diagnostic hooks (e.g. Claude-fixer) speak ABOVE the
+                # tool layer.
+                db.add_system_summary(
+                    conversation_id,
+                    "\n\n".join(workflow_notes),
+                )
             result_text = json.dumps(
                 {
                     "ok": result.get("ok"),

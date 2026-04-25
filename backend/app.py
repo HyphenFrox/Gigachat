@@ -2125,6 +2125,12 @@ class HookBody(BaseModel):
     matcher: str | None = None
     timeout_seconds: int = 10
     enabled: bool = True
+    # Used by the `consecutive_failures` event — fire after N back-to-back
+    # ok=False results from the same tool. Default = 1 (= fire on first
+    # failure, equivalent to `tool_error`).
+    error_threshold: int | None = None
+    # Per-conversation cap. NULL = unlimited.
+    max_fires_per_conv: int | None = None
 
 
 class HookPatchBody(BaseModel):
@@ -2135,12 +2141,22 @@ class HookPatchBody(BaseModel):
     matcher: str | None = None
     timeout_seconds: int | None = None
     enabled: bool | None = None
+    error_threshold: int | None = None
+    max_fires_per_conv: int | None = None
 
 
 @app.get("/api/hooks")
 def api_list_hooks() -> dict:
-    """Return every hook (enabled + disabled) newest-first."""
-    return {"hooks": db.list_hooks(), "events": sorted(db.HOOK_EVENTS)}
+    """Return every hook (enabled + disabled) newest-first.
+
+    Also surfaces the per-event timeout caps so the frontend can clamp
+    the form input before round-tripping.
+    """
+    return {
+        "hooks": db.list_hooks(),
+        "events": sorted(db.HOOK_EVENTS),
+        "timeout_caps": {e: db.hook_timeout_cap(e) for e in db.HOOK_EVENTS},
+    }
 
 
 @app.post("/api/hooks")
@@ -2153,6 +2169,8 @@ def api_create_hook(body: HookBody) -> dict:
             matcher=body.matcher,
             timeout_seconds=body.timeout_seconds,
             enabled=body.enabled,
+            error_threshold=body.error_threshold,
+            max_fires_per_conv=body.max_fires_per_conv,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
