@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="frontend/src/assets/gigachat-logo.jpg" alt="Gigachat logo" width="180" />
+</p>
+
 # Gigachat
 
 A self-hosted web app that turns **any locally-running Ollama model** (Gemma, Llama, Qwen, DeepSeek, Mistral — anything with function-calling) into a Claude-Code-style coding assistant: chat with conversation history, plus tools to run shell commands, read and write files, drive your desktop, search the web, and more — with a per-conversation permission gate on every tool call. Optional password auth + Tailscale-aware bind host for remote access.
@@ -171,6 +175,8 @@ Some Ollama models advertise `tools` capability but ship a passthrough chat temp
 Gigachat detects this on first use by probing `/api/show` and comparing the template against `.Tools` / `.ToolCalls` markers. When the template is a stub, the conversation switches to **prompt-space mode**: the tool list is serialized as an XML-tagged block in the system prompt, the model emits `<tool_call>{"name": ..., "args": ...}</tool_call>` inside its streamed text, and the agent loop parses those tags and feeds them into the same dispatch pipeline as native function calls.
 
 The same parser also runs as a **safety net for natively-tool-aware models** — some smaller Gemmas and Qwens occasionally announce a call in prose and dump JSON between `<tool_call>` tags while leaving the structured channel empty, even when their template DOES render `.Tools`. The fallback recovers those silently dropped calls. No setting to toggle.
+
+Gigachat also extends the picker to **tool-capable model families whose Ollama upload happens to strip the template** — `dolphin3:*` (Llama 3.1 base), `llama3.2-vision:11b`, `ikiru/Dolphin-Mistral-…` (Mistral 24B base), `deepseek-coder-v2:*`. Their weights were trained with function calling but the Modelfile shipped without the `{{ if .Tools }}` block, so Ollama drops the cap flag. Gigachat detects these by family pattern (`tool_prompt_adapter._matches_known_tool_capable`), shows them in the picker, and forces prompt-space mode for them — no `ollama create` workaround needed on your side.
 
 ### Picking a model
 

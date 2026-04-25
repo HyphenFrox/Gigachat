@@ -60,6 +60,71 @@ _TEMPLATE_TOOL_MARKERS = (
     "range $.Tools",
 )
 
+# Some Ollama uploads of tool-capable model families ship a Modelfile that
+# omits the ``{{ if .Tools }}`` block entirely — so Ollama drops the
+# ``tools`` capability flag, which would normally hide the model from the
+# picker AND skip the adapter. We override that for known-good families:
+# the underlying weights were trained with function calling, the upload is
+# just missing the template wiring. With this list:
+#
+#   * the picker shows them (`/api/models` allowlist),
+#   * the agent loop forces adapter mode for them (XML-tag tool calls in
+#     prose), so tools work without the user having to `ollama create`
+#     a custom Modelfile.
+#
+# Patterns are case-insensitive substring matches against the model name,
+# anchored only loosely so common tag suffixes (`:7b`, `:latest`, `-instruct`,
+# `-q4_K_M`, etc.) all match. Add to the list only when you've verified the
+# *base* model genuinely produces well-formed JSON tool calls when prompted
+# in prompt-space mode — adding a wrong entry surfaces as a `<tool_call>`
+# block the parser can't decode and a confused user.
+_KNOWN_TOOL_CAPABLE_NAME_PATTERNS = (
+    # Llama 3.1 / 3.2 / 3.3 families — trained with function calling. The
+    # vanilla ``llama3.1:8b`` ships a working template; community fine-tunes
+    # (Dolphin, abliterated forks, vision variants) usually don't.
+    "llama3.1",
+    "llama-3.1",
+    "llama3.2",
+    "llama-3.2",
+    "llama3.3",
+    "llama-3.3",
+    "dolphin3",          # Cognitive Computations Dolphin 3.0 → Llama 3.1 base.
+    # Mistral families — every modern Mistral (Nemo, Small, Small 3, Large,
+    # Mixtral) supports JSON function calling. ``ikiru/Dolphin-Mistral-24B-…``
+    # is Mistral Small 3 base with Dolphin fine-tuning.
+    "mistral",
+    "mixtral",
+    "dolphin-mistral",
+    # DeepSeek-V2 and V3 are both function-calling-trained. The original
+    # ``deepseek-coder:*`` (V1) is NOT — make the match specific to v2+ so
+    # we don't falsely admit the older series.
+    "deepseek-coder-v2",
+    "deepseek-v2",
+    "deepseek-v3",
+    "deepseek-r1",
+    # Qwen 2.5+ families. Qwen 2.5 ships a working tools template on Ollama
+    # so this is mainly belt-and-suspenders for community variants. Qwen 3 /
+    # 3.5 / 3.6 advertise the cap but ship a stub template — already covered
+    # by the existing `tools cap + no .Tools template` branch, listed here so
+    # a future bare ``qwen3.5:*`` rename without the cap flag still works.
+    "qwen2.5",
+    "qwen3",
+)
+
+
+def _matches_known_tool_capable(model: str) -> bool:
+    """Match the model name against `_KNOWN_TOOL_CAPABLE_NAME_PATTERNS`.
+
+    Case-insensitive substring match. Lets us handle tag variants
+    (`:7b`, `:latest`, `:e4b`), publisher prefixes
+    (`huihui_ai/qwen2.5-coder-abliterate:14b`), and quantization suffixes
+    (`-q4_K_M`) without enumerating each one.
+    """
+    if not model:
+        return False
+    n = model.lower()
+    return any(p in n for p in _KNOWN_TOOL_CAPABLE_NAME_PATTERNS)
+
 
 async def needs_adapter(
     model: str,
@@ -117,13 +182,22 @@ async def needs_adapter(
     has_cap = "tools" in caps
     renders = any(marker in template for marker in _TEMPLATE_TOOL_MARKERS)
     native_ok = bool(has_cap and renders)
-    use_adapter = not native_ok
+    # `not native_ok` is the original branch: cap flag missing OR template
+    # doesn't reference .Tools → use adapter. We also force-enable adapter
+    # mode for known-tool-capable model families when Ollama hasn't
+    # advertised the cap at all (i.e. the upload's Modelfile stripped the
+    # template). Without this branch those models would either be hidden
+    # from the picker entirely (filter side) or rejected by Ollama with a
+    # 400 when the agent tried to send `tools=[...]` natively.
+    known_family = (not has_cap) and _matches_known_tool_capable(model)
+    use_adapter = (not native_ok) or known_family
     _ADAPTER_CACHE[model] = use_adapter
     if use_adapter:
         log.info(
             "tool_prompt_adapter: %s will use prompt-space fallback "
-            "(capabilities=%s, template_references_tools=%s)",
-            model, caps, renders,
+            "(capabilities=%s, template_references_tools=%s, "
+            "known_tool_capable_family=%s)",
+            model, caps, renders, known_family,
         )
     return use_adapter
 

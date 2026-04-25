@@ -1088,20 +1088,30 @@ _MODEL_TOOL_CACHE_TTL = 600  # seconds
 
 
 async def _model_supports_tools(client: httpx.AsyncClient, name: str) -> bool:
-    """Return True iff the Ollama model advertises ``tools`` in ``capabilities``.
+    """Return True iff this model can drive the Gigachat agent loop.
 
-    Ollama's /api/show response exposes a ``capabilities`` list that reflects
-    exactly what /api/chat will accept — "tools" is present iff function-
-    calling requests won't 400. This is more reliable than parsing the raw
-    chat template, because Ollama injects tool handling at runtime for
-    certain model families even when the surface template doesn't mention
-    ``.Tools`` explicitly.
+    Two paths admit a model into the picker:
+
+      1. Ollama's /api/show ``capabilities`` list contains ``tools`` —
+         function-calling requests are accepted natively.
+      2. The model is in the prompt-space-adapter's known-tool-capable
+         allowlist (``tool_prompt_adapter._matches_known_tool_capable``).
+         These are model families whose weights were trained with
+         function calling but whose Ollama upload happens to ship a
+         Modelfile that omits the ``{{ if .Tools }}`` template block —
+         so Ollama drops the cap flag, but the model itself can still
+         emit JSON tool calls when prompted in prompt-space mode (XML
+         tags in prose). Examples: ``dolphin3:*`` (Llama 3.1 base),
+         ``ikiru/Dolphin-Mistral-…`` (Mistral 24B base),
+         ``llama3.2-vision:11b`` (text decoder supports tools, the
+         vision template just doesn't include them), ``deepseek-coder-v2``.
 
     Falls back to True on /api/show error so a transient hiccup doesn't
     silently hide every model — the worst case is one 400 on the next chat
     call, which now surfaces a clear "does not support tools" message.
     """
     import time as _t
+    from . import tool_prompt_adapter
     now = _t.time()
     cached = _MODEL_TOOL_CACHE.get(name)
     if cached and now - cached[0] < _MODEL_TOOL_CACHE_TTL:
@@ -1117,7 +1127,7 @@ async def _model_supports_tools(client: httpx.AsyncClient, name: str) -> bool:
     except Exception:
         # Don't cache failures — we'll retry next time.
         return True
-    supports = "tools" in caps
+    supports = ("tools" in caps) or tool_prompt_adapter._matches_known_tool_capable(name)
     _MODEL_TOOL_CACHE[name] = (now, supports)
     return supports
 

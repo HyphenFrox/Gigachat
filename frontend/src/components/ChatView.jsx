@@ -964,7 +964,22 @@ export default function ChatView({
   // gate so the Save button in an already-open editor never silently
   // no-ops when the parent's `busy` flips mid-edit.
   async function editUserMessage(messageId, newText) {
-    if (!conv) return
+    // Surface "no conversation loaded" instead of silently returning. If
+    // the user clicks Save & regenerate and the only feedback is "nothing
+    // happened", they have no way to know whether the click reached the
+    // handler at all — so we toast every refusal path explicitly.
+    if (!conv) {
+      toast.error('Could not save edit', {
+        description: 'No conversation is loaded. Try clicking the conversation in the sidebar again.',
+      })
+      return
+    }
+    if (!messageId || typeof messageId !== 'string' || messageId.startsWith('tmp-')) {
+      toast.error('Could not save edit', {
+        description: 'This message hasn\'t finished saving yet — wait a moment and retry.',
+      })
+      return
+    }
     if (busy) {
       toast.error('Cannot regenerate right now', {
         description:
@@ -973,13 +988,29 @@ export default function ChatView({
       return
     }
     // Optimistically rewrite the local row and drop messages after it; the
-    // SSE stream will push the new assistant reply into place.
+    // SSE stream will push the new assistant reply into place. If findIndex
+    // misses the row (could happen if `messages` raced with a server refresh
+    // mid-click) we still go through to the server — the backend has the
+    // canonical state and will 404 with a clear error if the id is wrong,
+    // which `send`'s catch will surface as a toast.
+    let optimisticHit = false
     setMessages((m) => {
       const idx = m.findIndex((x) => x.id === messageId)
       if (idx === -1) return m
+      optimisticHit = true
       const updated = { ...m[idx], content: newText }
       return [...m.slice(0, idx), updated]
     })
+    if (!optimisticHit) {
+      // Not fatal — keep going so the server still gets the edit — but warn
+      // so the user sees the row will only update after the post-stream
+      // refresh, not instantly.
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[edit-and-regenerate] message id not found in local state',
+        { messageId, knownIds: messages.map((m) => m.id) },
+      )
+    }
     setToolStates({})
     setLiveContent('')
     setLiveThinking('')
