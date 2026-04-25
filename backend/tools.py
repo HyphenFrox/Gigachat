@@ -4668,16 +4668,21 @@ async def click_element_id(id: str, click_type: str = "left") -> dict:
                 ),
             }
         result = await asyncio.to_thread(_click_element_id_sync, clean_id, click_type)
-        # Settle so the post-click screenshot reflects the new state.
-        await asyncio.sleep(0.15)
-        shot = await _capture_screenshot()
         if not result.get("ok"):
+            # Fast-path error: no click happened, so there's nothing new
+            # on screen worth screenshotting. Skipping the capture here
+            # also means the "unknown id" error survives on headless /
+            # no-display machines where a screenshot call would itself
+            # crash with `KeyError: 'DISPLAY'` and drown out the real
+            # reason the click failed.
             return {
                 "ok": False,
                 "output": "",
                 "error": result.get("error", "click_element_id failed"),
-                "image_path": shot["name"],
             }
+        # Settle so the post-click screenshot reflects the new state.
+        await asyncio.sleep(0.15)
+        shot = await _capture_screenshot()
         return {
             "ok": True,
             "output": _attach_shot_feedback(

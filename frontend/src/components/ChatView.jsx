@@ -323,17 +323,27 @@ export default function ChatView({
     return () => ro.disconnect()
   }, [])
 
-  // Dependency-driven scroll: fires on new messages, streaming deltas, tool
-  // state transitions, and busy flips. Complements the ResizeObserver above;
-  // together they keep the viewport pinned to the latest activity whenever
-  // the user hasn't manually scrolled away.
+  // Dependency-driven scroll: fires on discrete events — new messages,
+  // tool-state transitions, and busy flips. Does NOT fire on streaming
+  // token deltas; the ResizeObserver above handles content growth.
+  //
+  // We deliberately omit `liveContent` and `liveThinking` from the deps.
+  // Including them re-ran this effect on every token, which was fast
+  // enough to land a `scrollTop = scrollHeight` write between the user's
+  // wheel gesture and the browser's scroll event — before `onWheel` had
+  // a chance to set `userPinnedUpRef`. Under sustained streaming that
+  // made scroll-up feel broken ("every time I flick the wheel it jumps
+  // back to the bottom"). The ResizeObserver fires AFTER layout, by
+  // which point the wheel handler has already pinned, so it's the right
+  // signal for streaming growth; this effect stays for the discrete
+  // events where we really do want to snap to the latest activity.
   useEffect(() => {
     const el = scrollRef.current
     if (!el) return
     if (nearBottomRef.current && !userPinnedUpRef.current) {
       el.scrollTop = el.scrollHeight
     }
-  }, [messages, liveContent, liveThinking, toolStates, busy])
+  }, [messages, toolStates, busy])
 
   // Scroll to a specific message and briefly flash it. Triggered when the
   // user clicks a semantic-search hit in the sidebar — we land inside the

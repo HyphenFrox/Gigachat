@@ -36,6 +36,10 @@ vapid.json
 scripts/.last_conv_id
 scripts/.last_run.log
 
+# UIAutomation COM-init complaint file written from a background thread
+# during some tool tests. Transient; never useful to commit.
+@AutomationLog.txt
+
 # OS / editor
 .DS_Store
 Thumbs.db
