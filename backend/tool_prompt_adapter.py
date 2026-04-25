@@ -386,8 +386,11 @@ _TOOL_CALL_RE = re.compile(
 
 # Some models like to wrap the JSON in a markdown fence anyway — strip a
 # leading ```json or ``` prefix and the trailing ``` before parsing.
-_FENCE_PREFIX_RE = re.compile(r"^```[A-Za-z0-9_+-]*\n")
-_FENCE_SUFFIX_RE = re.compile(r"\n```\s*$")
+_FENCE_PREFIX_RE = re.compile(r"^`{1,3}[A-Za-z0-9_+-]*\n")
+# Match 1-3 trailing backticks. Models occasionally start to wrap the body
+# in a code fence (` ``` `) but emit only one or two — strip whatever they
+# left behind so JSON parsing isn't derailed by stray ticks.
+_FENCE_SUFFIX_RE = re.compile(r"\s*`{1,3}\s*$")
 
 # Python-style function call e.g. ``web_search(query="foo", top_k=5)``
 # that some models emit inside <execute_tool> blocks.

@@ -206,6 +206,33 @@ def test_parser_unwraps_args_inside_arguments_alias():
     assert calls[0]["args"]["content"] == "hi"
 
 
+def test_parser_strips_single_trailing_backtick():
+    """Real failure mode: model started to wrap the body in a code
+    fence and emitted only one trailing backtick. The JSON before it
+    was valid but the lone backtick failed `json.loads`. The parser
+    should strip 1-3 trailing backticks so legitimate parse goes
+    through."""
+    text = (
+        '<tool_call>{"name": "edit_file", "args": '
+        '{"path": "src/App.jsx", "new_string": "App"}}\n`\n</tool_call>'
+    )
+    _cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "edit_file"
+    assert calls[0]["args"]["path"] == "src/App.jsx"
+
+
+def test_parser_strips_double_backticks_too():
+    """Same shape but two trailing backticks — also stripped."""
+    text = (
+        '<tool_call>{"name": "write_file", "args": '
+        '{"path": "x", "content": "y"}}\n``\n</tool_call>'
+    )
+    _cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "write_file"
+
+
 def test_parser_does_not_unwrap_when_inner_args_is_two_keys():
     """The unwrap is gated on EXACTLY one key inside the wrapper —
     so a legitimate call where the user-tool happens to define an
