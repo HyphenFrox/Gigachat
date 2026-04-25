@@ -1238,21 +1238,20 @@ async def _stream_ollama_chat(
         # Small models (Gemma 4 e4b) need a low temperature for reliable
         # tool-call emission — at 0.7 they sometimes refuse to call tools even
         # when the system prompt says to.
-        # num_predict=8192 caps a single generation at ~6000 words. This is:
-        #   * well above any Modelfile default (typically 128/256/2048), so
-        #     it doesn't re-introduce the truncation-mid-tool-call problem
-        #     that drove us off the default; the retry-on-truncation nudge
-        #     handles the rare legitimate overflow.
-        #   * a hard safety fuse against runaway generation. Abliterated
-        #     models (safety fine-tuning removed) occasionally lock into
-        #     repetition loops and, with num_predict=-1, would stream
-        #     forever — wedging the conversation in state='running' until
-        #     the worker is killed. Capping lets the stream close cleanly,
-        #     the finally block runs, and the conversation returns to idle.
+        # `num_predict=-1` lets the model generate until EOS — no
+        # token cap. This used to be capped at 8 K as a safety fuse
+        # against runaway abliterated models locking into repetition
+        # loops, but the cap was also truncating legitimate long
+        # responses (full-file rewrites, edit_file payloads with the
+        # entire new file contents, multi-step plans). Two backstops
+        # remain when generation goes off the rails: the 600 s read
+        # timeout below closes the stream cleanly, and the Stop button
+        # in the UI flips a flag the agent loop polls between Ollama
+        # chunks.
         "options": {
             "temperature": 0.3,
             "num_ctx": NUM_CTX,
-            "num_predict": 8192,
+            "num_predict": -1,
         },
     }
     if not adapter_mode:

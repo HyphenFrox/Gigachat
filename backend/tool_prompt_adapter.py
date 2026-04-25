@@ -432,6 +432,27 @@ def _try_parse_tool_body(body: str) -> dict[str, Any] | None:
             parsed = json.loads(repaired)
         except Exception:
             parsed = None
+    # Repair pass #2: missing trailing braces. Small models stream long
+    # `edit_file` / `write_file` payloads that span thousands of tokens
+    # and sometimes drop the final closing `}` (or both — outer object
+    # AND `args` object). The body looks valid up until the very end:
+    # ``{"name": "edit_file", "args": {"path": "...", "new_string":
+    # "...export default App;"}`` — that's one `{` ahead of `}`. Try
+    # appending up to two closers; cheap to try, and the model's intent
+    # is unambiguous when everything else parses cleanly. We also gate
+    # by an opening-vs-closing brace count so we don't try to "repair"
+    # genuinely garbage bodies.
+    if parsed is None:
+        opens = body.count("{")
+        closes = body.count("}")
+        deficit = opens - closes
+        if 1 <= deficit <= 2:
+            try:
+                candidate = json.loads(body + ("}" * deficit))
+                if isinstance(candidate, dict):
+                    parsed = candidate
+            except Exception:
+                parsed = None
     if isinstance(parsed, dict):
         name = (
             parsed.get("name")

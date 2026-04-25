@@ -86,3 +86,43 @@ def test_parser_leaves_malformed_block_in_place():
     assert calls == []
     assert "<tool_call>" in cleaned.lower()
     assert "{not valid json}" in cleaned
+
+
+def test_parser_repairs_missing_outer_brace():
+    """Real failure mode from a gemma4:e4b conversation: the model
+    streamed a long `edit_file` payload and dropped the final `}`. The
+    body is missing one closing brace; everything else parses. Auto-
+    repair should accept it so the call reaches dispatch instead of
+    vanishing as a "Trying a call: <unparseable>" assistant message."""
+    # Body is missing the outer `}` — args closes but the wrapping
+    # object never does. Ends with `"}` (the new_string close + args
+    # close), no final `}` on the outer object.
+    text = (
+        "I will now edit App.jsx.\n"
+        "<tool_call>\n"
+        '{"name": "edit_file", "args": {"path": "src/App.jsx", '
+        '"old_string": "old", "new_string": "new"}\n'
+        "</tool_call>\n"
+    )
+    cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "edit_file"
+    assert calls[0]["args"]["path"] == "src/App.jsx"
+    assert calls[0]["args"]["new_string"] == "new"
+    # The repaired block was still stripped from the user-visible prose.
+    assert "<tool_call>" not in cleaned.lower()
+    assert "I will now edit App.jsx" in cleaned
+
+
+def test_parser_repairs_missing_both_braces():
+    """Worst-case: model dropped BOTH the args close and the outer
+    close. Two `}` short. Repair tries up to two trailing closers."""
+    text = (
+        "<tool_call>\n"
+        '{"name": "write_file", "args": {"path": "a.txt", "content": "hi"\n'
+        "</tool_call>\n"
+    )
+    cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "write_file"
+    assert calls[0]["args"]["content"] == "hi"
