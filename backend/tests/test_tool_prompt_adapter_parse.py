@@ -252,6 +252,81 @@ def test_parser_strips_double_backticks_too():
     assert calls[0]["name"] == "write_file"
 
 
+def test_parser_recovers_json_codefence_call():
+    """Real failure mode from a deepseek-coder-v2:lite conversation: the
+    model wrote a valid tool call but rendered it as a ```json {...}```
+    code fence inside its prose response, NOT wrapped in `<tool_call>`
+    tags. Without recovery the call vanishes into a text-only assistant
+    reply and the user sees a tutorial instead of action."""
+    text = (
+        "Here is what I will do:\n\n"
+        "```json\n"
+        '{"name": "python_exec", "args": {"code": "print(42)"}}\n'
+        "```\n\n"
+        "This will print 42 to stdout."
+    )
+    cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "python_exec"
+    assert calls[0]["args"]["code"] == "print(42)"
+    assert "```json" not in cleaned  # the fence got stripped
+    assert "Here is what I will do" in cleaned  # surrounding prose survives
+
+
+def test_parser_codefence_accepts_unlabelled_fence():
+    """Some models emit `` ``` ... ``` `` without the `json` language
+    tag. Should still work."""
+    text = (
+        "```\n"
+        '{"name": "read_file", "args": {"path": "x.txt"}}\n'
+        "```"
+    )
+    _cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "read_file"
+
+
+def test_parser_codefence_rejects_empty_args():
+    """A documentation example ("the tool call shape looks like
+    {name: foo, args: {}}") must NOT fire a real call. Conservative
+    gate: empty args reject."""
+    text = (
+        "The tool call shape looks like:\n"
+        "```json\n"
+        '{"name": "bash", "args": {}}\n'
+        "```"
+    )
+    _cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert calls == []
+
+
+def test_parser_codefence_rejects_non_dict_top_level():
+    """Random JSON that's not the right shape stays in prose."""
+    text = (
+        "```json\n"
+        '["not", "a", "tool", "call"]\n'
+        "```"
+    )
+    cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert calls == []
+    # Original code block survives in the prose unchanged.
+    assert "[\"not\"" in cleaned or "['not'" in cleaned or '["not"' in cleaned
+
+
+def test_parser_codefence_accepts_aliases():
+    """Some models use `arguments` (OpenAI alias) instead of `args`,
+    or `tool` instead of `name`. Both should resolve."""
+    text = (
+        "```json\n"
+        '{"tool": "list_dir", "arguments": {"path": "/tmp"}}\n'
+        "```"
+    )
+    _cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "list_dir"
+    assert calls[0]["args"]["path"] == "/tmp"
+
+
 def test_parser_does_not_unwrap_when_inner_args_is_two_keys():
     """The unwrap is gated on EXACTLY one key inside the wrapper —
     so a legitimate call where the user-tool happens to define an

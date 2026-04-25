@@ -605,6 +605,65 @@ def _parse_fn_call_args(raw: str) -> dict[str, Any]:
     return out
 
 
+# Match a fenced JSON block — `` ```json … ``` `` or just `` ``` … ``` ``.
+# We keep the fence regex permissive (any language tag, optional whitespace)
+# and validate the body's shape post-parse. Multiline-safe via DOTALL.
+_JSON_CODEFENCE_RE = re.compile(
+    r"```[A-Za-z0-9_+-]*\s*(\{.*?\})\s*```",
+    re.DOTALL,
+)
+
+
+def _try_extract_json_codefence_call(
+    text: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Recover tool calls emitted as ```json {...}``` code fences in prose.
+
+    Failure mode this addresses: code-completion models (deepseek-coder-v2,
+    some smaller Qwen-coder variants) sometimes render a perfectly valid
+    tool call as a JSON code fence inside their prose response — they know
+    the tool-call shape but emit it AS the answer instead of wrapping in
+    `<tool_call>` tags.
+
+    Conservative: we only accept a fenced JSON object whose top-level
+    shape is exactly `{name: str, args: {...non-empty...}}`. Empty `args`
+    are rejected because a documentation example ("the tool format
+    looks like {name: foo, args: {}}") would otherwise fire a real
+    call. False positives still go through dispatch's name validation,
+    so the worst case is a "unknown tool" error rather than misrouted
+    side effects.
+    """
+    if not text or "```" not in text:
+        return text, []
+    calls: list[dict[str, Any]] = []
+    spans: list[tuple[int, int]] = []
+    for m in _JSON_CODEFENCE_RE.finditer(text):
+        body = m.group(1).strip()
+        try:
+            obj = json.loads(body)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        # Accept the standard shape AND a couple of common aliases the
+        # model might pick up from its training distribution.
+        name = obj.get("name") or obj.get("tool") or obj.get("tool_name")
+        args = obj.get("args") or obj.get("arguments") or obj.get("parameters")
+        if not isinstance(name, str) or not name:
+            continue
+        if not isinstance(args, dict) or not args:
+            continue
+        calls.append({"name": str(name), "args": args})
+        spans.append(m.span())
+    if not spans:
+        return text, []
+    stripped = text
+    for start, end in reversed(spans):
+        stripped = stripped[:start] + stripped[end:]
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+    return stripped, calls
+
+
 def parse_tool_calls_from_text(
     text: str,
 ) -> tuple[str, list[dict[str, Any]]]:
@@ -623,11 +682,18 @@ def parse_tool_calls_from_text(
     if not text:
         return text, []
     lower = text.lower()
-    if not any(
+    has_tag = any(
         f"<{t}>" in lower
         for t in ("tool_call", "execute_tool", "tool_code", "function_call")
-    ):
-        return text, []
+    )
+    if not has_tag:
+        # No XML-style tags. Try the JSON-codefence fallback before
+        # giving up — small code-completion models (deepseek-coder-v2
+        # in particular) render tool calls as ```json {"name":...,
+        # "args":...} ``` blocks inside their prose instead of using
+        # the wrapper tags. The parser used to miss those entirely
+        # and the model's intent vanished into a text-only response.
+        return _try_extract_json_codefence_call(text)
 
     calls: list[dict[str, Any]] = []
     # We iterate matches but strip only the successful ones, so we can't
@@ -647,7 +713,10 @@ def parse_tool_calls_from_text(
         spans_to_remove.append(match.span())
 
     if not spans_to_remove:
-        return text, []
+        # XML tags were present but every body was unparseable — try
+        # the JSON-codefence fallback before returning empty so the
+        # call doesn't silently disappear.
+        return _try_extract_json_codefence_call(text)
 
     stripped = text
     for start, end in reversed(spans_to_remove):
