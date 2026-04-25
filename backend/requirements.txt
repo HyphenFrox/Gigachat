@@ -11,7 +11,7 @@ pyautogui==0.9.54
 Pillow==10.4.0
 # Web-search tools: DuckDuckGo (keyless) + readable-text extraction.
 # ddgs is the maintained successor to `duckduckgo-search`.
-ddgs==9.11.1
+ddgs==9.11.3
 trafilatura==2.0.0
 # Clipboard read/write tool (cross-platform).
 pyperclip==1.9.0
