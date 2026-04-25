@@ -1704,6 +1704,50 @@ async def _run_turn_impl(
         # plain empty-response nudge.
         truncation_retry_pending = False
 
+        # Defensive partial-persist helper. Used both at the natural end
+        # of the streaming loop AND inside the CancelledError branch so
+        # a Stop / disconnect / network drop saves whatever the model
+        # had streamed so far. Idempotent: a second call after a
+        # successful persist is a no-op (gated on `_state["persisted_id"]`).
+        _state = {"persisted_id": None}
+
+        def _persist_partial(*, partial: bool = False) -> dict | None:
+            """Write `accumulated_text` (and any `tool_calls_buf`) to the DB.
+
+            With `partial=True` the body is annotated with a
+            `[stopped mid-response]` marker so the user can tell the
+            transcript holds the in-flight prefix, not a finished
+            answer. Pure-thinking outputs (model wedged in reasoning,
+            no answer yet) are surfaced too — strictly better than
+            losing thousands of tokens of work.
+            """
+            nonlocal accumulated_text
+            if _state["persisted_id"]:
+                return None
+            body = accumulated_text
+            if partial:
+                if not body.strip() and accumulated_thinking.strip():
+                    body = (
+                        "(stopped before producing an answer; "
+                        "partial reasoning shown below)\n\n"
+                        + accumulated_thinking.strip()
+                    )
+                if body and not body.rstrip().endswith("[stopped mid-response]"):
+                    body = body.rstrip() + "\n\n[stopped mid-response]"
+                elif not body and tool_calls_buf:
+                    body = "[stopped mid-response]"
+            if not body and not tool_calls_buf:
+                return None
+            row = db.add_message(
+                conversation_id,
+                "assistant",
+                body,
+                tool_calls=tool_calls_buf or None,
+            )
+            _state["persisted_id"] = row["id"]
+            accumulated_text = body
+            return row
+
         while True:
             accumulated_text = ""
             accumulated_thinking = ""
@@ -1786,6 +1830,20 @@ async def _run_turn_impl(
             except httpx.HTTPError as e:
                 yield {"type": "error", "message": f"ollama error: {e}"}
                 return
+            except asyncio.CancelledError:
+                # The Stop button (frontend aborts the SSE fetch) and a
+                # client disconnect both surface here as cancellation
+                # raised at whatever Ollama-chunk await was current.
+                # Without a defensive persist, the post-stream
+                # `_persist_partial()` below never runs and thousands
+                # of tokens of streamed answer (or pure thinking) are
+                # silently lost. Save what we have with a "[stopped
+                # mid-response]" marker, then re-raise so run_turn()'s
+                # outer try/finally still flips state to idle. The DB
+                # write is sync (sqlite) so it can't itself be
+                # cancelled.
+                _persist_partial(partial=True)
+                raise
 
             # Post-parse fallback. In adapter mode the model is *expected*
             # to emit tool calls as <tool_call>...</tool_call> tags inside
@@ -1888,28 +1946,37 @@ async def _run_turn_impl(
                 "capability, or lowering context size.)"
             )
 
-        # Persist the assistant turn
-        assistant_row = db.add_message(
-            conversation_id,
-            "assistant",
-            accumulated_text,
-            tool_calls=tool_calls_buf or None,
-        )
-        # Embed prose replies too so semantic recall can surface relevant
-        # past answers. Tool-call-only assistant rows are skipped — they
-        # carry no searchable text.
-        if accumulated_text and accumulated_text.strip():
-            asyncio.create_task(
-                _schedule_embedding(
-                    assistant_row["id"], conversation_id, accumulated_text
+        # Persist the assistant turn (clean exit). The CancelledError
+        # branch around the streaming loop calls the same helper with
+        # `partial=True`; this branch finishes a complete turn.
+        assistant_row = _persist_partial()
+        if assistant_row is None:
+            # The model produced nothing AND emitted no tool calls AND
+            # we have no thinking to surface. Yield a synthetic event
+            # so downstream code that expects an `assistant_message`
+            # tick (UI, tests) doesn't get confused.
+            yield {
+                "type": "assistant_message",
+                "id": None,
+                "content": "",
+                "tool_calls": [],
+            }
+        else:
+            # Embed prose replies too so semantic recall can surface
+            # relevant past answers. Tool-call-only rows are skipped —
+            # they carry no searchable text.
+            if accumulated_text and accumulated_text.strip():
+                asyncio.create_task(
+                    _schedule_embedding(
+                        assistant_row["id"], conversation_id, accumulated_text
+                    )
                 )
-            )
-        yield {
-            "type": "assistant_message",
-            "id": assistant_row["id"],
-            "content": accumulated_text,
-            "tool_calls": tool_calls_buf,
-        }
+            yield {
+                "type": "assistant_message",
+                "id": assistant_row["id"],
+                "content": accumulated_text,
+                "tool_calls": tool_calls_buf,
+            }
 
         # If the Stop button was pressed during streaming, the partial
         # assistant message has been persisted (so the transcript isn't
