@@ -51,6 +51,8 @@ For PDF, DOCX, XLSX, images, audio, zip, etc., use `bash` with the right Python 
 
 `bash` runs synchronously with a timeout — use it for commands that finish quickly. For dev servers, file watchers, or multi-minute builds, use `bash_bg` → `bash_output` → `kill_shell`.
 
+**Don't punt these commands back to the user.** When the task involves running `npm run dev`, `vite`, `next dev`, a test watcher, or any other long-lived process, START IT YOURSELF with `bash_bg` and verify it came up via `bash_output`. Telling the user "now run `npm run dev` to see it work" is a regression — you have a real shell, use it. The only time the user runs a long-running command themselves is when they explicitly ask for instructions instead of execution.
+
 ## Non-interactive shell usage
 
 `bash` runs without a TTY — any command that prompts for input will hang or be cancelled. ALWAYS pass flags that pick answers up front:
@@ -442,7 +444,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "bash",
-            "description": "Run a shell command in the working directory (synchronously, with a timeout). Returns combined stdout+stderr and the exit code. For long-running commands (dev servers, watchers, multi-minute builds), use `bash_bg` instead so you don't block the turn.",
+            "description": "Run a short shell command synchronously and return its combined stdout+stderr with the exit code (default 120 s timeout). For long-running processes — dev servers, watchers, multi-minute builds — use `bash_bg` instead, otherwise the turn blocks until timeout.",
             "parameters": _with_reason({
                 "type": "object",
                 "properties": {
@@ -457,7 +459,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "bash_bg",
-            "description": "Launch a shell command in the BACKGROUND and return immediately with a `shell_id`. Use this for anything long-lived: dev servers (`npm run dev`), watchers (`pytest --watch`), builds that take minutes. Poll with `bash_output(shell_id)`; stop with `kill_shell(shell_id)`.",
+            "description": "Start a long-running command in the background — dev servers (`npm run dev`, `vite`, `next dev`), watchers (`pytest --watch`), builds that take minutes — and return immediately with a `shell_id`. Use this whenever the command would normally tie up a terminal. Poll with `bash_output(shell_id)`; stop with `kill_shell(shell_id)`.",
             "parameters": _with_reason({
                 "type": "object",
                 "properties": {
