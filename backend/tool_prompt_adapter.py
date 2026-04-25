@@ -456,6 +456,21 @@ def _try_parse_tool_body(body: str) -> dict[str, Any] | None:
                     parsed = candidate
             except Exception:
                 parsed = None
+    # Repair pass #3: extra trailing junk. Real failure mode: model
+    # closed the outer object too early — wrote `"}}` (closing args +
+    # outer) when it meant just `"}` (closing args only), then dangled
+    # the `reason` field outside as `, "reason": "..."}`. `json.loads`
+    # rejects with "Extra data" but the FIRST valid JSON object is
+    # exactly the tool call we want; the discarded tail is just the
+    # misplaced display-only `reason` field. Use `raw_decode` to take
+    # that first object and ignore everything after.
+    if parsed is None:
+        try:
+            candidate, _end = json.JSONDecoder().raw_decode(body)
+            if isinstance(candidate, dict):
+                parsed = candidate
+        except Exception:
+            parsed = None
     if isinstance(parsed, dict):
         # Unwrap shape #1 — full double-wrap with empty outer name:
         #   {"name": "", "args": {"name": "read_file", "args": {...}}}

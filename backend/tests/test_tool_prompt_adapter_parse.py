@@ -222,6 +222,25 @@ def test_parser_strips_single_trailing_backtick():
     assert calls[0]["args"]["path"] == "src/App.jsx"
 
 
+def test_parser_recovers_from_extra_trailing_junk():
+    """Real failure mode from iteration 3: model closed the outer
+    object too early (`"}}` instead of `"}`) and dangled the `reason`
+    field outside, leaving `, "reason": "..."}` as trailing garbage.
+    `json.loads` rejected with "Extra data". `raw_decode` takes the
+    first valid JSON and ignores the trailing junk — the misplaced
+    reason is display-only metadata so dropping it is safe."""
+    text = (
+        '<tool_call>{"name": "edit_file", "args": {"path": "x.css", '
+        '"new_string": ".a { font-size: 12px; }"}}, '
+        '"reason": "..."}</tool_call>'
+    )
+    _cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "edit_file"
+    assert calls[0]["args"]["path"] == "x.css"
+    assert calls[0]["args"]["new_string"] == ".a { font-size: 12px; }"
+
+
 def test_parser_strips_double_backticks_too():
     """Same shape but two trailing backticks — also stripped."""
     text = (
