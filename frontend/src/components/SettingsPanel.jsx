@@ -80,7 +80,11 @@ export default function SettingsPanel({ open, onClose }) {
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose?.()}>
-      <DialogContent className="flex max-h-[90vh] w-[95vw] flex-col overflow-hidden p-0 sm:max-w-2xl">
+      {/* Wider on desktop because the layout is now sidebar + content rather
+          than stacked tabs above content. md:max-w-3xl gives the right pane
+          enough room for forms; lg:max-w-4xl lets long lists (Schedules,
+          Memories) breathe without scrolling sideways. */}
+      <DialogContent className="flex max-h-[90vh] w-[95vw] flex-col overflow-hidden p-0 sm:max-w-2xl md:max-w-3xl lg:max-w-4xl">
         <DialogHeader className="border-b border-border px-6 pb-3 pt-4">
           <DialogTitle className="flex items-center gap-2">
             <Settings className="size-4" />
@@ -91,50 +95,55 @@ export default function SettingsPanel({ open, onClose }) {
           </DialogDescription>
         </DialogHeader>
 
-        {/* Tab bar — horizontal, icon + label, active tab gets an underline.
-            With 8 tabs, the dialog's max width (sm:2xl, 672 px) plus 95vw on
-            phones isn't always enough to render every tab inline, so the row
-            scrolls horizontally instead of clipping the rightmost tabs.
-            `flex-shrink-0` on each tab keeps labels readable; `whitespace-
-            nowrap` stops "Schedules" from wrapping into two lines mid-tab.
-            `scrollbar-thin scrollbar-track-transparent` keeps the scrollbar
-            visually subtle, native-mobile-app style, while still discoverable. */}
-        <div
-          className="flex items-center gap-1 overflow-x-auto whitespace-nowrap border-b border-border px-4 pt-1 [scrollbar-width:thin]"
-          role="tablist"
-        >
-          {TABS.map(({ id, label, Icon }) => (
-            <button
-              key={id}
-              type="button"
-              role="tab"
-              aria-selected={tab === id}
-              onClick={() => setTab(id)}
-              className={cn(
-                'flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-2 text-xs font-medium transition-colors -mb-px',
-                tab === id
-                  ? 'border-primary text-foreground'
-                  : 'border-transparent text-muted-foreground hover:text-foreground',
-              )}
-            >
-              <Icon className="size-3.5" />
-              {label}
-            </button>
-          ))}
-        </div>
+        {/* Body splits into a vertical tab list (left) and the active section
+            (right). Sidebar is the standard settings shape every modern app
+            uses (Anthropic, Linear, VSCode, GitHub) — scales to any number
+            of tabs without horizontal scroll, label compression, or
+            "More…" overflow menus. On phones (<sm) the sidebar collapses
+            to icon-only so the content gets the full remaining width. */}
+        <div className="flex flex-1 overflow-hidden">
+          <nav
+            className="flex shrink-0 flex-col gap-0.5 border-r border-border bg-muted/30 p-2 sm:w-44"
+            role="tablist"
+            aria-label="Settings sections"
+          >
+            {TABS.map(({ id, label, Icon }) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={tab === id}
+                title={label}
+                onClick={() => setTab(id)}
+                className={cn(
+                  'flex items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm font-medium transition-colors',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary',
+                  tab === id
+                    ? 'bg-primary/10 text-foreground'
+                    : 'text-muted-foreground hover:bg-accent hover:text-foreground',
+                )}
+              >
+                <Icon className="size-4 shrink-0" />
+                {/* Label hidden on phones to give the content area room.
+                    Tooltip via `title` keeps the icon-only state usable. */}
+                <span className="hidden truncate sm:inline">{label}</span>
+              </button>
+            ))}
+          </nav>
 
-        {/* Tab body — scrollable, padded. Conditional render so each section's
-            useEffect refresh runs on tab switch (matches the previous
-            per-panel open/close behavior). */}
-        <div className="flex-1 overflow-y-auto px-6 py-4">
-          {tab === 'general' && <GeneralSection />}
-          {tab === 'memories' && <MemoriesSection />}
-          {tab === 'secrets' && <SecretsSection />}
-          {tab === 'schedules' && <SchedulesSection />}
-          {tab === 'tools' && <UserToolsSection />}
-          {tab === 'hooks' && <HooksSection />}
-          {tab === 'docs' && <DocsSection />}
-          {tab === 'mcp' && <MCPSection />}
+          {/* Active section. Conditional render so each section's
+              useEffect refresh runs on tab switch (matches the previous
+              per-panel open/close behavior). */}
+          <div className="flex-1 overflow-y-auto px-6 py-4">
+            {tab === 'general' && <GeneralSection />}
+            {tab === 'memories' && <MemoriesSection />}
+            {tab === 'secrets' && <SecretsSection />}
+            {tab === 'schedules' && <SchedulesSection />}
+            {tab === 'tools' && <UserToolsSection />}
+            {tab === 'hooks' && <HooksSection />}
+            {tab === 'docs' && <DocsSection />}
+            {tab === 'mcp' && <MCPSection />}
+          </div>
         </div>
       </DialogContent>
     </Dialog>
