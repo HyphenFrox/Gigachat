@@ -454,13 +454,9 @@ def _try_parse_tool_body(body: str) -> dict[str, Any] | None:
             except Exception:
                 parsed = None
     if isinstance(parsed, dict):
-        # Unwrap a common adapter-mode mistake: small models sometimes
-        # emit a nested `{"name": "", "args": {"name": "read_file",
-        # "args": {...}}}` because the prompt-rendered tool examples
-        # show the wrapper shape and the model doubles it. If the outer
-        # name is empty and the inner dict looks like a tool call,
-        # promote the inner one. Bounded — we only unwrap one level so
-        # we can't infinite-loop on pathological inputs.
+        # Unwrap shape #1 — full double-wrap with empty outer name:
+        #   {"name": "", "args": {"name": "read_file", "args": {...}}}
+        # Outer name is empty so dispatch errors `unknown tool: ''`.
         if (
             not (parsed.get("name") or parsed.get("tool") or parsed.get("tool_name"))
             and isinstance(parsed.get("args"), dict)
@@ -485,6 +481,30 @@ def _try_parse_tool_body(body: str) -> dict[str, Any] | None:
                 or parsed.get("input")
                 or {}
             )
+        # Unwrap shape #2 — partial double-wrap with the outer name
+        # filled but `args` itself nested under another `args` key:
+        #   {"name": "bash", "args": {"args": {"command": "..."}}}
+        # Here dispatch sees `name=bash` but `args.command` is missing
+        # (it's actually under `args.args.command`), so bash returns
+        # "empty command" and the call vanishes. We only unwrap when
+        # the inner `args` dict is a SINGLE-KEY arg-shaped wrapper —
+        # this avoids touching a legitimate call where `args.args`
+        # happens to be a real parameter name (no built-in does that
+        # but a future user-tool might). The check is conservative:
+        # the inner key must be exactly one of the arg-aliases.
+        if isinstance(args, dict) and len(args) == 1:
+            (only_key,) = args.keys()
+            if only_key in ("args", "arguments", "parameters", "input"):
+                inner_args = args[only_key]
+                if isinstance(inner_args, dict):
+                    args = inner_args
+                elif isinstance(inner_args, str):
+                    try:
+                        candidate = json.loads(inner_args)
+                        if isinstance(candidate, dict):
+                            args = candidate
+                    except Exception:
+                        pass
         if isinstance(args, str):
             try:
                 args = json.loads(args)

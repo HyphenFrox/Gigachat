@@ -164,3 +164,57 @@ def test_parser_does_not_unwrap_genuine_args_with_name_field():
     assert calls[0]["name"] == "click_element"
     # `args.name` survived — no double-unwrap.
     assert calls[0]["args"] == {"name": "Submit"}
+
+
+def test_parser_unwraps_args_inside_args():
+    """Real failure mode from the latest test conversation: model
+    emitted
+
+        {"name": "bash", "args": {"args": {"command": "cd ...",
+                                           "reason": "..."}}}
+
+    Outer name is filled (`bash`) but the actual fields are nested
+    one level too deep under another `args` key. Dispatch sees
+    `args.command = undefined` and returns "empty command", which
+    cascades into npm running in the wrong directory and creating
+    a stray package-lock.json at the workspace root. Unwrap when
+    the inner `args` dict has a single arg-aliased key."""
+    text = (
+        "<tool_call>\n"
+        '{"name": "bash", "args": {"args": {"command": "cd stock-dashboard", '
+        '"reason": "Change into the project dir."}}}\n'
+        "</tool_call>\n"
+    )
+    _cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "bash"
+    assert calls[0]["args"]["command"] == "cd stock-dashboard"
+    assert "args" not in calls[0]["args"], "should have unwrapped one level"
+
+
+def test_parser_unwraps_args_inside_arguments_alias():
+    """Same shape but the inner key is `arguments` (the OpenAI-style
+    alias). Same unwrap should apply."""
+    text = (
+        '<tool_call>{"name": "write_file", "args": {"arguments": '
+        '{"path": "x.txt", "content": "hi"}}}</tool_call>'
+    )
+    _cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "write_file"
+    assert calls[0]["args"]["path"] == "x.txt"
+    assert calls[0]["args"]["content"] == "hi"
+
+
+def test_parser_does_not_unwrap_when_inner_args_is_two_keys():
+    """The unwrap is gated on EXACTLY one key inside the wrapper —
+    so a legitimate call where the user-tool happens to define an
+    `args` parameter alongside other params stays intact."""
+    text = (
+        '<tool_call>{"name": "user_tool", "args": '
+        '{"args": "literal-string", "other": "val"}}</tool_call>'
+    )
+    _cleaned, calls = tool_prompt_adapter.parse_tool_calls_from_text(text)
+    assert len(calls) == 1
+    # Both keys preserved — no false unwrap.
+    assert calls[0]["args"] == {"args": "literal-string", "other": "val"}
