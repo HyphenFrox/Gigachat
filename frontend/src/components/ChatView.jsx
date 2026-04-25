@@ -235,6 +235,15 @@ export default function ChatView({
   // the user scrolls back within ~32px of the bottom on their own, so a
   // fast-streaming response can't yank them forward.
   const userPinnedUpRef = useRef(false)
+  // Timestamp of the last user scroll-related gesture (wheel / touch / key).
+  // The auto-scroll effect honours a short grace window after this so a
+  // mid-flight gesture isn't fought by a streaming-delta render that
+  // arrived first. Without the grace window: each delta re-runs the effect
+  // and writes scrollTop=scrollHeight, while the user's wheel event is
+  // still queued in the event loop — so the view jumps back to bottom
+  // before the wheel handler has a chance to set `userPinnedUpRef`.
+  const lastUserGestureAtRef = useRef(0)
+  const _GESTURE_GRACE_MS = 250
 
   // Update nearBottomRef whenever the user scrolls. Using a ref (not state)
   // so we don't cause a re-render on every wheel tick.
@@ -277,9 +286,14 @@ export default function ChatView({
     // mobile) and let onScroll — which fires AFTER the scroll lands — be
     // the sole place that clears the pin when the user reaches the bottom.
     const onWheel = (e) => {
+      // Stamp every wheel — even downward — so a streaming auto-scroll
+      // doesn't fight a downward scrubbing gesture either; the grace
+      // window is symmetric.
+      lastUserGestureAtRef.current = Date.now()
       if (e.deltaY < 0) userPinnedUpRef.current = true
     }
     const onTouchMove = () => {
+      lastUserGestureAtRef.current = Date.now()
       userPinnedUpRef.current = true
     }
     const onKey = (e) => {
@@ -289,7 +303,10 @@ export default function ChatView({
         e.key === 'PageUp' ||
         e.key === 'ArrowUp' ||
         e.key === 'Home'
-      ) userPinnedUpRef.current = true
+      ) {
+        lastUserGestureAtRef.current = Date.now()
+        userPinnedUpRef.current = true
+      }
     }
     el.addEventListener('scroll', onScroll, { passive: true })
     el.addEventListener('wheel', onWheel, { passive: true })
@@ -306,6 +323,29 @@ export default function ChatView({
     }
   }, [])
 
+  // Shared gate for both auto-scroll paths below. Returns true when the
+  // viewport should be pinned to the bottom right now: the user hasn't
+  // scrolled away, was already near the bottom before this growth, and
+  // hasn't initiated a gesture in the very recent past.
+  //
+  // The gesture-grace window is the load-bearing piece. Without it, a
+  // streaming-delta render that lands BEFORE the user's queued wheel
+  // event re-runs the effect and writes scrollTop=scrollHeight while
+  // the gesture is still in-flight — so the view jumps back to bottom
+  // and the user has to wheel up over and over. With it, any wheel /
+  // touch / key gesture in the last 250 ms suspends auto-scroll long
+  // enough for the gesture to land, the wheel handler to set the pin,
+  // and onScroll to update nearBottomRef. After the grace window
+  // expires, if the user ended up at the bottom the pin is cleared and
+  // auto-scroll resumes; if they stopped above, the pin stays and
+  // auto-scroll stays off until they scroll back to the bottom.
+  const _shouldAutoScroll = () => {
+    if (userPinnedUpRef.current) return false
+    if (!nearBottomRef.current) return false
+    if (Date.now() - lastUserGestureAtRef.current < _GESTURE_GRACE_MS) return false
+    return true
+  }
+
   // Re-pin to bottom any time the inner content grows and the user was
   // near the bottom before the growth. This covers tool-card expansion,
   // async image loads, and anything else that changes layout outside of
@@ -315,7 +355,7 @@ export default function ChatView({
     const content = contentRef.current
     if (!scroll || !content || typeof ResizeObserver === 'undefined') return
     const ro = new ResizeObserver(() => {
-      if (nearBottomRef.current && !userPinnedUpRef.current) {
+      if (_shouldAutoScroll()) {
         scroll.scrollTop = scroll.scrollHeight
       }
     })
@@ -323,27 +363,28 @@ export default function ChatView({
     return () => ro.disconnect()
   }, [])
 
-  // Dependency-driven scroll: fires on discrete events — new messages,
-  // tool-state transitions, and busy flips. Does NOT fire on streaming
-  // token deltas; the ResizeObserver above handles content growth.
+  // Dependency-driven scroll: fires on new messages, streaming deltas,
+  // tool-state transitions, and busy flips. Complements the
+  // ResizeObserver above; together they keep the viewport pinned to the
+  // latest activity whenever the user hasn't manually scrolled away.
   //
-  // We deliberately omit `liveContent` and `liveThinking` from the deps.
-  // Including them re-ran this effect on every token, which was fast
-  // enough to land a `scrollTop = scrollHeight` write between the user's
-  // wheel gesture and the browser's scroll event — before `onWheel` had
-  // a chance to set `userPinnedUpRef`. Under sustained streaming that
-  // made scroll-up feel broken ("every time I flick the wheel it jumps
-  // back to the bottom"). The ResizeObserver fires AFTER layout, by
-  // which point the wheel handler has already pinned, so it's the right
-  // signal for streaming growth; this effect stays for the discrete
-  // events where we really do want to snap to the latest activity.
+  // We DO want `liveContent` / `liveThinking` in the deps: the
+  // ResizeObserver alone misses streaming-thinking growth, because the
+  // ThinkingBlock <pre> is `max-h-60 overflow-auto` — its inner
+  // scrollHeight grows but the outer container's size is capped, so the
+  // observer never fires. Without this effect ticking on every token
+  // the viewport would just sit there while reasoning streams in.
+  //
+  // The race condition the dep-list previously caused (auto-scroll
+  // landing between a user's wheel event and the browser's scroll) is
+  // handled by `_shouldAutoScroll`'s gesture-grace window above.
   useEffect(() => {
     const el = scrollRef.current
     if (!el) return
-    if (nearBottomRef.current && !userPinnedUpRef.current) {
+    if (_shouldAutoScroll()) {
       el.scrollTop = el.scrollHeight
     }
-  }, [messages, toolStates, busy])
+  }, [messages, liveContent, liveThinking, toolStates, busy])
 
   // Scroll to a specific message and briefly flash it. Triggered when the
   // user clicks a semantic-search hit in the sidebar — we land inside the

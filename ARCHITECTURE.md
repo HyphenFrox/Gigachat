@@ -69,7 +69,7 @@ drift.
 
 1. **POST** from the browser to `/api/conversations/{cid}/messages`.
    Body carries `content` and optional `images` (paths into `data/uploads/`).
-   → `app.py:1671  api_send()`.
+   → `app.py  api_send()`.
 
 2. **Validate & open SSE.** `api_send` 404s on a missing conversation, runs
    `_filter_safe_images()` so a malicious client can't exfiltrate arbitrary
@@ -77,10 +77,10 @@ drift.
    wrapping the async generator `gen()`.
 
 3. **Agent loop starts.** `gen()` iterates `agent.run_turn(cid, user_text,
-   user_images)` → `agent.py:1248`. `run_turn` is a thin wrapper that marks
-   the conversation `running` in SQLite (so a crash mid-turn is recoverable
-   by the startup resumer) and delegates to `_run_turn_impl` which is the
-   actual iteration state machine.
+   user_images)`. `run_turn` is a thin wrapper that marks the conversation
+   `running` in SQLite (so a crash mid-turn is recoverable by the startup
+   resumer) and delegates to `_run_turn_impl` which is the actual iteration
+   state machine.
 
 4. **Prompt assembly.** `_run_turn_impl` pulls conversation history from
    `db.list_messages`, injects global memories + per-conversation memory,
@@ -88,13 +88,17 @@ drift.
    the tool schema list based on the permission mode (`approve_all` /
    `approve_edits` / `read_only`).
 
-5. **Call Ollama.** `ollama_runtime.chat_stream()` opens a streaming HTTP
-   request. Tokens arrive as NDJSON; each chunk is yielded upstream as an
-   SSE `assistant_delta` event so the browser paints progressively.
+5. **Call Ollama.** `_stream_ollama_chat()` opens a streaming HTTP request.
+   Tokens arrive as NDJSON; each chunk is yielded upstream as an SSE
+   `delta` event so the browser paints progressively.
 
-6. **Tool-call detected.** When the model emits a `tool_calls` array (or the
-   dialect-specific equivalent handled by `tool_prompt_adapter`), the loop
-   stops streaming text and enters the tool phase.
+6. **Tool-call detected.** When the model emits a `tool_calls` array, the
+   loop stops streaming text and enters the tool phase. If the structured
+   channel is empty but the streamed text contains
+   `<tool_call>{...}</tool_call>` tags, `tool_prompt_adapter
+   .parse_tool_calls_from_text()` recovers the call before persistence —
+   covers both prompt-space mode (stub-template models) and the
+   misbehaving-native-tool-aware case (gemma4:e4b, smaller Qwens).
 
 7. **Approval gate (optional).** In `approve_edits` mode, write-class tools
    emit a `tool_request` SSE event and the loop blocks on an async Future
@@ -102,8 +106,8 @@ drift.
    `read_only` mode refuses write-class tools before the request even reaches
    the dispatcher.
 
-8. **Dispatch.** `tools.dispatch(name, args, cwd, conv_id, model)` →
-   `tools.py:9825`. Order of precedence:
+8. **Dispatch.** `tools.dispatch(name, args, cwd, conv_id, model)`.
+   Order of precedence:
    1. `resolve_tool_alias()` — canonicalize common misspellings
    2. MCP tools (prefix `mcp__`) route to `mcp.dispatch_tool`
    3. User-defined tools (`db.get_user_tool_by_name`) execute in a
@@ -156,10 +160,21 @@ non-obvious stops working.
   `db.init()`). Ad-hoc sqlite access from elsewhere would miss those
   migrations on startup and read from an outdated schema.
 
-- **Write-class tools respect permission mode.** The gating lives in
-  `agent.py` (see the `_tool_is_write_class` check inside `_run_turn_impl`),
-  not in the tool itself. A new tool that happens to write to disk or send
-  input must be classified on that allowlist or `read_only` mode leaks.
+- **Write-class tools respect permission mode.** The classifier lives in
+  `tools.classify_tool(name)` (backed by `TOOL_CATEGORIES` plus a fallback
+  rule that tags MCP tools as write-class because their side effects are
+  unknown). The agent loop reads that category to decide whether to refuse
+  the call (`read_only` mode), pause for approval (`approve_edits`), or
+  run silently (`allow_all`). A new tool that happens to write to disk or
+  send input must be added to `TOOL_CATEGORIES` or `read_only` mode leaks.
+
+- **File tools follow `bash`'s persisted cwd.** `tools._resolve(cwd, path,
+  conv_id)` consults the per-conversation `bash_cwd` for relative paths
+  whenever a `conv_id` is threaded through. Absolute paths still win.
+  Every dispatcher call into a file tool passes `conv_id`; tests for the
+  invariant live in `backend/tests/test_tools_cwd_follows_bash.py`. Break
+  this and the model's mental model diverges from reality the moment it
+  runs `cd subdir` in bash.
 
 ---
 
@@ -167,24 +182,27 @@ non-obvious stops working.
 
 ### SQLite (`data/app.db`)
 
-13 tables, all defined in `backend/db.py:54-256`:
+A handful of tables defined in `backend/db.py`'s schema block:
 
 | Table                 | Purpose                                                                   |
 |-----------------------|---------------------------------------------------------------------------|
-| `conversations`       | Per-conversation metadata: title, state (idle/running/error), budgets     |
+| `conversations`       | Per-conversation metadata: title, state (idle/running/error), budgets, persisted `bash_cwd` |
 | `messages`            | Append-only chat history (user / assistant / tool / system roles)         |
 | `message_embeddings`  | Optional vector embeddings for recall search                              |
 | `queued_inputs`       | Mid-turn message queue (persists across crashes)                          |
-| `scheduled_tasks`     | `schedule_task` tool state + next-run timestamps                          |
-| `doc_chunks`          | RAG chunks from `add_doc` tool                                            |
+| `scheduled_tasks`     | `schedule_task` / `start_loop` / `schedule_wakeup` queue + next-run timestamps |
+| `doc_chunks`          | RAG chunks: `doc_index` directories, codebase auto-index, and `docs:` URL crawls share this table |
+| `codebase_indexes`    | One row per cwd — status, file/chunk counts, last-run timestamp           |
+| `doc_urls`            | URL-crawl status for Settings → Docs                                      |
 | `hooks`               | Lifecycle / tool hooks (user-configured)                                  |
 | `global_memories`     | Notes injected into every conversation's system prompt                    |
 | `push_subscriptions`  | Web Push endpoints                                                        |
 | `mcp_servers`         | Registered MCP server configs                                             |
 | `user_settings`       | Single-row key/value blob for app settings                                |
 | `user_tools`          | User-defined tools (code + schema)                                        |
-| `secrets`             | Named secrets (encrypted at rest, exposed to user tools on demand)        |
-| `side_tasks`          | Background subagent bookkeeping (`delegate_parallel`)                     |
+| `secrets`             | Named secrets (plaintext at rest; threat model is single-user local)       |
+| `side_tasks`          | `spawn_task` chip queue under the composer                                |
+| `worktrees`           | `create_worktree` / `list_worktrees` / `remove_worktree` registry         |
 
 ### Files on disk
 
@@ -211,7 +229,7 @@ non-obvious stops working.
 | Add a new SSE event type                     | `agent.py` (emit) + frontend `ChatView.jsx`|
 | Add a new REST endpoint                      | `app.py`                                   |
 | New SQLite table or column                   | `db.py` (`init()` + CRUD functions)        |
-| New approval tier or permission mode         | `agent.py` (`_tool_is_write_class` + gate) |
+| New approval tier or permission mode         | `tools.py` (`TOOL_CATEGORIES` + `classify_tool`) and the gate in `agent.py` |
 | Change the system prompt                     | `prompts.py` (`build_system_prompt`)       |
 | Add a new React panel                        | `frontend/src/components/`                 |
 | Wire a new MCP server                        | `mcp.py` + `mcp_servers` table             |
