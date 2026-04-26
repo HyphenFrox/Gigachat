@@ -15,6 +15,7 @@ import {
   Wrench,
   Sparkles,
   BookOpen,
+  Server,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -33,12 +34,14 @@ import SchedulesSection from './SchedulesPanel'
 import SecretsSection from './SecretsPanel'
 import UserToolsSection from './UserToolsPanel'
 import DocsSection from './DocsPanel'
+import ComputePoolSection from './ComputePoolPanel'
 
 /**
  * SettingsPanel — consolidated settings drawer.
  *
  * Tabs:
  *   - General — default chat model, hardware summary, pull status.
+ *   - Compute — register other PCs as workers; live capability + status.
  *   - Memories — global memories injected into every system prompt.
  *   - Secrets — named credentials referenced via {{secret:NAME}} in tool calls.
  *   - Schedules — recurring / one-shot agent runs.
@@ -60,6 +63,7 @@ import DocsSection from './DocsPanel'
  */
 const TABS = [
   { id: 'general', label: 'General', Icon: Sliders },
+  { id: 'compute', label: 'Compute', Icon: Server },
   { id: 'memories', label: 'Memories', Icon: Brain },
   { id: 'secrets', label: 'Secrets', Icon: KeyRound },
   { id: 'schedules', label: 'Schedules', Icon: CalendarClock },
@@ -91,7 +95,7 @@ export default function SettingsPanel({ open, onClose }) {
             Settings
           </DialogTitle>
           <DialogDescription>
-            Preferences, memories, secrets, schedules, tools, hooks, docs, and MCP integrations — one place.
+            Preferences, compute pool, memories, secrets, schedules, tools, hooks, docs, and MCP integrations — one place.
           </DialogDescription>
         </DialogHeader>
 
@@ -136,6 +140,7 @@ export default function SettingsPanel({ open, onClose }) {
               per-panel open/close behavior). */}
           <div className="flex-1 overflow-y-auto px-6 py-4">
             {tab === 'general' && <GeneralSection />}
+            {tab === 'compute' && <ComputePoolSection />}
             {tab === 'memories' && <MemoriesSection />}
             {tab === 'secrets' && <SecretsSection />}
             {tab === 'schedules' && <SchedulesSection />}

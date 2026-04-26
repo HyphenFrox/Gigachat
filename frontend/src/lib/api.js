@@ -402,6 +402,58 @@ export const api = {
   /** Permanently delete a stored secret. */
   deleteSecret: (id) => request(`/api/secrets/${id}`, { method: 'DELETE' }),
 
+  /* -------------------- Compute pool (multi-PC workers) ----------------- */
+  /**
+   * List every registered compute worker plus the allowed `transport` values.
+   * Auth tokens are NEVER returned — each row carries `auth_token_set: bool`.
+   * Response: `{workers: [...], transports: ["lan","tailscale"]}`.
+   */
+  listComputeWorkers: () => request('/api/compute-workers'),
+
+  /**
+   * Register a new worker. `address` may be a hostname (`x.local`), an IPv4
+   * (`192.168.1.10`), or a Tailscale CGNAT IP (`100.x.x.x`) — the probe
+   * layer strips any `http(s)://` prefix the user pastes.
+   * @param {{label:string,address:string,ollama_port?:number,transport:string,
+   *          auth_token?:string|null,enabled?:boolean,
+   *          use_for_chat?:boolean,use_for_embeddings?:boolean,
+   *          use_for_subagents?:boolean}} body
+   */
+  createComputeWorker: (body) =>
+    request('/api/compute-workers', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /**
+   * Patch a worker in place. Send `auth_token: ""` to clear the token,
+   * `null`/omit to leave it alone, or a new string to replace it.
+   * @param {string} id
+   * @param {object} patch
+   */
+  updateComputeWorker: (id, patch) =>
+    request(`/api/compute-workers/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+
+  /** Permanently delete a worker row. */
+  deleteComputeWorker: (id) =>
+    request(`/api/compute-workers/${id}`, { method: 'DELETE' }),
+
+  /**
+   * Manually probe one worker now. Backend pings its Ollama and returns
+   * `{ok, capabilities:{version, models[]}, error, last_seen}`. Capabilities
+   * are also persisted on the row, so a follow-up `listComputeWorkers` will
+   * show the same data.
+   */
+  probeComputeWorker: (id) =>
+    request(`/api/compute-workers/${id}/probe`, { method: 'POST' }),
+
+  /** Probe every enabled worker now. Returns `{results: [{worker_id, label, ok, error}]}`. */
+  probeAllComputeWorkers: () =>
+    request('/api/compute-workers/probe-all', { method: 'POST' }),
+
   /* -------------------- Web Push notifications -------------------------- */
   /**
    * Count of browsers currently registered for push. Used by the settings UI
