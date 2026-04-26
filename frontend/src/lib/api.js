@@ -454,6 +454,60 @@ export const api = {
   probeAllComputeWorkers: () =>
     request('/api/compute-workers/probe-all', { method: 'POST' }),
 
+  /* -------------------- Split models (Phase 2) -------------------------- */
+  /**
+   * List every registered split model + the host's llama.cpp install
+   * status. Response: `{split_models: [...], llama_cpp: {...}}`.
+   */
+  listSplitModels: () => request('/api/split-models'),
+
+  /**
+   * Register a new split-model definition (just the row — doesn't
+   * spawn llama-server yet). Call `startSplitModel(id)` after to bring
+   * the server up.
+   * @param {{label:string, gguf_path:string, worker_ids?:string[],
+   *          llama_port?:number, enabled?:boolean}} body
+   */
+  createSplitModel: (body) =>
+    request('/api/split-models', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** Patch a split-model row's user-facing fields. */
+  updateSplitModel: (id, patch) =>
+    request(`/api/split-models/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+
+  /** Stop and remove a split-model row. */
+  deleteSplitModel: (id) =>
+    request(`/api/split-models/${id}`, { method: 'DELETE' }),
+
+  /** Spawn llama-server for this row; resolves once /health says OK. */
+  startSplitModel: (id) =>
+    request(`/api/split-models/${id}/start`, { method: 'POST' }),
+
+  /** Terminate the llama-server child. Idempotent. */
+  stopSplitModel: (id) =>
+    request(`/api/split-models/${id}/stop`, { method: 'POST' }),
+
+  /** Read-only status snapshot — the UI polls this while a row is `loading`. */
+  getSplitModelStatus: (id) =>
+    request(`/api/split-models/${id}/status`),
+
+  /**
+   * Trigger an explicit llama.cpp download + install on the host.
+   * Synchronous (multi-hundred-MB download — the UI shows a spinner).
+   * Variant defaults to `host` (CUDA build for the GPU).
+   */
+  installLlamaCpp: (variant = 'host') =>
+    request(
+      `/api/split-models/install-llamacpp?variant=${encodeURIComponent(variant)}`,
+      { method: 'POST' },
+    ),
+
   /* -------------------- Web Push notifications -------------------------- */
   /**
    * Count of browsers currently registered for push. Used by the settings UI

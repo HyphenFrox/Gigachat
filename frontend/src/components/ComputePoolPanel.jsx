@@ -26,6 +26,7 @@ import {
 } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
+import SplitModelsSection from './SplitModelsPanel'
 
 /**
  * ComputePoolSection — body for the "Compute Pool" tab inside SettingsPanel.
@@ -305,6 +306,12 @@ export default function ComputePoolSection() {
             />
           ))}
         </div>
+
+        {/* Phase 2: split models live below the worker list. They
+            consume worker_ids from the rows above; surfacing them in
+            the same tab keeps the "compute" mental model unified
+            (here is everything the host's compute pool knows about). */}
+        <SplitModelsSection workers={workers} />
       </div>
 
       {/* Add / edit drawer */}
