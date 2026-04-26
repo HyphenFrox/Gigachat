@@ -28,13 +28,13 @@ pytestmark = pytest.mark.smoke
 def test_create_basic_lan_worker(isolated_db):
     wid = isolated_db.create_compute_worker(
         label="laptop",
-        address="desktop-0692hok.local",
+        address="worker.local",
         transport="lan",
     )
     row = isolated_db.get_compute_worker(wid)
     assert row is not None
     assert row["label"] == "laptop"
-    assert row["address"] == "desktop-0692hok.local"
+    assert row["address"] == "worker.local"
     assert row["ollama_port"] == 11434
     assert row["transport"] == "lan"
     assert row["enabled"] is True

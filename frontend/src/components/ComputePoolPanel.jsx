@@ -336,7 +336,7 @@ export default function ComputePoolSection() {
                   onChange={(e) =>
                     setEditing({ ...editing, label: e.target.value })
                   }
-                  placeholder="e.g. Naresh's laptop, spare desktop"
+                  placeholder="e.g. office laptop, spare desktop"
                   autoFocus={editing._mode !== 'edit'}
                 />
               </div>
@@ -353,8 +353,8 @@ export default function ComputePoolSection() {
                     }
                     placeholder={
                       editing.transport === 'tailscale'
-                        ? '100.91.9.91'
-                        : 'desktop-0692hok.local'
+                        ? '100.x.x.x'
+                        : 'worker.local'
                     }
                   />
                 </div>

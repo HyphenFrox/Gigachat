@@ -3345,8 +3345,8 @@ def create_compute_worker(
 ) -> str:
     """Insert a new compute worker and return its id.
 
-    `address` is a hostname or IP — `desktop-0692hok.local` for LAN
-    mDNS, `192.168.1.10` for hardcoded LAN, `100.91.9.91` for Tailscale.
+    `address` is a hostname or IP — e.g. `worker.local` for LAN mDNS,
+    a `192.168.x.x` for hardcoded LAN, a `100.x.x.x` for Tailscale.
     The host probes `http://{address}:{ollama_port}` for capabilities.
     """
     lbl = (label or "").strip()

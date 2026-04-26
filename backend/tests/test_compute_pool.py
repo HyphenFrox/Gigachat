@@ -67,9 +67,9 @@ def _run(coro):
 
 def test_base_url_plain_hostname():
     url = compute_pool._worker_base_url(
-        {"address": "desktop-0692hok.local", "ollama_port": 11434},
+        {"address": "worker.local", "ollama_port": 11434},
     )
-    assert url == "http://desktop-0692hok.local:11434"
+    assert url == "http://worker.local:11434"
 
 
 def test_base_url_strips_http_scheme():
