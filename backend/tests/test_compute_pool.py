@@ -1232,3 +1232,35 @@ def test_resolve_ollama_model_uses_override_when_present(monkeypatch, tmp_path):
     assert info.get("override") is True
     # Ollama blob path is still surfaced for callers that want the original.
     assert "ollama_blob_path" in info
+
+
+# --- ensure_compatible_gguf (Scope B) ---------------------------------------
+
+
+def test_ensure_compatible_gguf_no_override_needed():
+    """A model that's not in the registry returns "no_override_needed"
+    immediately — most models route fine through Ollama's blob, no
+    surgery / download needed."""
+    result = _run(compute_pool.ensure_compatible_gguf("llama3.1:8b"))
+    assert result["ok"] is True
+    assert result["status"] == "no_override_needed"
+
+
+def test_ensure_compatible_gguf_already_present(monkeypatch, tmp_path):
+    """When all required override files already exist, returns "ready"
+    without spawning any download or surgery task."""
+    override_dir = tmp_path / "models"
+    override_dir.mkdir()
+    # Mimic both files existing for gemma4:26b.
+    (override_dir / "gemma4-26b.gguf").write_bytes(b"a" * 100)
+    (override_dir / "gemma4-26b.mmproj.gguf").write_bytes(b"b" * 50)
+    monkeypatch.setattr(compute_pool, "_OVERRIDE_GGUF_DIR", override_dir)
+
+    # Clear any leftover acquisition state from prior tests.
+    compute_pool._ACQUISITION_STATE.pop("gemma4:26b", None)
+    compute_pool._ACQUISITION_TASKS.pop("gemma4:26b", None)
+
+    result = _run(compute_pool.ensure_compatible_gguf("gemma4:26b"))
+    assert result == {"ok": True, "status": "ready"}
+    # No background task spawned.
+    assert "gemma4:26b" not in compute_pool._ACQUISITION_TASKS

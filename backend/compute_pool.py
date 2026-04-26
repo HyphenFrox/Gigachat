@@ -1238,6 +1238,304 @@ def _override_mmproj_path_for(model_name: str) -> Path:
     return _OVERRIDE_GGUF_DIR / f"{safe}.mmproj.gguf"
 
 
+# ---------------------------------------------------------------------------
+# Scope B: end-user auto-acquisition of override files
+# ---------------------------------------------------------------------------
+#
+# Registry of known incompatible Ollama models that need an override GGUF
+# (and optionally a separate mmproj GGUF) to load via llama.cpp's
+# llama-server. For each entry:
+#   * `needs_mmproj` - is a separate vision projector file required?
+#   * `main_strategy` - "extract_text_only" runs the surgery script,
+#     dropping `v.*` / `mm.*` tensors from the local Ollama blob (zero
+#     bandwidth, lossless). "download" goes straight to HuggingFace.
+#   * `main_url` / `main_size_gb` - HuggingFace fallback if surgery
+#     fails or the user doesn't have the blob locally.
+#   * `mmproj_url` / `mmproj_size_gb` - the multimodal projector. We
+#     always download these from upstream — they come pre-built in
+#     CLIP format (clip.has_vision_encoder=true, clip.projector_type=
+#     "gemma4v") which is much harder to derive from Ollama's bundle.
+#   * `reason` - human-readable explanation surfaced in errors / UI.
+#
+# Acquisition priority (cheapest -> most expensive):
+#   1. Files already in override dir -> no-op
+#   2. LAN copy: another worker has the override files -> SCP
+#      (requires `ssh_host` set on the worker AND the worker to have
+#      run the surgery before; the periodic probe loop will broadcast
+#      this state once it's tracked - V2)
+#   3. Local surgery: extract from user's Ollama blob (zero bandwidth)
+#   4. Direct download from HuggingFace
+_KNOWN_OVERRIDE_REGISTRY: dict[str, dict] = {
+    "gemma4:26b": {
+        "needs_mmproj": True,
+        "main_strategy": "extract_text_only",
+        "main_url": (
+            "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/"
+            "gemma-4-26B-A4B-it-UD-Q5_K_M.gguf"
+        ),
+        "main_size_gb": 19.7,
+        "mmproj_url": (
+            "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/"
+            "mmproj-BF16.gguf"
+        ),
+        "mmproj_size_gb": 1.11,
+        "reason": (
+            "Ollama bundles vision tower in the LLM GGUF; "
+            "llama.cpp expects a separate mmproj file."
+        ),
+    },
+    # gemma4:31b would go here once we identify a working Unsloth/community
+    # GGUF + mmproj pair. Pending llama.cpp upstream fix for gemma4 + RPC
+    # + SYCL on Intel iGPU (#21420 / #20259 / #21474).
+}
+
+
+# Acquisition state per model so concurrent route_chat_for calls don't
+# kick off duplicate downloads/surgeries. Keys are model names; values
+# are dicts: {status: "running"|"done"|"error",
+#             phase: "surgery"|"downloading-main"|"downloading-mmproj"|"done",
+#             progress_pct: float, error: str|None, started_at: float}.
+_ACQUISITION_STATE: dict[str, dict] = {}
+_ACQUISITION_TASKS: dict[str, asyncio.Task] = {}
+
+
+def get_acquisition_status(model_name: str) -> dict | None:
+    """Public read of the current acquisition state for a model.
+
+    Returns None if no acquisition has ever started for this model.
+    Used by the chat layer to surface a "preparing model" status to
+    the UI instead of returning a generic error.
+    """
+    return _ACQUISITION_STATE.get(model_name)
+
+
+async def ensure_compatible_gguf(model_name: str) -> dict:
+    """Make sure the override file(s) needed to load `model_name` via
+    llama-server exist on disk.
+
+    Behaviour:
+      * Model not in `_KNOWN_OVERRIDE_REGISTRY` -> no-op,
+        returns {"ok": True, "status": "no_override_needed"}.
+      * Files already in place -> no-op,
+        returns {"ok": True, "status": "ready"}.
+      * Files missing AND no acquisition running -> kick off a
+        background acquisition task and returns
+        {"ok": False, "status": "starting", ...}.
+      * Files missing AND acquisition running -> returns the live
+        status dict so the caller can decide whether to wait or
+        surface progress.
+
+    The acquisition task itself runs out-of-band (asyncio task on the
+    running loop). It does NOT block the chat call - by design. The
+    chat layer is expected to translate `status: starting/running` into
+    a user-facing "preparing the model, please retry shortly" response.
+    """
+    spec = _KNOWN_OVERRIDE_REGISTRY.get(model_name)
+    if not spec:
+        return {"ok": True, "status": "no_override_needed"}
+
+    main_path = _override_gguf_path_for(model_name)
+    mmproj_path = _override_mmproj_path_for(model_name)
+    main_present = main_path.is_file()
+    mmproj_present = mmproj_path.is_file() if spec.get("needs_mmproj") else True
+
+    if main_present and mmproj_present:
+        return {"ok": True, "status": "ready"}
+
+    # If a task is already running for this model, just return its state.
+    existing = _ACQUISITION_TASKS.get(model_name)
+    if existing and not existing.done():
+        return {"ok": False, **(_ACQUISITION_STATE.get(model_name) or {"status": "running"})}
+
+    # No live task -> spawn one. We use asyncio.create_task so the
+    # acquisition runs concurrently with chat handling.
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Called outside an event loop (e.g. test). Run synchronously
+        # so callers still get a clean answer.
+        result = await _acquire_override_files(model_name, spec)
+        return result
+
+    _ACQUISITION_STATE[model_name] = {
+        "status": "starting",
+        "phase": "init",
+        "progress_pct": 0.0,
+        "error": None,
+        "started_at": time.time(),
+        "needs_main": not main_present,
+        "needs_mmproj": spec.get("needs_mmproj") and not mmproj_present,
+    }
+    task = loop.create_task(_acquire_override_files(model_name, spec))
+    _ACQUISITION_TASKS[model_name] = task
+    return {
+        "ok": False,
+        **_ACQUISITION_STATE[model_name],
+        "estimated_total_gb": (
+            (spec.get("main_size_gb", 0) if not main_present else 0)
+            + (spec.get("mmproj_size_gb", 0) if spec.get("needs_mmproj") and not mmproj_present else 0)
+        ),
+    }
+
+
+async def _acquire_override_files(model_name: str, spec: dict) -> dict:
+    """Background acquisition worker — does the actual surgery /
+    download work. Updates `_ACQUISITION_STATE[model_name]` as it
+    progresses so the UI can show progress.
+
+    Strategy ordering (cheapest first):
+      1. Try local surgery if `main_strategy == "extract_text_only"` —
+         requires the Ollama blob to exist locally. Zero bandwidth,
+         lossless byte-copy of the LLM tensors.
+      2. Fall through to HuggingFace download for any file the
+         surgery couldn't produce (or wasn't applicable for).
+      3. Always download the mmproj from upstream — its CLIP-format
+         metadata can't be reliably derived from Ollama's bundle.
+    """
+    state = _ACQUISITION_STATE.setdefault(model_name, {})
+    main_path = _override_gguf_path_for(model_name)
+    mmproj_path = _override_mmproj_path_for(model_name)
+
+    try:
+        # Step 1: try local surgery for the main file if applicable.
+        if not main_path.is_file() and spec.get("main_strategy") == "extract_text_only":
+            blob_info = resolve_ollama_model(model_name)
+            ollama_blob = (blob_info or {}).get("ollama_blob_path")
+            if not ollama_blob:
+                # `resolve_ollama_model` only returns ollama_blob_path
+                # when an override exists already. Pull it directly.
+                manifest = _resolve_ollama_manifest(model_name)
+                if manifest:
+                    layers = manifest.get("layers") or []
+                    for layer in layers:
+                        if layer.get("mediaType") == "application/vnd.ollama.image.model":
+                            digest = (layer.get("digest") or "").replace("sha256:", "")
+                            candidate = _OLLAMA_MODELS_DIR / "blobs" / f"sha256-{digest}"
+                            if candidate.is_file():
+                                ollama_blob = str(candidate)
+                            break
+            if ollama_blob and Path(ollama_blob).is_file():
+                state.update({
+                    "status": "running", "phase": "surgery",
+                    "progress_pct": 5.0,
+                })
+                ok = await _run_text_only_surgery(
+                    ollama_blob=ollama_blob,
+                    dst=str(main_path),
+                    arch=model_name.split(":", 1)[0],  # e.g. "gemma4"
+                )
+                if ok:
+                    log.info("compute_pool: surgery produced %s for %s",
+                             main_path, model_name)
+
+        # Step 2: download main if surgery skipped / failed and a URL
+        # is registered.
+        if not main_path.is_file() and spec.get("main_url"):
+            state.update({
+                "status": "running", "phase": "downloading-main",
+                "progress_pct": 30.0,
+            })
+            await _download_to_path(spec["main_url"], main_path)
+
+        # Step 3: download mmproj if needed.
+        if (
+            spec.get("needs_mmproj")
+            and not mmproj_path.is_file()
+            and spec.get("mmproj_url")
+        ):
+            state.update({
+                "status": "running", "phase": "downloading-mmproj",
+                "progress_pct": 80.0,
+            })
+            await _download_to_path(spec["mmproj_url"], mmproj_path)
+
+        state.update({
+            "status": "done", "phase": "done", "progress_pct": 100.0,
+            "error": None, "completed_at": time.time(),
+        })
+        return {"ok": True, "status": "ready"}
+
+    except Exception as e:
+        log.warning("compute_pool: acquisition failed for %s: %s", model_name, e)
+        state.update({
+            "status": "error", "phase": state.get("phase", "unknown"),
+            "error": f"{type(e).__name__}: {e}", "completed_at": time.time(),
+        })
+        return {"ok": False, "status": "error", "error": str(e)}
+    finally:
+        # Pop the task reference so the next request can re-attempt.
+        _ACQUISITION_TASKS.pop(model_name, None)
+
+
+async def _run_text_only_surgery(
+    *, ollama_blob: str, dst: str, arch: str,
+) -> bool:
+    """Invoke the standalone surgery script in a subprocess.
+
+    Why subprocess instead of importing the script: the surgery is
+    CPU-heavy and reads the full GGUF (15+ GB). Running it in the
+    same process would block the asyncio loop for several seconds
+    even with thread pool tricks, and would tie up our process's
+    address space with the mmap. Subprocess isolates that.
+
+    Returns True on success (script exited 0 and dst exists), False
+    otherwise. Failures are logged but not raised — caller falls
+    back to download.
+    """
+    script = (
+        Path(__file__).resolve().parent.parent / "scripts" / "repack_text_only_gguf.py"
+    )
+    if not script.is_file():
+        return False
+    cmd = [
+        sys.executable, str(script),
+        "--src", ollama_blob,
+        "--dst", dst,
+        "--arch", arch,
+    ]
+
+    def _run() -> int:
+        import subprocess as _sp
+        try:
+            r = _sp.run(cmd, capture_output=True, text=True, timeout=900)
+            if r.returncode != 0:
+                log.warning(
+                    "compute_pool: surgery script exited %d: %s",
+                    r.returncode, (r.stderr or r.stdout)[:300],
+                )
+                return r.returncode
+            return 0
+        except Exception as e:
+            log.warning("compute_pool: surgery script error: %s", e)
+            return -1
+
+    rc = await asyncio.to_thread(_run)
+    return rc == 0 and Path(dst).is_file()
+
+
+async def _download_to_path(url: str, dest: Path) -> None:
+    """Stream a HuggingFace direct-download URL to `dest`, resuming
+    from `<dest>.part` if it already exists. Mirrors what
+    `scripts/install_gguf_override.py` does, in-process so we can
+    surface progress through `_ACQUISITION_STATE`. Raises on any
+    network or disk error.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    start_byte = tmp.stat().st_size if tmp.is_file() else 0
+    headers = {"Range": f"bytes={start_byte}-"} if start_byte > 0 else {}
+    timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+    mode = "ab" if start_byte > 0 else "wb"
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        async with client.stream("GET", url, headers=headers) as r:
+            if r.status_code not in (200, 206):
+                raise RuntimeError(f"download failed: HTTP {r.status_code} from {url}")
+            with tmp.open(mode) as f:
+                async for chunk in r.aiter_bytes(chunk_size=1024 * 1024):
+                    f.write(chunk)
+    tmp.rename(dest)
+
+
 def _resolve_ollama_manifest(model_name: str) -> dict | None:
     """Locate the manifest JSON for an Ollama model name.
 
@@ -1504,7 +1802,17 @@ async def stop_all_running_splits() -> None:
 class RouteChatError(RuntimeError):
     """Raised by route_chat_for when the model can't be served at all
     — e.g. the model file isn't present, or the combined pool is too
-    small to hold it. Caller should surface this to the user."""
+    small to hold it. Caller should surface this to the user.
+
+    `status` is an optional structured payload — populated by Scope B
+    when an override-file acquisition is in progress, so the chat
+    layer can render a "preparing model" indicator with progress
+    instead of a generic error.
+    """
+
+    def __init__(self, message: str, *, status: dict | None = None) -> None:
+        super().__init__(message)
+        self.status = status or {}
 
 
 async def route_chat_for(model_name: str) -> dict:
@@ -1634,6 +1942,29 @@ async def route_chat_for(model_name: str) -> dict:
 
         if engage_split:
             worker_ids = [w["id"] for w in rpc_workers]
+
+            # Scope B: ensure any required override / mmproj files are
+            # already on disk before we attempt to spawn llama-server.
+            # If the model is in `_KNOWN_OVERRIDE_REGISTRY` and its
+            # files are missing, kick off a background acquisition
+            # (lossless surgery from the local Ollama blob, falling
+            # back to HuggingFace download if needed) and surface a
+            # `RouteChatError` so the chat layer can show the user a
+            # "preparing the model" status with progress.
+            ready = await ensure_compatible_gguf(model_name)
+            if not ready.get("ok"):
+                phase = ready.get("phase") or ready.get("status") or "preparing"
+                raise RouteChatError(
+                    f"Compatible GGUF for {model_name} is being prepared "
+                    f"({phase}, ~{ready.get('estimated_total_gb', 0):.1f} GB total). "
+                    "Try again shortly.",
+                    status=ready,
+                )
+
+            # Re-resolve in case the acquisition just landed an override
+            # file we didn't know about earlier in this call.
+            info = resolve_ollama_model(model_name) or info
+
             # Strict semantics: if Tier 2 engages a split and the split
             # fails, we DO NOT fall back to Ollama on host. Split was
             # chosen because the host alone couldn't run this model
