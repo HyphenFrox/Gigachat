@@ -208,9 +208,15 @@ async def _probe_one(client: httpx.AsyncClient, base: str, token: str | None) ->
     out: dict[str, Any] = {}
     # gather() with return_exceptions so a partial failure on one
     # endpoint doesn't lose the other endpoints' payloads.
+    # Time the gather as a coarse LAN-latency proxy. With three small
+    # GETs in parallel the wall time is dominated by the slowest
+    # roundtrip, which gives us a reasonable "how snappy is this LAN
+    # link" signal for the routing decision.
+    _t0 = time.perf_counter()
     ver_res, tags_res, ps_res = await asyncio.gather(
         _ver(), _tags(), _ps(), return_exceptions=True,
     )
+    out["probe_latency_ms"] = int((time.perf_counter() - _t0) * 1000)
     if isinstance(ver_res, Exception):
         out["version_error"] = f"{type(ver_res).__name__}: {ver_res}"
     else:
@@ -321,6 +327,12 @@ async def probe_worker(wid: str) -> dict:
         "gpu_present": bool(payload.get("gpu_present")),
         "max_vram_seen_bytes": int(payload.get("max_vram_seen_bytes") or 0),
         "loaded_count": int(payload.get("loaded_count") or 0),
+        # LAN-latency hint from the parallel probe-GET round trip.
+        # Used by the routing layer as a proxy for "how expensive is
+        # a per-token RPC roundtrip to this worker": low latency →
+        # split path is viable; high latency → biased toward host
+        # CPU offload over split.
+        "probe_latency_ms": int(payload.get("probe_latency_ms") or 0),
     }
     try:
         db.update_compute_worker_capabilities(
@@ -997,29 +1009,95 @@ async def route_chat_for(model_name: str) -> dict:
 
     size_bytes = info["size_bytes"]
 
-    # Strongest single-node budget. The host counts its TOTAL memory
-    # (VRAM + RAM with a 70% safety multiplier) because Ollama uses
-    # CPU offload natively — layers that don't fit VRAM run on CPU
-    # from RAM, single-node. Workers count their proven max-VRAM
-    # (from /api/ps); we don't have visibility into their RAM, so we
-    # under-count their capacity and only credit them for what we've
-    # actually seen them load.
+    # Three-tier decision, fastest path first:
+    #   1. **Single-node VRAM fit** — strongest GPU (host or worker)
+    #      can hold the whole model in pure VRAM. No CPU offload, no
+    #      LAN. Always wins on per-token rate.
+    #   2. **Pool VRAM fit (split)** — combined VRAM across host + every
+    #      eligible worker covers the model. Engages llama-server
+    #      with --rpc; layers ride GPU memory across machines via
+    #      llama.cpp's native pipeline. Beats host CPU offload when the
+    #      LAN is fast (Ethernet) and workers have real GPUs (dGPU).
+    #      Loses on Wi-Fi + iGPU because per-token RPC overhead exceeds
+    #      the win from avoiding CPU offload on host — but that's a
+    #      real-world calibration the user can correct by setting
+    #      `use_for_chat=False` on a slow worker.
+    #   3. **Host VRAM + host RAM (CPU offload)** — single-node Ollama
+    #      with layer-spill into RAM. Slower per layer than VRAM, but
+    #      no LAN per-token cost. Last resort when split path can't
+    #      cover the model either.
+    host_vram = _host_vram_budget_bytes()
     host_total = _host_total_capacity_bytes()
     chat_workers = _eligible_workers("use_for_chat", model=model_name)
     best_worker_capacity = 0
+    pool_vram_total = host_vram
     if chat_workers:
-        best_worker_capacity = max(
+        worker_vrams = [
             (w.get("capabilities") or {}).get("max_vram_seen_bytes") or 0
             for w in chat_workers
-        )
+        ]
+        best_worker_capacity = max(worker_vrams) if worker_vrams else 0
+        # Sum every eligible worker's proven VRAM with host's. Honest
+        # under-count: max_vram_seen is a lower bound (it's whatever
+        # was loaded so far, not the worker's true VRAM ceiling).
+        pool_vram_total = host_vram + sum(worker_vrams)
 
-    strongest_single = max(host_total, best_worker_capacity)
-    if strongest_single > 0 and size_bytes <= strongest_single:
-        # Fits a single node (host RAM+VRAM combined, or a worker's
-        # proven VRAM). Ollama path. pick_chat_target picks which
-        # node (host vs strongest-eligible-worker) — single-node
-        # is always faster than RPC across a LAN, even with CPU
-        # offload involved on the chosen node.
+    # Tier 1: fits the strongest single GPU (host or worker)?
+    strongest_single_vram = max(host_vram, best_worker_capacity)
+    if strongest_single_vram > 0 and size_bytes <= strongest_single_vram:
+        await stop_all_running_splits()
+        return {"engine": "ollama"}
+
+    # Tier 2: fits combined VRAM via layer split? Split-rpc-eligible
+    # workers (rpc-server reachable) are what matters here, not just
+    # chat-eligible — Phase 2 doesn't need the model installed on the
+    # worker.
+    #
+    # Speed gate on the split path: every layer transition between
+    # nodes costs one RPC roundtrip per token, so a slow LAN multiplies
+    # the per-token wall time. We compare the observed probe latency
+    # (a coarse but real LAN signal) against host CPU-offload viability:
+    #   * If host CAN run the model (size <= host_total_capacity) AND
+    #     the slowest worker's roundtrip would dominate, prefer host
+    #     CPU offload over split. Single-node beats LAN.
+    #   * If host CAN'T run it (size > host_total), engage split
+    #     regardless of LAN — half-speed split is strictly better than
+    #     "won't run at all".
+    rpc_workers = _eligible_split_workers()
+    rpc_pool_vram = host_vram + sum(
+        (w.get("capabilities") or {}).get("max_vram_seen_bytes") or 0
+        for w in rpc_workers
+    )
+    if rpc_workers and rpc_pool_vram > 0 and size_bytes <= rpc_pool_vram:
+        host_can_run_alone = host_total > 0 and size_bytes <= host_total
+        worst_lan_latency_ms = max(
+            (w.get("capabilities") or {}).get("probe_latency_ms") or 0
+            for w in rpc_workers
+        )
+        # Threshold tuned to typical home-LAN values: <50 ms = wired
+        # Ethernet or strong Wi-Fi → split likely wins. >150 ms = slow
+        # Wi-Fi or Tailscale-relay → CPU offload on host wins. Between
+        # 50–150 ms we lean toward split when the host can't run the
+        # model alone, otherwise toward host.
+        skip_split_for_lan = (
+            host_can_run_alone and worst_lan_latency_ms > 150
+        )
+        if not skip_split_for_lan:
+            worker_ids = [w["id"] for w in rpc_workers]
+            try:
+                base_url = await _ensure_split_running_for(model_name, info["gguf_path"], worker_ids)
+                return {"engine": "llama_server", "base_url": base_url, "label": model_name}
+            except Exception as e:
+                log.warning("compute_pool: split start failed (%s); falling back to host", e)
+                # fall through to host CPU offload
+
+    # Tier 3: host CPU offload (still single-node, no LAN). If the
+    # model fits host's total memory, Ollama will run it slowly but
+    # correctly. Above the budget we fall through to the legacy split
+    # attempt one more time — even though we already established the
+    # split pool is too small, llama-server's per-layer placement may
+    # squeeze it in (workers have unreported RAM headroom).
+    if host_total > 0 and size_bytes <= host_total:
         await stop_all_running_splits()
         return {"engine": "ollama"}
 

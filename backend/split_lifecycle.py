@@ -83,11 +83,19 @@ log = logging.getLogger(__name__)
 _DEFAULT_NGL = 99
 
 # How long we wait for `llama-server` to come up before declaring the
-# start a failure. Loading a 17 GB model from disk + offloading layers
-# to GPU + opening rpc connections to workers takes longer than a
-# typical web server boot. 90 seconds covers the worst case (cold
-# disk + no GPU memory pre-allocated).
-_BOOT_TIMEOUT_SEC = 90.0
+# start a failure. Loading large models is slow:
+#   * Reading GGUF from disk: ~10 s for a 17 GB model on NVMe.
+#   * Pushing layer weights to host VRAM via CUDA: ~5–10 s.
+#   * Streaming layer weights to each worker's rpc-server over LAN:
+#     dominated by LAN bandwidth — at 100 Mb/s Wi-Fi, 10 GB takes
+#     ~14 minutes; at 1 Gb/s Ethernet, ~80 s. We size the timeout for
+#     the median home-LAN case (5 GHz Wi-Fi, ~30–50 MB/s effective):
+#     a 10 GB push lands in ~3–5 minutes.
+# 600 s (10 min) is conservative enough that any reasonable hardware
+# combination gets a fair shot, and short enough that a permanently-
+# wedged llama-server (port-bound, OOM, GGUF mismatch) doesn't make
+# the user wait forever.
+_BOOT_TIMEOUT_SEC = 600.0
 
 # Polling cadence for the readiness check. llama-server's `/health`
 # becomes available the moment the HTTP server binds; we poll often
@@ -188,10 +196,12 @@ def _build_command(
         # access the model via the rpc-server protocol, not HTTP.
         "--host", "127.0.0.1",
         "--port", str(port),
-        # Flash-attention is on-by-default in recent llama.cpp builds
-        # but pass it explicitly so a user reading the log line can
-        # tell what was negotiated.
-        "-fa",
+        # Flash-attention: newer llama.cpp builds require an explicit
+        # value (on/off/auto). 'auto' lets llama-server enable it when
+        # the model + backend support it; older code passed bare `-fa`
+        # which the new parser rejects (consumes the next arg as a
+        # value, e.g. swallows `--jinja`).
+        "-fa", "auto",
         # Use the GGUF's embedded chat template — most modern GGUFs
         # ship a Jinja template under metadata; without --jinja the
         # server falls back to a generic role-marker format that some
@@ -255,7 +265,7 @@ def _preflight(row: dict) -> tuple[Path, list[str]]:
     return server, rpc
 
 
-async def _wait_for_health(port: int, timeout: float = _BOOT_TIMEOUT_SEC) -> None:
+async def _wait_for_health(port: int, timeout: float | None = None) -> None:
     """Poll `http://127.0.0.1:<port>/health` until it returns 200, or
     raise SplitLifecycleError on timeout.
 
@@ -267,6 +277,10 @@ async def _wait_for_health(port: int, timeout: float = _BOOT_TIMEOUT_SEC) -> Non
     We treat all non-200s and connection-refused as "not ready yet"
     and keep polling until the timeout fires.
     """
+    # Read the constant at call time, not at function-def time, so
+    # tests / runtime tweaks of `_BOOT_TIMEOUT_SEC` are respected.
+    if timeout is None:
+        timeout = _BOOT_TIMEOUT_SEC
     deadline = time.monotonic() + timeout
     last_err: str | None = None
     async with httpx.AsyncClient(timeout=2.0) as client:
