@@ -366,6 +366,39 @@ def init() -> None:
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
+            -- Compute pool: other PCs the user has registered as workers.
+            -- The host can route embedding calls, subagent runs, and chat
+            -- turns to these workers to parallelise across machines. Each
+            -- worker exposes an Ollama endpoint on a Tailscale or LAN IP.
+            -- `auth_token` is a shared secret the worker validates; without
+            -- it any tailnet peer could drain the GPU.
+            -- `capabilities_json` is a cached snapshot of what the worker
+            -- reports (installed Ollama models, RAM/VRAM/GPU info from
+            -- sysdetect). Refreshed by the periodic probe.
+            -- `last_seen` tracks liveness — a worker the host hasn't been
+            -- able to reach for a while is greyed out in the picker.
+            -- `use_for_*` flags let the user opt a worker into specific
+            -- workloads (chat / embeddings / subagents) without having to
+            -- delete-and-readd to change scope.
+            CREATE TABLE IF NOT EXISTS compute_workers (
+                id TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                address TEXT NOT NULL,
+                ollama_port INTEGER NOT NULL DEFAULT 11434,
+                transport TEXT NOT NULL DEFAULT 'lan',
+                auth_token TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                use_for_chat INTEGER NOT NULL DEFAULT 1,
+                use_for_embeddings INTEGER NOT NULL DEFAULT 1,
+                use_for_subagents INTEGER NOT NULL DEFAULT 1,
+                capabilities_json TEXT,
+                last_seen REAL,
+                last_error TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_compute_workers_enabled
+                ON compute_workers(enabled);
             """
         )
         # Additive migration: images column (JSON array of upload filenames).
@@ -3281,3 +3314,218 @@ def _row_to_worktree(row: sqlite3.Row) -> dict:
         "created_at": row["created_at"],
         "removed_at": row["removed_at"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Compute pool (other PCs registered as workers).
+#
+# The host can route embeddings, subagents, and chat turns to these
+# workers to parallelise across machines. See `compute_pool.py` for
+# the routing logic and capability-probe loop; this layer is just CRUD.
+# ---------------------------------------------------------------------------
+
+# Two transports: `lan` (mDNS / direct LAN IP — preferred) and
+# `tailscale` (works anywhere but uses internet bandwidth and adds
+# latency). The transport is informational — actual routing decision
+# is per-call and chooses the cheapest path that's reachable.
+COMPUTE_WORKER_TRANSPORTS = {"lan", "tailscale"}
+
+
+def create_compute_worker(
+    *,
+    label: str,
+    address: str,
+    ollama_port: int = 11434,
+    transport: str = "lan",
+    auth_token: str | None = None,
+    enabled: bool = True,
+    use_for_chat: bool = True,
+    use_for_embeddings: bool = True,
+    use_for_subagents: bool = True,
+) -> str:
+    """Insert a new compute worker and return its id.
+
+    `address` is a hostname or IP — `desktop-0692hok.local` for LAN
+    mDNS, `192.168.1.10` for hardcoded LAN, `100.91.9.91` for Tailscale.
+    The host probes `http://{address}:{ollama_port}` for capabilities.
+    """
+    lbl = (label or "").strip()
+    if not lbl:
+        raise ValueError("label is required")
+    if len(lbl) > 80:
+        raise ValueError("label must be ≤ 80 chars")
+    addr = (address or "").strip()
+    if not addr:
+        raise ValueError("address is required")
+    if len(addr) > 256:
+        raise ValueError("address must be ≤ 256 chars")
+    if transport not in COMPUTE_WORKER_TRANSPORTS:
+        raise ValueError(
+            f"transport must be one of {sorted(COMPUTE_WORKER_TRANSPORTS)}, "
+            f"got {transport!r}"
+        )
+    # Be careful with the falsy coalesce — `int(0 or 11434)` returns
+    # 11434, but a caller passing 0 explicitly meant "clamp to 1", not
+    # "use default". Treat None as "use default" and any int as a value
+    # to clamp.
+    port = 11434 if ollama_port is None else max(1, min(int(ollama_port), 65535))
+    wid = str(uuid.uuid4())
+    now = time.time()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO compute_workers ("
+            "id, label, address, ollama_port, transport, auth_token, "
+            "enabled, use_for_chat, use_for_embeddings, use_for_subagents, "
+            "created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                wid, lbl, addr, port, transport, auth_token,
+                1 if enabled else 0,
+                1 if use_for_chat else 0,
+                1 if use_for_embeddings else 0,
+                1 if use_for_subagents else 0,
+                now, now,
+            ),
+        )
+    return wid
+
+
+def list_compute_workers(*, enabled_only: bool = False) -> list[dict]:
+    """Return every registered worker, newest-first."""
+    sql = "SELECT * FROM compute_workers"
+    if enabled_only:
+        sql += " WHERE enabled = 1"
+    sql += " ORDER BY created_at DESC"
+    with _conn() as c:
+        rows = c.execute(sql).fetchall()
+    return [_row_to_compute_worker(r) for r in rows]
+
+
+def get_compute_worker(wid: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM compute_workers WHERE id = ?", (wid,),
+        ).fetchone()
+    return _row_to_compute_worker(row) if row else None
+
+
+def update_compute_worker(wid: str, **fields: Any) -> dict | None:
+    """Patch allowed fields on a worker. Returns the refreshed row."""
+    allowed = {
+        "label", "address", "ollama_port", "transport", "auth_token",
+        "enabled", "use_for_chat", "use_for_embeddings", "use_for_subagents",
+    }
+    sets: list[str] = []
+    values: list[Any] = []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if k == "transport" and v not in COMPUTE_WORKER_TRANSPORTS:
+            raise ValueError(
+                f"transport must be one of {sorted(COMPUTE_WORKER_TRANSPORTS)}"
+            )
+        if k in ("enabled", "use_for_chat", "use_for_embeddings",
+                 "use_for_subagents"):
+            v = 1 if v else 0
+        if k == "ollama_port":
+            v = 11434 if v is None else max(1, min(int(v), 65535))
+        sets.append(f"{k} = ?")
+        values.append(v)
+    if not sets:
+        return get_compute_worker(wid)
+    sets.append("updated_at = ?")
+    values.append(time.time())
+    values.append(wid)
+    with _conn() as c:
+        c.execute(
+            f"UPDATE compute_workers SET {', '.join(sets)} WHERE id = ?",
+            values,
+        )
+    return get_compute_worker(wid)
+
+
+def update_compute_worker_capabilities(
+    wid: str,
+    *,
+    capabilities: dict | None = None,
+    last_seen: float | None = None,
+    last_error: str | None = None,
+) -> None:
+    """Cache the latest probe result on the worker row.
+
+    Separated from `update_compute_worker` because the capability probe
+    runs in the background and shouldn't be lumped in with user-facing
+    edits (different audit trail / different concurrency story).
+    """
+    sets: list[str] = []
+    values: list[Any] = []
+    if capabilities is not None:
+        sets.append("capabilities_json = ?")
+        values.append(json.dumps(capabilities))
+    if last_seen is not None:
+        sets.append("last_seen = ?")
+        values.append(float(last_seen))
+    # last_error: empty string means "clear"; None means "leave alone".
+    if last_error is not None:
+        sets.append("last_error = ?")
+        values.append(last_error or None)
+    if not sets:
+        return
+    sets.append("updated_at = ?")
+    values.append(time.time())
+    values.append(wid)
+    with _conn() as c:
+        c.execute(
+            f"UPDATE compute_workers SET {', '.join(sets)} WHERE id = ?",
+            values,
+        )
+
+
+def delete_compute_worker(wid: str) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM compute_workers WHERE id = ?", (wid,),
+        )
+        return cur.rowcount or 0
+
+
+def _row_to_compute_worker(row: sqlite3.Row) -> dict:
+    caps_raw = row["capabilities_json"]
+    try:
+        caps = json.loads(caps_raw) if caps_raw else None
+    except Exception:
+        caps = None
+    return {
+        "id": row["id"],
+        "label": row["label"],
+        "address": row["address"],
+        "ollama_port": row["ollama_port"],
+        "transport": row["transport"],
+        # auth_token is NEVER returned to the API/UI — the column exists
+        # for outbound requests only. Surfacing it would be a credential
+        # exfiltration vector. Use `get_compute_worker_auth_token(wid)`
+        # for the rare internal caller that needs it.
+        "auth_token_set": bool(row["auth_token"]),
+        "enabled": bool(row["enabled"]),
+        "use_for_chat": bool(row["use_for_chat"]),
+        "use_for_embeddings": bool(row["use_for_embeddings"]),
+        "use_for_subagents": bool(row["use_for_subagents"]),
+        "capabilities": caps,
+        "last_seen": row["last_seen"],
+        "last_error": row["last_error"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_compute_worker_auth_token(wid: str) -> str | None:
+    """Internal-only: fetch the raw auth token for outbound requests.
+
+    Kept off `_row_to_compute_worker` so the API surface can never
+    accidentally leak tokens via the standard list/get endpoints.
+    """
+    with _conn() as c:
+        row = c.execute(
+            "SELECT auth_token FROM compute_workers WHERE id = ?", (wid,),
+        ).fetchone()
+    return row["auth_token"] if row else None

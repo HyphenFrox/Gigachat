@@ -3225,6 +3225,96 @@ async def api_settings_patch(body: SettingsPatch) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Compute pool: register other PCs as workers the host can route work to.
+#
+# Each row represents another machine reachable over the LAN (preferred —
+# saves internet bandwidth) or via Tailscale (anywhere). Capability probe
+# + routing live in `compute_pool.py`; this layer is just CRUD.
+# ---------------------------------------------------------------------------
+class ComputeWorkerCreate(BaseModel):
+    """Body for POST /api/compute-workers."""
+    label: str
+    address: str
+    ollama_port: int = 11434
+    transport: str = "lan"  # "lan" or "tailscale"
+    auth_token: str | None = None
+    enabled: bool = True
+    use_for_chat: bool = True
+    use_for_embeddings: bool = True
+    use_for_subagents: bool = True
+
+
+class ComputeWorkerPatch(BaseModel):
+    """Body for PATCH /api/compute-workers/{wid}. All fields optional."""
+    label: str | None = None
+    address: str | None = None
+    ollama_port: int | None = None
+    transport: str | None = None
+    auth_token: str | None = None  # send "" to clear, null to leave alone
+    enabled: bool | None = None
+    use_for_chat: bool | None = None
+    use_for_embeddings: bool | None = None
+    use_for_subagents: bool | None = None
+
+
+@app.get("/api/compute-workers")
+def api_list_compute_workers() -> dict:
+    """Return every registered worker + the allowed transport values.
+
+    Auth tokens are NEVER included in the response — the row dict only
+    carries an `auth_token_set` boolean so the UI can show "(set)" or
+    "(none)" without ever exposing the secret.
+    """
+    return {
+        "workers": db.list_compute_workers(),
+        "transports": sorted(db.COMPUTE_WORKER_TRANSPORTS),
+    }
+
+
+@app.post("/api/compute-workers")
+def api_create_compute_worker(body: ComputeWorkerCreate) -> dict:
+    try:
+        wid = db.create_compute_worker(
+            label=body.label,
+            address=body.address,
+            ollama_port=body.ollama_port,
+            transport=body.transport,
+            auth_token=(body.auth_token or None),
+            enabled=body.enabled,
+            use_for_chat=body.use_for_chat,
+            use_for_embeddings=body.use_for_embeddings,
+            use_for_subagents=body.use_for_subagents,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return db.get_compute_worker(wid) or {}
+
+
+@app.patch("/api/compute-workers/{wid}")
+def api_update_compute_worker(wid: str, body: ComputeWorkerPatch) -> dict:
+    patch = body.model_dump(exclude_unset=True)
+    # Treat empty-string auth_token as "clear it" — the UI's clear
+    # button submits "" rather than re-sending the secret.
+    if "auth_token" in patch and patch["auth_token"] == "":
+        patch["auth_token"] = None
+    try:
+        updated = db.update_compute_worker(wid, **patch)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not updated:
+        raise HTTPException(404, "worker not found")
+    return updated
+
+
+@app.delete("/api/compute-workers/{wid}")
+def api_delete_compute_worker(wid: str) -> dict:
+    n = db.delete_compute_worker(wid)
+    if not n:
+        raise HTTPException(404, "worker not found")
+    return {"ok": True, "deleted": wid}
+
+
+# ---------------------------------------------------------------------------
 # Static frontend (production mode).
 #
 # When `frontend/dist` exists (after `npm run build`), we serve it at "/".
