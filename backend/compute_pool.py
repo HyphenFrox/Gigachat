@@ -64,6 +64,24 @@ _DEFAULT_RPC_PORT = 50052
 # IPv4 fallback connects. 5 seconds covers that.
 _RPC_PROBE_TIMEOUT_SEC = 5.0
 
+# How long a measured `tokens_per_second` is good for before we
+# re-benchmark. 1 hour is the right balance: long enough that the
+# bench cost amortizes (loading + 30 tokens of generation) but
+# short enough that hardware changes (different model loaded on
+# host changing GPU contention, worker reboot, etc.) get reflected
+# within a session.
+_THROUGHPUT_CACHE_TTL_SEC = 3600.0
+
+# Number of tokens to generate during the throughput benchmark.
+# 20 is enough to amortize first-token latency without dragging
+# probe time too long. On a typical 7B-Q4 model on host VRAM
+# this completes in <1 s; on a laptop CPU it might take 5-10 s.
+_THROUGHPUT_BENCH_TOKENS = 20
+
+# Cached host throughput, keyed by model name. Measured lazily on
+# first route decision and refreshed every TTL.
+_HOST_THROUGHPUT_CACHE: dict[str, tuple[float, float]] = {}  # model -> (tps, measured_at)
+
 
 def _worker_base_url(worker: dict) -> str:
     """Build the Ollama base URL for a worker row."""
@@ -90,6 +108,159 @@ def _worker_host(worker: dict) -> str:
     elif addr.startswith("https://"):
         addr = addr[len("https://"):]
     return addr.rstrip("/")
+
+
+async def _measure_throughput(
+    base_url: str,
+    auth_token: str | None,
+    model_name: str,
+    n_tokens: int = _THROUGHPUT_BENCH_TOKENS,
+) -> tuple[float, float]:
+    """Run a small Ollama generation, return (tokens_per_second, total_seconds).
+
+    Folds CPU, RAM bandwidth, GPU compute, and memory size into one
+    bottom-line number — the real speed signal for routing. We measure
+    rate AFTER the first token to skip cold-load time (model file
+    paging from disk into VRAM/RAM dominates the first hundred ms);
+    what callers actually want is "how fast does this machine generate
+    tokens once it's hot."
+
+    Returns (0, 0) on any failure — caller can fall back to the static
+    heuristic ranking when the bench couldn't run (model missing,
+    Ollama down, etc.).
+    """
+    headers: dict[str, str] = {}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    payload = {
+        "model": model_name,
+        "prompt": "Hello",
+        "stream": True,
+        "options": {"num_predict": int(n_tokens), "temperature": 0.0},
+    }
+    timeout = httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=10.0)
+    first_token_at: float | None = None
+    tok = 0
+    t_total_start = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            async with c.stream("POST", f"{base_url}/api/generate", json=payload, headers=headers) as r:
+                if r.status_code >= 400:
+                    return 0.0, 0.0
+                async for line in r.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("response"):
+                        if first_token_at is None:
+                            first_token_at = time.perf_counter()
+                        tok += 1
+                    if obj.get("done"):
+                        break
+    except Exception as e:
+        log.info("throughput bench failed for %s on %s: %s", model_name, base_url, e)
+        return 0.0, 0.0
+
+    total = time.perf_counter() - t_total_start
+    if tok == 0 or first_token_at is None:
+        return 0.0, total
+    gen_seconds = time.perf_counter() - first_token_at
+    if gen_seconds <= 0:
+        return 0.0, total
+    return tok / gen_seconds, total
+
+
+async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
+    """Query CPU + RAM + GPU details over SSH using the worker's
+    `ssh_host` alias. Returns a dict suitable for merging into
+    capabilities. Empty dict on any failure.
+
+    Workers run plain Ollama which doesn't expose system specs. The
+    /api/ps proxy gives us a binary "GPU present" + a VRAM lower
+    bound, but not CPU model, RAM total, or GPU class. SSH'ing to the
+    worker is the most reliable way to fill in the gaps without
+    requiring extra worker-side software. Free when ssh_host is
+    already set (the same alias used for LAN model copy).
+    """
+    ssh_host = (worker.get("ssh_host") or "").strip()
+    if not ssh_host:
+        return {}
+
+    # PowerShell one-liner that emits a JSON blob the host can parse.
+    # We pipe it through ssh -o BatchMode=yes so the call fails fast
+    # on auth issues instead of hanging on a password prompt.
+    ps = (
+        "$cs = Get-CimInstance Win32_ComputerSystem;"
+        "$os = Get-CimInstance Win32_OperatingSystem;"
+        "$cpu = Get-CimInstance Win32_Processor;"
+        "$gpus = @();"
+        "Get-CimInstance Win32_VideoController | ForEach-Object {"
+        "  $gpus += [pscustomobject]@{"
+        "    name = $_.Name;"
+        "    adapter_ram_gb = [math]::Round([uint64]$_.AdapterRAM/1GB, 2);"
+        "    driver_version = $_.DriverVersion"
+        "  }"
+        "};"
+        "$out = [pscustomobject]@{"
+        "  cpu_name = $cpu.Name;"
+        "  cpu_cores = $cpu.NumberOfCores;"
+        "  cpu_threads = $cpu.NumberOfLogicalProcessors;"
+        "  ram_total_gb = [math]::Round($cs.TotalPhysicalMemory/1GB, 1);"
+        "  ram_free_gb = [math]::Round($os.FreePhysicalMemory/1MB, 1);"
+        "  gpus = $gpus"
+        "};"
+        "$out | ConvertTo-Json -Compress -Depth 4"
+    )
+    # PowerShell -EncodedCommand bypasses every layer of arg-list /
+    # cmdline / shell quoting nightmare. The script is base64-encoded
+    # UTF-16LE bytes — PowerShell decodes and runs it verbatim with
+    # zero whitespace mangling.
+    import base64
+    encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+           ssh_host, "powershell", "-NoProfile", "-EncodedCommand", encoded]
+    import subprocess as _sp
+    def _run() -> tuple[int, bytes, bytes]:
+        try:
+            r = _sp.run(
+                cmd, capture_output=True, timeout=15.0,
+            )
+            return r.returncode, r.stdout, r.stderr
+        except _sp.TimeoutExpired:
+            return -1, b"", b"timeout"
+        except Exception as e:
+            return -2, b"", repr(e).encode()
+    try:
+        rc, stdout, stderr = await asyncio.to_thread(_run)
+    except Exception as e:
+        log.info("ssh specs probe failed for %s: %s", ssh_host, e)
+        return {}
+    if rc != 0:
+        return {}
+
+    # PowerShell's ConvertTo-Json may emit the object as either a JSON
+    # object (single record) or a JSON array (when implicit
+    # enumeration kicks in). Handle both.
+    text = stdout.decode("utf-8", errors="replace").strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(data, list):
+        if not data:
+            return {}
+        data = data[0]
+    if not isinstance(data, dict):
+        return {}
+
+    # Stamp the measurement so we know how stale the data is.
+    data["specs_measured_at"] = time.time()
+    return data
 
 
 async def _probe_rpc_server(
@@ -334,6 +505,50 @@ async def probe_worker(wid: str) -> dict:
         # CPU offload over split.
         "probe_latency_ms": int(payload.get("probe_latency_ms") or 0),
     }
+
+    # Carry over throughput + spec data from the previous probe IF
+    # they're still fresh (1 hour TTL). Re-measure only when stale —
+    # both are expensive enough that we don't want to run them on
+    # every 5-min sweep.
+    prev_caps = worker.get("capabilities") or {}
+    now_t = time.time()
+    if prev_caps.get("tokens_per_second") and (
+        now_t - (prev_caps.get("tps_measured_at") or 0)
+        < _THROUGHPUT_CACHE_TTL_SEC
+    ):
+        capabilities["tokens_per_second"] = prev_caps["tokens_per_second"]
+        capabilities["tps_measured_at"] = prev_caps["tps_measured_at"]
+        capabilities["tps_model"] = prev_caps.get("tps_model")
+    if prev_caps.get("specs_measured_at") and (
+        now_t - prev_caps["specs_measured_at"] < _THROUGHPUT_CACHE_TTL_SEC
+    ):
+        for k in ("cpu_name", "cpu_cores", "cpu_threads",
+                  "ram_total_gb", "ram_free_gb", "gpus", "specs_measured_at"):
+            if k in prev_caps:
+                capabilities[k] = prev_caps[k]
+
+    # Throughput bench — pick the smallest chat model on the worker
+    # so the bench loads fast. Embed-only models give us no chat
+    # speed signal; skip them as bench targets.
+    if "tokens_per_second" not in capabilities:
+        chat_models = [
+            m for m in (capabilities.get("models") or [])
+            if (m.get("name") or "") and "embed" not in (m.get("name") or "").lower()
+        ]
+        if chat_models:
+            chat_models.sort(key=lambda m: int(m.get("size") or 1 << 60))
+            bench_model = chat_models[0]["name"]
+            tps, _ = await _measure_throughput(base, token, bench_model)
+            if tps > 0:
+                capabilities["tokens_per_second"] = tps
+                capabilities["tps_measured_at"] = now_t
+                capabilities["tps_model"] = bench_model
+
+    # SSH-based hardware spec probe — fills in CPU/RAM/GPU details
+    # the API can't surface. Free when the user has set ssh_host.
+    if "specs_measured_at" not in capabilities:
+        specs = await _probe_worker_specs_via_ssh(worker)
+        capabilities.update(specs)
     try:
         db.update_compute_worker_capabilities(
             wid,
@@ -501,44 +716,85 @@ def _capability_score(worker: dict) -> tuple:
     Returns a tuple suitable for `sorted(key=...)` — bigger is better,
     so callers use `reverse=True`. Components, in priority order:
 
-      1. `gpu_present` (1 if the worker has a usable GPU). Inferred
-         best-effort from `/api/ps`'s `size_vram > 0`. Heavily-weighted
-         because GPU is dramatically faster than CPU for inference.
-      2. `max_vram_seen_bytes`. Lower bound on the worker's VRAM —
-         a worker that's loaded a 14 GB model has at least 14 GB. Among
-         GPU workers, more VRAM wins.
-      3. Freshness (last_seen). Tie-breaker.
+      1. `tokens_per_second` — real measured throughput from a tiny
+         /api/generate bench. Folds CPU + RAM bandwidth + GPU compute
+         + memory size into one bottom-line "how fast can this machine
+         run a model" number. Workers we haven't benchmarked yet
+         contribute 0 here and fall back to the heuristic axes below.
+      2. `gpu_present` — binary GPU detection from /api/ps.
+      3. `max_vram_seen_bytes` — lower bound on the worker's VRAM.
+      4. `ram_total_gb` — worker RAM total (from SSH probe). Held
+         out when ssh_host isn't set.
+      5. `cpu_threads` — CPU parallelism (also from SSH probe).
+      6. `last_seen` — final tie-breaker.
 
-    Workers with NO loaded-model history (`loaded_count==0`) have all-
-    zero hardware fields. They sort to the bottom — not because they
-    lack hardware, but because we can't see their hardware yet. The
-    next probe after they load anything will fix the ranking.
+    All four axes are intentionally factored: throughput is the
+    bottom-line speed signal but only available where benchmarked;
+    the heuristic axes (gpu / vram / ram / cpu) keep ranking sane
+    for workers without measurement data yet.
     """
     caps = worker.get("capabilities") or {}
     return (
+        float(caps.get("tokens_per_second") or 0.0),
         1 if caps.get("gpu_present") else 0,
         int(caps.get("max_vram_seen_bytes") or 0),
+        float(caps.get("ram_total_gb") or 0.0),
+        int(caps.get("cpu_threads") or 0),
         float(worker.get("last_seen") or 0),
     )
 
 
-def _host_capability_score() -> tuple:
-    """Same shape as `_capability_score` but for the host machine — so
-    we can compare host directly against eligible workers.
+async def _measure_host_throughput(model_name: str) -> float:
+    """Cached host throughput in tokens/sec for `model_name`. Runs a
+    tiny /api/generate against `localhost:11434`; result valid for
+    `_THROUGHPUT_CACHE_TTL_SEC`. Returns 0 on failure (caller falls
+    back to heuristic ranking).
+    """
+    cached = _HOST_THROUGHPUT_CACHE.get(model_name)
+    now = time.time()
+    if cached and (now - cached[1]) < _THROUGHPUT_CACHE_TTL_SEC:
+        return cached[0]
+    tps, _ = await _measure_throughput("http://localhost:11434", None, model_name)
+    if tps > 0:
+        _HOST_THROUGHPUT_CACHE[model_name] = (tps, now)
+    return tps
 
-    `vram_gb > 0` → gpu_present=1; the byte count is the host's actual
-    detected VRAM (not a "max seen" lower bound). `last_seen` is +inf
-    so among capability-tied candidates the host wins (it's always
-    online from our perspective; routing there avoids a network hop).
+
+def _host_capability_score(model_name: str | None = None) -> tuple:
+    """Host's capability tuple, same shape as `_capability_score`.
+
+    When `model_name` is provided AND we've benchmarked the host on
+    that model recently, slot the measured TPS in as the primary
+    axis. Otherwise we leave it at 0 and rely on the static heuristic
+    axes (vram bytes, ram_gb, cpu_threads, last_seen=inf for
+    "always online"). Last component is +inf so a host that ties on
+    all measurable axes still wins over a worker (no LAN hop).
     """
     try:
         spec = sysdetect.detect_system()
         vram_gb = float(spec.get("vram_gb") or 0.0)
+        ram_gb = float(spec.get("ram_gb") or 0.0)
     except Exception:
         vram_gb = 0.0
+        ram_gb = 0.0
+
+    host_tps = 0.0
+    if model_name:
+        cached = _HOST_THROUGHPUT_CACHE.get(model_name)
+        if cached and (time.time() - cached[1]) < _THROUGHPUT_CACHE_TTL_SEC:
+            host_tps = cached[0]
+
+    try:
+        cpu_threads = int(os.cpu_count() or 0)
+    except Exception:
+        cpu_threads = 0
+
     return (
+        host_tps,
         1 if vram_gb > 0 else 0,
         int(vram_gb * 1024 ** 3),
+        ram_gb,
+        cpu_threads,
         float("inf"),
     )
 
@@ -673,9 +929,10 @@ def pick_chat_target(model: str) -> tuple[str, str | None] | None:
     if not cands:
         return None
     w = cands[0]
-    if _capability_score(w) <= _host_capability_score():
+    if _capability_score(w) <= _host_capability_score(model):
         # Host is at least as powerful as the strongest eligible
-        # worker. Stay local.
+        # worker (using measured throughput when available, else
+        # falling back to GPU/VRAM/RAM/CPU heuristics). Stay local.
         return None
     return (_worker_base_url(w), db.get_compute_worker_auth_token(w["id"]))
 

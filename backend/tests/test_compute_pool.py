@@ -603,7 +603,7 @@ def test_pick_chat_target_picks_eligible(isolated_db, monkeypatch):
     # the seeded worker has no proven hardware data.
     monkeypatch.setattr(
         compute_pool, "_host_capability_score",
-        lambda: (0, 0, float("inf")),
+        lambda model_name=None: (0, 0, 0, 0, 0, float("inf")),
     )
     _seed_chat_worker(isolated_db, address="c.local", auth_token="t")
     # Tag the seeded worker as GPU-present so it beats the no-GPU host.
@@ -831,7 +831,7 @@ def test_pick_chat_target_keeps_host_when_worker_weaker(isolated_db, monkeypatch
     # Pretend host has 8 GB of GPU.
     monkeypatch.setattr(
         compute_pool, "_host_capability_score",
-        lambda: (1, 8 * 1024 ** 3, float("inf")),
+        lambda model_name=None: (0.0, 1, 8 * 1024 ** 3, 16.0, 16, float("inf")),
     )
 
     wid = isolated_db.create_compute_worker(
@@ -860,7 +860,7 @@ def test_pick_chat_target_routes_to_worker_when_strictly_more_capable(
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     monkeypatch.setattr(
         compute_pool, "_host_capability_score",
-        lambda: (1, 8 * 1024 ** 3, float("inf")),
+        lambda model_name=None: (0.0, 1, 8 * 1024 ** 3, 16.0, 16, float("inf")),
     )
 
     wid = isolated_db.create_compute_worker(
@@ -925,7 +925,7 @@ def test_pick_chat_target_picks_gpu_worker_over_cpu_only(isolated_db, monkeypatc
     # Host has no GPU so any worker beats it on the gpu_present axis.
     monkeypatch.setattr(
         compute_pool, "_host_capability_score",
-        lambda: (0, 0, float("inf")),
+        lambda model_name=None: (0, 0, 0, 0, 0, float("inf")),
     )
 
     # CPU-only worker, fresher probe.
