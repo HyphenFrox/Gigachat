@@ -283,9 +283,14 @@ def _preflight(row: dict) -> tuple[Path, list[str]]:
     return server, rpc
 
 
-async def _wait_for_health(port: int, timeout: float | None = None) -> None:
+async def _wait_for_health(
+    port: int,
+    timeout: float | None = None,
+    proc: subprocess.Popen | None = None,
+) -> None:
     """Poll `http://127.0.0.1:<port>/health` until it returns 200, or
-    raise SplitLifecycleError on timeout.
+    raise SplitLifecycleError on timeout — or as soon as the child
+    process exits, whichever comes first.
 
     llama-server's `/health` returns:
       200 + {"status":"ok"}     once the model is loaded and serving
@@ -294,6 +299,12 @@ async def _wait_for_health(port: int, timeout: float | None = None) -> None:
 
     We treat all non-200s and connection-refused as "not ready yet"
     and keep polling until the timeout fires.
+
+    If `proc` is provided we also poll the child's exit status each
+    loop. A dead child means the model failed to load (architecture
+    mismatch, OOM, missing tensor, etc.); waiting the full timeout
+    in that case is just dead time. Short-circuit and surface the
+    failure immediately.
     """
     # Read the constant at call time, not at function-def time, so
     # tests / runtime tweaks of `_BOOT_TIMEOUT_SEC` are respected.
@@ -303,6 +314,13 @@ async def _wait_for_health(port: int, timeout: float | None = None) -> None:
     last_err: str | None = None
     async with httpx.AsyncClient(timeout=2.0) as client:
         while time.monotonic() < deadline:
+            # Bail early if the child process has died — no point
+            # polling a port that nothing is going to bind to.
+            if proc is not None and proc.poll() is not None:
+                raise SplitLifecycleError(
+                    f"llama-server exited with code {proc.returncode} "
+                    f"before becoming healthy (last error: {last_err or 'n/a'})"
+                )
             try:
                 r = await client.get(f"http://127.0.0.1:{port}/health")
                 if r.status_code == 200:
@@ -387,9 +405,13 @@ async def start(split_id: str) -> dict:
     )
 
     # Wait for the HTTP server to come up. If health never reports OK,
-    # we kill the child and surface the timeout.
+    # we kill the child and surface the timeout. Pass `proc` so the
+    # waiter short-circuits the moment the child crashes (e.g. the
+    # GGUF architecture isn't supported by this llama.cpp build) —
+    # otherwise we'd burn the full _BOOT_TIMEOUT_SEC polling a port
+    # that nothing will ever bind to.
     try:
-        await _wait_for_health(row["llama_port"])
+        await _wait_for_health(row["llama_port"], proc=proc)
     except SplitLifecycleError as e:
         # Best-effort cleanup so we don't leave a half-loaded process
         # hogging VRAM.

@@ -16,7 +16,14 @@ import httpx
 from backend import agent, compute_pool, db
 
 
-WORKER_ID = db.list_compute_workers()[0]["id"] if db.list_compute_workers() else None
+WORKER_IDS = [w["id"] for w in db.list_compute_workers()]
+
+
+def set_all_workers_enabled(enabled: bool) -> None:
+    """Toggle ALL workers — needed when more than one is registered.
+    Without this the bench falsely measures a half-enabled pool."""
+    for wid in WORKER_IDS:
+        db.update_compute_worker(wid, enabled=enabled)
 EMBED_PROMPT = "The quick brown fox jumps over the lazy dog. " * 4
 CHAT_PROMPT = "Count from 1 to 30, numbers only, separated by spaces."
 N_PREDICT = 50
@@ -37,15 +44,43 @@ def discover_models():
                 continue
             if "vision" in name.lower():
                 continue
-            if name == "gemma4" and tag in ("26b", "31b"):
-                continue  # too big to bench in a quick pass
             if name == "gemma4" and tag == "latest":
                 continue  # duplicate of e4b
             models.append(full)
     return models
 
 
+async def _warmup_chat(model: str, target: str) -> None:
+    """Burn through one tiny call so the model is hot in VRAM/RAM
+    when the timed call fires. Cold-load (multi-GB model paging in
+    + Phase 2 layer push over LAN) gets accounted to warmup, NOT
+    to the timed metrics. Bounded by the timeout the caller chose
+    upstream."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ok"}],
+        "stream": True,
+        "options": {"temperature": 0.0, "num_predict": 1},
+    }
+    timeout = httpx.Timeout(connect=10.0, read=900.0, write=30.0, pool=10.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            async with c.stream("POST", f"{target}/api/chat", json=payload) as r:
+                async for line in r.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if obj.get("done"):
+                        break
+    except Exception:
+        pass  # warmup failures don't fail the bench; the timed call surfaces them
+
+
 async def measure_chat(model):
+    print(f"  starting {model} ...", flush=True)
     try:
         decision = await compute_pool.route_chat_for(model)
     except Exception as e:
@@ -60,13 +95,37 @@ async def measure_chat(model):
         }
     target = decision.get("base_url") or "http://localhost:11434"
     engine = decision.get("engine") or "?"
+
+    # Pre-populate the host throughput cache so pick_chat_target
+    # doesn't schedule a background bench that would contend for
+    # host GPU during the timed call. Runs synchronously here.
+    try:
+        await compute_pool._measure_host_throughput(model)
+    except Exception:
+        pass
+
+    # Warmup pass — loads the model into the chosen target's VRAM/RAM
+    # so the timed measurement reflects hot inference, not cold-load
+    # latency. For Phase 2 split this also pushes the layer weights
+    # across LAN once before timing.
+    print(f"    warmup ({engine}) ...", flush=True)
+    t_warm = time.perf_counter()
+    await _warmup_chat(model, target)
+    print(f"    warmup done in {time.perf_counter() - t_warm:.1f}s", flush=True)
+
+    # Small breather so any auto-sync SCP / probe / background tasks
+    # can drain before we start the timed measurement.
+    await asyncio.sleep(2.0)
+
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": CHAT_PROMPT}],
         "stream": True,
         "options": {"temperature": 0.0, "num_predict": N_PREDICT},
     }
-    timeout = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
+    # 15-minute read timeout. After warmup the timed call is hot, so
+    # this is plenty even for slow split paths.
+    timeout = httpx.Timeout(connect=10.0, read=900.0, write=30.0, pool=10.0)
     t0 = time.perf_counter()
     ttft = None
     tok = 0
@@ -91,7 +150,16 @@ async def measure_chat(model):
                         obj = json.loads(line)
                     except Exception:
                         continue
-                    if (obj.get("message") or {}).get("content"):
+                    # Count any token, whether the model emits it as
+                    # `content` (regular response) or `thinking` (chain-
+                    # of-thought models like qwen3.5 / DeepSeek-R1 emit
+                    # reasoning into a separate field before answering).
+                    # Both stream out at the same rate, so either is a
+                    # valid throughput signal — and ignoring `thinking`
+                    # makes thinking models look like they crashed when
+                    # they're actually working fine.
+                    msg = obj.get("message") or {}
+                    if msg.get("content") or msg.get("thinking"):
                         if ttft is None:
                             ttft = time.perf_counter()
                         tok += 1
@@ -154,9 +222,10 @@ async def measure_embed():
 
 
 async def main():
-    if WORKER_ID is None:
+    if not WORKER_IDS:
         print("No workers registered; nothing to compare.")
         return
+    print(f"Pool size: {len(WORKER_IDS)} worker(s)")
     models = discover_models()
     print(f"Models tested: {len(models)} chat + 1 embed")
     print(f"  prompt: {CHAT_PROMPT!r} num_predict={N_PREDICT}")
@@ -164,7 +233,7 @@ async def main():
     print()
 
     print("=== Phase A: WITHOUT compute pool ===")
-    db.update_compute_worker(WORKER_ID, enabled=False)
+    set_all_workers_enabled(False)
     await compute_pool.stop_all_running_splits()
     embed_off = await measure_embed()
     print(
@@ -184,7 +253,7 @@ async def main():
             )
 
     print("\n=== Phase B: WITH compute pool ===")
-    db.update_compute_worker(WORKER_ID, enabled=True)
+    set_all_workers_enabled(True)
     await compute_pool.probe_all_enabled()
     embed_on = await measure_embed()
     print(
