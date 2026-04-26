@@ -598,7 +598,25 @@ def test_pick_chat_target_none_when_no_workers(isolated_db, monkeypatch):
 
 def test_pick_chat_target_picks_eligible(isolated_db, monkeypatch):
     monkeypatch.setattr(compute_pool, "db", isolated_db)
+    # Pretend host has no GPU so any GPU worker beats it. Without this,
+    # the new "compare to host" logic correctly keeps chat local since
+    # the seeded worker has no proven hardware data.
+    monkeypatch.setattr(
+        compute_pool, "_host_capability_score",
+        lambda: (0, 0, float("inf")),
+    )
     _seed_chat_worker(isolated_db, address="c.local", auth_token="t")
+    # Tag the seeded worker as GPU-present so it beats the no-GPU host.
+    rows = isolated_db.list_compute_workers()
+    isolated_db.update_compute_worker_capabilities(
+        rows[0]["id"],
+        capabilities={
+            **(rows[0].get("capabilities") or {}),
+            "gpu_present": True,
+            "max_vram_seen_bytes": 4 * 1024 ** 3,
+            "loaded_count": 1,
+        },
+    )
     target = compute_pool.pick_chat_target("gemma4:e4b")
     assert target is not None
     assert target == ("http://c.local:11434", "t")
@@ -802,12 +820,113 @@ def test_capability_score_orders_more_vram_above_less():
     assert sorted_workers[0]["id"] == "big"
 
 
+def test_pick_chat_target_keeps_host_when_worker_weaker(isolated_db, monkeypatch):
+    """Worker is GPU but with only a 4 GB max-seen — host has 8 GB
+    VRAM. The router must NOT route the chat to the worker, because
+    routing to a weaker GPU through a LAN hop is strictly worse than
+    keeping the chat local. This is the user's main complaint about
+    the prior recap: 'fits host VRAM → host' was too greedy."""
+    import time
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    # Pretend host has 8 GB of GPU.
+    monkeypatch.setattr(
+        compute_pool, "_host_capability_score",
+        lambda: (1, 8 * 1024 ** 3, float("inf")),
+    )
+
+    wid = isolated_db.create_compute_worker(
+        label="weak", address="w.local", transport="lan", use_for_chat=True,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": "small:7b", "details": {}}],
+            "rpc_server_reachable": True, "rpc_port": 50052, "rpc_error": None,
+            "gpu_present": True, "max_vram_seen_bytes": 4 * 1024 ** 3, "loaded_count": 1,
+        },
+        last_seen=time.time() - 5.0, last_error="",
+    )
+    assert compute_pool.pick_chat_target("small:7b") is None  # host wins
+
+
+def test_pick_chat_target_routes_to_worker_when_strictly_more_capable(
+    isolated_db, monkeypatch
+):
+    """Worker has loaded a 14 GB model — that's a hard lower bound on
+    its VRAM. Host has 8 GB. The chat must route to the worker. This
+    is the case where 'use the more powerful machine' actually fires."""
+    import time
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    monkeypatch.setattr(
+        compute_pool, "_host_capability_score",
+        lambda: (1, 8 * 1024 ** 3, float("inf")),
+    )
+
+    wid = isolated_db.create_compute_worker(
+        label="beefy", address="big.local", transport="lan", use_for_chat=True,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": "small:7b", "details": {}}],
+            "rpc_server_reachable": True, "rpc_port": 50052, "rpc_error": None,
+            "gpu_present": True, "max_vram_seen_bytes": 14 * 1024 ** 3,
+            "loaded_count": 1,
+        },
+        last_seen=time.time() - 5.0, last_error="",
+    )
+    target = compute_pool.pick_chat_target("small:7b")
+    assert target is not None
+    assert target[0] == "http://big.local:11434"
+
+
+def test_route_chat_uses_ollama_when_worker_can_hold_model(isolated_db, monkeypatch):
+    """A 14 GB model doesn't fit the host's 8 GB VRAM, but a worker has
+    proven it can hold a 16 GB model. The router should pick Ollama
+    (single-node path) rather than spinning up a split — single-node
+    is faster (no LAN per-token overhead). Downstream pick_chat_target
+    sends the chat to the worker."""
+    import time
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    # Host: 8 GB VRAM (so host_budget = 8 GB * 0.85 = 6.8 GB).
+    monkeypatch.setattr(compute_pool, "_host_vram_budget_bytes", lambda: int(8 * 1024 ** 3 * 0.85))
+    # Model: 14 GB.
+    monkeypatch.setattr(
+        compute_pool, "resolve_ollama_model",
+        lambda name: {"gguf_path": "/m.gguf", "size_bytes": 14 * 1024 ** 3, "manifest": {}},
+    )
+
+    wid = isolated_db.create_compute_worker(
+        label="big", address="big.local", transport="lan", use_for_chat=True,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": "huge:24b", "details": {}}],
+            "rpc_server_reachable": True, "rpc_port": 50052, "rpc_error": None,
+            "gpu_present": True, "max_vram_seen_bytes": 16 * 1024 ** 3,
+            "loaded_count": 1,
+        },
+        last_seen=time.time() - 5.0, last_error="",
+    )
+    decision = _run(compute_pool.route_chat_for("huge:24b"))
+    assert decision == {"engine": "ollama"}
+
+
 def test_pick_chat_target_picks_gpu_worker_over_cpu_only(isolated_db, monkeypatch):
     """End-to-end: with two eligible chat workers, the GPU one must
     win the route. Maps to the user's 'prefer the more powerful
     worker' intent."""
     import time
     monkeypatch.setattr(compute_pool, "db", isolated_db)
+    # Host has no GPU so any worker beats it on the gpu_present axis.
+    monkeypatch.setattr(
+        compute_pool, "_host_capability_score",
+        lambda: (0, 0, float("inf")),
+    )
 
     # CPU-only worker, fresher probe.
     cpu_id = isolated_db.create_compute_worker(

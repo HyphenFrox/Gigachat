@@ -477,6 +477,27 @@ def _capability_score(worker: dict) -> tuple:
     )
 
 
+def _host_capability_score() -> tuple:
+    """Same shape as `_capability_score` but for the host machine — so
+    we can compare host directly against eligible workers.
+
+    `vram_gb > 0` → gpu_present=1; the byte count is the host's actual
+    detected VRAM (not a "max seen" lower bound). `last_seen` is +inf
+    so among capability-tied candidates the host wins (it's always
+    online from our perspective; routing there avoids a network hop).
+    """
+    try:
+        spec = sysdetect.detect_system()
+        vram_gb = float(spec.get("vram_gb") or 0.0)
+    except Exception:
+        vram_gb = 0.0
+    return (
+        1 if vram_gb > 0 else 0,
+        int(vram_gb * 1024 ** 3),
+        float("inf"),
+    )
+
+
 def _eligible_workers(flag: str, model: str | None = None) -> list[dict]:
     """Return enabled+fresh workers whose `flag` is on and (optionally) have
     `model` installed.
@@ -586,18 +607,31 @@ def pick_embed_target(model: str) -> tuple[str, str | None] | None:
 
 
 def pick_chat_target(model: str) -> tuple[str, str | None] | None:
-    """Choose a worker to run a single chat turn against, or None for host.
+    """Choose where the chat turn runs — return (base_url, token) for a
+    worker, or None to keep it on host.
 
-    Same eligibility rules as the embed picker, but gated on `use_for_chat`.
-    Picks the freshest eligible worker so the route is deterministic for
-    a given moment (helps tests; in practice with 1-2 workers a typical
-    home setup has, fairness over multiple turns falls out of normal
-    request timing rather than needing explicit round-robin).
+    This is where the "use the more powerful machine" rule lives.
+    Among eligible chat workers we already sort by `_capability_score`
+    (GPU > CPU, more VRAM > less). Now we ALSO compare the strongest
+    eligible worker against the host's own capability — if the worker
+    isn't strictly more powerful than host, we keep the turn local
+    (no LAN round-trip, KV cache stays warm). The worker only wins
+    when its proven hardware beats the host's.
+
+    Concretely: a worker beats host when EITHER
+      * host has no GPU and the worker does, OR
+      * both have a GPU but the worker has loaded a model larger than
+        the host's total VRAM (max_vram_seen_bytes > host_vram_bytes),
+        which is a hard lower-bound proof of more capacity.
     """
     cands = _eligible_workers("use_for_chat", model=model)
     if not cands:
         return None
     w = cands[0]
+    if _capability_score(w) <= _host_capability_score():
+        # Host is at least as powerful as the strongest eligible
+        # worker. Stay local.
+        return None
     return (_worker_base_url(w), db.get_compute_worker_auth_token(w["id"]))
 
 
@@ -857,13 +891,24 @@ async def route_chat_for(model_name: str) -> dict:
 
     Returns one of:
       {"engine": "ollama"}
-        → use the existing Ollama path on host (or a Phase 1 worker
-          via `pick_chat_target`). Caller continues with
-          `_stream_ollama_chat`.
+        → use the existing Ollama path. Downstream `pick_chat_target`
+          decides whether the actual node is host or a more-powerful
+          worker. Caller continues with `_stream_ollama_chat`.
 
       {"engine": "llama_server", "base_url": "http://127.0.0.1:NNNN", "label": <model>}
         → llama-server with --rpc was spawned (or already running) for
           this model. Caller uses `_stream_llama_server_chat` instead.
+
+    Decision logic (intelligent — the strongest single node wins):
+      * Compute the strongest single-node VRAM budget across host +
+        every eligible worker. A worker's contribution is its
+        `max_vram_seen_bytes` — only counts as "real" VRAM once the
+        worker has actually loaded a model that big.
+      * If the model fits the strongest single node → Ollama path.
+        (`pick_chat_target` then routes to whichever node won.)
+      * Else → split path: spawn llama-server with --rpc to every
+        eligible worker so layers fan across host + every node's
+        compute.
 
     Raises `RouteChatError` for unrecoverable cases. Side effects:
     may stop a currently-running llama-server (model switch) and may
@@ -885,20 +930,38 @@ async def route_chat_for(model_name: str) -> dict:
         return {"engine": "ollama"}
 
     size_bytes = info["size_bytes"]
+
+    # Strongest single-node budget. Ollama-eligible workers can hold
+    # the WHOLE model (Phase 1 routing), so their max-seen-VRAM
+    # competes with host VRAM as candidate single-node capacity.
     host_budget = _host_vram_budget_bytes()
-    if host_budget > 0 and size_bytes <= host_budget:
-        # Fits comfortably on host. Make sure no llama-server is
-        # holding VRAM we'll need.
+    chat_workers = _eligible_workers("use_for_chat", model=model_name)
+    best_worker_capacity = 0
+    if chat_workers:
+        # Take the worker that's proven the most VRAM. No headroom
+        # multiplier here — `max_vram_seen_bytes` already represents
+        # actual occupied VRAM during a previous load (including KV
+        # cache + overhead). A worker that successfully held a 16 GB
+        # model can hold another 16 GB model without further slack.
+        best_worker_capacity = max(
+            (w.get("capabilities") or {}).get("max_vram_seen_bytes") or 0
+            for w in chat_workers
+        )
+
+    strongest_single = max(host_budget, best_worker_capacity)
+    if strongest_single > 0 and size_bytes <= strongest_single:
+        # Fits a single node. Ollama path. pick_chat_target picks
+        # which node (host vs strongest-eligible-worker).
         await stop_all_running_splits()
         return {"engine": "ollama"}
 
-    # Need the split path. Find eligible workers.
+    # Need the split path. Find rpc-eligible workers (not the same as
+    # chat-eligible — split needs rpc-server, not whole-model-loading).
     workers = _eligible_split_workers()
     if not workers:
-        # Without workers, the only thing we could do is run on host
-        # with CPU offload — Ollama already does that automatically,
-        # so falling through to the Ollama path is the right call. If
-        # that fails the user gets Ollama's actual error message.
+        # No rpc workers. Fall back to Ollama on host — its CPU offload
+        # at least lets big models run slowly on host alone, which is
+        # better than refusing.
         await stop_all_running_splits()
         return {"engine": "ollama"}
 
