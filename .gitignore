@@ -28,6 +28,10 @@ auth.json
 auth_secret.key
 vapid.json
 
+# Per-machine connection details (Tailscale IPs, SSH config notes).
+# Contains identifying network info — never commit.
+LAPTOP.md
+
 # Claude Code local state
 .claude/
 .claude-test/
