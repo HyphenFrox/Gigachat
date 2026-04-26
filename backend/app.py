@@ -84,7 +84,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from . import agent, auth, db, mcp, ollama_runtime, push, sysdetect, tools
+from . import agent, auth, compute_pool, db, mcp, ollama_runtime, push, sysdetect, tools
 
 ROOT = Path(__file__).resolve().parent.parent
 # In production, the frontend is built to `frontend/dist` by Vite.
@@ -808,6 +808,20 @@ async def _auto_tune_ollama_models() -> None:
 
 
 @app.on_event("startup")
+async def _start_compute_pool_probe() -> None:
+    """Kick off the background liveness/capability sweep for compute workers.
+
+    The first sweep fires immediately so the Settings UI doesn't show stale
+    "never seen" state on a fresh boot; the loop then re-runs every 5 min.
+    Cheap: two GETs per enabled worker. No-op when no workers registered.
+    """
+    try:
+        compute_pool.start_periodic_probe()
+    except Exception as e:
+        print(f"[compute_pool] periodic probe failed to start: {e}", file=sys.stderr)
+
+
+@app.on_event("startup")
 async def _start_mcp() -> None:
     """Spawn every enabled MCP server once the event loop is running.
 
@@ -843,6 +857,16 @@ async def _stop_stale_watchdog() -> None:
             await _STALE_WATCHDOG_TASK
         except (asyncio.CancelledError, Exception):
             pass
+
+
+@app.on_event("shutdown")
+async def _stop_compute_pool_probe() -> None:
+    """Cancel the compute-pool sweep so uvicorn exits cleanly and the test
+    runner doesn't see a stranded task."""
+    try:
+        compute_pool.stop_periodic_probe()
+    except Exception:
+        pass
 
 
 @app.on_event("shutdown")
@@ -3312,6 +3336,29 @@ def api_delete_compute_worker(wid: str) -> dict:
     if not n:
         raise HTTPException(404, "worker not found")
     return {"ok": True, "deleted": wid}
+
+
+@app.post("/api/compute-workers/{wid}/probe")
+async def api_probe_compute_worker(wid: str) -> dict:
+    """Manual "Test connection" trigger from the Settings UI.
+
+    Probes one worker now (out-of-band of the 5-min sweep) and returns the
+    fresh result so the UI can show success/failure immediately. The probe
+    machinery itself persists capabilities/last_error/last_seen on the row,
+    so a subsequent GET /api/compute-workers reflects the same outcome.
+    """
+    result = await compute_pool.probe_worker(wid)
+    if result.get("error") == "worker not found":
+        raise HTTPException(404, "worker not found")
+    return result
+
+
+@app.post("/api/compute-workers/probe-all")
+async def api_probe_all_compute_workers() -> dict:
+    """Probe every enabled worker now. Useful as a "refresh all" action
+    from the Settings panel; returns a summary list (per-worker ok/error)
+    and the heavy capability data is persisted on the rows themselves."""
+    return {"results": await compute_pool.probe_all_enabled()}
 
 
 # ---------------------------------------------------------------------------
