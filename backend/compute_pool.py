@@ -717,6 +717,15 @@ def pick_split_chat_target(model_name: str) -> tuple[str, str] | None:
 # the model's KV cache. Below this fraction → Ollama. Above → split.
 _HOST_VRAM_USE_FRACTION = 0.85
 
+# How much of the host's TOTAL memory (VRAM + RAM) we'll trust Ollama
+# to run a single model from. Ollama auto-offloads layers that don't
+# fit VRAM into system RAM and runs them on CPU — slow per layer, but
+# strictly faster than streaming layer activations across a LAN every
+# token. 70% of (vram + ram) leaves room for the OS, browser, the
+# Gigachat backend itself, and KV cache. Below this fraction → host
+# (Ollama). Above → engage split path with workers.
+_HOST_TOTAL_USE_FRACTION = 0.70
+
 # Path to Ollama's on-disk model store. Default location on every
 # platform Ollama supports; matches what `ollama_runtime` assumes.
 _OLLAMA_MODELS_DIR = Path.home() / ".ollama" / "models"
@@ -805,13 +814,37 @@ def resolve_ollama_model(model_name: str) -> dict | None:
 
 def _host_vram_budget_bytes() -> int:
     """Bytes of host VRAM we're willing to let a single Ollama-loaded
-    model occupy. Below this → Ollama; above → engage split path."""
+    model occupy in VRAM only. Used for ranking host vs workers in
+    `_host_capability_score` (which compares pure GPU memory). NOT the
+    threshold for engaging the split path — that's
+    `_host_total_capacity_bytes` below."""
     try:
         spec = sysdetect.detect_system()
         vram_gb = float(spec.get("vram_gb") or 0.0)
     except Exception:
         vram_gb = 0.0
     return int(vram_gb * _HOST_VRAM_USE_FRACTION * 1024 * 1024 * 1024)
+
+
+def _host_total_capacity_bytes() -> int:
+    """Bytes the host can hold a single model in (VRAM + RAM). Ollama
+    natively uses CPU offload — layers that don't fit VRAM live in
+    system RAM and run on CPU. That stays single-node (no per-token
+    LAN overhead), so we should NOT engage split unless the model
+    truly exceeds the host's total memory budget.
+
+    For this host (8 GB VRAM + 15.8 GB RAM, 70% safety margin): ≈16.7 GB.
+    A 9 GB model fits trivially, even though it doesn't fit VRAM alone.
+    """
+    try:
+        spec = sysdetect.detect_system()
+        vram_gb = float(spec.get("vram_gb") or 0.0)
+        ram_gb = float(spec.get("ram_gb") or 0.0)
+    except Exception:
+        vram_gb = 0.0
+        ram_gb = 0.0
+    total_gb = vram_gb + ram_gb
+    return int(total_gb * _HOST_TOTAL_USE_FRACTION * 1024 * 1024 * 1024)
 
 
 def _eligible_split_workers() -> list[dict]:
@@ -964,27 +997,29 @@ async def route_chat_for(model_name: str) -> dict:
 
     size_bytes = info["size_bytes"]
 
-    # Strongest single-node budget. Ollama-eligible workers can hold
-    # the WHOLE model (Phase 1 routing), so their max-seen-VRAM
-    # competes with host VRAM as candidate single-node capacity.
-    host_budget = _host_vram_budget_bytes()
+    # Strongest single-node budget. The host counts its TOTAL memory
+    # (VRAM + RAM with a 70% safety multiplier) because Ollama uses
+    # CPU offload natively — layers that don't fit VRAM run on CPU
+    # from RAM, single-node. Workers count their proven max-VRAM
+    # (from /api/ps); we don't have visibility into their RAM, so we
+    # under-count their capacity and only credit them for what we've
+    # actually seen them load.
+    host_total = _host_total_capacity_bytes()
     chat_workers = _eligible_workers("use_for_chat", model=model_name)
     best_worker_capacity = 0
     if chat_workers:
-        # Take the worker that's proven the most VRAM. No headroom
-        # multiplier here — `max_vram_seen_bytes` already represents
-        # actual occupied VRAM during a previous load (including KV
-        # cache + overhead). A worker that successfully held a 16 GB
-        # model can hold another 16 GB model without further slack.
         best_worker_capacity = max(
             (w.get("capabilities") or {}).get("max_vram_seen_bytes") or 0
             for w in chat_workers
         )
 
-    strongest_single = max(host_budget, best_worker_capacity)
+    strongest_single = max(host_total, best_worker_capacity)
     if strongest_single > 0 and size_bytes <= strongest_single:
-        # Fits a single node. Ollama path. pick_chat_target picks
-        # which node (host vs strongest-eligible-worker).
+        # Fits a single node (host RAM+VRAM combined, or a worker's
+        # proven VRAM). Ollama path. pick_chat_target picks which
+        # node (host vs strongest-eligible-worker) — single-node
+        # is always faster than RPC across a LAN, even with CPU
+        # offload involved on the chosen node.
         await stop_all_running_splits()
         return {"engine": "ollama"}
 
