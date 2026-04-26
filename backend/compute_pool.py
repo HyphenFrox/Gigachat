@@ -1303,23 +1303,21 @@ _KNOWN_OVERRIDE_REGISTRY: dict[str, dict] = {
         ),
     },
     "qwen3.5:9b": {
-        # Different failure class from gemma4: it's not multimodal,
-        # but Ollama's blob has a `qwen35.rope.dimension_sections`
-        # array of length 3 while llama.cpp's qwen35 loader expects 4
-        # — a hyperparameter metadata mismatch that no surgery can
-        # fix from tensor data alone. Surgery isn't applicable here
-        # ("download" strategy), so we always pull a known-good
-        # community GGUF. Unsloth's repo ships a clean variant.
+        # Hyperparameter metadata mismatch: Ollama's blob has a
+        # `qwen35.rope.dimension_sections` array of length 3 while
+        # llama.cpp's qwen35 loader expects 4. The fix is purely
+        # METADATA — tensors are fine. We patch the array in-place
+        # (extend with a `0` for the no-vision sentinel that the
+        # multimodal Qwen3-VL convention uses), keeping Ollama's
+        # exact Q4_K_M tensor data byte-for-byte. Zero bandwidth,
+        # zero quantization change.
         "needs_mmproj": False,
-        "main_strategy": "download",
-        "main_url": (
-            "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/"
-            "Qwen3.5-9B-Q5_K_M.gguf"
-        ),
-        "main_size_gb": 6.13,
+        "main_strategy": "qwen3_rope_metadata_patch",
         "reason": (
             "Ollama blob's qwen35.rope.dimension_sections array has "
-            "wrong length for stock llama.cpp's qwen35 loader."
+            "wrong length for stock llama.cpp's qwen35 loader; we "
+            "extend it from 3 to 4 elements (append 0) in metadata "
+            "without touching tensor data."
         ),
     },
     # gemma4:e4b is also bundled-multimodal, but small enough that the
@@ -1550,7 +1548,37 @@ async def _acquire_override_files(model_name: str, spec: dict) -> dict:
                     )
                     break
 
-        # Step 1: try local surgery for the main file if applicable.
+        # Step 1a: qwen3 rope-metadata patch — purely metadata fix on
+        # the local Ollama blob; tensors copied verbatim. Zero
+        # bandwidth, zero quantization change. Only applies to models
+        # whose strategy is `qwen3_rope_metadata_patch`.
+        if not main_path.is_file() and spec.get("main_strategy") == "qwen3_rope_metadata_patch":
+            blob_info = resolve_ollama_model(model_name)
+            ollama_blob = (blob_info or {}).get("ollama_blob_path")
+            if not ollama_blob:
+                manifest = _resolve_ollama_manifest(model_name)
+                if manifest:
+                    layers = manifest.get("layers") or []
+                    for layer in layers:
+                        if layer.get("mediaType") == "application/vnd.ollama.image.model":
+                            digest = (layer.get("digest") or "").replace("sha256:", "")
+                            candidate = _OLLAMA_MODELS_DIR / "blobs" / f"sha256-{digest}"
+                            if candidate.is_file():
+                                ollama_blob = str(candidate)
+                            break
+            if ollama_blob and Path(ollama_blob).is_file():
+                state.update({
+                    "status": "running", "phase": "metadata-patch",
+                    "progress_pct": 5.0,
+                })
+                ok = await _run_qwen3_rope_patch(ollama_blob, str(main_path))
+                if ok:
+                    log.info(
+                        "compute_pool: rope-metadata patch produced %s for %s",
+                        main_path, model_name,
+                    )
+
+        # Step 1b: try local surgery for the main file if applicable.
         if not main_path.is_file() and spec.get("main_strategy") == "extract_text_only":
             blob_info = resolve_ollama_model(model_name)
             ollama_blob = (blob_info or {}).get("ollama_blob_path")
@@ -1649,8 +1677,9 @@ async def _run_text_only_surgery(
     )
     if not script.is_file():
         return False
+    import sys as _sys
     cmd = [
-        sys.executable, str(script),
+        _sys.executable, str(script),
         "--src", ollama_blob,
         "--dst", dst,
         "--arch", arch,
@@ -1669,6 +1698,40 @@ async def _run_text_only_surgery(
             return 0
         except Exception as e:
             log.warning("compute_pool: surgery script error: %s", e)
+            return -1
+
+    rc = await asyncio.to_thread(_run)
+    return rc == 0 and Path(dst).is_file()
+
+
+async def _run_qwen3_rope_patch(ollama_blob: str, dst: str) -> bool:
+    """Invoke `scripts/repack_qwen3_rope_fix.py` in a subprocess to
+    extend Ollama's qwen3.5 GGUF rope-section arrays from length 3
+    to length 4 (zero bandwidth, zero quantization change).
+
+    Returns True if the patched file lands cleanly at `dst`. Failures
+    fall through to the download fallback if a URL is registered.
+    """
+    script = (
+        Path(__file__).resolve().parent.parent / "scripts" / "repack_qwen3_rope_fix.py"
+    )
+    if not script.is_file():
+        return False
+    import sys as _sys
+    cmd = [_sys.executable, str(script), "--src", ollama_blob, "--dst", dst]
+
+    def _run() -> int:
+        import subprocess as _sp
+        try:
+            r = _sp.run(cmd, capture_output=True, text=True, timeout=900)
+            if r.returncode != 0:
+                log.warning(
+                    "compute_pool: qwen rope-patch script exited %d: %s",
+                    r.returncode, (r.stderr or r.stdout)[:300],
+                )
+            return r.returncode
+        except Exception as e:
+            log.warning("compute_pool: qwen rope-patch script error: %s", e)
             return -1
 
     rc = await asyncio.to_thread(_run)
