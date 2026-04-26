@@ -1385,41 +1385,47 @@ async def route_chat_for(model_name: str) -> dict:
         await stop_all_running_splits()
         return {"engine": "ollama"}
 
-    # Tier 2: fits combined VRAM via layer split? Split-rpc-eligible
-    # workers (rpc-server reachable) are what matters here, not just
-    # chat-eligible — Phase 2 doesn't need the model installed on the
-    # worker.
+    # Tier 2: engage Phase 2 split. Split-rpc-eligible workers
+    # (rpc-server reachable) are what matters here — Phase 2 doesn't
+    # need the model installed on the worker; layer weights stream
+    # from host's local GGUF.
     #
-    # Speed gate on the split path: every layer transition between
-    # nodes costs one RPC roundtrip per token, so a slow LAN multiplies
-    # the per-token wall time. We compare the observed probe latency
-    # (a coarse but real LAN signal) against host CPU-offload viability:
-    #   * If host CAN run the model (size <= host_total_capacity) AND
-    #     the slowest worker's roundtrip would dominate, prefer host
-    #     CPU offload over split. Single-node beats LAN.
-    #   * If host CAN'T run it (size > host_total), engage split
-    #     regardless of LAN — half-speed split is strictly better than
-    #     "won't run at all".
+    # When to engage split:
+    #   * If model is so big the host CAN'T run it alone
+    #     (size > host_total) → engage split regardless of estimated
+    #     pool VRAM. Workers' `max_vram_seen_bytes` is a hard lower
+    #     bound (often 0 for never-benchmarked workers), so the
+    #     estimated combined VRAM is always an under-count. llama.cpp
+    #     itself does the actual per-layer placement based on each
+    #     rpc-server's real available memory; if it truly can't fit,
+    #     llama-server reports a clean error — strictly better than
+    #     "Ollama on host says no tokens" with no diagnostic.
+    #   * If host CAN run alone but estimated pool VRAM covers the
+    #     model AND the slowest worker LAN latency is < 150 ms,
+    #     engage split anyway — combined GPU VRAM beats single-host
+    #     CPU offload on a fast LAN. Above 150 ms latency we keep it
+    #     local (LAN cost dominates the GPU win).
     rpc_workers = _eligible_split_workers()
-    rpc_pool_vram = host_vram + sum(
-        (w.get("capabilities") or {}).get("max_vram_seen_bytes") or 0
-        for w in rpc_workers
-    )
-    if rpc_workers and rpc_pool_vram > 0 and size_bytes <= rpc_pool_vram:
+    if rpc_workers:
+        rpc_pool_vram = host_vram + sum(
+            (w.get("capabilities") or {}).get("max_vram_seen_bytes") or 0
+            for w in rpc_workers
+        )
         host_can_run_alone = host_total > 0 and size_bytes <= host_total
         worst_lan_latency_ms = max(
             (w.get("capabilities") or {}).get("probe_latency_ms") or 0
             for w in rpc_workers
         )
-        # Threshold tuned to typical home-LAN values: <50 ms = wired
-        # Ethernet or strong Wi-Fi → split likely wins. >150 ms = slow
-        # Wi-Fi or Tailscale-relay → CPU offload on host wins. Between
-        # 50–150 ms we lean toward split when the host can't run the
-        # model alone, otherwise toward host.
-        skip_split_for_lan = (
-            host_can_run_alone and worst_lan_latency_ms > 150
+
+        # Decision: engage split if host can't run alone (mandatory
+        # — only path that might work) OR if pool VRAM covers it AND
+        # LAN is fast enough.
+        engage_split = (
+            not host_can_run_alone
+            or (rpc_pool_vram > 0 and size_bytes <= rpc_pool_vram and worst_lan_latency_ms <= 150)
         )
-        if not skip_split_for_lan:
+
+        if engage_split:
             worker_ids = [w["id"] for w in rpc_workers]
             try:
                 base_url = await _ensure_split_running_for(model_name, info["gguf_path"], worker_ids)
