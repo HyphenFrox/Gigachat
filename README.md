@@ -274,9 +274,24 @@ After each successful local acquisition, the override files are distributed to e
 
 The chat layer surfaces acquisition progress via a `preparing_model` SSE event with status (`surgery` / `downloading-main` / `downloading-mmproj`) and progress percentage. UI shows a toast: *"Preparing gemma4:26b · downloading-mmproj · 60% · to fetch: ~1.1 GB · Retry in a few minutes."*
 
-### Known upstream limitation
+### SYCL+RPC bug workaround — dynamic worker backend
 
-Gemma 4 MoE models (`gemma4:26b`, `gemma4:31b`) currently fail to load via Phase 2 split with `"Remote RPC server crashed or returned malformed response"`. This is an upstream llama.cpp + Intel SYCL bug ([#21420](https://github.com/ggml-org/llama.cpp/issues/21420), [#20259](https://github.com/ggml-org/llama.cpp/issues/20259), [#21474](https://github.com/ggml-org/llama.cpp/issues/21474)) triggered by the fused MoE expert tensors crashing the SYCL backend on Intel iGPUs during layer push. The infrastructure (override mechanism, mmproj plumbing, adaptive ngl, dual-device exposure) all works — the route just produces a clean error until upstream fixes the SYCL+RPC interaction. Smaller / non-MoE models (`llama3.1:8b`, etc.) work fine through the full pool.
+llama.cpp has an open bug ([#21420](https://github.com/ggml-org/llama.cpp/issues/21420), [#20259](https://github.com/ggml-org/llama.cpp/issues/20259), [#21474](https://github.com/ggml-org/llama.cpp/issues/21474)) where pushing layer tensors over RPC to a worker's SYCL backend crashes the rpc-server with `"Remote RPC server crashed or returned malformed response"`. Empirically the bug fires for any non-trivial architecture (MoE, SSM hybrid, gemma4) — only vanilla transformers like llama3.1 sometimes survive.
+
+**Workaround in `compute_pool._ensure_split_running_for`**: when a Phase 2 split is about to spawn, every worker's rpc-server is restarted with `-d CPU` (no SYCL exposed). Workers contribute via system RAM + CPU compute; the host still does GPU compute via CUDA. After the split stops (`stop_all_running_splits`), workers restore to the default `-d SYCL0,CPU` so non-split paths (Phase 1 chat routing, embeddings, subagents) get full iGPU acceleration.
+
+The switch is dynamic and tracked in each worker's `capabilities.current_rpc_backend` so back-to-back split requests don't churn rpc-server unnecessarily.
+
+Empirical results on our 1-host + 2-laptop pool:
+
+| Model | Without pool (host alone) | With pool (split path) | Speedup |
+|---|---|---|---|
+| gemma4:31b (~17 GB) | 0.1 tok/s (heavy CPU offload) | 1.4 tok/s (split) | **14×** |
+| dolphin-mixtral:8x7b (24.6 GB) | 0.7 tok/s (CPU offload + disk paging) | 2.4 tok/s (split) | **3.6×** |
+| qwen3.5:9b (5.3 GB) | 15.0 tok/s (host fits) | 16.7 tok/s (router stays on host) | +11% |
+| gemma4:26b (16.7 GB) | 9.5 tok/s (Ollama mmap on host) | 8.4 tok/s (router still picks host) | -11% (state pressure) |
+
+The pool's value is the bottom two rows: models that were too big for the host alone now run at meaningful speed via layer-split across host + workers' RAM.
 
 ### Setup, per machine
 
