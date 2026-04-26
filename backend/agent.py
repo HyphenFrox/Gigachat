@@ -1236,27 +1236,45 @@ def _format_recall(hits: list[dict]) -> str:
 # /api/chat every turn — a TTL-less in-proc cache is fine because model caps
 # only change when the user re-pulls a model, which restarts the server via
 # the Ollama host anyway. Value is the raw list from /api/show.
-_MODEL_CAPS_CACHE: dict[str, list[str]] = {}
+_MODEL_CAPS_CACHE: dict[tuple[str, str], list[str]] = {}
 
 
-async def _model_capabilities(client: httpx.AsyncClient, model: str) -> list[str]:
+async def _model_capabilities(
+    client: httpx.AsyncClient,
+    model: str,
+    *,
+    base_url: str = OLLAMA_URL,
+    auth_token: str | None = None,
+) -> list[str]:
     """Fetch + cache the Ollama capabilities list for ``model``.
 
     Returns an empty list on any error so callers can fall back to default
     behaviour (don't pass opt-in flags the model might reject).
+
+    `base_url` defaults to the host's local Ollama; pass a worker URL when
+    routing a subagent / chat call to a registered worker. The cache key is
+    `(base_url, model)` so two Ollama instances reporting different caps for
+    the same model name don't pollute each other.
     """
-    cached = _MODEL_CAPS_CACHE.get(model)
+    cache_key = (base_url, model)
+    cached = _MODEL_CAPS_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    headers: dict[str, str] = {}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
     try:
         r = await client.post(
-            f"{OLLAMA_URL}/api/show", json={"name": model}, timeout=5.0
+            f"{base_url}/api/show",
+            json={"name": model},
+            headers=headers,
+            timeout=5.0,
         )
         r.raise_for_status()
         caps = r.json().get("capabilities") or []
     except Exception:
         caps = []
-    _MODEL_CAPS_CACHE[model] = caps
+    _MODEL_CAPS_CACHE[cache_key] = caps
     return caps
 
 
@@ -1267,6 +1285,8 @@ async def _stream_ollama_chat(
     *,
     adapter_mode: bool = False,
     disable_thinking: bool = False,
+    base_url: str = OLLAMA_URL,
+    auth_token: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     """Yield raw chunks from Ollama /api/chat with stream=true.
 
@@ -1315,11 +1335,18 @@ async def _stream_ollama_chat(
     if not adapter_mode:
         payload["tools"] = tool_schemas
     timeout = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0)
+    headers: dict[str, str] = {}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
     async with httpx.AsyncClient(timeout=timeout) as client:
-        caps = await _model_capabilities(client, model)
+        caps = await _model_capabilities(
+            client, model, base_url=base_url, auth_token=auth_token,
+        )
         if "thinking" in caps:
             payload["think"] = False if disable_thinking else True
-        async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as r:
+        async with client.stream(
+            "POST", f"{base_url}/api/chat", json=payload, headers=headers,
+        ) as r:
             # Ollama returns a JSON-encoded ``{"error": "..."}`` body on 4xx/5xx.
             # ``raise_for_status`` alone just surfaces the generic status line
             # ("Client error '400 Bad Request' for url ...") which hides the
@@ -2667,6 +2694,9 @@ async def run_subagent(
     parent_conv_id: str | None = None,
     parent_tool_call_id: str | None = None,
     branch_id: str | None = None,
+    *,
+    base_url: str = OLLAMA_URL,
+    auth_token: str | None = None,
 ) -> dict:
     """Execute `task` in an isolated agent loop. Returns the same
     {ok, output, error} shape as a normal tool result.
@@ -2798,7 +2828,10 @@ async def run_subagent(
         acc_text = ""
         tool_calls: list[dict] = []
         try:
-            async for chunk in _stream_ollama_chat(model, messages, schemas):
+            async for chunk in _stream_ollama_chat(
+                model, messages, schemas,
+                base_url=base_url, auth_token=auth_token,
+            ):
                 msg = chunk.get("message") or {}
                 if msg.get("content"):
                     acc_text += msg["content"]
@@ -2977,18 +3010,40 @@ async def run_subagents_parallel(
     # Pre-assign a stable branch id per task so the UI can differentiate
     # sibling subagents in a delegate_parallel fan-out.
     branch_ids = [f"sub_{uuid.uuid4().hex[:8]}" for _ in cleaned]
+
+    # Distribute across host + every eligible compute worker so the fan-out
+    # actually parallelizes on hardware: 6 tasks across 1 host + 2 workers
+    # schedules ~2 per machine. Fall through to host-only when no workers
+    # are registered or eligible (the common case before the user adds
+    # devices). Host is always slot 0 — gives the host first dibs on the
+    # smallest fan-outs (1-2 tasks) since its loopback Ollama is the
+    # cheapest hop and we don't want to wake up a sleeping laptop for a
+    # single subagent task.
+    targets: list[tuple[str, str | None]] = [(OLLAMA_URL, None)]
+    try:
+        targets.extend(compute_pool.list_subagent_workers(model))
+    except Exception:
+        # compute_pool can't fail here in practice (pure DB read), but
+        # belt-and-braces: a routing layer hiccup must never break the
+        # core delegate_parallel call. Stay host-only.
+        pass
+
     # Fan out. return_exceptions=True turns a single subagent crash into a
     # value in the results list rather than aborting the gather.
-    coros = [
-        run_subagent(
-            t, cwd, model, max_iterations,
-            subagent_type=subagent_type,
-            parent_conv_id=parent_conv_id,
-            parent_tool_call_id=parent_tool_call_id,
-            branch_id=bid,
+    coros = []
+    for i, (t, bid) in enumerate(zip(cleaned, branch_ids)):
+        base_url, token = targets[i % len(targets)]
+        coros.append(
+            run_subagent(
+                t, cwd, model, max_iterations,
+                subagent_type=subagent_type,
+                parent_conv_id=parent_conv_id,
+                parent_tool_call_id=parent_tool_call_id,
+                branch_id=bid,
+                base_url=base_url,
+                auth_token=token,
+            )
         )
-        for t, bid in zip(cleaned, branch_ids)
-    ]
     results = await asyncio.gather(*coros, return_exceptions=True)
 
     # Format each result into its own labelled block so the parent agent can

@@ -464,3 +464,88 @@ def test_pick_embed_target_no_token_when_unset(isolated_db, monkeypatch):
     target = compute_pool.pick_embed_target("nomic-embed-text")
     assert target is not None
     assert target[1] is None
+
+
+# --- list_subagent_workers ------------------------------------------------
+
+
+def _seed_eligible_subagent_worker(isolated_db, **kwargs):
+    """Helper for subagent picker tests — defaults to a chat model + the
+    `use_for_subagents` flag, but still uses the same eligibility shape
+    as the embed helper so we test the same plumbing."""
+    import time as _t
+    kwargs.setdefault("models", ("gemma4:e4b",))
+    kwargs.setdefault("use_for_embeddings", False)  # not relevant here
+    last_seen_age = kwargs.pop("last_seen_age_sec", 30.0)
+    last_error = kwargs.pop("last_error", "")
+    auth_token = kwargs.pop("auth_token", None)
+    label = kwargs.pop("label", "A")
+    address = kwargs.pop("address", "a.local")
+    enabled = kwargs.pop("enabled", True)
+    use_for_subagents = kwargs.pop("use_for_subagents", True)
+    models = kwargs.pop("models")
+    _ = kwargs.pop("use_for_embeddings", None)  # discard; we only need subagents flag
+    wid = isolated_db.create_compute_worker(
+        label=label,
+        address=address,
+        transport="lan",
+        enabled=enabled,
+        use_for_subagents=use_for_subagents,
+        auth_token=auth_token,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": m, "details": {}} for m in models],
+        },
+        last_seen=_t.time() - last_seen_age,
+        last_error=last_error,
+    )
+    return wid
+
+
+def test_list_subagent_workers_empty_when_no_workers(isolated_db, monkeypatch):
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    assert compute_pool.list_subagent_workers("gemma4:e4b") == []
+
+
+def test_list_subagent_workers_returns_eligible_only(isolated_db, monkeypatch):
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_subagent_worker(isolated_db, label="A", address="a.local")
+    _seed_eligible_subagent_worker(
+        isolated_db, label="off", address="off.local", use_for_subagents=False,
+    )
+    _seed_eligible_subagent_worker(
+        isolated_db, label="bad-model",
+        address="bad.local", models=("llama3.1:8b",),
+    )
+    targets = compute_pool.list_subagent_workers("gemma4:e4b")
+    assert len(targets) == 1
+    assert targets[0][0] == "http://a.local:11434"
+
+
+def test_list_subagent_workers_orders_freshest_first(isolated_db, monkeypatch):
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_subagent_worker(
+        isolated_db, label="old", address="old.local", last_seen_age_sec=1800,
+    )
+    _seed_eligible_subagent_worker(
+        isolated_db, label="new", address="new.local", last_seen_age_sec=10,
+    )
+    targets = compute_pool.list_subagent_workers("gemma4:e4b")
+    assert [t[0] for t in targets] == [
+        "http://new.local:11434",
+        "http://old.local:11434",
+    ]
+
+
+def test_list_subagent_workers_skips_workers_without_model(isolated_db, monkeypatch):
+    """If none of the workers has the requested chat model installed, we
+    can't route subagents there — Ollama would try to pull on the fly
+    and the fan-out latency would blow up. Caller falls back to host."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_subagent_worker(
+        isolated_db, address="a.local", models=("nomic-embed-text:latest",),
+    )
+    assert compute_pool.list_subagent_workers("gemma4:e4b") == []

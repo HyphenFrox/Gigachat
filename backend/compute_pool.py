@@ -359,3 +359,23 @@ def pick_embed_target(model: str) -> tuple[str, str | None] | None:
     base = _worker_base_url(w)
     token = db.get_compute_worker_auth_token(w["id"])
     return (base, token)
+
+
+def list_subagent_workers(model: str) -> list[tuple[str, str | None]]:
+    """Return every eligible compute worker for parallel-subagent fan-out.
+
+    The host itself is NOT in this list — the caller (`run_subagents_parallel`)
+    composes `[host] + workers` and round-robins, so a 6-task fan-out across
+    1 host + 2 workers schedules roughly 2 per machine. Returning workers
+    only here keeps `compute_pool` host-agnostic; agent.py owns the host URL.
+
+    Eligibility uses the same rules as embed routing: enabled, flag on,
+    fresh probe, model installed. Ordered freshest-first so a tied
+    distribution at least picks the healthier worker as the first
+    non-host slot.
+    """
+    cands = _eligible_workers("use_for_subagents", model=model)
+    return [
+        (_worker_base_url(w), db.get_compute_worker_auth_token(w["id"]))
+        for w in cands
+    ]
