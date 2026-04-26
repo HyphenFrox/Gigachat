@@ -1612,46 +1612,30 @@ async def route_chat_for(model_name: str) -> dict:
 
         if engage_split:
             worker_ids = [w["id"] for w in rpc_workers]
-            try:
-                base_url = await _ensure_split_running_for(
-                    model_name,
-                    info["gguf_path"],
-                    worker_ids,
-                    mmproj_path=info.get("mmproj_path"),
-                )
-                return {"engine": "llama_server", "base_url": base_url, "label": model_name}
-            except Exception as e:
-                log.warning("compute_pool: split start failed (%s); falling back to host", e)
-                # fall through to host CPU offload
+            # Strict semantics: if Tier 2 engages a split and the split
+            # fails, we DO NOT fall back to Ollama on host. Split was
+            # chosen because the host alone couldn't run this model
+            # cleanly (or because the pool is faster), so silently
+            # degrading to a much slower path defeats the user's intent
+            # in setting up the pool. Raise so the caller surfaces the
+            # error and the user can free pool memory / shrink the
+            # model / disable workers explicitly. The exception
+            # propagates out of `route_chat_for` to the chat layer.
+            base_url = await _ensure_split_running_for(
+                model_name,
+                info["gguf_path"],
+                worker_ids,
+                mmproj_path=info.get("mmproj_path"),
+            )
+            return {"engine": "llama_server", "base_url": base_url, "label": model_name}
 
-    # Tier 3: host CPU offload (still single-node, no LAN). If the
-    # model fits host's total memory, Ollama will run it slowly but
-    # correctly. Above the budget we fall through to the legacy split
-    # attempt one more time — even though we already established the
-    # split pool is too small, llama-server's per-layer placement may
-    # squeeze it in (workers have unreported RAM headroom).
-    if host_total > 0 and size_bytes <= host_total:
-        await stop_all_running_splits()
-        return {"engine": "ollama"}
-
-    # Need the split path. Find rpc-eligible workers (not the same as
-    # chat-eligible — split needs rpc-server, not whole-model-loading).
-    workers = _eligible_split_workers()
-    if not workers:
-        # No rpc workers. Fall back to Ollama on host — its CPU offload
-        # at least lets big models run slowly on host alone, which is
-        # better than refusing.
-        await stop_all_running_splits()
-        return {"engine": "ollama"}
-
-    worker_ids = [w["id"] for w in workers]
-    base_url = await _ensure_split_running_for(
-        model_name,
-        info["gguf_path"],
-        worker_ids,
-        mmproj_path=info.get("mmproj_path"),
-    )
-    return {"engine": "llama_server", "base_url": base_url, "label": model_name}
+    # Tier 3: no eligible RPC workers were found, OR Tier 2 decided
+    # not to engage split (host can run alone AND latency too high to
+    # benefit). Use Ollama on host. Ollama supports CPU offload + mmap
+    # spill so even larger-than-VRAM models run (slowly, via disk
+    # paging) without needing the pool.
+    await stop_all_running_splits()
+    return {"engine": "ollama"}
 
 
 def list_subagent_workers(model: str) -> list[tuple[str, str | None]]:
