@@ -1284,10 +1284,120 @@ _KNOWN_OVERRIDE_REGISTRY: dict[str, dict] = {
             "llama.cpp expects a separate mmproj file."
         ),
     },
-    # gemma4:31b would go here once we identify a working Unsloth/community
-    # GGUF + mmproj pair. Pending llama.cpp upstream fix for gemma4 + RPC
-    # + SYCL on Intel iGPU (#21420 / #20259 / #21474).
+    "gemma4:31b": {
+        "needs_mmproj": True,
+        "main_strategy": "extract_text_only",
+        "main_url": (
+            "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/"
+            "gemma-4-31B-it-Q5_K_M.gguf"
+        ),
+        "main_size_gb": 20.17,
+        "mmproj_url": (
+            "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/"
+            "mmproj-BF16.gguf"
+        ),
+        "mmproj_size_gb": 1.12,
+        "reason": (
+            "Same bundled-multimodal pattern as gemma4:26b — Ollama's "
+            "blob has a vision tower llama-server can't load directly."
+        ),
+    },
+    "qwen3.5:9b": {
+        # Different failure class from gemma4: it's not multimodal,
+        # but Ollama's blob has a `qwen35.rope.dimension_sections`
+        # array of length 3 while llama.cpp's qwen35 loader expects 4
+        # — a hyperparameter metadata mismatch that no surgery can
+        # fix from tensor data alone. Surgery isn't applicable here
+        # ("download" strategy), so we always pull a known-good
+        # community GGUF. Unsloth's repo ships a clean variant.
+        "needs_mmproj": False,
+        "main_strategy": "download",
+        "main_url": (
+            "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/"
+            "Qwen3.5-9B-Q5_K_M.gguf"
+        ),
+        "main_size_gb": 6.13,
+        "reason": (
+            "Ollama blob's qwen35.rope.dimension_sections array has "
+            "wrong length for stock llama.cpp's qwen35 loader."
+        ),
+    },
+    # gemma4:e4b is also bundled-multimodal, but small enough that the
+    # router's Tier 1 keeps it on host (Ollama's runtime handles its
+    # multimodal blob natively, so no override needed). Adding here
+    # would be defensive only.
 }
+
+
+# ---------------------------------------------------------------------------
+# Generic auto-detection: any GGUF that ships with bundled vision
+# tensors (`v.*`, `mm.*`) needs surgery + mmproj before it can load via
+# stock llama-server. The registry above provides DOWNLOAD URLs for
+# specific known models; this auto-detection lets us fire surgery for
+# ANY model with the bundled-multimodal pattern, even ones we haven't
+# explicitly registered. mmproj download still needs a registry entry
+# (CLIP-format metadata can't be safely derived from Ollama's bundle).
+# ---------------------------------------------------------------------------
+
+
+def _ollama_blob_has_bundled_multimodal(model_name: str) -> bool:
+    """Return True if Ollama's blob for `model_name` contains bundled
+    vision-tower tensors (`v.*` / `mm.*`) — a strong signal that
+    stock llama-server can't load it without surgery + a separate
+    mmproj. Cheap check (reads only the GGUF tensor index, not the
+    weights), so it's safe to call from the routing hot path.
+
+    Returns False on any read error so the caller falls back to
+    its previous behavior (registry lookup or skip).
+    """
+    info = resolve_ollama_model(model_name)
+    if not info:
+        return False
+    blob_path = info.get("ollama_blob_path") or info.get("gguf_path")
+    if not blob_path or not Path(blob_path).is_file():
+        return False
+    try:
+        import gguf
+        reader = gguf.GGUFReader(blob_path)
+    except Exception:
+        return False
+    for t in reader.tensors:
+        name = t.name or ""
+        if name.startswith("v.") or name.startswith("mm."):
+            return True
+    return False
+
+
+def _auto_synthesize_registry_entry(model_name: str) -> dict | None:
+    """If `model_name` looks like it needs surgery (Ollama blob has
+    bundled vision tensors) but isn't explicitly in the registry,
+    synthesize an "extract_text_only" entry on the fly.
+
+    The synthesized entry has NO download URLs — the user's local
+    Ollama blob is the only acquisition source. If surgery fails
+    or there's no Ollama blob, the chat-time error explains that
+    a registry entry is needed for the download fallback.
+
+    Returns None if the model doesn't need an override at all
+    (clean GGUF, would load fine in llama-server as-is).
+    """
+    if not _ollama_blob_has_bundled_multimodal(model_name):
+        return None
+    return {
+        "needs_mmproj": True,
+        "main_strategy": "extract_text_only",
+        "main_url": None,
+        "main_size_gb": 0,
+        "mmproj_url": None,
+        "mmproj_size_gb": 0,
+        "reason": (
+            "Auto-detected: Ollama's blob bundles vision tensors that "
+            "stock llama-server can't load. Surgery extracts the text "
+            "LLM from the local blob; provide an mmproj URL via the "
+            "registry to enable image input."
+        ),
+        "synthesized": True,
+    }
 
 
 # Acquisition state per model so concurrent route_chat_for calls don't
@@ -1332,7 +1442,18 @@ async def ensure_compatible_gguf(model_name: str) -> dict:
     """
     spec = _KNOWN_OVERRIDE_REGISTRY.get(model_name)
     if not spec:
-        return {"ok": True, "status": "no_override_needed"}
+        # Generic fallback: any model whose Ollama blob has bundled
+        # multimodal tensors (`v.*` / `mm.*`) needs surgery to load
+        # in stock llama-server, even if we haven't explicitly
+        # registered it. Synthesize a minimal "extract_text_only"
+        # spec on the fly so the acquisition pipeline kicks in.
+        # Surgery from the local Ollama blob is the entire strategy
+        # — without a download URL we can't fall back to HF, but
+        # most users will have the Ollama blob locally, so the
+        # "lossless local extraction" path covers the common case.
+        spec = _auto_synthesize_registry_entry(model_name)
+        if not spec:
+            return {"ok": True, "status": "no_override_needed"}
 
     main_path = _override_gguf_path_for(model_name)
     mmproj_path = _override_mmproj_path_for(model_name)
