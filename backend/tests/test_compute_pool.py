@@ -561,6 +561,140 @@ def test_list_subagent_workers_skips_workers_without_model(isolated_db, monkeypa
     assert compute_pool.list_subagent_workers("gemma4:e4b") == []
 
 
+def test_list_subagent_workers_skips_too_slow_relative_to_host(isolated_db, monkeypatch):
+    """Worker with 4 tok/s vs host's 100 tok/s should be excluded from
+    parallel fan-out. Round-robin distributes tasks evenly; a worker
+    25× slower than host bottlenecks the whole fan-out (slowest task
+    blocks the gather). Maps to the user's hardware: weak laptop
+    shouldn't poison delegate_parallel on a strong host."""
+    import time
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    monkeypatch.setattr(
+        compute_pool, "_host_capability_score",
+        lambda model_name=None: (100.0, 1, 8 * 1024 ** 3, 16.0, 16, float("inf")),
+    )
+
+    wid = isolated_db.create_compute_worker(
+        label="slow", address="slow.local", transport="lan", use_for_subagents=True,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": "gemma4:e4b", "details": {}}],
+            "rpc_server_reachable": True, "rpc_port": 50052, "rpc_error": None,
+            "gpu_present": False, "max_vram_seen_bytes": 0,
+            "loaded_count": 1,
+            "tokens_per_second": 4.0,  # 4% of host's 100 — way below the 25% gate
+            "tps_measured_at": time.time(),
+            "tps_model": "gemma4:e4b",
+        },
+        last_seen=time.time() - 5.0, last_error="",
+    )
+    targets = compute_pool.list_subagent_workers("gemma4:e4b")
+    assert targets == [], "weak worker must NOT be included in parallel fan-out"
+
+
+def test_list_subagent_workers_includes_fast_enough_workers(isolated_db, monkeypatch):
+    """Worker at 50% of host's TPS — above the 25% gate, should be included."""
+    import time
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    monkeypatch.setattr(
+        compute_pool, "_host_capability_score",
+        lambda model_name=None: (100.0, 1, 8 * 1024 ** 3, 16.0, 16, float("inf")),
+    )
+
+    wid = isolated_db.create_compute_worker(
+        label="fast-enough", address="ok.local", transport="lan", use_for_subagents=True,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": "gemma4:e4b", "details": {}}],
+            "rpc_server_reachable": True, "rpc_port": 50052, "rpc_error": None,
+            "gpu_present": True, "max_vram_seen_bytes": 4 * 1024 ** 3,
+            "loaded_count": 1,
+            "tokens_per_second": 60.0,  # 60% of host — above the 25% gate
+            "tps_measured_at": time.time(),
+            "tps_model": "gemma4:e4b",
+        },
+        last_seen=time.time() - 5.0, last_error="",
+    )
+    targets = compute_pool.list_subagent_workers("gemma4:e4b")
+    assert len(targets) == 1
+    assert targets[0][0] == "http://ok.local:11434"
+
+
+def test_list_subagent_workers_includes_unmeasured_worker(isolated_db, monkeypatch):
+    """A worker that's never been benchmarked (tps=0 cache miss)
+    should be INCLUDED — the gate falls back to letting it in so
+    fresh workers can bootstrap into the parallel pool. The next
+    probe sweep measures real TPS and the gate then takes effect."""
+    import time
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    monkeypatch.setattr(
+        compute_pool, "_host_capability_score",
+        lambda model_name=None: (100.0, 1, 8 * 1024 ** 3, 16.0, 16, float("inf")),
+    )
+
+    wid = isolated_db.create_compute_worker(
+        label="unbenched", address="unb.local", transport="lan", use_for_subagents=True,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": "gemma4:e4b", "details": {}}],
+            "rpc_server_reachable": True, "rpc_port": 50052, "rpc_error": None,
+            "gpu_present": True, "max_vram_seen_bytes": 4 * 1024 ** 3,
+            # No tokens_per_second yet — never benchmarked.
+        },
+        last_seen=time.time() - 5.0, last_error="",
+    )
+    targets = compute_pool.list_subagent_workers("gemma4:e4b")
+    assert len(targets) == 1
+
+
+# --- Phase 2 commit 18: deferred auto-sync ------------------------------
+
+
+def test_eligible_workers_enqueues_sync_instead_of_firing(isolated_db, monkeypatch):
+    """When a worker is enabled+fresh+ssh_host but missing the model,
+    `_eligible_workers` must NOT spawn an SCP — only enqueue. This
+    prevents auto-sync SCP processes from competing for host disk/CPU
+    during chat turns."""
+    import time
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    # Clear any leftover queue state.
+    compute_pool._DEFERRED_SYNC_QUEUE.clear()
+    compute_pool._AUTO_SYNC_TASKS.clear()
+
+    wid = isolated_db.create_compute_worker(
+        label="A", address="a.local", transport="lan", ssh_host="a-alias",
+        use_for_chat=True,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": "different:7b", "details": {}}],  # NOT the one we want
+            "rpc_server_reachable": True, "rpc_port": 50052, "rpc_error": None,
+        },
+        last_seen=time.time() - 5.0, last_error="",
+    )
+
+    # Routing call: worker missing the requested model.
+    cands = compute_pool._eligible_workers("use_for_chat", model="wanted:7b")
+    assert cands == [], "worker missing the model must not be eligible"
+
+    # Side effect: queued, NOT spawned.
+    assert (wid, "wanted:7b") in compute_pool._DEFERRED_SYNC_QUEUE
+    assert not compute_pool._AUTO_SYNC_TASKS, (
+        "auto-sync must not spawn during routing — defer to periodic probe"
+    )
+
+
 # --- pick_chat_target -----------------------------------------------------
 
 

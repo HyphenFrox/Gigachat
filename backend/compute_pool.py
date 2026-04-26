@@ -82,6 +82,16 @@ _THROUGHPUT_BENCH_TOKENS = 20
 # first route decision and refreshed every TTL.
 _HOST_THROUGHPUT_CACHE: dict[str, tuple[float, float]] = {}  # model -> (tps, measured_at)
 
+# Subagent fan-out performance gate. A worker is included in the
+# parallel-subagent target list only if its measured TPS is at least
+# this fraction of the host's measured TPS for the same model.
+# Rationale: round-robin fan-out gets bottlenecked by the slowest
+# task; a worker dramatically slower than host slows down the whole
+# fan-out instead of accelerating it. 0.25 = "must be at least
+# one-quarter as fast as host." Tunable; chosen so a weak laptop
+# doesn't degrade `delegate_parallel` on a fast host.
+_SUBAGENT_MIN_PERF_RATIO = 0.25
+
 
 def _worker_base_url(worker: dict) -> str:
     """Build the Ollama base URL for a worker row."""
@@ -604,7 +614,13 @@ _PROBE_TASK: asyncio.Task | None = None
 
 async def _periodic_loop() -> None:
     """Internal: sweep every `_SWEEP_INTERVAL_SEC`. Started/stopped via
-    `start_periodic_probe` / `stop_periodic_probe` on app lifecycle."""
+    `start_periodic_probe` / `stop_periodic_probe` on app lifecycle.
+
+    After each liveness sweep we drain any queued auto-syncs that
+    routing calls deferred. Doing it here (rather than from the
+    routing call) keeps SCP off the chat hot path — bench-confirmed
+    win in commit 18.
+    """
     while True:
         try:
             await probe_all_enabled()
@@ -612,6 +628,15 @@ async def _periodic_loop() -> None:
             raise
         except Exception as e:
             log.warning("compute_pool periodic probe failed: %s", e)
+        # Drain the auto-sync queue after the sweep — workers'
+        # capabilities reflect any newly-installed models from the
+        # previous drain, so the queue from this turn is fresh.
+        try:
+            n = await drain_deferred_syncs()
+            if n:
+                log.info("compute_pool: started %d deferred LAN-copy task(s)", n)
+        except Exception as e:
+            log.warning("compute_pool: drain_deferred_syncs failed: %s", e)
         try:
             await asyncio.sleep(_SWEEP_INTERVAL_SEC)
         except asyncio.CancelledError:
@@ -838,56 +863,89 @@ def _eligible_workers(flag: str, model: str | None = None) -> list[dict]:
     return out
 
 
-# Track in-flight auto-syncs so we don't fire the same SCP twice if
-# `_eligible_workers` runs back-to-back (every chat turn). Keyed by
-# (worker_id, model_name); value is a Task we never await but keep
-# referenced so it doesn't get GC'd mid-flight.
+# Auto-sync architecture (Phase 2 commit 18 redesign):
+#
+# Auto-syncing was previously fired DIRECTLY from the routing call
+# (`_eligible_workers`) — every chat turn that found a worker missing
+# a model would kick off a background SCP. Real-world bench showed
+# that SCP eats host disk + CPU bandwidth, contending with the chat
+# turn that's actively streaming. Net result: chat got 4% slower with
+# pool enabled, embed savings didn't compound.
+#
+# New design: routing calls only ENQUEUE the (worker, model) sync
+# requests; they do NOT spawn SCPs. The periodic probe loop
+# (`_periodic_loop`, every 5 min) drains the queue and runs the syncs
+# then. So:
+#   * Chat turns never compete with SCP for host bandwidth.
+#   * Background sync still happens — just batched on the probe
+#     cadence instead of per-turn.
+#   * The bench now measures hot inference cleanly, no SCP noise.
+_DEFERRED_SYNC_QUEUE: set[tuple[str, str]] = set()
 _AUTO_SYNC_TASKS: dict[tuple[str, str], asyncio.Task] = {}
 
 
 def _maybe_kickoff_lan_sync(worker: dict, model_name: str) -> None:
-    """Launch a background SCP of `model_name` from host to `worker`.
+    """Defer (not fire) a LAN-copy of `model_name` to `worker`.
 
-    Called from the routing layer when a worker is *almost* eligible —
-    same hardware/freshness/flag eligibility but missing the model. The
-    auto-sync transparently fixes the model gap; subsequent routes get
-    a more capable choice.
+    Called from `_eligible_workers` when a worker is otherwise eligible
+    but missing the model. Just adds to the deferred queue; the
+    periodic probe loop drains it. Means routing decisions are pure
+    DB reads — no SCP work in the chat hot path.
 
     Guards:
-      * ssh_host must be set on the worker (the only way we can reach it).
-      * Skip if the same (worker, model) is already mid-sync.
-      * Wrapped in try/except — sync failures NEVER bubble to the caller.
+      * ssh_host must be set on the worker.
+      * Skip if already in queue or already mid-sync.
     """
     wid = worker.get("id")
     if not wid or not model_name:
         return
+    if not (worker.get("ssh_host") or "").strip():
+        return
     key = (wid, model_name)
+    if key in _DEFERRED_SYNC_QUEUE:
+        return
     existing = _AUTO_SYNC_TASKS.get(key)
     if existing and not existing.done():
-        return  # already in flight; let it finish
+        return  # already mid-flight from a prior drain
+    _DEFERRED_SYNC_QUEUE.add(key)
 
+
+async def drain_deferred_syncs() -> int:
+    """Run any queued auto-syncs in the background.
+
+    Called from the periodic probe loop AFTER the liveness sweep
+    finishes — so syncs never compete with chat traffic the way the
+    old per-routing trigger did. Returns the number of syncs
+    started so the caller can log it.
+    """
+    started = 0
+    pending = list(_DEFERRED_SYNC_QUEUE)
+    _DEFERRED_SYNC_QUEUE.clear()
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # Sync entry point — no event loop, skip. The next async caller
-        # will retry.
-        return
+        # Re-enqueue and bail; next sweep will catch it.
+        _DEFERRED_SYNC_QUEUE.update(pending)
+        return 0
 
-    async def _run():
-        # Local import to dodge the import cycle (model_sync depends
-        # on this module for `_model_matches`).
-        try:
-            from . import model_sync
-            await model_sync.sync_model(model_name, wid)
-            log.info("compute_pool: auto-synced %s → worker %s",
-                     model_name, worker.get("label"))
-        except Exception as e:
-            log.info("compute_pool: auto-sync %s → %s deferred (%s)",
-                     model_name, worker.get("label"), e)
-        finally:
-            _AUTO_SYNC_TASKS.pop(key, None)
-
-    _AUTO_SYNC_TASKS[key] = loop.create_task(_run())
+    for wid, model_name in pending:
+        existing = _AUTO_SYNC_TASKS.get((wid, model_name))
+        if existing and not existing.done():
+            continue
+        async def _run(wid=wid, model_name=model_name):
+            try:
+                from . import model_sync
+                await model_sync.sync_model(model_name, wid)
+                log.info("compute_pool: auto-synced %s -> worker %s",
+                         model_name, wid)
+            except Exception as e:
+                log.info("compute_pool: auto-sync %s -> %s failed: %s",
+                         model_name, wid, e)
+            finally:
+                _AUTO_SYNC_TASKS.pop((wid, model_name), None)
+        _AUTO_SYNC_TASKS[(wid, model_name)] = loop.create_task(_run())
+        started += 1
+    return started
 
 
 def pick_embed_target(model: str) -> tuple[str, str | None] | None:
@@ -1400,15 +1458,50 @@ def list_subagent_workers(model: str) -> list[tuple[str, str | None]]:
 
     The host itself is NOT in this list — the caller (`run_subagents_parallel`)
     composes `[host] + workers` and round-robins, so a 6-task fan-out across
-    1 host + 2 workers schedules roughly 2 per machine. Returning workers
-    only here keeps `compute_pool` host-agnostic; agent.py owns the host URL.
+    1 host + 2 workers schedules roughly 2 per machine.
 
-    Eligibility uses the same rules as embed routing: enabled, flag on,
-    fresh probe, model installed. Ordered freshest-first so a tied
-    distribution at least picks the healthier worker as the first
-    non-host slot.
+    Performance gate (Phase 2 commit 18): a worker is included ONLY if
+    its measured throughput is at least `_SUBAGENT_MIN_PERF_RATIO` of
+    the host's measured throughput on this model. Without this gate,
+    a worker that's 25× slower than host (e.g. a Core 3 100U laptop
+    iGPU vs an RTX 3060 Ti) would still get round-robin-assigned tasks
+    in `run_subagents_parallel` — and the slowest task bottlenecks the
+    whole fan-out. Net result: parallel calls get SLOWER with the
+    weak worker than without it. The gate keeps weak workers out of
+    parallel jobs while still letting them serve embed routing and
+    contribute layer storage to Phase 2 splits.
+
+    When neither host nor worker has a measured TPS yet (cold cache),
+    we fall back to including the worker — there's no signal to make
+    a smarter call, and the next probe will fix it.
     """
     cands = _eligible_workers("use_for_subagents", model=model)
+    if not cands:
+        return []
+
+    host_score = _host_capability_score(model)
+    host_tps = host_score[0]
+
+    if host_tps > 0:
+        min_tps = host_tps * _SUBAGENT_MIN_PERF_RATIO
+        gated = []
+        for w in cands:
+            w_tps = float((w.get("capabilities") or {}).get("tokens_per_second") or 0.0)
+            if w_tps <= 0:
+                # No measurement yet — include and let the probe sort
+                # this out next sweep. Excluding unknown workers would
+                # never let a fresh worker bootstrap into the pool.
+                gated.append(w)
+            elif w_tps >= min_tps:
+                gated.append(w)
+            else:
+                log.info(
+                    "subagent fan-out: skipping %r (tps=%.1f) — below %.0f%% of host's %.1f tps",
+                    w.get("label"), w_tps,
+                    _SUBAGENT_MIN_PERF_RATIO * 100, host_tps,
+                )
+        cands = gated
+
     return [
         (_worker_base_url(w), db.get_compute_worker_auth_token(w["id"]))
         for w in cands
