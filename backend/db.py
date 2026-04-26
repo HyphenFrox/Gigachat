@@ -399,6 +399,42 @@ def init() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_compute_workers_enabled
                 ON compute_workers(enabled);
+
+            -- Split-model definitions (Phase 2 of the compute-pool feature).
+            --
+            -- A "split model" is a single GGUF served by `llama-server` on
+            -- the host with `--rpc <worker>:<port>` flags so layers fan
+            -- across one or more compute workers. Used for models too big
+            -- for the host's own VRAM/RAM (Phase 1 routes WHOLE requests
+            -- per machine; Phase 2 splits ONE inference across machines).
+            --
+            -- `gguf_path` is an absolute path on the host's disk — typically
+            -- pointing at an Ollama-managed blob (`~/.ollama/models/blobs/
+            -- sha256-…`). We re-use Ollama's already-downloaded GGUFs to
+            -- avoid duplicating multi-GB files.
+            -- `worker_ids_json` is a JSON array of `compute_workers.id`
+            -- values whose rpc-server should be wired into llama-server's
+            -- `--rpc` flag. Order matters: it controls layer assignment.
+            -- `llama_port` is the local TCP port `llama-server` binds on
+            -- the host (default 11500 — separate from Ollama's 11434 so
+            -- both can coexist).
+            -- `status` reflects the runtime state of the local
+            -- `llama-server` process: stopped / loading / running / error.
+            -- Updated by the lifecycle module, NOT by user edits.
+            CREATE TABLE IF NOT EXISTS split_models (
+                id TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                gguf_path TEXT NOT NULL,
+                worker_ids_json TEXT NOT NULL DEFAULT '[]',
+                llama_port INTEGER NOT NULL DEFAULT 11500,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'stopped',
+                last_error TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_split_models_enabled
+                ON split_models(enabled);
             """
         )
         # Additive migration: images column (JSON array of upload filenames).
@@ -3529,3 +3565,234 @@ def get_compute_worker_auth_token(wid: str) -> str | None:
             "SELECT auth_token FROM compute_workers WHERE id = ?", (wid,),
         ).fetchone()
     return row["auth_token"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# Split models (Phase 2 of the compute-pool feature)
+# ---------------------------------------------------------------------------
+# A split model is a GGUF served by a host-local `llama-server` instance
+# with `--rpc <worker>:<port>` flags so the model's layers fan across
+# multiple machines. Each row here represents ONE split-model definition
+# the user has registered; lifecycle (start/stop) lives in
+# `layered_runtime.py` and updates `status` / `last_error` here.
+#
+# Routing layer reads these rows to know "is this conversation's model a
+# split model? if so, send chat to the local llama-server rather than
+# Ollama."
+# ---------------------------------------------------------------------------
+
+# Allowed values for split_models.status. The lifecycle module enforces
+# these transitions; user-facing edits never write status directly.
+SPLIT_MODEL_STATUSES = {"stopped", "loading", "running", "error"}
+
+# Default port range for `llama-server`. We pick a default that doesn't
+# collide with Ollama (11434) and sits in the unprivileged range. Users
+# can override per row if they're already running something on 11500.
+SPLIT_MODEL_DEFAULT_PORT = 11500
+
+
+def create_split_model(
+    *,
+    label: str,
+    gguf_path: str,
+    worker_ids: list[str] | None = None,
+    llama_port: int = SPLIT_MODEL_DEFAULT_PORT,
+    enabled: bool = True,
+) -> str:
+    """Insert a new split-model definition and return its id.
+
+    Validates aggressively up front because a malformed row (empty path,
+    non-list worker_ids, out-of-range port) would later break the
+    lifecycle module in ways that are harder to diagnose. Status is
+    always created as `stopped` — the lifecycle module flips it to
+    `loading` / `running` / `error` as it brings llama-server up.
+    """
+    lbl = (label or "").strip()
+    if not lbl:
+        raise ValueError("label is required")
+    if len(lbl) > 80:
+        raise ValueError("label must be ≤ 80 chars")
+
+    path = (gguf_path or "").strip()
+    if not path:
+        raise ValueError("gguf_path is required")
+
+    # `worker_ids` must be a list of strings — empty list is allowed
+    # (means "run on host alone, no rpc workers"); the lifecycle module
+    # then invokes llama-server without any --rpc flags.
+    wids = list(worker_ids or [])
+    for i, w in enumerate(wids):
+        if not isinstance(w, str) or not w.strip():
+            raise ValueError(f"worker_ids[{i}] must be a non-empty string")
+
+    port = SPLIT_MODEL_DEFAULT_PORT if llama_port is None else int(llama_port)
+    if port < 1 or port > 65535:
+        raise ValueError("llama_port must be 1–65535")
+
+    sid = uuid.uuid4().hex
+    now = time.time()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO split_models ("
+            "id, label, gguf_path, worker_ids_json, llama_port, "
+            "enabled, status, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, 'stopped', ?, ?)",
+            (
+                sid,
+                lbl,
+                path,
+                json.dumps(wids),
+                port,
+                1 if enabled else 0,
+                now, now,
+            ),
+        )
+    return sid
+
+
+def list_split_models(*, enabled_only: bool = False) -> list[dict]:
+    """Return every split-model definition, newest first.
+
+    `enabled_only=True` is what the routing layer uses — disabled rows
+    don't influence chat routing even if their llama-server happens to
+    still be running.
+    """
+    sql = "SELECT * FROM split_models"
+    if enabled_only:
+        sql += " WHERE enabled = 1"
+    sql += " ORDER BY created_at DESC"
+    with _conn() as c:
+        rows = c.execute(sql).fetchall()
+    return [_row_to_split_model(r) for r in rows]
+
+
+def get_split_model(sid: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM split_models WHERE id = ?", (sid,),
+        ).fetchone()
+    return _row_to_split_model(row) if row else None
+
+
+def update_split_model(sid: str, **fields: Any) -> dict | None:
+    """User-facing patch. Same shape as `update_compute_worker`:
+    unknown keys are silently ignored so an old client sending a removed
+    field doesn't break, and `status`/`last_error` are NOT updateable
+    here — they belong to the lifecycle module."""
+    if not get_split_model(sid):
+        return None
+
+    allowed = {"label", "gguf_path", "worker_ids", "llama_port", "enabled"}
+    cols: list[str] = []
+    vals: list[Any] = []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if k == "label":
+            lbl = (v or "").strip()
+            if not lbl:
+                raise ValueError("label cannot be blank")
+            if len(lbl) > 80:
+                raise ValueError("label must be ≤ 80 chars")
+            cols.append("label = ?")
+            vals.append(lbl)
+        elif k == "gguf_path":
+            path = (v or "").strip()
+            if not path:
+                raise ValueError("gguf_path cannot be blank")
+            cols.append("gguf_path = ?")
+            vals.append(path)
+        elif k == "worker_ids":
+            wids = list(v or [])
+            for i, w in enumerate(wids):
+                if not isinstance(w, str) or not w.strip():
+                    raise ValueError(f"worker_ids[{i}] must be a non-empty string")
+            cols.append("worker_ids_json = ?")
+            vals.append(json.dumps(wids))
+        elif k == "llama_port":
+            port = int(v) if v is not None else SPLIT_MODEL_DEFAULT_PORT
+            if port < 1 or port > 65535:
+                raise ValueError("llama_port must be 1–65535")
+            cols.append("llama_port = ?")
+            vals.append(port)
+        elif k == "enabled":
+            cols.append("enabled = ?")
+            vals.append(1 if v else 0)
+
+    if not cols:
+        return get_split_model(sid)
+
+    cols.append("updated_at = ?")
+    vals.append(time.time())
+    vals.append(sid)
+    with _conn() as c:
+        c.execute(
+            f"UPDATE split_models SET {', '.join(cols)} WHERE id = ?",
+            tuple(vals),
+        )
+    return get_split_model(sid)
+
+
+def update_split_model_status(
+    sid: str,
+    *,
+    status: str | None = None,
+    last_error: str | None = None,
+) -> None:
+    """Internal: lifecycle module calls this when llama-server starts /
+    stops / errors. Separated from `update_split_model` so a user PATCH
+    can never set the row to a fictitious 'running' state.
+
+    Pass `last_error=""` to clear an error after a successful start;
+    `last_error=None` (the default) means "leave it alone".
+    """
+    cols: list[str] = []
+    vals: list[Any] = []
+    if status is not None:
+        if status not in SPLIT_MODEL_STATUSES:
+            raise ValueError(
+                f"status must be one of {sorted(SPLIT_MODEL_STATUSES)}"
+            )
+        cols.append("status = ?")
+        vals.append(status)
+    if last_error is not None:
+        cols.append("last_error = ?")
+        vals.append(last_error or None)
+    if not cols:
+        return
+    cols.append("updated_at = ?")
+    vals.append(time.time())
+    vals.append(sid)
+    with _conn() as c:
+        c.execute(
+            f"UPDATE split_models SET {', '.join(cols)} WHERE id = ?",
+            tuple(vals),
+        )
+
+
+def delete_split_model(sid: str) -> int:
+    """Remove a split-model row. Caller is responsible for stopping the
+    llama-server process first — the data layer doesn't touch runtime
+    state."""
+    with _conn() as c:
+        c.execute("DELETE FROM split_models WHERE id = ?", (sid,))
+        return c.total_changes
+
+
+def _row_to_split_model(row: sqlite3.Row) -> dict:
+    try:
+        wids = json.loads(row["worker_ids_json"]) if row["worker_ids_json"] else []
+    except Exception:
+        wids = []
+    return {
+        "id": row["id"],
+        "label": row["label"],
+        "gguf_path": row["gguf_path"],
+        "worker_ids": wids,
+        "llama_port": row["llama_port"],
+        "enabled": bool(row["enabled"]),
+        "status": row["status"],
+        "last_error": row["last_error"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
