@@ -1079,6 +1079,29 @@ _HOST_TOTAL_USE_FRACTION = 0.70
 # platform Ollama supports; matches what `ollama_runtime` assumes.
 _OLLAMA_MODELS_DIR = Path.home() / ".ollama" / "models"
 
+# Where users drop replacement GGUFs that override Ollama's blob for a given
+# model name. Necessary because some upstream GGUFs ship with a tensor layout
+# that stock llama.cpp can't load even though the architecture is supported
+# (e.g. Ollama's `gemma4:26b` packs the MoE expert weights as fused
+# `ffn_gate_up_exps` per layer — 658 tensors total — while llama.cpp's
+# `gemma4` loader spec expects them unfused as `ffn_gate_exps` +
+# `ffn_up_exps` separately, 1014 tensors). The override path lets the user
+# install Unsloth's GGUF (which uses the unfused layout) and have Phase 2
+# split routing pick it up automatically without us mutating Ollama's
+# blob store. Filename is the Ollama model name with `:` replaced by `-`,
+# so `gemma4:26b` becomes `gemma4-26b.gguf`.
+_OVERRIDE_GGUF_DIR = Path.home() / ".gigachat" / "llama-cpp" / "models"
+
+
+def _override_gguf_path_for(model_name: str) -> Path:
+    """Map an Ollama model name to its override GGUF path.
+
+    Returns the path regardless of whether the file exists — callers
+    check `.is_file()` to decide whether to use it.
+    """
+    safe = (model_name or "").strip().replace(":", "-").replace("/", "-")
+    return _OVERRIDE_GGUF_DIR / f"{safe}.gguf"
+
 
 def _resolve_ollama_manifest(model_name: str) -> dict | None:
     """Locate the manifest JSON for an Ollama model name.
@@ -1136,6 +1159,13 @@ def resolve_ollama_model(model_name: str) -> dict | None:
 
     `gguf_path` is the absolute path to the blob, suitable for passing
     as llama-server's `--model` flag.
+
+    Override path: if a file exists at `_override_gguf_path_for(name)`,
+    we return that instead of the Ollama blob. Used to swap in GGUFs
+    with tensor layouts that stock llama.cpp can load (see the
+    `_OVERRIDE_GGUF_DIR` docstring) without disturbing Ollama's own
+    blob store. The Ollama manifest is still consulted for the size
+    metadata so routing / VRAM-budget logic stays consistent.
     """
     manifest = _resolve_ollama_manifest(model_name)
     if not manifest:
@@ -1154,6 +1184,26 @@ def resolve_ollama_model(model_name: str) -> dict | None:
     blob_path = _OLLAMA_MODELS_DIR / "blobs" / f"sha256-{digest}"
     if not blob_path.is_file():
         return None
+
+    # Override hook: prefer a user-installed replacement GGUF if one
+    # exists. Size is taken from THAT file (not the manifest), since
+    # the override may be a different quantization than the Ollama
+    # blob. Manifest-derived size is kept as a hint for callers that
+    # want the original.
+    override = _override_gguf_path_for(model_name)
+    if override.is_file():
+        try:
+            override_size = override.stat().st_size
+        except OSError:
+            override_size = 0
+        return {
+            "gguf_path": str(override),
+            "size_bytes": override_size or int(model_layer.get("size") or 0),
+            "manifest": manifest,
+            "ollama_blob_path": str(blob_path),
+            "override": True,
+        }
+
     return {
         "gguf_path": str(blob_path),
         "size_bytes": int(model_layer.get("size") or 0),

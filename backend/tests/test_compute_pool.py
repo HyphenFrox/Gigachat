@@ -1169,3 +1169,66 @@ def test_pick_chat_target_picks_gpu_worker_over_cpu_only(isolated_db, monkeypatc
     target = compute_pool.pick_chat_target("gemma4:e4b")
     assert target is not None
     assert target[0] == "http://gpu.local:11434"
+
+
+# --- override GGUF path -----------------------------------------------------
+
+
+def test_override_gguf_path_for_sanitizes_name():
+    """Override filename strips `:` and `/` from the Ollama model name —
+    those aren't legal in Windows paths and would break the lookup."""
+    p = compute_pool._override_gguf_path_for("gemma4:26b")
+    assert p.name == "gemma4-26b.gguf"
+    p = compute_pool._override_gguf_path_for("library/llama3.1:8b")
+    assert p.name == "library-llama3.1-8b.gguf"
+    p = compute_pool._override_gguf_path_for("")
+    assert p.name == ".gguf"
+
+
+def test_resolve_ollama_model_uses_override_when_present(monkeypatch, tmp_path):
+    """If a user has installed a replacement GGUF (Unsloth's gemma4 etc.)
+    at the override path, `resolve_ollama_model` returns THAT path —
+    keeping Phase 2 split functional for models whose Ollama blob has
+    a tensor layout llama.cpp can't load. Manifest data still drives
+    the rest of routing logic."""
+    # Set up a fake Ollama manifest + blob.
+    blob = tmp_path / "ollama_blob"
+    blob.write_bytes(b"x" * 100)
+    fake_manifest = {
+        "layers": [
+            {
+                "mediaType": "application/vnd.ollama.image.model",
+                "digest": "sha256:" + "a" * 64,
+                "size": 100,
+            }
+        ],
+    }
+    monkeypatch.setattr(compute_pool, "_resolve_ollama_manifest", lambda name: fake_manifest)
+    monkeypatch.setattr(compute_pool, "_OLLAMA_MODELS_DIR", tmp_path)
+    # Place the fake blob where the standard path resolver expects it.
+    blobs_dir = tmp_path / "blobs"
+    blobs_dir.mkdir()
+    (blobs_dir / f"sha256-{'a' * 64}").write_bytes(b"x" * 100)
+
+    # Without an override, we get the Ollama blob path.
+    monkeypatch.setattr(compute_pool, "_OVERRIDE_GGUF_DIR", tmp_path / "override_empty")
+    info = compute_pool.resolve_ollama_model("gemma4:26b")
+    assert info is not None
+    assert info["gguf_path"].endswith(f"sha256-{'a' * 64}")
+    assert info.get("override") is not True
+
+    # With an override file present, we get THAT path and the override
+    # flag is set.
+    override_dir = tmp_path / "override_present"
+    override_dir.mkdir()
+    override_file = override_dir / "gemma4-26b.gguf"
+    override_file.write_bytes(b"y" * 200)  # different size to verify size_bytes uses the override
+    monkeypatch.setattr(compute_pool, "_OVERRIDE_GGUF_DIR", override_dir)
+
+    info = compute_pool.resolve_ollama_model("gemma4:26b")
+    assert info is not None
+    assert info["gguf_path"] == str(override_file)
+    assert info["size_bytes"] == 200
+    assert info.get("override") is True
+    # Ollama blob path is still surfaced for callers that want the original.
+    assert "ollama_blob_path" in info
