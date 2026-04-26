@@ -46,6 +46,17 @@ _SWEEP_INTERVAL_SEC = 300
 # multi-second response means it's overloaded or down, not slow.
 _PROBE_TIMEOUT_SEC = 5.0
 
+# Default TCP port `rpc-server` (llama.cpp's worker process) listens on.
+# This is the upstream's default; users can override per-worker once the
+# `rpc_port` schema column lands. Phase 2 commit 3 just probes this port
+# to surface whether rpc-server is running on each worker.
+_DEFAULT_RPC_PORT = 50052
+
+# How long to wait for the TCP handshake on the rpc-server probe. Smaller
+# than the HTTP probe timeout because we're literally just checking if
+# the listener exists — a SYN-ACK round trip on LAN is sub-millisecond.
+_RPC_PROBE_TIMEOUT_SEC = 2.0
+
 
 def _worker_base_url(worker: dict) -> str:
     """Build the Ollama base URL for a worker row."""
@@ -58,6 +69,61 @@ def _worker_base_url(worker: dict) -> str:
         addr = addr[len("https://"):]
     addr = addr.rstrip("/")
     return f"http://{addr}:{port}"
+
+
+def _worker_host(worker: dict) -> str:
+    """Bare hostname / IP for non-HTTP probes (rpc-server uses TCP, not HTTP).
+
+    Same scheme stripping as `_worker_base_url` but returns just the host
+    portion — `rpc-server` listens on its own port, not the Ollama port.
+    """
+    addr = (worker.get("address") or "").strip()
+    if addr.startswith("http://"):
+        addr = addr[len("http://"):]
+    elif addr.startswith("https://"):
+        addr = addr[len("https://"):]
+    return addr.rstrip("/")
+
+
+async def _probe_rpc_server(
+    host: str, port: int, timeout: float = _RPC_PROBE_TIMEOUT_SEC,
+) -> tuple[bool, str | None]:
+    """TCP-connect probe for rpc-server. Returns (reachable, error_str).
+
+    rpc-server speaks llama.cpp's binary RPC protocol — it doesn't have
+    an HTTP health endpoint, and its protocol handshake is more involved
+    than we want to replicate just for liveness. A successful TCP connect
+    is enough to know the listener is up; a real RPC call from
+    `llama-server --rpc <host>:<port>` will surface protocol mismatches
+    later if the version is wrong.
+
+    Why asyncio.open_connection instead of httpx: we don't need HTTP, and
+    httpx has no clean "TCP connect only" mode. asyncio.open_connection +
+    immediately closing the writer gives us exactly the SYN/SYN-ACK
+    round-trip we want.
+    """
+    try:
+        # asyncio.wait_for + open_connection is the canonical "is this
+        # host:port accepting TCP connections within N seconds" pattern.
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return False, "rpc-server probe: timeout"
+    except (OSError, ConnectionError) as e:
+        # ECONNREFUSED most commonly — rpc-server isn't running.
+        return False, f"rpc-server probe: {type(e).__name__}: {e}"
+    except Exception as e:
+        return False, f"rpc-server probe: {type(e).__name__}: {e}"
+    # Connect succeeded — close immediately. We don't speak the binary
+    # protocol; just the listener-existence check.
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+    return True, None
 
 
 async def _probe_one(client: httpx.AsyncClient, base: str, token: str | None) -> dict:
@@ -160,9 +226,23 @@ async def probe_worker(wid: str) -> dict:
         error_parts.append(payload.get("version_error") or "no version field")
     error_str = "; ".join(error_parts) if error_parts else ""
 
+    # Phase 2 add-on: TCP-probe the worker's rpc-server port so the UI
+    # can show whether layer-split inference is available on this
+    # worker. Probe failure is NOT counted as `last_error` — rpc-server
+    # is optional (Phase 1 routing works without it), so a worker with
+    # Ollama up but rpc-server down is still "online" for chat /
+    # embeddings / subagent routing. We just record the rpc state in
+    # capabilities so commit 6's UI can render a separate badge.
+    rpc_host = _worker_host(worker)
+    rpc_port = _DEFAULT_RPC_PORT
+    rpc_ok, rpc_err = await _probe_rpc_server(rpc_host, rpc_port)
+
     capabilities = {
         "version": payload.get("version"),
         "models": payload.get("models") or [],
+        "rpc_server_reachable": rpc_ok,
+        "rpc_port": rpc_port,
+        "rpc_error": rpc_err,
     }
     try:
         db.update_compute_worker_capabilities(

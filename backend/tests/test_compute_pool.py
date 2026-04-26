@@ -38,13 +38,18 @@ pytestmark = pytest.mark.smoke
 # --- helpers --------------------------------------------------------------
 
 
-def _install_mock_http(monkeypatch, handler):
+def _install_mock_http(monkeypatch, handler, *, rpc_reachable: bool = False):
     """Wrap `httpx.AsyncClient` so every probe call uses a MockTransport.
 
     `compute_pool.probe_worker` constructs its own `httpx.AsyncClient`, so
     we can't pass a mock client in directly. Instead we replace the class
     in the module's namespace with a factory that always supplies our
     mock transport — caller-side code is unchanged.
+
+    Also stubs `_probe_rpc_server` to a no-op (fast return) so tests
+    that don't care about Phase 2's rpc-server probe don't pay the
+    multi-second TCP timeout per test. Pass `rpc_reachable=True` if a
+    test wants to assert the rpc path is reflected in capabilities.
     """
     real_async_client = httpx.AsyncClient
     transport = httpx.MockTransport(handler)
@@ -55,6 +60,11 @@ def _install_mock_http(monkeypatch, handler):
         return real_async_client(*args, **kwargs)
 
     monkeypatch.setattr(compute_pool.httpx, "AsyncClient", _factory)
+
+    async def _stub_rpc_probe(host, port, timeout=2.0):
+        return (rpc_reachable, None if rpc_reachable else "stubbed: not reachable")
+
+    monkeypatch.setattr(compute_pool, "_probe_rpc_server", _stub_rpc_probe)
 
 
 def _run(coro):
@@ -610,3 +620,84 @@ def test_pick_chat_target_skips_workers_without_model(isolated_db, monkeypatch):
         isolated_db, address="c.local", models=("nomic-embed-text:latest",),
     )
     assert compute_pool.pick_chat_target("gemma4:e4b") is None
+
+
+# --- Phase 2 commit 3: rpc-server probe -----------------------------------
+
+
+def test_probe_records_rpc_reachable_in_capabilities(isolated_db, monkeypatch):
+    """When rpc-server is up on the worker (the laptop has installed +
+    started llama.cpp's rpc-server.exe), the probe must surface that on
+    the row's capabilities so the Settings UI can render a green "RPC"
+    badge separately from the Ollama status."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    wid = isolated_db.create_compute_worker(
+        label="A", address="x.local", transport="lan",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/version":
+            return httpx.Response(200, json={"version": "0.5.4"})
+        return httpx.Response(200, json={"models": [
+            {"name": "gemma4:e4b", "size": 1, "details": {}},
+        ]})
+
+    _install_mock_http(monkeypatch, handler, rpc_reachable=True)
+
+    result = _run(compute_pool.probe_worker(wid))
+    assert result["ok"] is True
+    caps = result["capabilities"]
+    assert caps["rpc_server_reachable"] is True
+    assert caps["rpc_port"] == compute_pool._DEFAULT_RPC_PORT
+    assert caps["rpc_error"] is None
+
+    # Persisted on the row.
+    row = isolated_db.get_compute_worker(wid)
+    assert row["capabilities"]["rpc_server_reachable"] is True
+
+
+def test_probe_records_rpc_unreachable_separately_from_last_error(
+    isolated_db, monkeypatch
+):
+    """rpc-server being down is NOT a worker-level error — Phase 1
+    routing (chat / embed / subagent via Ollama) still works without
+    rpc-server. The row's `last_error` must stay clean so the worker
+    counts as online for those workloads, while `capabilities.rpc_*`
+    reflects the missing rpc daemon for the Settings UI."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    wid = isolated_db.create_compute_worker(
+        label="A", address="x.local", transport="lan",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/version":
+            return httpx.Response(200, json={"version": "0.5.4"})
+        return httpx.Response(200, json={"models": [
+            {"name": "gemma4:e4b", "size": 1, "details": {}},
+        ]})
+
+    # Default rpc_reachable=False from the helper.
+    _install_mock_http(monkeypatch, handler)
+
+    result = _run(compute_pool.probe_worker(wid))
+    assert result["ok"] is True              # ollama still good
+    assert result["error"] is None           # last_error stays clean
+    caps = result["capabilities"]
+    assert caps["rpc_server_reachable"] is False
+    assert caps["rpc_error"]                 # error string present
+
+
+def test_probe_rpc_server_real_call_against_unbound_port(monkeypatch):
+    """Smoke-test the actual TCP probe (no stub) against a port that's
+    very unlikely to be bound. Confirms the function returns a (False,
+    error) tuple in a reasonable time rather than hanging forever."""
+    import asyncio
+    # Use 127.0.0.1:1 — port 1 is reserved/unused on practically every
+    # system. asyncio.open_connection will get ECONNREFUSED quickly.
+    ok, err = asyncio.run(
+        compute_pool._probe_rpc_server("127.0.0.1", 1, timeout=2.0),
+    )
+    assert ok is False
+    assert err is not None
+    # Some flavor of "connection refused" / "actively refused".
+    assert "rpc-server probe:" in err
