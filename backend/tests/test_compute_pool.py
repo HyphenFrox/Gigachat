@@ -701,3 +701,143 @@ def test_probe_rpc_server_real_call_against_unbound_port(monkeypatch):
     assert err is not None
     # Some flavor of "connection refused" / "actively refused".
     assert "rpc-server probe:" in err
+
+
+# --- Phase 2 commit 9: per-worker hardware capability capture -------------
+
+
+def test_probe_records_gpu_present_when_loaded_model_in_vram(isolated_db, monkeypatch):
+    """When /api/ps reports a model with size_vram>0, the worker's
+    capabilities must surface gpu_present=True. The router uses this
+    to prefer GPU-equipped workers over CPU-only ones."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    wid = isolated_db.create_compute_worker(
+        label="gpu-worker", address="g.local", transport="lan",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/version":
+            return httpx.Response(200, json={"version": "0.5.4"})
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [
+                {"name": "gemma4:e4b", "details": {}},
+            ]})
+        if request.url.path == "/api/ps":
+            # 6 GB loaded into VRAM — clear GPU signal.
+            return httpx.Response(200, json={"models": [{
+                "name": "gemma4:e4b",
+                "size": 4500000000,
+                "size_vram": 6442450944,  # 6 GB
+            }]})
+        return httpx.Response(404)
+
+    _install_mock_http(monkeypatch, handler, rpc_reachable=False)
+    result = _run(compute_pool.probe_worker(wid))
+    caps = result["capabilities"]
+    assert caps["gpu_present"] is True
+    assert caps["max_vram_seen_bytes"] == 6442450944
+    assert caps["loaded_count"] == 1
+
+
+def test_probe_records_no_gpu_when_ps_empty(isolated_db, monkeypatch):
+    """A worker with nothing currently loaded gives us no hardware
+    signal — gpu_present must be False (we treat absence of evidence
+    as 'unknown, treat as no-GPU' so CPU-only workers don't get
+    artificially preferred)."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    wid = isolated_db.create_compute_worker(
+        label="idle", address="i.local", transport="lan",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/version":
+            return httpx.Response(200, json={"version": "0.5.4"})
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [
+                {"name": "gemma4:e4b", "details": {}},
+            ]})
+        if request.url.path == "/api/ps":
+            return httpx.Response(200, json={"models": []})
+        return httpx.Response(404)
+
+    _install_mock_http(monkeypatch, handler, rpc_reachable=False)
+    result = _run(compute_pool.probe_worker(wid))
+    caps = result["capabilities"]
+    assert caps["gpu_present"] is False
+    assert caps["max_vram_seen_bytes"] == 0
+    assert caps["loaded_count"] == 0
+
+
+def test_capability_score_orders_gpu_above_no_gpu():
+    """The router's ranking key must treat GPU-equipped workers as
+    strictly more powerful than CPU-only ones (within the same
+    eligibility class)."""
+    cpu_only = {
+        "id": "a", "last_seen": 9999.0,
+        "capabilities": {"gpu_present": False, "max_vram_seen_bytes": 0},
+    }
+    gpu_worker = {
+        "id": "b", "last_seen": 1.0,
+        "capabilities": {"gpu_present": True, "max_vram_seen_bytes": 4 * 1024 ** 3},
+    }
+    # GPU should sort first even though its last_seen is older.
+    sorted_workers = sorted(
+        [cpu_only, gpu_worker], key=compute_pool._capability_score, reverse=True,
+    )
+    assert sorted_workers[0]["id"] == "b"
+
+
+def test_capability_score_orders_more_vram_above_less():
+    small = {
+        "id": "small", "last_seen": 9999.0,
+        "capabilities": {"gpu_present": True, "max_vram_seen_bytes": 4 * 1024 ** 3},
+    }
+    big = {
+        "id": "big", "last_seen": 1.0,
+        "capabilities": {"gpu_present": True, "max_vram_seen_bytes": 24 * 1024 ** 3},
+    }
+    sorted_workers = sorted(
+        [small, big], key=compute_pool._capability_score, reverse=True,
+    )
+    assert sorted_workers[0]["id"] == "big"
+
+
+def test_pick_chat_target_picks_gpu_worker_over_cpu_only(isolated_db, monkeypatch):
+    """End-to-end: with two eligible chat workers, the GPU one must
+    win the route. Maps to the user's 'prefer the more powerful
+    worker' intent."""
+    import time
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+
+    # CPU-only worker, fresher probe.
+    cpu_id = isolated_db.create_compute_worker(
+        label="cpu", address="cpu.local", transport="lan", use_for_chat=True,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        cpu_id,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": "gemma4:e4b", "details": {}}],
+            "rpc_server_reachable": True, "rpc_port": 50052, "rpc_error": None,
+            "gpu_present": False, "max_vram_seen_bytes": 0, "loaded_count": 0,
+        },
+        last_seen=time.time() - 5.0, last_error="",
+    )
+    # GPU worker, slightly older probe.
+    gpu_id = isolated_db.create_compute_worker(
+        label="gpu", address="gpu.local", transport="lan", use_for_chat=True,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        gpu_id,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": "gemma4:e4b", "details": {}}],
+            "rpc_server_reachable": True, "rpc_port": 50052, "rpc_error": None,
+            "gpu_present": True, "max_vram_seen_bytes": 4 * 1024 ** 3, "loaded_count": 1,
+        },
+        last_seen=time.time() - 30.0, last_error="",
+    )
+
+    target = compute_pool.pick_chat_target("gemma4:e4b")
+    assert target is not None
+    assert target[0] == "http://gpu.local:11434"

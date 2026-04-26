@@ -130,13 +130,24 @@ async def _probe_rpc_server(
 
 
 async def _probe_one(client: httpx.AsyncClient, base: str, token: str | None) -> dict:
-    """Issue the two GETs in parallel and merge the results.
+    """Issue the probe GETs in parallel and merge the results.
 
-    Returns a dict with `version`, `models`, and any `error`. Either
-    field may be missing if its specific GET failed; we don't fail the
-    whole probe on a single endpoint hiccup so a worker running an
-    Ollama version that hasn't shipped `/api/version` (rare, but
-    possible on very old builds) still surfaces its model list.
+    Returns a dict with `version`, `models`, hardware-capability hints,
+    and any `*_error` markers. Any single endpoint may fail without
+    breaking the others — we want the most signal we can get out of
+    one round trip.
+
+    Hardware-capability detection: workers run plain Ollama so they
+    don't volunteer system specs. The closest signal Ollama exposes is
+    `/api/ps` — currently-loaded models with their VRAM split. From
+    that we infer:
+      * `gpu_present`: True if any loaded model reports `size_vram > 0`.
+        A worker with no loaded models doesn't tell us anything yet,
+        which is why we treat absence as `False` rather than `None`.
+      * `max_vram_seen_bytes`: the largest `size_vram` across loaded
+        models, giving a rough lower bound on the worker's VRAM. The
+        router uses this to prefer hardware-stronger workers when
+        ranking ties.
     """
     headers: dict[str, str] = {}
     if token:
@@ -156,11 +167,16 @@ async def _probe_one(client: httpx.AsyncClient, base: str, token: str | None) ->
         r.raise_for_status()
         return r.json()
 
+    async def _ps() -> Any:
+        r = await client.get(f"{base}/api/ps", headers=headers)
+        r.raise_for_status()
+        return r.json()
+
     out: dict[str, Any] = {}
     # gather() with return_exceptions so a partial failure on one
-    # endpoint doesn't lose the other endpoint's payload.
-    ver_res, tags_res = await asyncio.gather(
-        _ver(), _tags(), return_exceptions=True,
+    # endpoint doesn't lose the other endpoints' payloads.
+    ver_res, tags_res, ps_res = await asyncio.gather(
+        _ver(), _tags(), _ps(), return_exceptions=True,
     )
     if isinstance(ver_res, Exception):
         out["version_error"] = f"{type(ver_res).__name__}: {ver_res}"
@@ -181,6 +197,26 @@ async def _probe_one(client: httpx.AsyncClient, base: str, token: str | None) ->
             })
         # Drop entries with no name (defensive against malformed responses).
         out["models"] = [m for m in models if m.get("name")]
+    # /api/ps is purely a heuristic source — failures shouldn't dim the
+    # probe's overall verdict, just leave the hardware fields empty so
+    # the router falls through to the no-info default.
+    if isinstance(ps_res, Exception):
+        out["gpu_present"] = False
+        out["max_vram_seen_bytes"] = 0
+        out["loaded_count"] = 0
+    else:
+        loaded = (ps_res or {}).get("models", []) or []
+        max_vram = 0
+        any_gpu = False
+        for m in loaded:
+            v = int(m.get("size_vram") or 0)
+            if v > 0:
+                any_gpu = True
+            if v > max_vram:
+                max_vram = v
+        out["gpu_present"] = any_gpu
+        out["max_vram_seen_bytes"] = max_vram
+        out["loaded_count"] = len(loaded)
     return out
 
 
@@ -246,6 +282,12 @@ async def probe_worker(wid: str) -> dict:
         "rpc_server_reachable": rpc_ok,
         "rpc_port": rpc_port,
         "rpc_error": rpc_err,
+        # Hardware hints — best-effort, populated from /api/ps. Used by
+        # the router to prefer hardware-stronger workers over weaker
+        # ones when both are otherwise eligible.
+        "gpu_present": bool(payload.get("gpu_present")),
+        "max_vram_seen_bytes": int(payload.get("max_vram_seen_bytes") or 0),
+        "loaded_count": int(payload.get("loaded_count") or 0),
     }
     try:
         db.update_compute_worker_capabilities(
@@ -408,10 +450,43 @@ def _is_fresh(worker: dict, now: float | None = None) -> bool:
     return (now - float(last_seen)) < _FRESHNESS_SEC
 
 
+def _capability_score(worker: dict) -> tuple:
+    """Power-ranking key for sorting eligible workers.
+
+    Returns a tuple suitable for `sorted(key=...)` — bigger is better,
+    so callers use `reverse=True`. Components, in priority order:
+
+      1. `gpu_present` (1 if the worker has a usable GPU). Inferred
+         best-effort from `/api/ps`'s `size_vram > 0`. Heavily-weighted
+         because GPU is dramatically faster than CPU for inference.
+      2. `max_vram_seen_bytes`. Lower bound on the worker's VRAM —
+         a worker that's loaded a 14 GB model has at least 14 GB. Among
+         GPU workers, more VRAM wins.
+      3. Freshness (last_seen). Tie-breaker.
+
+    Workers with NO loaded-model history (`loaded_count==0`) have all-
+    zero hardware fields. They sort to the bottom — not because they
+    lack hardware, but because we can't see their hardware yet. The
+    next probe after they load anything will fix the ranking.
+    """
+    caps = worker.get("capabilities") or {}
+    return (
+        1 if caps.get("gpu_present") else 0,
+        int(caps.get("max_vram_seen_bytes") or 0),
+        float(worker.get("last_seen") or 0),
+    )
+
+
 def _eligible_workers(flag: str, model: str | None = None) -> list[dict]:
     """Return enabled+fresh workers whose `flag` is on and (optionally) have
-    `model` installed. Sorted newest-`last_seen` first so the picker grabs
-    the most-recently-confirmed-healthy worker."""
+    `model` installed.
+
+    Sort order (`_capability_score` desc): GPU-present workers first,
+    then by max VRAM observed, then freshest probe. The user's
+    intuition "use the more powerful machine" maps to (1) → GPU wins
+    over CPU-only, (2) → more VRAM wins over less. Tie at hardware →
+    fall back to freshest, like Phase 1 commit 6's original behavior.
+    """
     rows = db.list_compute_workers(enabled_only=True)
     now = time.time()
     out: list[dict] = []
@@ -423,7 +498,7 @@ def _eligible_workers(flag: str, model: str | None = None) -> list[dict]:
         if model and not _worker_has_model(w, model):
             continue
         out.append(w)
-    out.sort(key=lambda w: float(w.get("last_seen") or 0), reverse=True)
+    out.sort(key=_capability_score, reverse=True)
     return out
 
 
