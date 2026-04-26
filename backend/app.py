@@ -84,7 +84,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from . import agent, auth, compute_pool, db, mcp, ollama_runtime, push, sysdetect, tools
+from . import agent, auth, compute_pool, db, mcp, ollama_runtime, push, split_lifecycle, split_runtime, sysdetect, tools
 
 ROOT = Path(__file__).resolve().parent.parent
 # In production, the frontend is built to `frontend/dist` by Vite.
@@ -865,6 +865,17 @@ async def _stop_compute_pool_probe() -> None:
     runner doesn't see a stranded task."""
     try:
         compute_pool.stop_periodic_probe()
+    except Exception:
+        pass
+
+
+@app.on_event("shutdown")
+async def _stop_split_models() -> None:
+    """Terminate every running llama-server child on app shutdown so
+    GPU memory is reclaimed cleanly and uvicorn doesn't leave orphan
+    processes."""
+    try:
+        await split_lifecycle.stop_all()
     except Exception:
         pass
 
@@ -3359,6 +3370,141 @@ async def api_probe_all_compute_workers() -> dict:
     from the Settings panel; returns a summary list (per-worker ok/error)
     and the heavy capability data is persisted on the rows themselves."""
     return {"results": await compute_pool.probe_all_enabled()}
+
+
+# ---------------------------------------------------------------------------
+# Split models (Phase 2): one big model whose layers fan across host +
+# workers via llama.cpp's RPC mechanism. Schema/CRUD live in db.py;
+# this layer wraps it for the API + adds start/stop/status endpoints
+# tied to the lifecycle module.
+# ---------------------------------------------------------------------------
+class SplitModelCreate(BaseModel):
+    """Body for POST /api/split-models."""
+    label: str
+    gguf_path: str
+    worker_ids: list[str] = []
+    llama_port: int = db.SPLIT_MODEL_DEFAULT_PORT
+    enabled: bool = True
+
+
+class SplitModelPatch(BaseModel):
+    """Body for PATCH /api/split-models/{sid}. All fields optional."""
+    label: str | None = None
+    gguf_path: str | None = None
+    worker_ids: list[str] | None = None
+    llama_port: int | None = None
+    enabled: bool | None = None
+
+
+@app.get("/api/split-models")
+def api_list_split_models() -> dict:
+    """Return every registered split model + the host's llama.cpp install
+    status so the UI can show "install llama.cpp" prompts up front."""
+    install = split_runtime.get_install_status()
+    return {
+        "split_models": db.list_split_models(),
+        "llama_cpp": {
+            "installed": install.installed,
+            "version": install.version,
+            "install_dir": install.install_dir,
+            "llama_server_path": install.llama_server_path,
+            "rpc_server_path": install.rpc_server_path,
+            "platform_supported": install.platform_supported,
+            "platform_reason": install.platform_reason,
+        },
+    }
+
+
+@app.post("/api/split-models")
+def api_create_split_model(body: SplitModelCreate) -> dict:
+    try:
+        sid = db.create_split_model(
+            label=body.label,
+            gguf_path=body.gguf_path,
+            worker_ids=body.worker_ids,
+            llama_port=body.llama_port,
+            enabled=body.enabled,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return db.get_split_model(sid) or {}
+
+
+@app.patch("/api/split-models/{sid}")
+def api_update_split_model(sid: str, body: SplitModelPatch) -> dict:
+    patch = body.model_dump(exclude_unset=True)
+    try:
+        updated = db.update_split_model(sid, **patch)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not updated:
+        raise HTTPException(404, "split_model not found")
+    return updated
+
+
+@app.delete("/api/split-models/{sid}")
+async def api_delete_split_model(sid: str) -> dict:
+    """Remove a split-model row. Stops the llama-server first so the
+    deletion doesn't leave a stranded subprocess holding VRAM."""
+    try:
+        await split_lifecycle.stop(sid)
+    except Exception:
+        # Stop failures shouldn't block delete — the user wants this row
+        # gone. The lifecycle module already best-effort cleans up.
+        pass
+    n = db.delete_split_model(sid)
+    if not n:
+        raise HTTPException(404, "split_model not found")
+    return {"ok": True, "deleted": sid}
+
+
+@app.post("/api/split-models/{sid}/start")
+async def api_start_split_model(sid: str) -> dict:
+    """Spawn llama-server for this row. Returns once /health says OK or
+    times out. The UI shows a spinner during the wait."""
+    try:
+        return await split_lifecycle.start(sid)
+    except split_lifecycle.SplitLifecycleError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/split-models/{sid}/stop")
+async def api_stop_split_model(sid: str) -> dict:
+    """Terminate the llama-server child. Idempotent on a stopped row."""
+    return await split_lifecycle.stop(sid)
+
+
+@app.get("/api/split-models/{sid}/status")
+def api_status_split_model(sid: str) -> dict:
+    """Read-only snapshot. Cheap; the UI polls this every few seconds
+    while a row is `loading`."""
+    s = split_lifecycle.status(sid)
+    if not s.get("ok"):
+        raise HTTPException(404, s.get("error") or "not found")
+    return s
+
+
+@app.post("/api/split-models/install-llamacpp")
+def api_install_llamacpp(variant: str = "host") -> dict:
+    """Trigger an explicit llama.cpp download + install for the host.
+
+    Variant defaults to `host` (CUDA build for the RTX 3060 Ti). The
+    download is multi-hundred-MB and runs synchronously here — the UI
+    shows a spinner and is intentionally serialized so the user
+    doesn't accidentally trigger two parallel downloads. If you need
+    progress streaming, switch to a streaming endpoint later.
+    """
+    try:
+        path = split_runtime.download_llama_cpp(variant=variant)
+    except Exception as e:
+        raise HTTPException(500, f"install failed: {type(e).__name__}: {e}")
+    install = split_runtime.get_install_status()
+    return {
+        "ok": True,
+        "install_dir": str(path),
+        "installed": install.installed,
+        "llama_server_path": install.llama_server_path,
+    }
 
 
 # ---------------------------------------------------------------------------
