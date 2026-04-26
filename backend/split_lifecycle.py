@@ -82,6 +82,22 @@ log = logging.getLogger(__name__)
 # (deferred — most users won't tune this manually).
 _DEFAULT_NGL = 99
 
+
+def _lower_priority_posix() -> None:
+    """preexec hook that nice's the child to +10 on POSIX. Called only
+    on Linux/macOS — Windows uses BELOW_NORMAL_PRIORITY_CLASS via
+    creationflags. Both achieve the same goal: the OS scheduler
+    de-prioritizes our inference when other workloads compete for CPU,
+    so the user's foreground apps stay responsive without us giving up
+    full speed on an otherwise-idle machine.
+    """
+    try:
+        os.nice(10)
+    except Exception:
+        # Best-effort; if it fails (rare), child still runs at default
+        # priority. Not worth crashing the spawn for.
+        pass
+
 # How long we wait for `llama-server` to come up before declaring the
 # start a failure. Loading large models is slow:
 #   * Reading GGUF from disk: ~10 s for a 17 GB model on NVMe.
@@ -571,9 +587,22 @@ async def start(split_id: str) -> dict:
     # process if it's restarted, but kept under the same console
     # group so we can SIGTERM it cleanly. On Windows that's
     # CREATE_NEW_PROCESS_GROUP; on POSIX, no special flags.
+    #
+    # Resource cooperation: launch llama-server at BELOW_NORMAL
+    # priority. With this flag, the OS scheduler gives priority to
+    # whatever app the user is interacting with — if they open a
+    # browser / play a video / launch any other workload, the
+    # scheduler de-prioritizes our background inference so the user's
+    # foreground work stays responsive. On idle host (no other
+    # workload), our process gets full CPU so inference still runs
+    # at top speed. "Use as much as possible when free, yield to
+    # foreground apps when busy" — the standard cooperative pattern.
     creationflags = 0
     if sys.platform == "win32":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.BELOW_NORMAL_PRIORITY_CLASS
+        )
 
     log_file = log_path.open("ab")
     try:
@@ -583,6 +612,9 @@ async def start(split_id: str) -> dict:
             stderr=subprocess.STDOUT,   # merge into one log file
             stdin=subprocess.DEVNULL,
             creationflags=creationflags,
+            # POSIX: nice the process to +10 (lower priority) so the
+            # kernel CFS scheduler also de-prioritizes it under load.
+            preexec_fn=(_lower_priority_posix if sys.platform != "win32" else None),
         )
     except Exception as e:
         log_file.close()

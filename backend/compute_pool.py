@@ -345,6 +345,15 @@ async def _attempt_rpc_server_restart(
         "if ($result.ReturnValue -ne 0) { Write-Output 'WMI_FAIL'; exit 3 };"
         "Start-Sleep -Seconds 4;"
         "$rpc = Get-Process -Name 'rpc-server' -ErrorAction SilentlyContinue;"
+        "if ($rpc) {"
+        # Lower the rpc-server's priority class to BelowNormal so it
+        # cooperates when the user wants to actively use the worker
+        # for other work. Inference still runs at full speed when the
+        # user isn't doing anything else; under load the OS scheduler
+        # gives priority to whatever the user is interacting with.
+        "  try { $rpc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } "
+        "  catch { Write-Output 'PRIORITY_FAIL' };"
+        "}"
         "$port = Get-NetTCPConnection -LocalPort 50052 -State Listen -ErrorAction SilentlyContinue;"
         "if ($rpc -and $port) { Write-Output 'OK' } else { Write-Output 'NO_LISTEN' }"
     )
