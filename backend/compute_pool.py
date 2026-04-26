@@ -274,7 +274,7 @@ async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
 
 
 _DEFAULT_WORKER_BACKEND = "SYCL0,CPU"
-_MOE_WORKER_BACKEND = "CPU"
+_SPLIT_WORKER_BACKEND = "CPU"
 
 
 async def _attempt_rpc_server_restart(
@@ -2196,26 +2196,27 @@ async def _ensure_split_running_for(
             )
             target_row = db.get_split_model(target_row["id"])
 
-    # SYCL+RPC+MoE workaround (issue #21420 / #20259 / #21474):
-    # if the model is MoE, switch every worker's rpc-server to the
-    # CPU-only backend before spawning llama-server. With no SYCL
-    # device exposed on the workers, llama.cpp's auto-distribution
-    # routes the heavy MoE expert tensors to host CPU + worker CPU
-    # devices — using ALL pool memory across host RAM + worker RAM
-    # without ever touching the broken SYCL+RPC path. Non-MoE models
-    # keep the default `SYCL0,CPU` backend (full iGPU acceleration).
+    # SYCL+RPC workaround (issues #21420 / #20259 / #21474 / and
+    # related): empirically the crash isn't limited to MoE expert
+    # tensors. qwen3.5 (SSM hybrid) crashes at ggml-rpc.cpp:534
+    # during slot init; gemma4 (MoE) crashes at :477 during layer
+    # push; mixtral (MoE) crashes too. The only model class we've
+    # seen survive split with SYCL exposed is vanilla transformers
+    # (llama3.1:8b worked — but it's the exception). The reliable
+    # rule is: ANY model that engages the split path gets CPU-only
+    # workers, and so SYCL never sees an RPC layer push.
     #
-    # We only switch when needed: workers track their current backend
-    # in `capabilities.current_rpc_backend` and `_set_workers_backend`
-    # is a no-op when they already match.
+    # Workers stay on `-d SYCL0,CPU` when NOT in split mode (Phase 1
+    # routing, embeddings, subagents) so iGPU acceleration is still
+    # used for those paths. The CPU-only switch is purely for the
+    # llama-server split spawn.
+    #
+    # `stop_all_running_splits` restores the default backend so the
+    # next non-split request (or smaller model that fits host alone)
+    # immediately gets SYCL again.
     workers_for_split = [db.get_compute_worker(wid) for wid in worker_ids]
     workers_for_split = [w for w in workers_for_split if w]
-    desired_backend = (
-        _MOE_WORKER_BACKEND
-        if split_lifecycle._is_moe_model(gguf_path)
-        else _DEFAULT_WORKER_BACKEND
-    )
-    await _set_workers_backend(workers_for_split, desired_backend)
+    await _set_workers_backend(workers_for_split, _SPLIT_WORKER_BACKEND)
 
     sid = target_row["id"]
     if target_row.get("status") != "running":
