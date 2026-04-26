@@ -457,6 +457,36 @@ def pick_chat_target(model: str) -> tuple[str, str | None] | None:
     return (_worker_base_url(w), db.get_compute_worker_auth_token(w["id"]))
 
 
+def pick_split_chat_target(model_name: str) -> tuple[str, str] | None:
+    """Resolve a conversation's model name to a running llama-server, or None.
+
+    Convention: split-model conversations carry a model field of the form
+    `split:<label>`. We strip the prefix, look up the matching split_models
+    row, and — if its status is `running` — return `(base_url, label)`.
+    Caller composes `<base_url>/v1/chat/completions` and uses `label` as
+    the OpenAI-style `model` field in the POST body (llama-server doesn't
+    care what you put there; one server, one loaded model).
+
+    Returns None for:
+      * Anything not prefixed with `split:` — that's a normal Ollama model.
+      * A `split:<label>` whose row doesn't exist (label was renamed,
+        deleted, etc.).
+      * A row whose status is anything other than `running` — caller
+        should NOT route chat to a stopped/loading server.
+    """
+    if not model_name or not model_name.startswith("split:"):
+        return None
+    label = model_name[len("split:"):].strip()
+    if not label:
+        return None
+    # Linear scan over split_models — the table is tiny (typical user
+    # has 0-5 rows) so an index would be over-engineering.
+    for row in db.list_split_models(enabled_only=True):
+        if row.get("label") == label and row.get("status") == "running":
+            return (f"http://127.0.0.1:{row['llama_port']}", label)
+    return None
+
+
 def list_subagent_workers(model: str) -> list[tuple[str, str | None]]:
     """Return every eligible compute worker for parallel-subagent fan-out.
 

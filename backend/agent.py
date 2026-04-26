@@ -1381,6 +1381,105 @@ async def _stream_ollama_chat(
                     continue
 
 
+# ---------------------------------------------------------------------------
+# Split-model chat: talk to llama-server (OpenAI-compatible) and translate
+# its SSE chunks into the Ollama chunk shape the rest of agent.py expects.
+#
+# llama-server's /v1/chat/completions speaks SSE with payloads like
+#   data: {"choices":[{"delta":{"role":"assistant","content":"hi"}}]}
+#   data: [DONE]
+# We yield Ollama-shaped dicts so callers don't need a code branch:
+#   {"message": {"role":"assistant","content":"hi"}, "done": False}
+#
+# Tool calling: split models go through the prompt-space adapter
+# (`tool_prompt_adapter.needs_adapter` returns True for split: prefixes
+# in `_resolve_chat_target`), so tool calls arrive as plaintext
+# <tool_call>…</tool_call> blocks in `delta.content` rather than via
+# OpenAI's structured `tool_calls` field. The agent loop's existing
+# adapter parsing then handles them. This keeps split-model and
+# Ollama-model code paths uniform.
+# ---------------------------------------------------------------------------
+async def _stream_llama_server_chat(
+    model: str,
+    messages: list[dict],
+    *,
+    base_url: str,
+    auth_token: str | None = None,
+) -> AsyncGenerator[dict, None]:
+    """Yield Ollama-shape chunks from a llama-server `/v1/chat/completions`
+    streaming response.
+
+    `model` is whatever label llama-server should echo back — the server
+    has only one model loaded so this is mostly cosmetic.
+
+    Tools are deliberately NOT passed in the OpenAI shape — the caller
+    is expected to be in adapter mode (system prompt has the tool
+    block inlined) so we send only `messages`.
+    """
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "temperature": 0.3,
+        # No max_tokens cap — llama-server defaults to its own context
+        # ceiling. Adding -1 here would 400 (OpenAI rejects negatives).
+    }
+    headers: dict[str, str] = {"Accept": "text/event-stream"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
+    timeout = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
+            "POST",
+            f"{base_url}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+        ) as r:
+            if r.status_code >= 400:
+                body = await r.aread()
+                detail = body.decode("utf-8", errors="replace")[:400]
+                msg = (detail or f"HTTP {r.status_code}").strip()
+                raise httpx.HTTPStatusError(msg, request=r.request, response=r)
+
+            # SSE framing: lines prefixed with "data: " carry the JSON.
+            # Empty lines separate events. The terminal sentinel is
+            # "data: [DONE]" — we yield a final {"done": True} when we
+            # see it so the agent loop's "if chunk.get('done'): break"
+            # check fires the same way as for Ollama's `done` flag.
+            async for line in r.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                payload_str = line[len("data:"):].strip()
+                if payload_str == "[DONE]":
+                    yield {"message": {"role": "assistant", "content": ""}, "done": True}
+                    break
+                try:
+                    obj = json.loads(payload_str)
+                except json.JSONDecodeError:
+                    continue
+                # OpenAI streaming: delta lives at choices[0].delta.
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = (choices[0] or {}).get("delta") or {}
+                # Translate to Ollama shape. We collect role + content
+                # into `message` and surface `done` only on the [DONE]
+                # sentinel above (OpenAI's per-chunk `finish_reason`
+                # isn't a perfect mirror — better to wait for the
+                # explicit terminator).
+                yield {
+                    "message": {
+                        "role": delta.get("role") or "assistant",
+                        "content": delta.get("content") or "",
+                    },
+                    "done": False,
+                }
+
+
 async def run_turn(
     conversation_id: str,
     user_text: str | None = None,
@@ -1733,8 +1832,21 @@ async def _run_turn_impl(
             if (((s.get("function") or {}).get("name")) in loaded_set)
         ]
 
-        # Compute-pool routing for the parent chat turn. Same picker rules
-        # as embeddings/subagents — pick a worker iff one is enabled,
+        # Phase 2 split-model routing takes precedence: when the user
+        # has flagged the active model as `split:<label>` (a llama-server
+        # process running with --rpc workers), we send chat there
+        # instead of to Ollama. Layers fan across host VRAM/RAM + every
+        # rpc-server's CPU+GPU+RAM. The OpenAI-shape API on llama-server
+        # forces adapter mode (tool block inlined in system prompt).
+        split_target = None
+        try:
+            split_target = compute_pool.pick_split_chat_target(conv["model"])
+        except Exception:
+            split_target = None
+
+        # Compute-pool Phase 1 routing for the parent chat turn (only
+        # when we're NOT going to a split model). Same picker rules as
+        # embeddings/subagents — pick a worker iff one is enabled,
         # `use_for_chat=True`, freshly probed, and has the model installed.
         # If no worker is eligible we stay on the host (the common case
         # before the user adds devices). Pick once per turn so the entire
@@ -1742,12 +1854,13 @@ async def _run_turn_impl(
         # streamed tool-call iterations.
         chat_base_url = OLLAMA_URL
         chat_auth_token: str | None = None
-        try:
-            chat_target = compute_pool.pick_chat_target(conv["model"])
-        except Exception:
-            chat_target = None
-        if chat_target is not None:
-            chat_base_url, chat_auth_token = chat_target
+        if split_target is None:
+            try:
+                chat_target = compute_pool.pick_chat_target(conv["model"])
+            except Exception:
+                chat_target = None
+            if chat_target is not None:
+                chat_base_url, chat_auth_token = chat_target
 
         # Prompt-space tool adapter: some Ollama models advertise the
         # `tools` capability but ship a passthrough chat template
@@ -1764,9 +1877,18 @@ async def _run_turn_impl(
         #     `_stream_ollama_chat`),
         #   * parse any <tool_call> blocks out of the streamed text after
         #     the response completes (below).
-        adapter_mode = await tool_prompt_adapter.needs_adapter(
-            conv["model"], chat_base_url, auth_token=chat_auth_token,
-        )
+        # Split-model chat ALWAYS uses adapter mode. llama-server's
+        # /v1/chat/completions speaks OpenAI tool format, not Ollama's,
+        # and we don't translate that here — the prompt-space adapter
+        # inlines tool definitions in the system prompt and parses
+        # <tool_call>…</tool_call> out of plain assistant text. This
+        # keeps the agent loop's tool plumbing identical for both paths.
+        if split_target is not None:
+            adapter_mode = True
+        else:
+            adapter_mode = await tool_prompt_adapter.needs_adapter(
+                conv["model"], chat_base_url, auth_token=chat_auth_token,
+            )
         if adapter_mode:
             ollama_msgs = tool_prompt_adapter.inject_tools_block_into_system(
                 ollama_msgs, merged_schemas,
@@ -1841,8 +1963,20 @@ async def _run_turn_impl(
             # silently swallow the entire replacement response.
             delta_filter = _StreamTagFilter()
             thinking_filter = _StreamTagFilter()
-            try:
-                async for chunk in _stream_ollama_chat(
+            # Pick the right streamer for the target. For split models we
+            # talk OpenAI shape on llama-server; for everything else we
+            # talk Ollama shape. Both yield `{message: {role, content,
+            # tool_calls}, done: bool}` so the rest of the loop is
+            # streamer-agnostic.
+            if split_target is not None:
+                split_base, split_label = split_target
+                stream_iter = _stream_llama_server_chat(
+                    split_label, stream_msgs,
+                    base_url=split_base,
+                    auth_token=None,    # llama-server is loopback, no auth
+                )
+            else:
+                stream_iter = _stream_ollama_chat(
                     conv["model"],
                     stream_msgs,
                     merged_schemas,
@@ -1853,7 +1987,9 @@ async def _run_turn_impl(
                     disable_thinking=empty_retries > 0,
                     base_url=chat_base_url,
                     auth_token=chat_auth_token,
-                ):
+                )
+            try:
+                async for chunk in stream_iter:
                     # Honour Stop button mid-stream. Breaking here closes the
                     # httpx streaming context (via the async-generator protocol),
                     # which aborts the request to Ollama — so the local model

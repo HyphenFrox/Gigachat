@@ -1196,6 +1196,21 @@ async def list_models(all: bool = False) -> dict:
                 for n, ok in zip(names, results)
                 if isinstance(ok, bool) and ok
             ]
+        # Append running split-model entries as `split:<label>`. The
+        # agent's chat router (run_turn) recognizes the prefix and
+        # sends the turn to the local llama-server instead of Ollama.
+        # We only include `running` rows — there's no point letting
+        # the user pick a stopped split model and getting a connection
+        # refused on the first message.
+        try:
+            for row in db.list_split_models(enabled_only=True):
+                if row.get("status") == "running":
+                    filtered.append(f"split:{row['label']}")
+        except Exception:
+            # Listing split models can't really fail (pure DB read),
+            # but we don't want a corrupt row to break the model list
+            # for everyone.
+            pass
         return {"models": filtered}
     except Exception as e:
         return {"models": [], "error": str(e)}
