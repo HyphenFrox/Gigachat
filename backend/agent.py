@@ -1832,26 +1832,41 @@ async def _run_turn_impl(
             if (((s.get("function") or {}).get("name")) in loaded_set)
         ]
 
-        # Phase 2 split-model routing takes precedence: when the user
-        # has flagged the active model as `split:<label>` (a llama-server
-        # process running with --rpc workers), we send chat there
-        # instead of to Ollama. Layers fan across host VRAM/RAM + every
-        # rpc-server's CPU+GPU+RAM. The OpenAI-shape API on llama-server
-        # forces adapter mode (tool block inlined in system prompt).
-        split_target = None
+        # Phase 2 auto-router: decide whether to route this turn to a
+        # transparent layer-split llama-server or to Ollama. The router
+        # checks the model's GGUF size against host VRAM and the
+        # connected workers' rpc-server availability; it auto-spawns
+        # llama-server with --rpc when the model exceeds host budget,
+        # auto-stops it when it doesn't. Everything is invisible to the
+        # user — they just pick a model from the picker.
+        split_target: tuple[str, str] | None = None
         try:
-            split_target = compute_pool.pick_split_chat_target(conv["model"])
-        except Exception:
-            split_target = None
+            decision = await compute_pool.route_chat_for(conv["model"])
+        except compute_pool.RouteChatError as e:
+            # Hard fail: model can't be served at all (e.g. doesn't fit
+            # combined pool). Persist an assistant-role error message so
+            # the user sees what went wrong instead of a stuck spinner.
+            db.add_message(
+                conversation_id, "assistant",
+                f"[compute pool] Could not run {conv['model']!r}: {e}",
+            )
+            yield {"type": "error", "error": str(e)}
+            return
+        except Exception as e:
+            log.warning("compute_pool: route_chat_for failed: %s", e)
+            decision = {"engine": "ollama"}
+
+        if decision.get("engine") == "llama_server":
+            split_target = (decision["base_url"], decision["label"])
 
         # Compute-pool Phase 1 routing for the parent chat turn (only
-        # when we're NOT going to a split model). Same picker rules as
-        # embeddings/subagents — pick a worker iff one is enabled,
-        # `use_for_chat=True`, freshly probed, and has the model installed.
-        # If no worker is eligible we stay on the host (the common case
-        # before the user adds devices). Pick once per turn so the entire
-        # tool-loop hits the same Ollama: KV-cache warmth survives across
-        # streamed tool-call iterations.
+        # when the auto-router didn't pick a split target). Same picker
+        # rules as embeddings/subagents — pick a worker iff one is
+        # enabled, `use_for_chat=True`, freshly probed, and has the
+        # model installed. If no worker is eligible we stay on the host
+        # (the common case before the user adds devices). Pick once per
+        # turn so the entire tool-loop hits the same Ollama: KV-cache
+        # warmth survives across streamed tool-call iterations.
         chat_base_url = OLLAMA_URL
         chat_auth_token: str | None = None
         if split_target is None:

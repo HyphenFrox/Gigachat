@@ -223,3 +223,191 @@ def test_stream_sends_bearer_when_token_set(monkeypatch):
 
     _run(go())
     assert seen_auth == ["Bearer hunter2"]
+
+
+# --- route_chat_for (auto-router) ----------------------------------------
+
+
+def _stub_split_lifecycle(monkeypatch, started_ports: dict[str, int]):
+    """Replace split_lifecycle.start/stop with stubs that just flip
+    DB status. Avoids spawning real subprocesses in tests."""
+    import asyncio
+    from backend import split_lifecycle
+
+    async def _start(sid):
+        # Flip the row to running and pick its port from the DB row.
+        from backend import db as _db
+        row = _db.get_split_model(sid)
+        if not row:
+            return {"ok": False, "status": "error", "error": "not found"}
+        _db.update_split_model_status(sid, status="running", last_error="")
+        started_ports[sid] = row["llama_port"]
+        return {"ok": True, "status": "running", "port": row["llama_port"]}
+
+    async def _stop(sid, *, _from_failed_start=False):
+        from backend import db as _db
+        _db.update_split_model_status(sid, status="stopped")
+        started_ports.pop(sid, None)
+        return {"ok": True, "status": "stopped"}
+
+    monkeypatch.setattr(split_lifecycle, "start", _start)
+    monkeypatch.setattr(split_lifecycle, "stop", _stop)
+
+
+def _seed_eligible_split_worker(isolated_db, *, label, address, model_present="gemma3:27b"):
+    """Worker with rpc-server reachable + use_for_chat enabled."""
+    import time
+    wid = isolated_db.create_compute_worker(
+        label=label, address=address, transport="lan",
+        use_for_chat=True,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": model_present, "details": {}}],
+            "rpc_server_reachable": True,
+            "rpc_port": 50052,
+            "rpc_error": None,
+        },
+        last_seen=time.time() - 5.0,
+        last_error="",
+    )
+    return wid
+
+
+def test_route_uses_ollama_when_model_not_in_manifest(isolated_db, monkeypatch):
+    """Model name we can't resolve to a GGUF blob → fall through to
+    Ollama (Ollama itself will surface the right error if the model
+    truly doesn't exist anywhere)."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    # Make resolve_ollama_model return None.
+    monkeypatch.setattr(compute_pool, "resolve_ollama_model", lambda _: None)
+    decision = _run(compute_pool.route_chat_for("custom:thing"))
+    assert decision == {"engine": "ollama"}
+
+
+def test_route_uses_ollama_when_model_fits_host_vram(isolated_db, monkeypatch):
+    """Model size < host budget → host Ollama (fastest path; no LAN
+    overhead, workers stay free for parallel embed/subagent)."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    # 4 GB model.
+    monkeypatch.setattr(
+        compute_pool, "resolve_ollama_model",
+        lambda name: {"gguf_path": "/m.gguf", "size_bytes": 4 * 1024 ** 3, "manifest": {}},
+    )
+    # Host has 8 GB VRAM (host_budget = 8 * 0.85 = 6.8 GB).
+    monkeypatch.setattr(compute_pool, "_host_vram_budget_bytes", lambda: 8 * 1024 ** 3 * 85 // 100)
+    decision = _run(compute_pool.route_chat_for("small:7b"))
+    assert decision == {"engine": "ollama"}
+
+
+def test_route_falls_back_to_ollama_when_model_too_big_but_no_workers(isolated_db, monkeypatch):
+    """Model exceeds host VRAM but no eligible workers exist → fall
+    back to Ollama. Ollama's CPU offload handles it (slowly) — strictly
+    better than refusing."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    monkeypatch.setattr(
+        compute_pool, "resolve_ollama_model",
+        lambda name: {"gguf_path": "/m.gguf", "size_bytes": 12 * 1024 ** 3, "manifest": {}},
+    )
+    monkeypatch.setattr(compute_pool, "_host_vram_budget_bytes", lambda: 8 * 1024 ** 3 * 85 // 100)
+    decision = _run(compute_pool.route_chat_for("big:27b"))
+    assert decision == {"engine": "ollama"}
+
+
+def test_route_engages_split_when_model_too_big_and_workers_eligible(isolated_db, monkeypatch):
+    """Model exceeds host VRAM AND a worker has rpc-server reachable
+    → auto-spawn llama-server and route there."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_split_worker(isolated_db, label="A", address="a.local")
+
+    monkeypatch.setattr(
+        compute_pool, "resolve_ollama_model",
+        lambda name: {"gguf_path": "/big.gguf", "size_bytes": 17 * 1024 ** 3, "manifest": {}},
+    )
+    monkeypatch.setattr(compute_pool, "_host_vram_budget_bytes", lambda: 8 * 1024 ** 3 * 85 // 100)
+
+    started_ports: dict[str, int] = {}
+    _stub_split_lifecycle(monkeypatch, started_ports)
+
+    decision = _run(compute_pool.route_chat_for("big:27b"))
+    assert decision["engine"] == "llama_server"
+    assert decision["label"] == "big:27b"
+    assert decision["base_url"].startswith("http://127.0.0.1:")
+    # Auto-created a split_models row for this exact model.
+    rows = isolated_db.list_split_models()
+    assert any(r["label"] == "big:27b" for r in rows)
+    # And started llama-server for it (stub flipped status to running).
+    assert any(r["status"] == "running" for r in rows)
+
+
+def test_route_reuses_existing_running_split_for_same_model(isolated_db, monkeypatch):
+    """Second turn for the same big model → reuse the warm
+    llama-server (no fresh spawn, no double-start)."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_split_worker(isolated_db, label="A", address="a.local")
+    monkeypatch.setattr(
+        compute_pool, "resolve_ollama_model",
+        lambda name: {"gguf_path": "/big.gguf", "size_bytes": 17 * 1024 ** 3, "manifest": {}},
+    )
+    monkeypatch.setattr(compute_pool, "_host_vram_budget_bytes", lambda: 8 * 1024 ** 3 * 85 // 100)
+    started_ports: dict[str, int] = {}
+    _stub_split_lifecycle(monkeypatch, started_ports)
+
+    _run(compute_pool.route_chat_for("big:27b"))
+    rows1 = isolated_db.list_split_models()
+    sid1 = rows1[0]["id"]
+
+    _run(compute_pool.route_chat_for("big:27b"))
+    rows2 = isolated_db.list_split_models()
+    # Same row, same id — no second auto-create.
+    assert len(rows2) == 1
+    assert rows2[0]["id"] == sid1
+    assert rows2[0]["status"] == "running"
+
+
+def test_route_stops_other_split_when_switching_models(isolated_db, monkeypatch):
+    """Switching from big-model-A to big-model-B should stop A's
+    llama-server (one big model hot at a time — finite VRAM)."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_split_worker(isolated_db, label="A", address="a.local")
+
+    sizes = {"a:27b": 17, "b:32b": 19}
+    monkeypatch.setattr(
+        compute_pool, "resolve_ollama_model",
+        lambda name: {"gguf_path": f"/{name}.gguf", "size_bytes": sizes[name] * 1024 ** 3, "manifest": {}},
+    )
+    monkeypatch.setattr(compute_pool, "_host_vram_budget_bytes", lambda: 8 * 1024 ** 3 * 85 // 100)
+    started_ports: dict[str, int] = {}
+    _stub_split_lifecycle(monkeypatch, started_ports)
+
+    _run(compute_pool.route_chat_for("a:27b"))
+    _run(compute_pool.route_chat_for("b:32b"))
+
+    rows = {r["label"]: r for r in isolated_db.list_split_models()}
+    assert rows["a:27b"]["status"] == "stopped"
+    assert rows["b:32b"]["status"] == "running"
+
+
+def test_route_stops_split_when_switching_to_small_model(isolated_db, monkeypatch):
+    """Switching from a big split model back to a small Ollama-fits
+    model → free the VRAM by stopping the llama-server."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_split_worker(isolated_db, label="A", address="a.local")
+
+    sizes = {"big:27b": 17, "small:7b": 4}
+    monkeypatch.setattr(
+        compute_pool, "resolve_ollama_model",
+        lambda name: {"gguf_path": f"/{name}.gguf", "size_bytes": sizes[name] * 1024 ** 3, "manifest": {}},
+    )
+    monkeypatch.setattr(compute_pool, "_host_vram_budget_bytes", lambda: 8 * 1024 ** 3 * 85 // 100)
+    started_ports: dict[str, int] = {}
+    _stub_split_lifecycle(monkeypatch, started_ports)
+
+    _run(compute_pool.route_chat_for("big:27b"))
+    decision = _run(compute_pool.route_chat_for("small:7b"))
+    assert decision == {"engine": "ollama"}
+    rows = {r["label"]: r for r in isolated_db.list_split_models()}
+    # Big was stopped during the switch.
+    assert rows["big:27b"]["status"] == "stopped"

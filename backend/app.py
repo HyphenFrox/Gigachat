@@ -822,6 +822,22 @@ async def _start_compute_pool_probe() -> None:
 
 
 @app.on_event("startup")
+async def _reconcile_split_models() -> None:
+    """Reset stale `running`/`loading` rows on boot.
+
+    If the previous app process was killed mid-flight, llama-server
+    children went with it but the DB still says `running`. Without
+    reconcile the UI shows phantom green pills and chat routing tries
+    to talk to a port nothing is bound to."""
+    try:
+        n = split_lifecycle.reconcile_on_boot()
+        if n:
+            print(f"[split] reconciled {n} stale split-model row(s) to stopped", file=sys.stderr)
+    except Exception as e:
+        print(f"[split] boot reconcile failed: {e}", file=sys.stderr)
+
+
+@app.on_event("startup")
 async def _start_mcp() -> None:
     """Spawn every enabled MCP server once the event loop is running.
 
@@ -1196,21 +1212,11 @@ async def list_models(all: bool = False) -> dict:
                 for n, ok in zip(names, results)
                 if isinstance(ok, bool) and ok
             ]
-        # Append running split-model entries as `split:<label>`. The
-        # agent's chat router (run_turn) recognizes the prefix and
-        # sends the turn to the local llama-server instead of Ollama.
-        # We only include `running` rows — there's no point letting
-        # the user pick a stopped split model and getting a connection
-        # refused on the first message.
-        try:
-            for row in db.list_split_models(enabled_only=True):
-                if row.get("status") == "running":
-                    filtered.append(f"split:{row['label']}")
-        except Exception:
-            # Listing split models can't really fail (pure DB read),
-            # but we don't want a corrupt row to break the model list
-            # for everyone.
-            pass
+        # Phase 2 split path is invisible from the picker — the user
+        # picks any normal Ollama model and the auto-router
+        # (compute_pool.route_chat_for) decides at run-turn time
+        # whether to use Ollama or to spawn llama-server with --rpc.
+        # No `split:<label>` prefixes here.
         return {"models": filtered}
     except Exception as e:
         return {"models": [], "error": str(e)}
@@ -3497,6 +3503,21 @@ def api_status_split_model(sid: str) -> dict:
     if not s.get("ok"):
         raise HTTPException(404, s.get("error") or "not found")
     return s
+
+
+@app.get("/api/split-models/{sid}/log")
+def api_split_model_log(sid: str, lines: int = 100) -> dict:
+    """Return the tail of llama-server's per-split log file.
+
+    Most start failures (port already bound, GGUF too new for this
+    llama.cpp build, OOM during layer offload) surface in the log
+    BEFORE the bare 'failed to start' status reaches the API. The
+    Settings UI's diagnostic pane uses this to show the operator what
+    really went wrong.
+    """
+    if not db.get_split_model(sid):
+        raise HTTPException(404, "split_model not found")
+    return {"id": sid, "log": split_lifecycle.read_log_tail(sid, lines=lines)}
 
 
 @app.post("/api/split-models/install-llamacpp")

@@ -358,3 +358,64 @@ def test_status_unknown_id(isolated_db, monkeypatch):
     s = split_lifecycle.status("nonexistent")
     assert s["ok"] is False
     assert "not found" in s["error"]
+
+
+# --- reconcile_on_boot ---------------------------------------------------
+
+
+def test_reconcile_resets_running_rows_to_stopped(isolated_db, monkeypatch):
+    """A row that the DB thinks is `running` after an app crash must
+    be reset, with a clear last_error explaining why."""
+    monkeypatch.setattr(split_lifecycle, "db", isolated_db)
+    sid_running = isolated_db.create_split_model(label="A", gguf_path="/a.gguf")
+    isolated_db.update_split_model_status(sid_running, status="running")
+    sid_loading = isolated_db.create_split_model(label="B", gguf_path="/b.gguf")
+    isolated_db.update_split_model_status(sid_loading, status="loading")
+    sid_stopped = isolated_db.create_split_model(label="C", gguf_path="/c.gguf")
+    # Already stopped — should NOT be touched.
+
+    n = split_lifecycle.reconcile_on_boot()
+    assert n == 2
+
+    # A and B reset; their last_error explains.
+    a = isolated_db.get_split_model(sid_running)
+    b = isolated_db.get_split_model(sid_loading)
+    c = isolated_db.get_split_model(sid_stopped)
+    assert a["status"] == "stopped"
+    assert "boot" in (a["last_error"] or "")
+    assert b["status"] == "stopped"
+    # C untouched (already stopped, no error history to overwrite).
+    assert c["status"] == "stopped"
+    assert c["last_error"] is None
+
+
+def test_reconcile_no_op_when_all_clean(isolated_db, monkeypatch):
+    monkeypatch.setattr(split_lifecycle, "db", isolated_db)
+    isolated_db.create_split_model(label="A", gguf_path="/a.gguf")
+    n = split_lifecycle.reconcile_on_boot()
+    assert n == 0
+
+
+# --- read_log_tail -------------------------------------------------------
+
+
+def test_read_log_tail_empty_when_no_log(isolated_db, monkeypatch, tmp_path):
+    monkeypatch.setattr(split_runtime, "LLAMA_CPP_INSTALL_DIR", tmp_path / "llama-cpp")
+    monkeypatch.setattr(split_lifecycle, "db", isolated_db)
+    assert split_lifecycle.read_log_tail("any-id") == ""
+
+
+def test_read_log_tail_returns_last_n_lines(isolated_db, monkeypatch, tmp_path):
+    monkeypatch.setattr(split_runtime, "LLAMA_CPP_INSTALL_DIR", tmp_path / "llama-cpp")
+    monkeypatch.setattr(split_lifecycle, "db", isolated_db)
+    log_path = split_lifecycle._log_path_for("test-id")
+    log_path.write_text(
+        "\n".join(f"line {i}" for i in range(200)) + "\n",
+        encoding="utf-8",
+    )
+    out = split_lifecycle.read_log_tail("test-id", lines=20)
+    out_lines = out.splitlines()
+    # Last 20 should land — line 180 .. line 199.
+    assert len(out_lines) == 20
+    assert out_lines[-1] == "line 199"
+    assert out_lines[0] == "line 180"

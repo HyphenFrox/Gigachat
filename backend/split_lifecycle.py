@@ -455,3 +455,63 @@ async def stop_all() -> None:
             await stop(sid)
         except Exception as e:
             log.warning("split_lifecycle: stop_all error for %s: %s", sid, e)
+
+
+def reconcile_on_boot() -> int:
+    """Reset DB rows that claim `running` / `loading` but have no process.
+
+    Scenario: the app crashed (or was Ctrl-C'd hard) while a split
+    model was active. The DB row still says `running`, but the
+    llama-server child is gone — Windows reclaimed it when uvicorn
+    died. Without this reset, the UI would show a phantom green pill
+    and the routing layer would happily try to send chat to a port
+    nothing is listening on.
+
+    Called once at app startup. Returns the number of rows that were
+    reset so the startup hook can log it.
+    """
+    reset_count = 0
+    for row in db.list_split_models():
+        if row.get("status") in ("running", "loading"):
+            db.update_split_model_status(
+                row["id"],
+                status="stopped",
+                last_error="reset on app boot — process did not survive restart",
+            )
+            reset_count += 1
+    return reset_count
+
+
+def read_log_tail(split_id: str, lines: int = 100) -> str:
+    """Return the last `lines` lines of the per-split log file.
+
+    Used by the Settings UI to show what llama-server is actually
+    saying — most start failures (port already bound, GGUF too new
+    for this build, OOM during layer offload) surface here BEFORE
+    the bare 'failed to start' status reaches the API. Returns empty
+    string if the log doesn't exist yet.
+
+    No streaming/follow — keep it simple. The UI fetches once on
+    open and re-fetches on user click.
+    """
+    log_path = _log_path_for(split_id)
+    if not log_path.is_file():
+        return ""
+    try:
+        with log_path.open("rb") as f:
+            # Cheap tail: read up to ~256 KB and split. For typical
+            # llama-server logs (~few KB total in the first few minutes)
+            # this is plenty; a runaway log gets truncated to the most
+            # recent slice, which is what the operator wants anyway.
+            f.seek(0, 2)  # end
+            size = f.tell()
+            read_bytes = min(size, 256 * 1024)
+            f.seek(size - read_bytes)
+            data = f.read()
+    except OSError:
+        return ""
+    text = data.decode("utf-8", errors="replace")
+    out_lines = text.splitlines()
+    if len(out_lines) > lines:
+        out_lines = out_lines[-lines:]
+    return "\n".join(out_lines)

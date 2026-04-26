@@ -26,7 +26,7 @@ import {
 } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import { api } from '@/lib/api'
-import SplitModelsSection from './SplitModelsPanel'
+import AutoSplitInstallSection from './SplitModelsPanel'
 
 /**
  * ComputePoolSection — body for the "Compute Pool" tab inside SettingsPanel.
@@ -307,11 +307,15 @@ export default function ComputePoolSection() {
           ))}
         </div>
 
-        {/* Phase 2: split models live below the worker list. They
-            consume worker_ids from the rows above; surfacing them in
-            the same tab keeps the "compute" mental model unified
-            (here is everything the host's compute pool knows about). */}
-        <SplitModelsSection workers={workers} />
+        {/* Phase 2 install banner only — actual split-model routing is
+            fully automatic. When the user picks a model in chat, the
+            backend's `compute_pool.route_chat_for` decides whether the
+            model fits the host's VRAM (→ Ollama) or needs to fan across
+            workers via llama.cpp RPC (→ llama-server auto-spawned).
+            The user never sees a "split models" registry — just this
+            small banner that asks for the one-time llama.cpp install
+            when they want to enable the big-model path. */}
+        <AutoSplitInstallSection />
       </div>
 
       {/* Add / edit drawer */}

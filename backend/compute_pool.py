@@ -24,13 +24,16 @@ flakiness appears.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
 
-from . import db
+from . import db, sysdetect
 
 log = logging.getLogger(__name__)
 
@@ -458,33 +461,309 @@ def pick_chat_target(model: str) -> tuple[str, str | None] | None:
 
 
 def pick_split_chat_target(model_name: str) -> tuple[str, str] | None:
-    """Resolve a conversation's model name to a running llama-server, or None.
+    """Legacy lookup retained for back-compat with tests / explicit
+    `split:<label>` model names. The auto-router below
+    (`route_chat_for`) is the live entry point now; it never produces
+    `split:` prefixes — it just inspects the model and decides whether
+    to engage the split path transparently.
 
-    Convention: split-model conversations carry a model field of the form
-    `split:<label>`. We strip the prefix, look up the matching split_models
-    row, and — if its status is `running` — return `(base_url, label)`.
-    Caller composes `<base_url>/v1/chat/completions` and uses `label` as
-    the OpenAI-style `model` field in the POST body (llama-server doesn't
-    care what you put there; one server, one loaded model).
-
-    Returns None for:
-      * Anything not prefixed with `split:` — that's a normal Ollama model.
-      * A `split:<label>` whose row doesn't exist (label was renamed,
-        deleted, etc.).
-      * A row whose status is anything other than `running` — caller
-        should NOT route chat to a stopped/loading server.
+    Returns `(base_url, label)` for an explicit `split:<label>` whose
+    row is `running`; None otherwise.
     """
     if not model_name or not model_name.startswith("split:"):
         return None
     label = model_name[len("split:"):].strip()
     if not label:
         return None
-    # Linear scan over split_models — the table is tiny (typical user
-    # has 0-5 rows) so an index would be over-engineering.
     for row in db.list_split_models(enabled_only=True):
         if row.get("label") == label and row.get("status") == "running":
             return (f"http://127.0.0.1:{row['llama_port']}", label)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Auto-routing: pick host-Ollama vs spawn-llama-server-with-RPC for a model
+# ---------------------------------------------------------------------------
+# This is the intelligent split-or-not decision the user actually picks
+# their model against. They never see `split:<label>` — they pick e.g.
+# `gemma3:27b` from the model picker, and the router decides:
+#
+#   1. Resolve the model's GGUF blob + size from Ollama's manifest store.
+#   2. If size <= host_vram_budget → Ollama on host (fastest path; 0 LAN
+#      overhead; workers stay free for parallel embeddings/subagents).
+#   3. Else → ensure a llama-server is running for THIS exact model with
+#      --rpc to every eligible compute worker, return its URL.
+#   4. If the model can't fit even with the combined pool → raise so the
+#      user gets a clear error rather than silent OOM.
+#
+# Per-conversation lifecycle: when the user switches between two big
+# models, we stop the previously-running llama-server (one big model hot
+# at a time — we have one finite VRAM budget). Switching back to a small
+# model also stops any running llama-server so its VRAM is freed for
+# Ollama.
+# ---------------------------------------------------------------------------
+
+# How much of the host's VRAM we're willing to let one model occupy
+# without engaging the split path. 85% leaves headroom for the OS, the
+# desktop compositor, any other Ollama models loaded simultaneously, and
+# the model's KV cache. Below this fraction → Ollama. Above → split.
+_HOST_VRAM_USE_FRACTION = 0.85
+
+# Path to Ollama's on-disk model store. Default location on every
+# platform Ollama supports; matches what `ollama_runtime` assumes.
+_OLLAMA_MODELS_DIR = Path.home() / ".ollama" / "models"
+
+
+def _resolve_ollama_manifest(model_name: str) -> dict | None:
+    """Locate the manifest JSON for an Ollama model name.
+
+    Ollama stores manifests at
+        ~/.ollama/models/manifests/<registry>/<namespace>/<name>/<tag>
+    The default registry is `registry.ollama.ai` and the default namespace
+    is `library`. Custom registries / namespaces are rare for end users
+    but we still walk the tree to find the file.
+
+    Returns the parsed manifest dict, or None if no matching file exists
+    (model not pulled, name typo, etc.).
+    """
+    name = (model_name or "").strip()
+    if not name:
+        return None
+    # Tag defaults to `latest` when omitted.
+    if ":" in name:
+        bare, tag = name.split(":", 1)
+    else:
+        bare, tag = name, "latest"
+
+    # Default location first — covers >99% of cases.
+    candidate = _OLLAMA_MODELS_DIR / "manifests" / "registry.ollama.ai" / "library" / bare / tag
+    if candidate.is_file():
+        try:
+            return json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    # Fallback: walk the manifests tree. Slower but handles the user
+    # who pulled a model from a non-default registry.
+    manifests = _OLLAMA_MODELS_DIR / "manifests"
+    if not manifests.is_dir():
+        return None
+    needle = (bare, tag)
+    for root, _dirs, files in os.walk(manifests):
+        for fname in files:
+            if fname == tag and Path(root).name == bare:
+                try:
+                    return json.loads(Path(root, fname).read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+    return None
+
+
+def resolve_ollama_model(model_name: str) -> dict | None:
+    """Resolve a model name to its on-disk GGUF + size.
+
+    Returns `{gguf_path, size_bytes, manifest}` or None if the manifest
+    can't be found. The "model" layer of the manifest is the GGUF; we
+    compute size from `layers[].size` for the layer whose mediaType is
+    `application/vnd.ollama.image.model` (large) — license / params /
+    template layers are tiny config blobs and don't count toward VRAM.
+
+    `gguf_path` is the absolute path to the blob, suitable for passing
+    as llama-server's `--model` flag.
+    """
+    manifest = _resolve_ollama_manifest(model_name)
+    if not manifest:
+        return None
+    layers = manifest.get("layers") or []
+    model_layer = None
+    for layer in layers:
+        if layer.get("mediaType") == "application/vnd.ollama.image.model":
+            model_layer = layer
+            break
+    if not model_layer:
+        return None
+    digest = (model_layer.get("digest") or "").replace("sha256:", "")
+    if not digest:
+        return None
+    blob_path = _OLLAMA_MODELS_DIR / "blobs" / f"sha256-{digest}"
+    if not blob_path.is_file():
+        return None
+    return {
+        "gguf_path": str(blob_path),
+        "size_bytes": int(model_layer.get("size") or 0),
+        "manifest": manifest,
+    }
+
+
+def _host_vram_budget_bytes() -> int:
+    """Bytes of host VRAM we're willing to let a single Ollama-loaded
+    model occupy. Below this → Ollama; above → engage split path."""
+    try:
+        spec = sysdetect.detect_system()
+        vram_gb = float(spec.get("vram_gb") or 0.0)
+    except Exception:
+        vram_gb = 0.0
+    return int(vram_gb * _HOST_VRAM_USE_FRACTION * 1024 * 1024 * 1024)
+
+
+def _eligible_split_workers() -> list[dict]:
+    """Workers that can contribute layers via rpc-server.
+
+    Same `enabled` + `use_for_chat` gate as Phase 1's chat picker —
+    workers the user toggled off for chat shouldn't suddenly start
+    receiving inference traffic just because the model needs splitting.
+    Plus the rpc-specific gate: probe must report rpc-server reachable.
+    """
+    rows = db.list_compute_workers(enabled_only=True)
+    out = []
+    for w in rows:
+        if not w.get("use_for_chat"):
+            continue
+        caps = w.get("capabilities") or {}
+        if not caps.get("rpc_server_reachable"):
+            continue
+        out.append(w)
+    # Freshest probe first — if we have to pick a subset later, we'd
+    # rather use the worker we just confirmed alive than one whose
+    # last_seen is an hour stale.
+    out.sort(key=lambda w: float(w.get("last_seen") or 0), reverse=True)
+    return out
+
+
+async def _ensure_split_running_for(
+    model_name: str, gguf_path: str, worker_ids: list[str],
+) -> str:
+    """Idempotent: ensure a `split_models` row exists + is running for
+    this exact (model_name, gguf_path) pair, then return its base_url.
+
+    Auto-creates the row keyed by model_name as label. If a row with the
+    same label already exists, we reuse it (updating worker_ids if the
+    user added/removed workers between turns). If a DIFFERENT split row
+    is currently running, we stop it first — only one big model hot at
+    a time.
+    """
+    # Local import to dodge the circular dep — split_lifecycle imports
+    # compute_pool indirectly via db / runtime.
+    from . import split_lifecycle
+
+    rows = db.list_split_models()
+    target_row = next((r for r in rows if r.get("label") == model_name), None)
+
+    # Stop any other running split row — finite VRAM means one big
+    # model active at a time.
+    for r in rows:
+        if r["id"] != (target_row or {}).get("id") and r.get("status") in ("running", "loading"):
+            try:
+                await split_lifecycle.stop(r["id"])
+            except Exception as e:
+                log.warning("compute_pool: failed to stop %s: %s", r["id"], e)
+
+    if target_row is None:
+        sid = db.create_split_model(
+            label=model_name,
+            gguf_path=gguf_path,
+            worker_ids=worker_ids,
+        )
+        target_row = db.get_split_model(sid)
+    else:
+        # Refresh gguf_path + worker_ids in case the user changed
+        # things since the previous turn.
+        if target_row.get("gguf_path") != gguf_path or target_row.get("worker_ids") != worker_ids:
+            db.update_split_model(
+                target_row["id"],
+                gguf_path=gguf_path,
+                worker_ids=worker_ids,
+            )
+            target_row = db.get_split_model(target_row["id"])
+
+    sid = target_row["id"]
+    if target_row.get("status") != "running":
+        result = await split_lifecycle.start(sid)
+        if not result.get("ok"):
+            raise RuntimeError(
+                f"failed to start llama-server for {model_name}: "
+                f"{result.get('error') or 'unknown'}"
+            )
+
+    fresh = db.get_split_model(sid)
+    return f"http://127.0.0.1:{fresh['llama_port']}"
+
+
+async def stop_all_running_splits() -> None:
+    """Free VRAM held by any running llama-server. Called when the
+    router decides the upcoming chat turn fits Ollama on host alone —
+    no point keeping a big-model llama-server warm if the active
+    conversation no longer needs it."""
+    from . import split_lifecycle
+
+    for r in db.list_split_models():
+        if r.get("status") in ("running", "loading"):
+            try:
+                await split_lifecycle.stop(r["id"])
+            except Exception as e:
+                log.warning("compute_pool: stop_all_running_splits %s: %s", r["id"], e)
+
+
+class RouteChatError(RuntimeError):
+    """Raised by route_chat_for when the model can't be served at all
+    — e.g. the model file isn't present, or the combined pool is too
+    small to hold it. Caller should surface this to the user."""
+
+
+async def route_chat_for(model_name: str) -> dict:
+    """Pick the right inference engine for this model + drive any
+    needed lifecycle changes.
+
+    Returns one of:
+      {"engine": "ollama"}
+        → use the existing Ollama path on host (or a Phase 1 worker
+          via `pick_chat_target`). Caller continues with
+          `_stream_ollama_chat`.
+
+      {"engine": "llama_server", "base_url": "http://127.0.0.1:NNNN", "label": <model>}
+        → llama-server with --rpc was spawned (or already running) for
+          this model. Caller uses `_stream_llama_server_chat` instead.
+
+    Raises `RouteChatError` for unrecoverable cases. Side effects:
+    may stop a currently-running llama-server (model switch) and may
+    auto-create a `split_models` row.
+    """
+    # Cheap reject: explicit `split:` prefix is back-compat — short-
+    # circuit to the legacy picker so existing tests still pass.
+    legacy = pick_split_chat_target(model_name)
+    if legacy is not None:
+        base, label = legacy
+        return {"engine": "llama_server", "base_url": base, "label": label}
+
+    info = resolve_ollama_model(model_name)
+    if info is None:
+        # Not an Ollama-managed model. Could be a custom name the user
+        # set up another way. Stay on the Ollama path — Ollama will
+        # surface its own error if the model truly doesn't exist.
+        await stop_all_running_splits()
+        return {"engine": "ollama"}
+
+    size_bytes = info["size_bytes"]
+    host_budget = _host_vram_budget_bytes()
+    if host_budget > 0 and size_bytes <= host_budget:
+        # Fits comfortably on host. Make sure no llama-server is
+        # holding VRAM we'll need.
+        await stop_all_running_splits()
+        return {"engine": "ollama"}
+
+    # Need the split path. Find eligible workers.
+    workers = _eligible_split_workers()
+    if not workers:
+        # Without workers, the only thing we could do is run on host
+        # with CPU offload — Ollama already does that automatically,
+        # so falling through to the Ollama path is the right call. If
+        # that fails the user gets Ollama's actual error message.
+        await stop_all_running_splits()
+        return {"engine": "ollama"}
+
+    worker_ids = [w["id"] for w in workers]
+    base_url = await _ensure_split_running_for(model_name, info["gguf_path"], worker_ids)
+    return {"engine": "llama_server", "base_url": base_url, "label": model_name}
 
 
 def list_subagent_workers(model: str) -> list[tuple[str, str | None]]:
