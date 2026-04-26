@@ -273,6 +273,83 @@ async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
     return data
 
 
+async def _attempt_rpc_server_restart(worker: dict) -> bool:
+    """SSH into the worker and re-spawn its rpc-server.
+
+    Used by `probe_worker` when the rpc-server TCP probe fails. If the
+    worker has an `ssh_host` set, we kill any stale rpc-server.exe and
+    relaunch it via WMI Win32_Process.Create so the new process
+    survives the SSH session's exit. Returns True if the post-restart
+    process appears alive (process found AND port 50052 listening).
+
+    Locks to SYCL backend (`-d SYCL0`) so dual-loaded backends
+    (SYCL + Vulkan both targeting the same Intel iGPU) don't get
+    enumerated as separate RPC devices and double-allocate the iGPU
+    during model load — that double-counting is what causes "Remote
+    RPC server crashed" mid-push when the second virtual device runs
+    out of physical memory.
+
+    Failure modes (all return False, no exceptions):
+      * No ssh_host configured (caller falls back to "unreachable").
+      * ssh connect timeout / auth failure.
+      * rpc-server.exe missing on the worker.
+      * Process spawned but port not listening within ~4 s.
+    """
+    ssh_host = (worker.get("ssh_host") or "").strip()
+    if not ssh_host:
+        return False
+
+    # Single PowerShell payload: kill stale, spawn fresh, verify alive.
+    # Same WMI pattern used in the manual recovery commands so the
+    # spawned process outlives the SSH session.
+    ps = (
+        "$ErrorActionPreference = 'Continue';"
+        "Get-Process -Name 'rpc-server' -ErrorAction SilentlyContinue | "
+        "  ForEach-Object { Stop-Process -Id $_.Id -Force };"
+        "Start-Sleep -Milliseconds 800;"
+        "$exe = \"$env:USERPROFILE\\.gigachat\\llama-cpp\\rpc-server.exe\";"
+        "if (-not (Test-Path $exe)) { Write-Output 'NO_BINARY'; exit 2 };"
+        "$cmdline = '\"' + $exe + '\" -H 0.0.0.0 -p 50052 -d SYCL0';"
+        "$result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+        "  -Arguments @{ CommandLine = $cmdline; "
+        "                CurrentDirectory = \"$env:USERPROFILE\\.gigachat\\llama-cpp\" };"
+        "if ($result.ReturnValue -ne 0) { Write-Output 'WMI_FAIL'; exit 3 };"
+        "Start-Sleep -Seconds 4;"
+        "$rpc = Get-Process -Name 'rpc-server' -ErrorAction SilentlyContinue;"
+        "$port = Get-NetTCPConnection -LocalPort 50052 -State Listen -ErrorAction SilentlyContinue;"
+        "if ($rpc -and $port) { Write-Output 'OK' } else { Write-Output 'NO_LISTEN' }"
+    )
+    import base64
+    encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+           ssh_host, "powershell", "-NoProfile", "-EncodedCommand", encoded]
+
+    import subprocess as _sp
+    def _run() -> tuple[int, bytes, bytes]:
+        try:
+            r = _sp.run(cmd, capture_output=True, timeout=30.0)
+            return r.returncode, r.stdout, r.stderr
+        except _sp.TimeoutExpired:
+            return -1, b"", b"timeout"
+        except Exception as e:
+            return -2, b"", repr(e).encode()
+
+    try:
+        rc, stdout, stderr = await asyncio.to_thread(_run)
+    except Exception as e:
+        log.info("compute_pool: rpc-server restart ssh failed for %s: %s", ssh_host, e)
+        return False
+
+    out = stdout.decode("utf-8", errors="replace").strip()
+    if rc != 0 or "OK" not in out:
+        log.info(
+            "compute_pool: rpc-server restart on %s did not come up "
+            "(rc=%d, output=%r)", ssh_host, rc, out[-200:],
+        )
+        return False
+    return True
+
+
 async def _probe_rpc_server(
     host: str, port: int, timeout: float = _RPC_PROBE_TIMEOUT_SEC,
 ) -> tuple[bool, str | None]:
@@ -495,6 +572,26 @@ async def probe_worker(wid: str) -> dict:
     rpc_host = _worker_host(worker)
     rpc_port = _DEFAULT_RPC_PORT
     rpc_ok, rpc_err = await _probe_rpc_server(rpc_host, rpc_port)
+
+    # Self-heal: if rpc-server is down AND the worker has ssh_host
+    # configured, attempt to restart it remotely. This covers the
+    # common case where the rpc-server process died (crash, OS
+    # restart, transient driver issue) since the previous probe.
+    # We try restart at most once per probe cycle to avoid tight
+    # loops if the binary is genuinely broken — a successful restart
+    # is verified by an immediate re-probe of the port.
+    if not rpc_ok and (worker.get("ssh_host") or "").strip():
+        log.info(
+            "compute_pool: rpc-server unreachable on %s; attempting "
+            "remote restart via ssh_host=%s",
+            rpc_host, worker["ssh_host"],
+        )
+        restarted = await _attempt_rpc_server_restart(worker)
+        if restarted:
+            # Re-probe to confirm the new process is actually serving.
+            rpc_ok, rpc_err = await _probe_rpc_server(rpc_host, rpc_port)
+            if rpc_ok:
+                log.info("compute_pool: rpc-server self-heal succeeded on %s", rpc_host)
 
     capabilities = {
         "version": payload.get("version"),
