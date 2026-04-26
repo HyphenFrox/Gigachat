@@ -351,6 +351,121 @@ async def _wait_for_health(
     )
 
 
+def _compute_optimal_ngl(
+    gguf_path: str, worker_ids: list[str], *, safety: float = 0.7,
+) -> int:
+    """Decide how many layers to put on GPU pools (rest stay on host
+    CPU + RAM, paged from disk via mmap).
+
+    Why this matters: llama-server's auto-distribution with `-ngl 99`
+    optimistically tries to put every layer on a GPU device (host CUDA
+    + each RPC worker). If the combined GPU memory is barely enough,
+    one device's allocator overcommits and the rpc-server crashes
+    mid-load — this is the "Remote RPC server crashed" failure mode
+    the targeted bench exposed for gemma4:26b on tight pool memory.
+
+    Ollama's runtime sidesteps this by mmap'ing the GGUF on the host
+    and lazily paging layers in only when computing them — RAM
+    pressure pushes pages out, OS swap absorbs the overflow, no
+    explicit OOM. We can't replicate mmap on the worker side
+    (rpc-server has no GGUF file; layers arrive over network and
+    must be resident), but we CAN cap GPU offload to the conservative
+    fit and let the remaining layers ride host CPU + mmap'd file
+    bytes — same trick Ollama uses on the host side.
+
+    Algorithm: sum (host VRAM + each worker's free RAM) × `safety`,
+    divide by average bytes per layer (file size / block_count from
+    the GGUF metadata), clamp to [0, n_layers]. Returns the integer
+    `-ngl` value to pass.
+
+    Falls back to `_DEFAULT_NGL` if any input is missing — e.g.
+    a worker without a probe yet, or a GGUF without the
+    `<arch>.block_count` metadata key. The default `-ngl 99` keeps
+    llama.cpp's old behaviour where it works (small models that fit
+    comfortably).
+    """
+    try:
+        import gguf
+    except ImportError:
+        return _DEFAULT_NGL
+
+    # File size as a proxy for total weight bytes — close enough since
+    # quantization metadata + tokenizer KV are small relative to weights.
+    try:
+        file_size = os.path.getsize(gguf_path)
+    except OSError:
+        return _DEFAULT_NGL
+    if file_size <= 0:
+        return _DEFAULT_NGL
+
+    # Read block count from the GGUF metadata (the correct metadata key
+    # is architecture-specific: `gemma4.block_count`, `llama.block_count`,
+    # etc.). We probe the file once and walk known keys.
+    try:
+        reader = gguf.GGUFReader(gguf_path)
+    except Exception:
+        return _DEFAULT_NGL
+
+    arch_field = reader.fields.get("general.architecture")
+    if not arch_field or not arch_field.types:
+        return _DEFAULT_NGL
+    try:
+        arch = arch_field.parts[arch_field.data[0]].tobytes().decode(
+            "utf-8", errors="replace",
+        )
+    except Exception:
+        return _DEFAULT_NGL
+
+    n_layers = 0
+    for key in (f"{arch}.block_count", "llama.block_count", "general.block_count"):
+        f = reader.fields.get(key)
+        if f and f.data:
+            try:
+                n_layers = int(f.parts[f.data[0]][0])
+                break
+            except Exception:
+                continue
+    if n_layers <= 0:
+        return _DEFAULT_NGL
+
+    avg_layer_bytes = file_size / n_layers
+
+    # Sum free pool memory: host VRAM + each enabled worker's free RAM.
+    # Worker iGPUs (Intel SYCL) draw from system RAM as shared GPU
+    # memory, so `ram_free_gb` is a reasonable upper bound for what
+    # SYCL can allocate on that worker.
+    pool_free_bytes = 0
+    try:
+        from . import sysdetect
+        spec = sysdetect.detect_system()
+        # Host VRAM (CUDA / dGPU) — `vram_gb` is total; we approximate
+        # free as 80% of total (OS / driver reservation).
+        pool_free_bytes += int(float(spec.get("vram_gb") or 0) * (1024 ** 3) * 0.8)
+    except Exception:
+        pass
+
+    for wid in worker_ids:
+        w = db.get_compute_worker(wid)
+        if not w or not w.get("enabled"):
+            continue
+        caps = w.get("capabilities") or {}
+        free_gb = float(caps.get("ram_free_gb") or 0)
+        pool_free_bytes += int(free_gb * (1024 ** 3))
+
+    if pool_free_bytes <= 0:
+        return _DEFAULT_NGL
+
+    fits = int(pool_free_bytes * safety / avg_layer_bytes)
+    fits = max(0, min(n_layers, fits))
+    log.info(
+        "split_lifecycle: adaptive ngl: file_size=%.2f GB n_layers=%d "
+        "avg_layer=%.0f MiB pool_free=%.2f GB safety=%.2f -> ngl=%d",
+        file_size / (1024 ** 3), n_layers, avg_layer_bytes / (1024 ** 2),
+        pool_free_bytes / (1024 ** 3), safety, fits,
+    )
+    return fits
+
+
 async def start(split_id: str) -> dict:
     """Bring up the llama-server for one split_model row.
 
@@ -385,12 +500,24 @@ async def start(split_id: str) -> dict:
     # input works. Older split rows (pre-migration) won't have the
     # column; .get() returns None which the builder ignores.
     mmproj = (row.get("mmproj_path") or "").strip() or None
+
+    # Compute -ngl adaptively based on real pool free memory + GGUF
+    # metadata. This is the Ollama-style "spill to host CPU + mmap"
+    # trick: layers that don't fit GPU pools stay on host CPU/RAM
+    # paged from the GGUF file, instead of the optimistic
+    # `-ngl 99` push that overcommits and crashes one rpc-server.
+    # Falls back to _DEFAULT_NGL if metadata or pool state is
+    # missing — small models keep their old fast path.
+    worker_ids = row.get("worker_ids") or []
+    ngl = _compute_optimal_ngl(row["gguf_path"], worker_ids)
+
     cmd = _build_command(
         llama_server=server,
         gguf_path=row["gguf_path"],
         port=row["llama_port"],
         rpc_endpoints=rpc_endpoints,
         mmproj_path=mmproj,
+        ngl=ngl,
     )
     log_path = _log_path_for(split_id)
 

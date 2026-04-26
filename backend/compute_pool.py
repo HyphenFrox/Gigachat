@@ -282,12 +282,20 @@ async def _attempt_rpc_server_restart(worker: dict) -> bool:
     survives the SSH session's exit. Returns True if the post-restart
     process appears alive (process found AND port 50052 listening).
 
-    Locks to SYCL backend (`-d SYCL0`) so dual-loaded backends
-    (SYCL + Vulkan both targeting the same Intel iGPU) don't get
-    enumerated as separate RPC devices and double-allocate the iGPU
-    during model load — that double-counting is what causes "Remote
-    RPC server crashed" mid-push when the second virtual device runs
-    out of physical memory.
+    Exposes both SYCL (Intel iGPU) AND CPU as RPC devices via
+    `-d SYCL0,CPU`. Why both:
+      * SYCL0 contributes the iGPU's shared GPU memory pool (~3 GB
+        on a typical Intel Iris Xe with default BIOS settings).
+      * CPU contributes the worker's full system RAM (typically
+        8-16 GB) as a host-style device — llama.cpp can place
+        layers there too, just without GPU acceleration. This is
+        the "use ALL pool resources" mode: every worker contributes
+        TWO tiers (GPU + CPU) to the layer-distribution pool
+        instead of one.
+      * We deliberately exclude Vulkan because on Intel iGPUs it
+        targets the SAME physical hardware as SYCL and would
+        double-enumerate the iGPU, causing the "Remote RPC server
+        crashed" mid-push that the targeted bench surfaced.
 
     Failure modes (all return False, no exceptions):
       * No ssh_host configured (caller falls back to "unreachable").
@@ -309,7 +317,7 @@ async def _attempt_rpc_server_restart(worker: dict) -> bool:
         "Start-Sleep -Milliseconds 800;"
         "$exe = \"$env:USERPROFILE\\.gigachat\\llama-cpp\\rpc-server.exe\";"
         "if (-not (Test-Path $exe)) { Write-Output 'NO_BINARY'; exit 2 };"
-        "$cmdline = '\"' + $exe + '\" -H 0.0.0.0 -p 50052 -d SYCL0';"
+        "$cmdline = '\"' + $exe + '\" -H 0.0.0.0 -p 50052 -d SYCL0,CPU';"
         "$result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
         "  -Arguments @{ CommandLine = $cmdline; "
         "                CurrentDirectory = \"$env:USERPROFILE\\.gigachat\\llama-cpp\" };"
