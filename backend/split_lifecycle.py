@@ -172,6 +172,42 @@ def _resolve_rpc_endpoints(worker_ids: list[str]) -> list[str]:
     return out
 
 
+def _is_moe_model(gguf_path: str) -> bool:
+    """Heuristic: does this GGUF describe a Mixture-of-Experts model?
+
+    Reads `<arch>.expert_count` from the metadata; > 0 means MoE.
+    Used to decide whether to add the `-ot` flag that pins MoE expert
+    tensors to the host CUDA backend (see `_build_command` docstring
+    for why).
+
+    Returns False on any read error so non-MoE models keep their
+    current command path unchanged.
+    """
+    try:
+        import gguf
+        reader = gguf.GGUFReader(gguf_path)
+    except Exception:
+        return False
+
+    arch_field = reader.fields.get("general.architecture")
+    if not arch_field or not arch_field.types:
+        return False
+    try:
+        arch = arch_field.parts[arch_field.data[0]].tobytes().decode(
+            "utf-8", errors="replace",
+        )
+    except Exception:
+        return False
+
+    f = reader.fields.get(f"{arch}.expert_count")
+    if f and f.data:
+        try:
+            return int(f.parts[f.data[0]][0]) > 0
+        except Exception:
+            return False
+    return False
+
+
 def _build_command(
     *,
     llama_server: Path,
@@ -247,6 +283,21 @@ def _build_command(
         # llama-server keeps the CLIP graph on its own backend (host
         # by default) while the LLM tensors layer-split via --rpc.
         cmd.extend(["--mmproj", mmproj_path])
+    # NOTE on MoE + SYCL: sending the large fused expert tensors
+    # (e.g. gemma4:26b's `ffn_gate_up_exps.weight` at ~1 GB per
+    # layer × 30 layers, ~15 GB total) over RPC to a worker's SYCL
+    # backend triggers an upstream llama.cpp bug at ggml-rpc.cpp:477
+    # ("Remote RPC server crashed or returned malformed response").
+    # Confirmed open issues: #21420 (gemma4 crashes on plain CUDA
+    # too), #20259 (rpc-server crashes during warmup since b8233),
+    # #21474 (SYCL iGPU warmup-crash regression, no fix).
+    # We previously tried `-ot "...exps...=CUDA0"` to pin experts to
+    # host VRAM (OOMs at 15 GB > 8 GB VRAM) and `-ot "...=CPU"` to
+    # pin to host RAM (works but doesn't use the pool's other
+    # devices). Neither matches the user's "use all pool resources"
+    # constraint. Leaving llama.cpp's auto-distribution in place;
+    # gemma4-class models will fail until upstream fixes the
+    # SYCL+RPC interaction. Smaller / non-MoE models work fine.
     if rpc_endpoints:
         # llama-server takes --rpc as a comma-separated list of
         # `<host>:<port>` endpoints. Order controls layer assignment.

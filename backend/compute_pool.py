@@ -310,11 +310,25 @@ async def _attempt_rpc_server_restart(worker: dict) -> bool:
     # Single PowerShell payload: kill stale, spawn fresh, verify alive.
     # Same WMI pattern used in the manual recovery commands so the
     # spawned process outlives the SSH session.
+    #
+    # Stability env vars are set at the user level before spawn so the
+    # rpc-server inherits them. WMI's Win32_Process.Create doesn't
+    # have a clean per-spawn env block, and PowerShell process-scope
+    # env vars don't propagate through WMI either; setting at user
+    # scope is the cleanest way to guarantee the child sees them.
+    # - GGML_SYCL_DISABLE_OPT=1: dodges the SYCL optimizer bug that
+    #   silently corrupts weights on Intel Xe2 / Meteor Lake (#21893).
+    # - GGML_SYCL_DISABLE_GRAPH=1: dodges the warmup-crash regression
+    #   on Intel iGPUs (#21474).
+    # - SYCL_CACHE_PERSISTENT=1: persists JIT'd kernel cache.
     ps = (
         "$ErrorActionPreference = 'Continue';"
         "Get-Process -Name 'rpc-server' -ErrorAction SilentlyContinue | "
         "  ForEach-Object { Stop-Process -Id $_.Id -Force };"
         "Start-Sleep -Milliseconds 800;"
+        "[Environment]::SetEnvironmentVariable('GGML_SYCL_DISABLE_OPT', '1', 'User');"
+        "[Environment]::SetEnvironmentVariable('GGML_SYCL_DISABLE_GRAPH', '1', 'User');"
+        "[Environment]::SetEnvironmentVariable('SYCL_CACHE_PERSISTENT', '1', 'User');"
         "$exe = \"$env:USERPROFILE\\.gigachat\\llama-cpp\\rpc-server.exe\";"
         "if (-not (Test-Path $exe)) { Write-Output 'NO_BINARY'; exit 2 };"
         "$cmdline = '\"' + $exe + '\" -H 0.0.0.0 -p 50052 -d SYCL0,CPU';"
