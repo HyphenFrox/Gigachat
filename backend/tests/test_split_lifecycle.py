@@ -161,7 +161,13 @@ def test_preflight_raises_when_gguf_missing(monkeypatch, tmp_path):
     surface a clear error before we burn time on a doomed start."""
     install = tmp_path / "llama-cpp"
     install.mkdir()
-    (install / "llama-server.exe").write_bytes(b"")
+    # Platform-aware fake binary: Windows expects `.exe`, POSIX
+    # expects no extension. Without this the test passes on Windows
+    # (where the binary name happens to match) but fails on Linux CI
+    # (`find_llama_server` looks for `llama-server`, not `.exe`).
+    import sys
+    exe_name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
+    (install / exe_name).write_bytes(b"")
     monkeypatch.setattr(split_runtime, "LLAMA_CPP_INSTALL_DIR", install)
     monkeypatch.setenv("PATH", "")
     with pytest.raises(split_lifecycle.SplitLifecycleError, match="does not exist"):
@@ -173,7 +179,13 @@ def test_preflight_raises_when_gguf_missing(monkeypatch, tmp_path):
 def test_preflight_happy_path(monkeypatch, tmp_path):
     install = tmp_path / "llama-cpp"
     install.mkdir()
-    (install / "llama-server.exe").write_bytes(b"")
+    # Platform-aware fake binary: Windows expects `.exe`, POSIX
+    # expects no extension. Without this the test passes on Windows
+    # (where the binary name happens to match) but fails on Linux CI
+    # (`find_llama_server` looks for `llama-server`, not `.exe`).
+    import sys
+    exe_name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
+    (install / exe_name).write_bytes(b"")
     monkeypatch.setattr(split_runtime, "LLAMA_CPP_INSTALL_DIR", install)
     monkeypatch.setenv("PATH", "")
     gguf = tmp_path / "m.gguf"
@@ -181,7 +193,7 @@ def test_preflight_happy_path(monkeypatch, tmp_path):
     server, eps = split_lifecycle._preflight(
         {"gguf_path": str(gguf), "worker_ids": []}
     )
-    assert server == install / "llama-server.exe"
+    assert server == install / exe_name
     assert eps == []
 
 
@@ -219,7 +231,13 @@ def _arrange_start(isolated_db, monkeypatch, tmp_path):
     create a real GGUF on disk, register a split_model row."""
     install = tmp_path / "llama-cpp"
     install.mkdir()
-    (install / "llama-server.exe").write_bytes(b"")
+    # Platform-aware fake binary: Windows expects `.exe`, POSIX
+    # expects no extension. Without this the test passes on Windows
+    # (where the binary name happens to match) but fails on Linux CI
+    # (`find_llama_server` looks for `llama-server`, not `.exe`).
+    import sys
+    exe_name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
+    (install / exe_name).write_bytes(b"")
     monkeypatch.setattr(split_runtime, "LLAMA_CPP_INSTALL_DIR", install)
     monkeypatch.setenv("PATH", "")
 
