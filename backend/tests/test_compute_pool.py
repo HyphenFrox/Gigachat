@@ -549,3 +549,64 @@ def test_list_subagent_workers_skips_workers_without_model(isolated_db, monkeypa
         isolated_db, address="a.local", models=("nomic-embed-text:latest",),
     )
     assert compute_pool.list_subagent_workers("gemma4:e4b") == []
+
+
+# --- pick_chat_target -----------------------------------------------------
+
+
+def _seed_chat_worker(isolated_db, **kwargs):
+    """Same shape as _seed_eligible_worker but for the chat flag."""
+    import time as _t
+    label = kwargs.pop("label", "C")
+    address = kwargs.pop("address", "c.local")
+    models = kwargs.pop("models", ("gemma4:e4b",))
+    use_for_chat = kwargs.pop("use_for_chat", True)
+    enabled = kwargs.pop("enabled", True)
+    last_seen_age = kwargs.pop("last_seen_age_sec", 30.0)
+    last_error = kwargs.pop("last_error", "")
+    auth_token = kwargs.pop("auth_token", None)
+    wid = isolated_db.create_compute_worker(
+        label=label, address=address, transport="lan",
+        enabled=enabled, use_for_chat=use_for_chat, auth_token=auth_token,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": m, "details": {}} for m in models],
+        },
+        last_seen=_t.time() - last_seen_age,
+        last_error=last_error,
+    )
+    return wid
+
+
+def test_pick_chat_target_none_when_no_workers(isolated_db, monkeypatch):
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    assert compute_pool.pick_chat_target("gemma4:e4b") is None
+
+
+def test_pick_chat_target_picks_eligible(isolated_db, monkeypatch):
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_chat_worker(isolated_db, address="c.local", auth_token="t")
+    target = compute_pool.pick_chat_target("gemma4:e4b")
+    assert target is not None
+    assert target == ("http://c.local:11434", "t")
+
+
+def test_pick_chat_target_skips_use_for_chat_false(isolated_db, monkeypatch):
+    """Toggling chat off but keeping the row enabled means the user wants
+    this worker for embeddings/subagents only — chat must NOT route here."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_chat_worker(isolated_db, address="c.local", use_for_chat=False)
+    assert compute_pool.pick_chat_target("gemma4:e4b") is None
+
+
+def test_pick_chat_target_skips_workers_without_model(isolated_db, monkeypatch):
+    """The chat picker must enforce model presence — Ollama would
+    otherwise pull a multi-GB model mid-turn just to fail the request."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_chat_worker(
+        isolated_db, address="c.local", models=("nomic-embed-text:latest",),
+    )
+    assert compute_pool.pick_chat_target("gemma4:e4b") is None

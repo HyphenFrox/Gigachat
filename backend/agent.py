@@ -1733,13 +1733,30 @@ async def _run_turn_impl(
             if (((s.get("function") or {}).get("name")) in loaded_set)
         ]
 
+        # Compute-pool routing for the parent chat turn. Same picker rules
+        # as embeddings/subagents — pick a worker iff one is enabled,
+        # `use_for_chat=True`, freshly probed, and has the model installed.
+        # If no worker is eligible we stay on the host (the common case
+        # before the user adds devices). Pick once per turn so the entire
+        # tool-loop hits the same Ollama: KV-cache warmth survives across
+        # streamed tool-call iterations.
+        chat_base_url = OLLAMA_URL
+        chat_auth_token: str | None = None
+        try:
+            chat_target = compute_pool.pick_chat_target(conv["model"])
+        except Exception:
+            chat_target = None
+        if chat_target is not None:
+            chat_base_url, chat_auth_token = chat_target
+
         # Prompt-space tool adapter: some Ollama models advertise the
         # `tools` capability but ship a passthrough chat template
         # (`{{ .Prompt }}`) that never renders `.Tools`. The native
         # function-calling path silently fails on those — the model sees
-        # no tool list and refuses to act. We detect that once per model
-        # (`tool_prompt_adapter.needs_adapter` caches the probe result)
-        # and when the adapter is needed we:
+        # no tool list and refuses to act. We detect that once per
+        # `(model, ollama_url)` (templates can technically differ between
+        # host and a worker running a different Ollama version) and when
+        # the adapter is needed we:
         #   * append an XML-tagged tool block to the system prompt,
         #   * rewrite historical `role=tool` rows and assistant
         #     `tool_calls` into inline <tool_call> / <tool_result> text,
@@ -1748,7 +1765,7 @@ async def _run_turn_impl(
         #   * parse any <tool_call> blocks out of the streamed text after
         #     the response completes (below).
         adapter_mode = await tool_prompt_adapter.needs_adapter(
-            conv["model"], OLLAMA_URL,
+            conv["model"], chat_base_url, auth_token=chat_auth_token,
         )
         if adapter_mode:
             ollama_msgs = tool_prompt_adapter.inject_tools_block_into_system(
@@ -1834,6 +1851,8 @@ async def _run_turn_impl(
                     # got lost in reasoning is forced to produce the answer
                     # (or a tool call) directly.
                     disable_thinking=empty_retries > 0,
+                    base_url=chat_base_url,
+                    auth_token=chat_auth_token,
                 ):
                     # Honour Stop button mid-stream. Breaking here closes the
                     # httpx streaming context (via the async-generator protocol),

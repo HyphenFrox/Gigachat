@@ -361,6 +361,22 @@ def pick_embed_target(model: str) -> tuple[str, str | None] | None:
     return (base, token)
 
 
+def pick_chat_target(model: str) -> tuple[str, str | None] | None:
+    """Choose a worker to run a single chat turn against, or None for host.
+
+    Same eligibility rules as the embed picker, but gated on `use_for_chat`.
+    Picks the freshest eligible worker so the route is deterministic for
+    a given moment (helps tests; in practice with 1-2 workers a typical
+    home setup has, fairness over multiple turns falls out of normal
+    request timing rather than needing explicit round-robin).
+    """
+    cands = _eligible_workers("use_for_chat", model=model)
+    if not cands:
+        return None
+    w = cands[0]
+    return (_worker_base_url(w), db.get_compute_worker_auth_token(w["id"]))
+
+
 def list_subagent_workers(model: str) -> list[tuple[str, str | None]]:
     """Return every eligible compute worker for parallel-subagent fan-out.
 

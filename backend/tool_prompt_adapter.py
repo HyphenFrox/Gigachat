@@ -43,10 +43,14 @@ log = logging.getLogger(__name__)
 # Detection
 # ---------------------------------------------------------------------------
 
-# Process-wide cache keyed by model name.
+# Process-wide cache keyed by `(model, ollama_url)`. Two Ollama instances
+# (host + a registered compute worker) might serve the same `gemma4:e4b`
+# but ship different chat templates if the user is running mismatched
+# Ollama versions, so per-URL caching keeps a probe done on the host
+# from leaking the wrong adapter decision to a worker call.
 #   True  = native tool calling works (template renders .Tools).
 #   False = stub template / no tools capability — use adapter.
-_ADAPTER_CACHE: dict[str, bool] = {}
+_ADAPTER_CACHE: dict[tuple[str, str], bool] = {}
 
 # Substrings we accept as proof that the chat template actually renders
 # tools. Ollama templates use Go `text/template` syntax, so ``.Tools`` is
@@ -131,6 +135,7 @@ async def needs_adapter(
     ollama_url: str,
     *,
     client: httpx.AsyncClient | None = None,
+    auth_token: str | None = None,
 ) -> bool:
     """Return ``True`` when the given model can't do native tool calls.
 
@@ -149,14 +154,20 @@ async def needs_adapter(
     """
     if not model:
         return False
-    cached = _ADAPTER_CACHE.get(model)
+    cache_key = (model, ollama_url)
+    cached = _ADAPTER_CACHE.get(cache_key)
     if cached is not None:
         return cached
+
+    headers: dict[str, str] = {}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
 
     async def _probe(c: httpx.AsyncClient) -> dict[str, Any]:
         r = await c.post(
             f"{ollama_url}/api/show",
             json={"name": model},
+            headers=headers,
             timeout=5.0,
         )
         r.raise_for_status()
@@ -174,7 +185,7 @@ async def needs_adapter(
             "assuming native tool calling works",
             model, e,
         )
-        _ADAPTER_CACHE[model] = False
+        _ADAPTER_CACHE[cache_key] = False
         return False
 
     caps = info.get("capabilities") or []
@@ -191,7 +202,7 @@ async def needs_adapter(
     # 400 when the agent tried to send `tools=[...]` natively.
     known_family = (not has_cap) and _matches_known_tool_capable(model)
     use_adapter = (not native_ok) or known_family
-    _ADAPTER_CACHE[model] = use_adapter
+    _ADAPTER_CACHE[cache_key] = use_adapter
     if use_adapter:
         log.info(
             "tool_prompt_adapter: %s will use prompt-space fallback "

@@ -95,8 +95,12 @@ class _FakeClient:
         self._info = info
         self.calls: list[dict] = []
 
-    async def post(self, url, *, json=None, timeout=None):  # noqa: A002
-        self.calls.append({"url": url, "json": json})
+    async def post(self, url, *, json=None, timeout=None, headers=None):  # noqa: A002
+        # `headers` was added when needs_adapter learned to forward a Bearer
+        # token to the worker's Ollama; the legacy stub had no use for it,
+        # but the kwarg must be accepted or the probe call raises TypeError
+        # and falls into the "assume native works" fallback path.
+        self.calls.append({"url": url, "json": json, "headers": headers})
         return _FakeResponse(self._info)
 
 
