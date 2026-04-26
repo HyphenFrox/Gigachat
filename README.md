@@ -213,12 +213,21 @@ Register other PCs (laptops, spare desktops) as **compute workers** in Settings 
 
 ### Whole-request routing (Phase 1)
 
-Each chat / embedding / parallel-subagent call goes to ONE machine — whichever is best for it. The router picks the strongest eligible node by hardware:
+Each chat / embedding / parallel-subagent call goes to ONE machine — whichever is best for it. The router ranks every eligible node (host included) on a 6-axis capability score and picks the strongest. **The host is just one candidate**, not a privileged default — if a registered worker is strictly more capable than the host (faster measured tokens/sec, more VRAM, etc.), chat goes there.
 
-- **GPU presence** — workers with a GPU beat CPU-only workers.
-- **Proven VRAM** — among GPU workers, the one that's loaded the largest model wins (max-VRAM-seen is a hard lower-bound on capacity).
-- **Model availability** — the picked node has to have the model installed; otherwise the router skips it (and silently kicks off a LAN-first SCP from host to backfill, if `ssh_host` is configured).
-- **Host comparison** — the chosen worker has to be **strictly more capable than host** to win. Otherwise chat stays local (no LAN hop, KV cache stays warm).
+The score, in priority order:
+
+1. **Measured throughput** — real `tokens/sec` benchmarked via `/api/generate` (cached 1 hour). The bottom-line "how fast does this machine actually run this model" number; folds CPU + memory bandwidth + GPU compute into a single signal. Used as the primary key whenever both sides have measurements; falls back to the heuristic axes below otherwise.
+2. **GPU presence** — binary signal from `/api/ps` (any loaded model with VRAM > 0).
+3. **Proven VRAM** — `max(size_vram)` across loaded models. Hard lower bound on capacity.
+4. **Total RAM** (workers via SSH probe; host via sysdetect).
+5. **CPU threads** — for Phase 2 splits where rpc-server runs CPU layers.
+6. **Last-seen freshness** — final tie-breaker; host always wins ties (no LAN hop).
+
+Other gates the router applies before scoring:
+
+- **Model availability** — the picked node has to have the model installed; otherwise it's skipped (and a LAN-first SCP from host to backfill silently fires, if `ssh_host` is configured).
+- **Strictly more capable than host** — among eligible workers, only one with a strictly higher score wins; ties go to host (KV cache stays warm).
 
 Eligibility per worker is fine-grained: `Use for chat / embeddings / subagents` toggles per row let you split workloads (e.g. embeddings → laptop, chat stays on host).
 

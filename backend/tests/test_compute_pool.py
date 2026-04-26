@@ -882,6 +882,81 @@ def test_pick_chat_target_routes_to_worker_when_strictly_more_capable(
     assert target[0] == "http://big.local:11434"
 
 
+def test_pick_chat_target_routes_to_worker_with_higher_measured_tps(
+    isolated_db, monkeypatch
+):
+    """Worker has a measured 250 tok/s on this exact model; host has
+    100 tok/s. Even though both have a GPU + VRAM, the WORKER wins
+    because TPS is the primary axis. Maps directly to the user's
+    'use a faster device when one is connected' requirement."""
+    import time
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    # Host: 100 tok/s on the same model.
+    monkeypatch.setattr(
+        compute_pool, "_host_capability_score",
+        lambda model_name=None: (100.0, 1, 8 * 1024 ** 3, 16.0, 16, float("inf")),
+    )
+
+    wid = isolated_db.create_compute_worker(
+        label="beefy-gpu", address="big.local", transport="lan", use_for_chat=True,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": "fast:7b", "details": {}}],
+            "rpc_server_reachable": True, "rpc_port": 50052, "rpc_error": None,
+            "gpu_present": True, "max_vram_seen_bytes": 24 * 1024 ** 3,
+            "loaded_count": 1,
+            # Measured throughput beats host's 100.
+            "tokens_per_second": 250.0,
+            "tps_measured_at": time.time(),
+            "tps_model": "fast:7b",
+            "ram_total_gb": 64.0, "cpu_threads": 32,
+        },
+        last_seen=time.time() - 5.0, last_error="",
+    )
+    target = compute_pool.pick_chat_target("fast:7b")
+    assert target is not None, "stronger worker must win the route"
+    assert target[0] == "http://big.local:11434"
+
+
+def test_pick_chat_target_keeps_host_when_worker_tps_lower(
+    isolated_db, monkeypatch
+):
+    """Worker has measured 4 tok/s; host has 100 tok/s. Even though
+    the worker has a GPU and bigger raw RAM, host's higher measured
+    TPS wins — the router doesn't fall for 'has-GPU' alone when real
+    perf data is available."""
+    import time
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    monkeypatch.setattr(
+        compute_pool, "_host_capability_score",
+        lambda model_name=None: (100.0, 1, 8 * 1024 ** 3, 16.0, 16, float("inf")),
+    )
+
+    wid = isolated_db.create_compute_worker(
+        label="weak-gpu", address="weak.local", transport="lan", use_for_chat=True,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": "fast:7b", "details": {}}],
+            "rpc_server_reachable": True, "rpc_port": 50052, "rpc_error": None,
+            "gpu_present": True, "max_vram_seen_bytes": 4 * 1024 ** 3,
+            "loaded_count": 1,
+            "tokens_per_second": 4.0,
+            "tps_measured_at": time.time(),
+            "tps_model": "fast:7b",
+            "ram_total_gb": 8.0, "cpu_threads": 8,
+        },
+        last_seen=time.time() - 5.0, last_error="",
+    )
+    target = compute_pool.pick_chat_target("fast:7b")
+    assert target is None, "weaker worker must not be picked over a faster host"
+
+
 def test_route_chat_uses_ollama_when_worker_can_hold_model(isolated_db, monkeypatch):
     """A 14 GB model doesn't fit the host's 8 GB VRAM, but a worker has
     proven it can hold a 16 GB model. The router should pick Ollama
