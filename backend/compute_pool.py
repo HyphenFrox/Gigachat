@@ -273,7 +273,13 @@ async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
     return data
 
 
-async def _attempt_rpc_server_restart(worker: dict) -> bool:
+_DEFAULT_WORKER_BACKEND = "SYCL0,CPU"
+_MOE_WORKER_BACKEND = "CPU"
+
+
+async def _attempt_rpc_server_restart(
+    worker: dict, backend: str = _DEFAULT_WORKER_BACKEND,
+) -> bool:
     """SSH into the worker and re-spawn its rpc-server.
 
     Used by `probe_worker` when the rpc-server TCP probe fails. If the
@@ -282,8 +288,13 @@ async def _attempt_rpc_server_restart(worker: dict) -> bool:
     survives the SSH session's exit. Returns True if the post-restart
     process appears alive (process found AND port 50052 listening).
 
-    Exposes both SYCL (Intel iGPU) AND CPU as RPC devices via
-    `-d SYCL0,CPU`. Why both:
+    `backend` is passed to rpc-server's `-d` flag. Default
+    `SYCL0,CPU` exposes both Intel iGPU and CPU. For MoE models that
+    trigger the upstream SYCL+RPC crash, callers can override to
+    `CPU` (no SYCL exposed; works around the bug). See
+    `_set_workers_backend` for the per-model dynamic switching.
+
+    With the default `SYCL0,CPU`:
       * SYCL0 contributes the iGPU's shared GPU memory pool (~3 GB
         on a typical Intel Iris Xe with default BIOS settings).
       * CPU contributes the worker's full system RAM (typically
@@ -331,7 +342,7 @@ async def _attempt_rpc_server_restart(worker: dict) -> bool:
         "[Environment]::SetEnvironmentVariable('SYCL_CACHE_PERSISTENT', '1', 'User');"
         "$exe = \"$env:USERPROFILE\\.gigachat\\llama-cpp\\rpc-server.exe\";"
         "if (-not (Test-Path $exe)) { Write-Output 'NO_BINARY'; exit 2 };"
-        "$cmdline = '\"' + $exe + '\" -H 0.0.0.0 -p 50052 -d SYCL0,CPU';"
+        f"$cmdline = '\"' + $exe + '\" -H 0.0.0.0 -p 50052 -d {backend}';"
         "$result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
         "  -Arguments @{ CommandLine = $cmdline; "
         "                CurrentDirectory = \"$env:USERPROFILE\\.gigachat\\llama-cpp\" };"
@@ -370,6 +381,48 @@ async def _attempt_rpc_server_restart(worker: dict) -> bool:
         )
         return False
     return True
+
+
+async def _set_workers_backend(workers: list[dict], backend: str) -> int:
+    """Ensure every worker's rpc-server is running with the given `-d`
+    backend flag. Restarts any worker whose current backend doesn't
+    match. Returns the count of workers successfully re-aligned.
+
+    Used by `_ensure_split_running_for` to dynamically switch between:
+      * `SYCL0,CPU` — full pool (iGPU + CPU). Default for non-MoE.
+      * `CPU` — drops SYCL exposure to dodge the upstream
+        `Remote RPC server crashed` bug that fires when MoE expert
+        tensors are pushed to SYCL devices.
+
+    Tracks current backend in the worker's capabilities dict via
+    `current_rpc_backend` so we don't restart unnecessarily on every
+    spawn. First-time switches always restart; subsequent calls with
+    the same backend are no-ops.
+    """
+    aligned = 0
+    for w in workers:
+        if not (w.get("ssh_host") or "").strip():
+            continue
+        caps = w.get("capabilities") or {}
+        current = caps.get("current_rpc_backend", "unknown")
+        if current == backend:
+            aligned += 1
+            continue
+        ok = await _attempt_rpc_server_restart(w, backend=backend)
+        if ok:
+            try:
+                db.update_compute_worker_capabilities(
+                    w["id"],
+                    capabilities={**caps, "current_rpc_backend": backend},
+                )
+            except Exception:
+                pass
+            aligned += 1
+            log.info(
+                "compute_pool: worker %s switched rpc-server backend "
+                "%s -> %s", w.get("label"), current, backend,
+            )
+    return aligned
 
 
 async def _probe_rpc_server(
@@ -1303,21 +1356,32 @@ _KNOWN_OVERRIDE_REGISTRY: dict[str, dict] = {
         ),
     },
     "qwen3.5:9b": {
-        # Hyperparameter metadata mismatch: Ollama's blob has a
-        # `qwen35.rope.dimension_sections` array of length 3 while
-        # llama.cpp's qwen35 loader expects 4. The fix is purely
-        # METADATA — tensors are fine. We patch the array in-place
-        # (extend with a `0` for the no-vision sentinel that the
-        # multimodal Qwen3-VL convention uses), keeping Ollama's
-        # exact Q4_K_M tensor data byte-for-byte. Zero bandwidth,
-        # zero quantization change.
+        # Multi-layer structural mismatch between Ollama's blob and
+        # stock llama.cpp's qwen35 loader spec:
+        #   1. rope.dimension_sections array length 3 vs expected 4
+        #   2. SSM tensors named `ssm_dt` / `ssm_a` (no .bias suffix)
+        #      vs llama.cpp's expected `ssm_dt.bias`, `ssm_a.bias`
+        #   3. llama.cpp expects BOTH `blk.N.ssm_a` AND
+        #      `blk.N.ssm_a.bias` as separate tensors; Ollama ships
+        #      only one
+        # Surgery on the local blob would need to synthesize the
+        # missing bias tensors with zero values, which introduces
+        # silent quality risk (we'd be guessing values the model
+        # was trained against). User's "no issues" constraint rules
+        # that out. Strategy = "download" pulls Unsloth's clean
+        # Q4_K_M variant (matches Ollama's quant level — same
+        # quality, just packaged for stock llama.cpp).
         "needs_mmproj": False,
-        "main_strategy": "qwen3_rope_metadata_patch",
+        "main_strategy": "download",
+        "main_url": (
+            "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/"
+            "Qwen3.5-9B-Q4_K_M.gguf"
+        ),
+        "main_size_gb": 5.29,
         "reason": (
-            "Ollama blob's qwen35.rope.dimension_sections array has "
-            "wrong length for stock llama.cpp's qwen35 loader; we "
-            "extend it from 3 to 4 elements (append 0) in metadata "
-            "without touching tensor data."
+            "Ollama blob's qwen35 layout has multiple structural "
+            "mismatches with stock llama.cpp; surgery would require "
+            "synthesizing missing tensors with arbitrary values."
         ),
     },
     # gemma4:e4b is also bundled-multimodal, but small enough that the
@@ -2132,6 +2196,27 @@ async def _ensure_split_running_for(
             )
             target_row = db.get_split_model(target_row["id"])
 
+    # SYCL+RPC+MoE workaround (issue #21420 / #20259 / #21474):
+    # if the model is MoE, switch every worker's rpc-server to the
+    # CPU-only backend before spawning llama-server. With no SYCL
+    # device exposed on the workers, llama.cpp's auto-distribution
+    # routes the heavy MoE expert tensors to host CPU + worker CPU
+    # devices — using ALL pool memory across host RAM + worker RAM
+    # without ever touching the broken SYCL+RPC path. Non-MoE models
+    # keep the default `SYCL0,CPU` backend (full iGPU acceleration).
+    #
+    # We only switch when needed: workers track their current backend
+    # in `capabilities.current_rpc_backend` and `_set_workers_backend`
+    # is a no-op when they already match.
+    workers_for_split = [db.get_compute_worker(wid) for wid in worker_ids]
+    workers_for_split = [w for w in workers_for_split if w]
+    desired_backend = (
+        _MOE_WORKER_BACKEND
+        if split_lifecycle._is_moe_model(gguf_path)
+        else _DEFAULT_WORKER_BACKEND
+    )
+    await _set_workers_backend(workers_for_split, desired_backend)
+
     sid = target_row["id"]
     if target_row.get("status") != "running":
         result = await split_lifecycle.start(sid)
@@ -2149,7 +2234,14 @@ async def stop_all_running_splits() -> None:
     """Free VRAM held by any running llama-server. Called when the
     router decides the upcoming chat turn fits Ollama on host alone —
     no point keeping a big-model llama-server warm if the active
-    conversation no longer needs it."""
+    conversation no longer needs it.
+
+    Also restores any workers that were switched to the MoE workaround
+    backend (`-d CPU`) back to the default `-d SYCL0,CPU` so the next
+    non-MoE request gets full iGPU acceleration. No-op for workers
+    already on the default; the helper checks `current_rpc_backend`
+    in capabilities before touching them.
+    """
     from . import split_lifecycle
 
     for r in db.list_split_models():
@@ -2158,6 +2250,17 @@ async def stop_all_running_splits() -> None:
                 await split_lifecycle.stop(r["id"])
             except Exception as e:
                 log.warning("compute_pool: stop_all_running_splits %s: %s", r["id"], e)
+
+    # Restore default backend on every enabled worker. Best-effort —
+    # failures are logged but don't propagate; the next probe loop's
+    # auto-restart will re-align state if a worker is unreachable.
+    try:
+        workers = db.list_compute_workers(enabled_only=True)
+        await _set_workers_backend(workers, _DEFAULT_WORKER_BACKEND)
+    except Exception as e:
+        log.warning(
+            "compute_pool: restore default backend after stop failed: %s", e,
+        )
 
 
 class RouteChatError(RuntimeError):

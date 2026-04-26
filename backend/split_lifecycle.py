@@ -283,21 +283,16 @@ def _build_command(
         # llama-server keeps the CLIP graph on its own backend (host
         # by default) while the LLM tensors layer-split via --rpc.
         cmd.extend(["--mmproj", mmproj_path])
-    # NOTE on MoE + SYCL: sending the large fused expert tensors
-    # (e.g. gemma4:26b's `ffn_gate_up_exps.weight` at ~1 GB per
-    # layer × 30 layers, ~15 GB total) over RPC to a worker's SYCL
-    # backend triggers an upstream llama.cpp bug at ggml-rpc.cpp:477
-    # ("Remote RPC server crashed or returned malformed response").
-    # Confirmed open issues: #21420 (gemma4 crashes on plain CUDA
-    # too), #20259 (rpc-server crashes during warmup since b8233),
-    # #21474 (SYCL iGPU warmup-crash regression, no fix).
-    # We previously tried `-ot "...exps...=CUDA0"` to pin experts to
-    # host VRAM (OOMs at 15 GB > 8 GB VRAM) and `-ot "...=CPU"` to
-    # pin to host RAM (works but doesn't use the pool's other
-    # devices). Neither matches the user's "use all pool resources"
-    # constraint. Leaving llama.cpp's auto-distribution in place;
-    # gemma4-class models will fail until upstream fixes the
-    # SYCL+RPC interaction. Smaller / non-MoE models work fine.
+    # No `-ot` flag here. The MoE+SYCL+RPC bug is dodged at a higher
+    # layer: `compute_pool._ensure_split_running_for` switches each
+    # worker's rpc-server to `-d CPU` (no SYCL exposure) before
+    # spawning llama-server for an MoE model, then restores
+    # `-d SYCL0,CPU` afterwards. With workers exposing only CPU,
+    # llama.cpp's auto-distribution naturally fans expert tensors
+    # across host CPU + every worker CPU — using ALL pool memory
+    # without ever touching SYCL. Non-MoE models keep the full
+    # `-d SYCL0,CPU` pool with iGPU acceleration. See
+    # `_set_workers_backend` in compute_pool.
     if rpc_endpoints:
         # llama-server takes --rpc as a comma-separated list of
         # `<host>:<port>` endpoints. Order controls layer assignment.
