@@ -212,6 +212,24 @@ def _build_command(
         # means "as many as fit". Layers that don't fit GPUs cascade
         # to CPU+RAM.
         "-ngl", str(ngl),
+        # Context size: cap at 4096 tokens. llama-server otherwise
+        # allocates the model's full native context (e.g. llama3.1
+        # defaults to 131k tokens / 54k effective with 4 seqs), which
+        # blows up KV-cache memory on small workers — the actual
+        # crash mode in early bench runs was OOM during KV buffer
+        # allocation on a laptop, AFTER the model layers had already
+        # loaded successfully across the pool. 4096 is plenty for
+        # chat turns and keeps KV memory bounded.
+        "-c", "4096",
+        # Skip the empty-run warmup. By default llama-server does one
+        # forward pass on an empty input to JIT-compile kernels and
+        # prime caches. Across an RPC pool with 32 layers × 3 nodes
+        # over LAN, that warmup takes 10+ minutes — long enough that
+        # /health never reports OK within our boot timeout. The first
+        # real request pays the JIT cost instead (one-shot ~5–10 s
+        # extra TTFT), which is dramatically less than waiting for
+        # warmup before any traffic at all.
+        "--no-warmup",
     ]
     if rpc_endpoints:
         # llama-server takes --rpc as a comma-separated list of
