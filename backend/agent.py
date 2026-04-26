@@ -1843,9 +1843,38 @@ async def _run_turn_impl(
         try:
             decision = await compute_pool.route_chat_for(conv["model"])
         except compute_pool.RouteChatError as e:
-            # Hard fail: model can't be served at all (e.g. doesn't fit
-            # combined pool). Persist an assistant-role error message so
-            # the user sees what went wrong instead of a stuck spinner.
+            # Two failure modes:
+            # 1. Acquisition in progress (Scope B): override / mmproj
+            #    files are being prepared — phase / progress in
+            #    `e.status`. Persist a friendly "preparing the model"
+            #    message that the user can act on (wait + retry) and
+            #    yield a structured `preparing_model` event so the UI
+            #    can render a progress bar instead of the generic
+            #    error toast.
+            # 2. Hard fail: model can't be served at all (doesn't fit
+            #    combined pool, missing GGUF, etc.). Persist a clear
+            #    error message so the user isn't stuck on a spinner.
+            status = getattr(e, "status", {}) or {}
+            preparing_phases = (
+                "starting", "running", "init",
+                "surgery", "downloading-main", "downloading-mmproj",
+            )
+            if status.get("status") in preparing_phases or status.get("phase") in preparing_phases:
+                msg = (
+                    f"[compute pool] Preparing {conv['model']!r} for the pool: "
+                    f"{status.get('phase', 'starting')} "
+                    f"({status.get('progress_pct', 0):.0f}%). "
+                    f"~{status.get('estimated_total_gb', 0):.1f} GB to fetch in total. "
+                    "Please retry in a few minutes."
+                )
+                db.add_message(conversation_id, "assistant", msg)
+                yield {
+                    "type": "preparing_model",
+                    "model": conv["model"],
+                    "status": status,
+                    "message": msg,
+                }
+                return
             db.add_message(
                 conversation_id, "assistant",
                 f"[compute pool] Could not run {conv['model']!r}: {e}",

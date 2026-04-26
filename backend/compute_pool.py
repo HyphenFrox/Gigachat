@@ -1384,19 +1384,51 @@ async def _acquire_override_files(model_name: str, spec: dict) -> dict:
     progresses so the UI can show progress.
 
     Strategy ordering (cheapest first):
-      1. Try local surgery if `main_strategy == "extract_text_only"` —
+      0. LAN copy: check every enabled worker with `ssh_host` set;
+         if any of them already has the override / mmproj file in
+         their `~/.gigachat/llama-cpp/models/` (e.g. from a previous
+         distribution after a different host's acquisition), SCP it
+         over via SSH. Zero internet bandwidth. Useful when the
+         user reinstalls on a host or adds a new host to a pool
+         where workers already cache overrides.
+      1. Local surgery if `main_strategy == "extract_text_only"` —
          requires the Ollama blob to exist locally. Zero bandwidth,
          lossless byte-copy of the LLM tensors.
-      2. Fall through to HuggingFace download for any file the
-         surgery couldn't produce (or wasn't applicable for).
-      3. Always download the mmproj from upstream — its CLIP-format
-         metadata can't be reliably derived from Ollama's bundle.
+      2. HuggingFace download for any file the prior steps couldn't
+         produce.
+
+    After the function lands the files locally, it kicks off a
+    fire-and-forget background distribution to every worker so the
+    next host that needs them can take the LAN path (step 0 above).
     """
     state = _ACQUISITION_STATE.setdefault(model_name, {})
     main_path = _override_gguf_path_for(model_name)
     mmproj_path = _override_mmproj_path_for(model_name)
 
     try:
+        # Step 0: LAN-first — check every worker with ssh_host set to
+        # see if it already caches the file. Save internet bandwidth
+        # when another node in the pool has the override stashed.
+        for path in (main_path, mmproj_path):
+            if path.is_file():
+                continue
+            if path is mmproj_path and not spec.get("needs_mmproj"):
+                continue
+            for worker in db.list_compute_workers(enabled_only=True):
+                if not (worker.get("ssh_host") or "").strip():
+                    continue
+                state.update({
+                    "status": "running", "phase": "lan-copy",
+                    "progress_pct": 2.0,
+                })
+                ok = await _lan_pull_override(worker, path.name, path)
+                if ok:
+                    log.info(
+                        "compute_pool: pulled %s from %s via LAN",
+                        path.name, worker.get("label"),
+                    )
+                    break
+
         # Step 1: try local surgery for the main file if applicable.
         if not main_path.is_file() and spec.get("main_strategy") == "extract_text_only":
             blob_info = resolve_ollama_model(model_name)
@@ -1453,6 +1485,15 @@ async def _acquire_override_files(model_name: str, spec: dict) -> dict:
             "status": "done", "phase": "done", "progress_pct": 100.0,
             "error": None, "completed_at": time.time(),
         })
+
+        # Fire-and-forget LAN distribution to workers, so subsequent
+        # acquisitions on this LAN can take the cheap path.
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_distribute_override_to_workers(model_name))
+        except RuntimeError:
+            pass
+
         return {"ok": True, "status": "ready"}
 
     except Exception as e:
@@ -1511,6 +1552,142 @@ async def _run_text_only_surgery(
 
     rc = await asyncio.to_thread(_run)
     return rc == 0 and Path(dst).is_file()
+
+
+async def _lan_pull_override(worker: dict, filename: str, dst: Path) -> bool:
+    """Try to pull `filename` from a worker's override dir over SSH/SCP.
+
+    Returns True on a complete copy, False otherwise. The check is
+    two-step:
+      1. SSH `ls -l <path>` to confirm the file exists with non-zero
+         size on the worker.
+      2. SCP `<worker>:<path>` to a `.lan-part` temp; rename atomic
+         on success.
+
+    Failures (no ssh_host, file missing on worker, scp error) all
+    return False quietly so the caller falls through to local
+    surgery / HF download. Logged at INFO so the periodic-loop log
+    surfaces what's happening.
+    """
+    ssh_host = (worker.get("ssh_host") or "").strip()
+    if not ssh_host:
+        return False
+
+    remote_path = f"~/.gigachat/llama-cpp/models/{filename}"
+
+    # Step 1: confirm it exists. Use `stat -c %s` to get a byte count
+    # we can sanity-check (skip empty / partial files).
+    check_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                 ssh_host, f'stat -c "%s" {remote_path} 2>/dev/null || echo MISSING']
+
+    import subprocess as _sp
+    def _run(cmd):
+        try:
+            return _sp.run(cmd, capture_output=True, text=True, timeout=20)
+        except Exception:
+            return None
+
+    r = await asyncio.to_thread(_run, check_cmd)
+    if r is None or r.returncode != 0:
+        return False
+    out = (r.stdout or "").strip()
+    if out == "MISSING" or not out.isdigit() or int(out) == 0:
+        return False
+    expected_size = int(out)
+
+    # Step 2: scp pull via temp file, rename on success.
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".lan-part")
+    if tmp.exists():
+        tmp.unlink()
+    scp_cmd = ["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+               f"{ssh_host}:{remote_path}", str(tmp)]
+    log.info(
+        "compute_pool: lan-pull %s from %s (%.2f GB)",
+        filename, ssh_host, expected_size / (1024 ** 3),
+    )
+    r = await asyncio.to_thread(
+        lambda: _sp.run(scp_cmd, capture_output=True, text=True, timeout=3600),
+    )
+    if r is None or r.returncode != 0:
+        if tmp.exists():
+            tmp.unlink()
+        return False
+    if not tmp.is_file() or tmp.stat().st_size != expected_size:
+        if tmp.exists():
+            tmp.unlink()
+        return False
+    tmp.rename(dst)
+    return True
+
+
+async def _distribute_override_to_workers(model_name: str) -> None:
+    """After a successful local acquisition, push the override files
+    to every enabled worker with `ssh_host` set, so subsequent
+    acquisitions (e.g. from another host on the same LAN) can take
+    the LAN path. Fire-and-forget; failures are logged but never
+    propagated.
+
+    Idempotent: skips workers that already have the file at the
+    expected size. Bandwidth is local LAN, capped to whatever the
+    user's network can sustain — typically faster and cheaper than
+    re-downloading from HuggingFace.
+    """
+    spec = _KNOWN_OVERRIDE_REGISTRY.get(model_name)
+    if not spec:
+        return
+    main_path = _override_gguf_path_for(model_name)
+    mmproj_path = _override_mmproj_path_for(model_name)
+    paths_to_distribute = [main_path]
+    if spec.get("needs_mmproj"):
+        paths_to_distribute.append(mmproj_path)
+
+    workers = [
+        w for w in db.list_compute_workers(enabled_only=True)
+        if (w.get("ssh_host") or "").strip()
+    ]
+    if not workers:
+        return
+
+    import subprocess as _sp
+    for path in paths_to_distribute:
+        if not path.is_file():
+            continue
+        local_size = path.stat().st_size
+        for worker in workers:
+            ssh_host = worker["ssh_host"].strip()
+            remote_path = f"~/.gigachat/llama-cpp/models/{path.name}"
+            # Skip if the worker already has the file at full size.
+            check_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                         ssh_host,
+                         f'stat -c "%s" {remote_path} 2>/dev/null || echo MISSING']
+            r = await asyncio.to_thread(
+                lambda c=check_cmd: _sp.run(c, capture_output=True, text=True, timeout=15),
+            )
+            if r and r.returncode == 0:
+                out = (r.stdout or "").strip()
+                if out.isdigit() and int(out) == local_size:
+                    continue  # already there
+            # Ensure the dir exists, then push the file.
+            mkdir_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                         ssh_host, "mkdir -p ~/.gigachat/llama-cpp/models"]
+            await asyncio.to_thread(
+                lambda c=mkdir_cmd: _sp.run(c, capture_output=True, text=True, timeout=15),
+            )
+            scp_cmd = ["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                       str(path), f"{ssh_host}:{remote_path}"]
+            log.info(
+                "compute_pool: distributing %s to %s (%.2f GB)",
+                path.name, ssh_host, local_size / (1024 ** 3),
+            )
+            r = await asyncio.to_thread(
+                lambda c=scp_cmd: _sp.run(c, capture_output=True, text=True, timeout=3600),
+            )
+            if r is None or r.returncode != 0:
+                log.info(
+                    "compute_pool: distribution to %s failed: %s",
+                    ssh_host, (r.stderr or r.stdout or "")[-200:] if r else "no result",
+                )
 
 
 async def _download_to_path(url: str, dest: Path) -> None:

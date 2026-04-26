@@ -250,6 +250,34 @@ Workers do **not** need the model installed for the split path — bytes stream 
 
 The split decision is automatic: if the model fits the strongest single node, Phase 1 wins (faster, no per-token LAN overhead). If it doesn't, llama-server is auto-spawned with `--rpc <worker>:50052,...` flags pointing at every reachable worker. Subsequent turns reuse the warm process. Switching to a different big model auto-stops the previous llama-server (one big model hot at a time — finite VRAM).
 
+**Worker devices expose both iGPU + CPU.** rpc-server is launched with `-d SYCL0,CPU` on each worker so llama.cpp sees TWO devices per laptop — the Intel iGPU (via SYCL) and the system CPU (via system RAM). Net effect: a 2-laptop pool contributes ~14 GB of usable memory beyond what each laptop's iGPU alone would offer, AND the auto-distribution can place the heaviest layers on whichever device has free memory.
+
+**Adaptive `-ngl`.** Before spawning llama-server the backend reads the GGUF's `block_count` metadata, divides total file size by layer count to estimate bytes-per-layer, and computes how many layers fit in the sum of pool free memory with a 30% safety margin. The result is passed as `-ngl <N>`. Layers beyond that stay on host CPU paged from the GGUF via mmap — same trick Ollama uses on the host side. Without this, the optimistic `-ngl 99` would overcommit and crash one rpc-server's allocator when memory is tight.
+
+**Auto-restart of dead rpc-servers.** When `probe_worker` finds rpc-server unreachable AND the worker has `ssh_host` configured, the backend remotely kills any stale process and re-spawns rpc-server via WMI `Win32_Process.Create` (so the new process outlives the SSH session). Includes Intel-SYCL stability env vars (`GGML_SYCL_DISABLE_OPT=1`, `GGML_SYCL_DISABLE_GRAPH=1`, `SYCL_CACHE_PERSISTENT=1`) to dodge known regressions on Intel iGPUs.
+
+**Strict pool semantics.** When the router engages a Phase 2 split and the split fails, the error propagates instead of silently falling back to Ollama-on-host. Reasoning: the user opted into the pool because the host alone can't run this model well; degrading to a 0.5 tok/s CPU-offload path silently is worse UX than a clear "pool can't fit this model" error. Tier 3 still uses Ollama for the case where no split was attempted (no eligible RPC workers, or model fits a single node).
+
+**Multimodal split.** llama-server supports `--mmproj <file>` for vision-capable inference. The pool resolver checks for an mmproj GGUF alongside the main override (`gemma4-26b.mmproj.gguf` next to `gemma4-26b.gguf`) and threads it through to llama-server. The CLIP graph runs on the host backend; LLM tensors fan out via RPC.
+
+### Override-file mechanism + auto-acquisition (Scope B)
+
+Some Ollama-distributed multimodal models bundle the vision tower into the same GGUF as the text LLM (e.g. `gemma4:26b`'s 16.75 GB blob includes 354 vision tensors that stock `llama-server` doesn't recognize). To handle these, the pool supports a generic GGUF override at `~/.gigachat/llama-cpp/models/<sanitized-model-name>.gguf` — when present, `resolve_ollama_model` returns this file instead of Ollama's blob.
+
+Override files are produced/acquired automatically the first time the user requests an affected model:
+
+1. **LAN copy** — if any enabled worker (`ssh_host` set) already has the override file in its own `~/.gigachat/llama-cpp/models/` from a previous distribution, it's pulled via SCP. Zero internet bandwidth.
+2. **Local surgery** — if the user has the Ollama blob locally, `scripts/repack_text_only_gguf.py` extracts only the text LLM tensors (filter-and-copy at the byte level, no dequant/requant — bit-identical to the source). Zero internet bandwidth.
+3. **HuggingFace download** — fallback when steps 1–2 fail or aren't applicable. Pre-built mmproj GGUFs (CLIP format) always come from upstream.
+
+After each successful local acquisition, the override files are distributed to every enabled worker in the pool (fire-and-forget background SCP), so subsequent acquisitions on the same LAN take the cheap path.
+
+The chat layer surfaces acquisition progress via a `preparing_model` SSE event with status (`surgery` / `downloading-main` / `downloading-mmproj`) and progress percentage. UI shows a toast: *"Preparing gemma4:26b · downloading-mmproj · 60% · to fetch: ~1.1 GB · Retry in a few minutes."*
+
+### Known upstream limitation
+
+Gemma 4 MoE models (`gemma4:26b`, `gemma4:31b`) currently fail to load via Phase 2 split with `"Remote RPC server crashed or returned malformed response"`. This is an upstream llama.cpp + Intel SYCL bug ([#21420](https://github.com/ggml-org/llama.cpp/issues/21420), [#20259](https://github.com/ggml-org/llama.cpp/issues/20259), [#21474](https://github.com/ggml-org/llama.cpp/issues/21474)) triggered by the fused MoE expert tensors crashing the SYCL backend on Intel iGPUs during layer push. The infrastructure (override mechanism, mmproj plumbing, adaptive ngl, dual-device exposure) all works — the route just produces a clean error until upstream fixes the SYCL+RPC interaction. Smaller / non-MoE models (`llama3.1:8b`, etc.) work fine through the full pool.
+
 ### Setup, per machine
 
 - **Worker side** — Ollama installed and listening on `0.0.0.0:11434` (set `OLLAMA_HOST` env var, allow port 11434 on the Private firewall profile). Optional but enables Phase 2: install [llama.cpp's prebuilt Vulkan build](https://github.com/ggml-org/llama.cpp/releases) at `~/.gigachat/llama-cpp/`, run `rpc-server.exe --host 0.0.0.0 --port 50052`. Allow port 50052 on the Private firewall profile.

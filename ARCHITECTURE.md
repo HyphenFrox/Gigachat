@@ -277,6 +277,63 @@ different model (one big model hot at a time, finite VRAM).
 The `split_models` table is internal — there's no user-facing CRUD UI.
 Users just pick a model in the chat picker; the router decides.
 
+**Dual-device worker exposure.** rpc-server on each worker is launched
+with `-d SYCL0,CPU` so a single worker contributes TWO devices to the
+RPC pool — its Intel iGPU (via SYCL) AND its CPU+RAM (via the CPU
+backend). Without this, only the iGPU's shared memory is visible
+(typically ~3 GB), which dramatically undercuts what the worker can
+actually offer (8-16 GB system RAM). Vulkan is excluded because on
+Intel iGPUs it targets the same physical hardware as SYCL, causing
+double-allocation and the upstream "Remote RPC server crashed" failure.
+
+**Adaptive `-ngl` based on real pool memory.**
+`split_lifecycle._compute_optimal_ngl` reads the GGUF's `block_count`
+metadata, divides total file size by layer count to estimate
+bytes-per-layer, sums (host VRAM + each enabled worker's free RAM)
+with a 30% safety margin, and computes how many layers fit on GPU
+pools. Layers beyond that stay on host CPU mmap'd from the GGUF —
+same trick Ollama uses on the host side. Without this, the
+optimistic `-ngl 99` overcommits and one rpc-server's allocator
+fails mid layer-push.
+
+**Auto-restart of dead rpc-servers.** Probe loop self-heals:
+`_attempt_rpc_server_restart` SSHes into the worker (using its
+`ssh_host` alias), kills any stale process, re-spawns rpc-server via
+WMI Win32_Process.Create so the new process outlives the SSH
+session. Sets Intel-SYCL stability env vars
+(`GGML_SYCL_DISABLE_OPT=1`, `GGML_SYCL_DISABLE_GRAPH=1`,
+`SYCL_CACHE_PERSISTENT=1`) at user scope before spawn so the new
+rpc-server inherits them.
+
+**Override-file mechanism.** Some Ollama-distributed models bundle
+multimodal vision towers into the LLM GGUF in a layout stock
+`llama-server` can't load. `compute_pool.resolve_ollama_model` checks
+for a replacement at `~/.gigachat/llama-cpp/models/<sanitized>.gguf`
+before returning Ollama's blob. The override hook is generic — works
+for any future model with a similar format mismatch. A separate
+mmproj override at `<sanitized>.mmproj.gguf` is auto-detected and
+passed through to llama-server's `--mmproj` flag (vision input
+support). The `split_models.mmproj_path` column persists this
+across process restarts.
+
+**Auto-acquisition of override files (Scope B).**
+`compute_pool.ensure_compatible_gguf(model_name)` is called from
+`route_chat_for` before engaging a Phase 2 split.
+`_KNOWN_OVERRIDE_REGISTRY` is a hardcoded dict of models that need
+overrides; for each, we know the acquisition strategy (lossless
+local surgery vs HuggingFace download) and the upstream URL. The
+acquisition runs as a background asyncio task with progress tracked
+in `_ACQUISITION_STATE[model_name]`. Strategy ordering, cheapest
+first: (1) LAN pull from any worker that already caches the file
+(`_lan_pull_override` via SSH+SCP), (2) local surgery via
+`scripts/repack_text_only_gguf.py` subprocess, (3) HuggingFace
+download via `_download_to_path`. After a successful acquisition,
+`_distribute_override_to_workers` fires-and-forgets an SCP push to
+every enabled worker so future acquisitions on the same LAN can
+take the cheap path. The chat layer surfaces a `preparing_model`
+SSE event with phase + progress so the UI renders an informative
+toast instead of a generic error.
+
 ---
 
 ## Frontend error-handling convention

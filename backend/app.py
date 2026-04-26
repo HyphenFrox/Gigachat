@@ -3429,6 +3429,50 @@ def api_push_model_plan(wid: str, model: str) -> dict:
     }
 
 
+@app.get("/api/compute-pool/acquisition/{model_name:path}")
+def api_acquisition_status(model_name: str) -> dict:
+    """Return the live override-file acquisition status for `model_name`.
+
+    Used by the UI to render a progress bar when Phase 2 split needs an
+    override / mmproj file that isn't yet on disk. Body shape:
+        {
+          "status": "no_override_needed" | "starting" | "running" | "done" | "error",
+          "phase":  "init" | "surgery" | "downloading-main" | "downloading-mmproj" | "done",
+          "progress_pct": 0..100,
+          "needs_main": bool, "needs_mmproj": bool,
+          "estimated_total_gb": float,
+          "started_at": float, "completed_at": float | None,
+          "error": str | None,
+        }
+    Returns `{"status": "no_override_needed"}` for models that don't
+    need any override (most models).
+    """
+    state = compute_pool.get_acquisition_status(model_name)
+    if state is not None:
+        return state
+    # No live state — derive a one-shot view: is this model in the
+    # registry at all, and are its files present?
+    if model_name not in compute_pool._KNOWN_OVERRIDE_REGISTRY:
+        return {"status": "no_override_needed"}
+    spec = compute_pool._KNOWN_OVERRIDE_REGISTRY[model_name]
+    main_path = compute_pool._override_gguf_path_for(model_name)
+    mmproj_path = compute_pool._override_mmproj_path_for(model_name)
+    main_present = main_path.is_file()
+    mmproj_present = mmproj_path.is_file() if spec.get("needs_mmproj") else True
+    if main_present and mmproj_present:
+        return {"status": "ready"}
+    return {
+        "status": "needed",
+        "needs_main": not main_present,
+        "needs_mmproj": spec.get("needs_mmproj") and not mmproj_present,
+        "estimated_total_gb": (
+            (spec.get("main_size_gb", 0) if not main_present else 0)
+            + (spec.get("mmproj_size_gb", 0) if spec.get("needs_mmproj") and not mmproj_present else 0)
+        ),
+        "reason": spec.get("reason"),
+    }
+
+
 @app.get("/api/models/lan-source")
 def api_find_lan_source(model: str, exclude_worker_id: str | None = None) -> dict:
     """Where on the LAN is this model already available?

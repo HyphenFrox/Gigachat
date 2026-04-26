@@ -983,6 +983,36 @@ export default function ChatView({
       case 'error':
         toast.error('Agent error', { description: evt.message })
         break
+      case 'preparing_model':
+        // Compute pool's Scope B handler: an override / mmproj GGUF
+        // is being acquired in the background (lossless surgery from
+        // the local Ollama blob, falling back to LAN copy from another
+        // worker, then HuggingFace download). The chat layer surfaces
+        // a friendly toast so the user knows to retry shortly. The
+        // backend already persisted an assistant-role status message
+        // in the conversation history so the in-chat record is clean.
+        {
+          const s = evt.status || {}
+          const phase = s.phase || s.status || 'preparing'
+          const pct =
+            typeof s.progress_pct === 'number' ? `${Math.round(s.progress_pct)}%` : ''
+          const totalGb =
+            typeof s.estimated_total_gb === 'number' && s.estimated_total_gb > 0
+              ? `~${s.estimated_total_gb.toFixed(1)} GB`
+              : ''
+          toast.info(`Preparing ${evt.model || 'model'}`, {
+            description: [
+              phase,
+              pct,
+              totalGb && `to fetch: ${totalGb}`,
+              'Retry in a few minutes.',
+            ]
+              .filter(Boolean)
+              .join(' · '),
+            duration: 8000,
+          })
+        }
+        break
       default:
         break
     }
