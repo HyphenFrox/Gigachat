@@ -464,12 +464,24 @@ async def _set_workers_backend(workers: list[dict], *, in_split: bool) -> int:
     + freshly-restarted).
     """
     aligned = 0
+    # Pull in the standalone llamapool's view of `current_rpc_backend`
+    # so we don't bounce a worker out from under a peer workload (e.g.,
+    # Peerful's extraction script) that already aligned this worker
+    # via `llamapool-llama-server`. Best-effort: missing JSON is fine.
+    peer_backends = _read_llamapool_peer_backends()
     for w in workers:
         if not (w.get("ssh_host") or "").strip():
             continue
         backend = _select_worker_backend(w, in_split=in_split)
         caps = w.get("capabilities") or {}
         current = caps.get("current_rpc_backend", "unknown")
+        # Always prefer the peer's view when present. The standalone
+        # llamapool wrapper writes `current_rpc_backend` to the JSON
+        # atomically when it bounces rpc-server, so its value is the
+        # live ground truth — our SQLite cache may be stale.
+        peer_current = peer_backends.get(w.get("label") or "")
+        if peer_current:
+            current = peer_current
         if current == backend:
             aligned += 1
             continue
@@ -488,6 +500,31 @@ async def _set_workers_backend(workers: list[dict], *, in_split: bool) -> int:
                 "%s -> %s", w.get("label"), current, backend,
             )
     return aligned
+
+
+def _read_llamapool_peer_backends() -> dict[str, str]:
+    """Read `~/.llamapool/config.json` and return a {label:
+    current_rpc_backend} map of any backends a peer workload (using
+    the standalone llamapool wrapper) has set.
+
+    Used by `_set_workers_backend` to avoid bouncing rpc-server out
+    from under a peer that's mid-split. Returns an empty dict if the
+    file doesn't exist or is unreadable — best-effort coordination.
+    """
+    import json
+    from pathlib import Path
+    path = Path.home() / ".llamapool" / "config.json"
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    out: dict[str, str] = {}
+    for w in (cfg.get("workers") or []):
+        label = w.get("label")
+        backend = w.get("current_rpc_backend")
+        if label and backend:
+            out[label] = backend
+    return out
 
 
 async def _probe_rpc_server(

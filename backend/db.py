@@ -3446,6 +3446,7 @@ def create_compute_worker(
                 now, now,
             ),
         )
+    _sync_llamapool_safe()
     return wid
 
 
@@ -3505,6 +3506,7 @@ def update_compute_worker(wid: str, **fields: Any) -> dict | None:
             f"UPDATE compute_workers SET {', '.join(sets)} WHERE id = ?",
             values,
         )
+    _sync_llamapool_safe()
     return get_compute_worker(wid)
 
 
@@ -3543,6 +3545,7 @@ def update_compute_worker_capabilities(
             f"UPDATE compute_workers SET {', '.join(sets)} WHERE id = ?",
             values,
         )
+    _sync_llamapool_safe()
 
 
 def delete_compute_worker(wid: str) -> int:
@@ -3550,7 +3553,27 @@ def delete_compute_worker(wid: str) -> int:
         cur = c.execute(
             "DELETE FROM compute_workers WHERE id = ?", (wid,),
         )
-        return cur.rowcount or 0
+        rowcount = cur.rowcount or 0
+    if rowcount:
+        _sync_llamapool_safe()
+    return rowcount
+
+
+def _sync_llamapool_safe() -> None:
+    """Mirror compute_workers -> ~/.llamapool/config.json so other
+    LLM workloads on this host (Peerful's extraction script, third-
+    party tools using `llamapool-llama-server`) inherit the same pool.
+
+    Best-effort: any failure is silently logged. Keeping CRUD writes
+    transactional matters more than perfect sync.
+    """
+    try:
+        from . import llamapool_sync
+        llamapool_sync.sync_now()
+    except Exception:
+        # Already logged inside sync_now; we never want to fail the
+        # CRUD call because of a sync issue.
+        pass
 
 
 def _row_to_compute_worker(row: sqlite3.Row) -> dict:
