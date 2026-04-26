@@ -929,9 +929,31 @@ def pick_chat_target(model: str) -> tuple[str, str | None] | None:
     if not cands:
         return None
     w = cands[0]
-    if _capability_score(w) <= _host_capability_score(model):
-        # Host is at least as powerful as the strongest eligible
-        # worker (using measured throughput when available, else
+    # Schedule a background bench of the host on this exact model so
+    # the cache is populated for the next routing call. We can't await
+    # here (this function is sync), so the FIRST call falls through
+    # to heuristic axes only — that's safer than letting the worker's
+    # measured-TPS field beat the host's missing-measurement field.
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_measure_host_throughput(model))
+    except RuntimeError:
+        pass
+
+    worker_score = _capability_score(w)
+    host_score = _host_capability_score(model)
+    # If either side hasn't been benchmarked on this exact model
+    # (TPS=0 means cache miss or measurement failure), fall through
+    # to the heuristic axes so the comparison is apples-to-apples.
+    # Otherwise the worker's "measured 4 tok/s on a different model"
+    # would beat the host's "no measurement yet" → false positive.
+    if worker_score[0] <= 0 or host_score[0] <= 0:
+        worker_score = (0.0,) + worker_score[1:]
+        host_score = (0.0,) + host_score[1:]
+
+    if worker_score <= host_score:
+        # Host wins (using measured throughput when available, else
         # falling back to GPU/VRAM/RAM/CPU heuristics). Stay local.
         return None
     return (_worker_base_url(w), db.get_compute_worker_auth_token(w["id"]))
