@@ -38,9 +38,17 @@ backend/            FastAPI app, agent loop, tool implementations
   mcp.py            MCP server integration (external tool backends)
   tool_prompt_adapter.py   Converts structured tool calls to model dialect
   user_tools_runtime.py    Sandboxed venv execution for user-defined tools
+  compute_pool.py   Worker registry, capability probe, intelligent chat router (auto-decides
+                    Ollama-on-host vs Ollama-on-worker vs split-via-llama.cpp; ranks nodes
+                    by GPU presence + proven VRAM).
+  split_runtime.py  Detects / installs the host's llama.cpp binaries (CUDA build for orchestration).
+  split_lifecycle.py llama-server process supervision: spawn with `--rpc <worker>:<port>`,
+                    wait for /health, stop on model switch, boot reconcile after a crash.
+  model_sync.py     LAN-first SCP of Ollama model blobs from host to a worker (saves internet
+                    bandwidth on multi-GB pulls). Wired automatically into the chat router.
   auth.py           Session cookies + login/logout
   push.py           Web Push notifications
-  sysdetect.py      OS / capability probes (monitor layout, UIA availability)
+  sysdetect.py      OS / capability probes (monitor layout, UIA availability, host VRAM)
   server.py         uvicorn entry point
   tests/            pytest suite (conftest uses an isolated temp DB per test)
 
@@ -233,6 +241,41 @@ A handful of tables defined in `backend/db.py`'s schema block:
 | Change the system prompt                     | `prompts.py` (`build_system_prompt`)       |
 | Add a new React panel                        | `frontend/src/components/`                 |
 | Wire a new MCP server                        | `mcp.py` + `mcp_servers` table             |
+| Tweak the chat-routing policy (host vs worker vs split) | `compute_pool.py` (`route_chat_for`, `pick_chat_target`, `_capability_score`, `_host_capability_score`) |
+| Adjust the per-worker probe (new capability hint) | `compute_pool._probe_one` (returns dict merged into `capabilities_json`) |
+| Add a new `llama-server` CLI flag            | `split_lifecycle._build_command`           |
+
+---
+
+## Compute pool
+
+Two routing tiers; both live in `compute_pool.py` and are invoked from
+`agent.run_turn` early in each turn.
+
+**Whole-request routing (Phase 1).** A single chat / embedding /
+parallel-subagent call goes to ONE machine. `pick_chat_target` (and the
+embed/subagent siblings) ranks workers by `_capability_score` — a
+`(gpu_present, max_vram_seen_bytes, last_seen)` tuple — and compares
+the strongest worker to `_host_capability_score()` derived from
+`sysdetect`. Workers only win when STRICTLY more capable than host;
+ties go local (no LAN hop, KV cache stays warm). Workers ineligible
+because they're missing the model auto-trigger an SCP from host
+(`_maybe_kickoff_lan_sync`) when `ssh_host` is configured — fully
+non-blocking, future turns route to the now-loaded worker.
+
+**Layer-split routing (Phase 2).** When a model exceeds the strongest
+single node's capacity, `route_chat_for` spawns
+`llama-server --rpc <worker>:50052,...` on host port 11500 via
+`split_lifecycle.start`. llama.cpp natively distributes layers across
+host VRAM/RAM + each worker's `rpc-server` (which contributes its own
+GPU + CPU + RAM). Workers don't need the model installed for the split
+path — bytes stream over RPC from the host's local GGUF blob. Process
+state is tracked in the `split_models` table; rows are auto-created
+keyed by model name and auto-stopped when the user switches to a
+different model (one big model hot at a time, finite VRAM).
+
+The `split_models` table is internal — there's no user-facing CRUD UI.
+Users just pick a model in the chat picker; the router decides.
 
 ---
 

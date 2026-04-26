@@ -193,9 +193,10 @@ Gigachat also extends the picker to **tool-capable model families whose Ollama u
 
 ## Settings drawer
 
-One sidebar footer button (⚙ Settings) hosts eight tabs:
+One sidebar footer button (⚙ Settings) hosts nine tabs:
 
 - **General** — default chat model, hardware summary, auto-pull status.
+- **Compute** — register other PCs as compute workers; auto-route work across them. See [Compute pool](#compute-pool) below.
 - **Memories** — global memory CRUD (one entry per row, optional `topic` for grouping; edits propagate immediately, no save button).
 - **Secrets** — named API tokens / credentials referenced via `{{secret:NAME}}`. Values hidden by default; click reveal to show one. The agent has no write access here.
 - **Schedules** — every queued prompt with next-run / interval / cwd. Add / delete from the UI; rows back the agent's `schedule_task` tool too.
@@ -203,6 +204,53 @@ One sidebar footer button (⚙ Settings) hosts eight tabs:
 - **Tools** — user-defined Python tools (review, pause, delete, or add new ones with code + schema + deps form).
 - **Hooks** — register shell commands at agent lifecycle points (`user_prompt_submit`, `pre_tool` / `post_tool`, `turn_done`). Each receives a structured JSON payload on stdin; stdout is injected back as a system-note. Hooks run with your full shell privileges — UI warns on creation.
 - **MCP** — external Model Context Protocol servers.
+
+---
+
+## Compute pool
+
+Register other PCs (laptops, spare desktops) as **compute workers** in Settings → **Compute**, and Gigachat automatically uses their CPU + RAM + GPU + VRAM alongside the host's. Two routing modes engage transparently based on the model you pick:
+
+### Whole-request routing (Phase 1)
+
+Each chat / embedding / parallel-subagent call goes to ONE machine — whichever is best for it. The router picks the strongest eligible node by hardware:
+
+- **GPU presence** — workers with a GPU beat CPU-only workers.
+- **Proven VRAM** — among GPU workers, the one that's loaded the largest model wins (max-VRAM-seen is a hard lower-bound on capacity).
+- **Model availability** — the picked node has to have the model installed; otherwise the router skips it (and silently kicks off a LAN-first SCP from host to backfill, if `ssh_host` is configured).
+- **Host comparison** — the chosen worker has to be **strictly more capable than host** to win. Otherwise chat stays local (no LAN hop, KV cache stays warm).
+
+Eligibility per worker is fine-grained: `Use for chat / embeddings / subagents` toggles per row let you split workloads (e.g. embeddings → laptop, chat stays on host).
+
+### Layer-split routing (Phase 2)
+
+When the model is too big for any single node — e.g. a 27 B Q4 model that doesn't fit either machine alone — the router automatically engages [llama.cpp](https://github.com/ggml-org/llama.cpp)'s `--rpc` mechanism:
+
+```
+[Host CUDA + RAM]  ─RPC─►  [Worker iGPU/CPU + RAM]
+                           [Worker dGPU + VRAM + RAM]
+                           ...
+       ▲                          ▲
+       └── llama-server reads GGUF locally on host,
+           streams layer weights to each rpc-server
+           over LAN/Tailscale. Layers cascade
+           VRAM → RAM → next node, native to llama.cpp.
+```
+
+Workers do **not** need the model installed for the split path — bytes stream over RPC from the host's local GGUF blob.
+
+The split decision is automatic: if the model fits the strongest single node, Phase 1 wins (faster, no per-token LAN overhead). If it doesn't, llama-server is auto-spawned with `--rpc <worker>:50052,...` flags pointing at every reachable worker. Subsequent turns reuse the warm process. Switching to a different big model auto-stops the previous llama-server (one big model hot at a time — finite VRAM).
+
+### Setup, per machine
+
+- **Worker side** — Ollama installed and listening on `0.0.0.0:11434` (set `OLLAMA_HOST` env var, allow port 11434 on the Private firewall profile). Optional but enables Phase 2: install [llama.cpp's prebuilt Vulkan build](https://github.com/ggml-org/llama.cpp/releases) at `~/.gigachat/llama-cpp/`, run `rpc-server.exe --host 0.0.0.0 --port 50052`. Allow port 50052 on the Private firewall profile.
+- **Host side** — register each worker via Settings → Compute → Add device. Fill in the LAN address (mDNS `.local` works) or Tailscale IP. Set `ssh_host` to your `~/.ssh/config` alias for that machine if you want LAN-first model copy. One-click "Install llama.cpp" in the Compute panel fetches the host's CUDA build (~150 MB).
+
+The Settings panel shows live status pills per worker (Ollama version, model count, RPC reachability, GPU detection). The panel polls capabilities every 5 minutes; click the 🔄 on any row to probe immediately.
+
+### Heads-up: Smart App Control on Windows 11
+
+Windows 11's Smart App Control blocks unsigned executables — the prebuilt llama.cpp binaries won't run on a worker that has SAC enabled. You'll see *"An Application Control policy has blocked this file"* on the first launch attempt. Either disable Smart App Control on the worker (Windows Security → App & browser control → Smart App Control → Off — note this is irreversible without an OS reset) or build llama.cpp from source and sign it yourself. Phase 1 routing (Ollama-only) works regardless of SAC since Ollama ships signed.
 
 Notifications stays as its own footer entry because push permission is a per-device toggle, not a shared preference.
 

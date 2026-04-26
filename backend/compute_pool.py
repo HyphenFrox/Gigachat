@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import time
 from pathlib import Path
 from typing import Any
@@ -55,10 +56,13 @@ _PROBE_TIMEOUT_SEC = 5.0
 # to surface whether rpc-server is running on each worker.
 _DEFAULT_RPC_PORT = 50052
 
-# How long to wait for the TCP handshake on the rpc-server probe. Smaller
-# than the HTTP probe timeout because we're literally just checking if
-# the listener exists — a SYN-ACK round trip on LAN is sub-millisecond.
-_RPC_PROBE_TIMEOUT_SEC = 2.0
+# How long to wait for the TCP handshake on the rpc-server probe.
+# Slightly larger than you'd expect for a SYN-ACK because mDNS
+# hostnames often resolve to multiple addresses (IPv4 + IPv6 link-
+# local) and asyncio's `open_connection` tries them in turn — the
+# IPv6 link-local hop can take several seconds to fail before the
+# IPv4 fallback connects. 5 seconds covers that.
+_RPC_PROBE_TIMEOUT_SEC = 5.0
 
 
 def _worker_base_url(worker: dict) -> str:
@@ -96,37 +100,66 @@ async def _probe_rpc_server(
     rpc-server speaks llama.cpp's binary RPC protocol — it doesn't have
     an HTTP health endpoint, and its protocol handshake is more involved
     than we want to replicate just for liveness. A successful TCP connect
-    is enough to know the listener is up; a real RPC call from
-    `llama-server --rpc <host>:<port>` will surface protocol mismatches
-    later if the version is wrong.
+    is enough to know the listener is up.
 
-    Why asyncio.open_connection instead of httpx: we don't need HTTP, and
-    httpx has no clean "TCP connect only" mode. asyncio.open_connection +
-    immediately closing the writer gives us exactly the SYN/SYN-ACK
-    round-trip we want.
+    Address-family handling: mDNS hostnames like `worker.local` resolve
+    to multiple addresses — typically IPv6 link-local first, then IPv6
+    global, then IPv4. asyncio's `open_connection` tries them in
+    sequence; the first IPv6 link-local fails after a multi-second OS-
+    level timeout that defeats our deadline before the IPv4 fallback
+    even gets a chance. To make the probe deterministic on a normal
+    LAN, we resolve the host ourselves and try IPv4 first (or any
+    IPv6 entry that isn't link-local), in parallel via gather. First
+    successful connect wins.
     """
     try:
-        # asyncio.wait_for + open_connection is the canonical "is this
-        # host:port accepting TCP connections within N seconds" pattern.
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
-            timeout=timeout,
+        # getaddrinfo returns ((family, type, proto, canonname, sockaddr), …).
+        infos = await asyncio.get_event_loop().getaddrinfo(
+            host, port, type=socket.SOCK_STREAM,
         )
-    except asyncio.TimeoutError:
-        return False, "rpc-server probe: timeout"
-    except (OSError, ConnectionError) as e:
-        # ECONNREFUSED most commonly — rpc-server isn't running.
-        return False, f"rpc-server probe: {type(e).__name__}: {e}"
     except Exception as e:
-        return False, f"rpc-server probe: {type(e).__name__}: {e}"
-    # Connect succeeded — close immediately. We don't speak the binary
-    # protocol; just the listener-existence check.
-    try:
-        writer.close()
-        await writer.wait_closed()
-    except Exception:
-        pass
-    return True, None
+        return False, f"rpc-server probe: getaddrinfo failed: {e}"
+
+    # Order: IPv4 first (LAN happy path), then IPv6 globals, then
+    # IPv6 link-local last. We don't drop link-local entirely — on
+    # some setups (no IPv4 stack at all) it's the only path — but it
+    # shouldn't gate the probe.
+    def _rank(info):
+        family, _, _, _, sockaddr = info
+        if family == socket.AF_INET:
+            return 0
+        ip = sockaddr[0] if sockaddr else ""
+        if ip.startswith("fe80"):
+            return 2  # link-local — last resort
+        return 1
+    infos = sorted(infos, key=_rank)
+
+    async def _try(info):
+        family, type_, proto, _, sockaddr = info
+        try:
+            sock = socket.socket(family, type_, proto)
+            sock.setblocking(False)
+            await asyncio.get_event_loop().sock_connect(sock, sockaddr)
+            sock.close()
+            return True, None
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    last_err: str | None = None
+    deadline = asyncio.get_event_loop().time() + timeout
+    for info in infos:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            break
+        try:
+            ok, err = await asyncio.wait_for(_try(info), timeout=remaining)
+        except asyncio.TimeoutError:
+            last_err = "timeout"
+            continue
+        if ok:
+            return True, None
+        last_err = err
+    return False, f"rpc-server probe: {last_err or 'no addresses tried'}"
 
 
 async def _probe_one(client: httpx.AsyncClient, base: str, token: str | None) -> dict:

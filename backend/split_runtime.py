@@ -59,7 +59,7 @@ log = logging.getLogger(__name__)
 # need (RPC stability fixes especially). Bumping is a deliberate act —
 # we don't track main because the prebuilt zip layout has shifted in
 # the past, and our extractor expects a specific shape.
-LLAMA_CPP_VERSION = "b5174"
+LLAMA_CPP_VERSION = "b8934"
 
 # Where we keep our private llama.cpp install. Lives outside the repo
 # so a `git clean` doesn't wipe it; lives under the user's home so
