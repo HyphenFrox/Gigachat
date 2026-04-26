@@ -486,6 +486,15 @@ def _eligible_workers(flag: str, model: str | None = None) -> list[dict]:
     intuition "use the more powerful machine" maps to (1) → GPU wins
     over CPU-only, (2) → more VRAM wins over less. Tie at hardware →
     fall back to freshest, like Phase 1 commit 6's original behavior.
+
+    Auto-sync side effect: when a worker has `ssh_host` set, is
+    enabled+fresh, and has the right `flag` on, but is missing the
+    model, this function kicks off a background SCP from host so the
+    model lands on the worker without the user touching a button. The
+    current call still excludes that worker (it really doesn't have
+    the model right now), but subsequent probes will see the new model
+    and the worker becomes eligible. Failures are silent — auto-sync
+    is best-effort.
     """
     rows = db.list_compute_workers(enabled_only=True)
     now = time.time()
@@ -495,11 +504,68 @@ def _eligible_workers(flag: str, model: str | None = None) -> list[dict]:
             continue
         if not _is_fresh(w, now=now):
             continue
-        if model and not _worker_has_model(w, model):
-            continue
-        out.append(w)
+        if model:
+            if _worker_has_model(w, model):
+                out.append(w)
+            elif w.get("ssh_host"):
+                _maybe_kickoff_lan_sync(w, model)
+            # else: no ssh_host, no path to install — skip silently.
+        else:
+            out.append(w)
     out.sort(key=_capability_score, reverse=True)
     return out
+
+
+# Track in-flight auto-syncs so we don't fire the same SCP twice if
+# `_eligible_workers` runs back-to-back (every chat turn). Keyed by
+# (worker_id, model_name); value is a Task we never await but keep
+# referenced so it doesn't get GC'd mid-flight.
+_AUTO_SYNC_TASKS: dict[tuple[str, str], asyncio.Task] = {}
+
+
+def _maybe_kickoff_lan_sync(worker: dict, model_name: str) -> None:
+    """Launch a background SCP of `model_name` from host to `worker`.
+
+    Called from the routing layer when a worker is *almost* eligible —
+    same hardware/freshness/flag eligibility but missing the model. The
+    auto-sync transparently fixes the model gap; subsequent routes get
+    a more capable choice.
+
+    Guards:
+      * ssh_host must be set on the worker (the only way we can reach it).
+      * Skip if the same (worker, model) is already mid-sync.
+      * Wrapped in try/except — sync failures NEVER bubble to the caller.
+    """
+    wid = worker.get("id")
+    if not wid or not model_name:
+        return
+    key = (wid, model_name)
+    existing = _AUTO_SYNC_TASKS.get(key)
+    if existing and not existing.done():
+        return  # already in flight; let it finish
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Sync entry point — no event loop, skip. The next async caller
+        # will retry.
+        return
+
+    async def _run():
+        # Local import to dodge the import cycle (model_sync depends
+        # on this module for `_model_matches`).
+        try:
+            from . import model_sync
+            await model_sync.sync_model(model_name, wid)
+            log.info("compute_pool: auto-synced %s → worker %s",
+                     model_name, worker.get("label"))
+        except Exception as e:
+            log.info("compute_pool: auto-sync %s → %s deferred (%s)",
+                     model_name, worker.get("label"), e)
+        finally:
+            _AUTO_SYNC_TASKS.pop(key, None)
+
+    _AUTO_SYNC_TASKS[key] = loop.create_task(_run())
 
 
 def pick_embed_target(model: str) -> tuple[str, str | None] | None:

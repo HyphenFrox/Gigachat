@@ -387,6 +387,14 @@ def init() -> None:
                 ollama_port INTEGER NOT NULL DEFAULT 11434,
                 transport TEXT NOT NULL DEFAULT 'lan',
                 auth_token TEXT,
+                -- SSH alias / hostname the host can use to scp blobs to
+                -- this worker (LAN-first model copy, Phase 2 commit 10).
+                -- NULL means "no SSH configured" — model copy falls
+                -- back to manual `ollama pull` on the worker. Typically
+                -- the user puts an entry in ~/.ssh/config (e.g.
+                -- `Host laptop`) and stores that alias here so the
+                -- backend can `scp file laptop:dest` cleanly.
+                ssh_host TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 use_for_chat INTEGER NOT NULL DEFAULT 1,
                 use_for_embeddings INTEGER NOT NULL DEFAULT 1,
@@ -561,6 +569,12 @@ def init() -> None:
             # CREATE INDEX IF NOT EXISTS would otherwise see the old
             # index name and silently keep the wrong shape.
             "DROP INDEX IF EXISTS idx_conversations_sort",
+            # Phase 2 commit 10: SSH alias / hostname for LAN-first
+            # model copy. NULL means "no SSH configured" — the host
+            # falls back to manual `ollama pull` instructions on the
+            # worker side. Typical value is the alias the user has
+            # in ~/.ssh/config (e.g. "laptop").
+            "ALTER TABLE compute_workers ADD COLUMN ssh_host TEXT",
         ):
             try:
                 c.execute(ddl)
@@ -3374,6 +3388,7 @@ def create_compute_worker(
     ollama_port: int = 11434,
     transport: str = "lan",
     auth_token: str | None = None,
+    ssh_host: str | None = None,
     enabled: bool = True,
     use_for_chat: bool = True,
     use_for_embeddings: bool = True,
@@ -3410,12 +3425,13 @@ def create_compute_worker(
     with _conn() as c:
         c.execute(
             "INSERT INTO compute_workers ("
-            "id, label, address, ollama_port, transport, auth_token, "
+            "id, label, address, ollama_port, transport, auth_token, ssh_host, "
             "enabled, use_for_chat, use_for_embeddings, use_for_subagents, "
             "created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 wid, lbl, addr, port, transport, auth_token,
+                (ssh_host or "").strip() or None,
                 1 if enabled else 0,
                 1 if use_for_chat else 0,
                 1 if use_for_embeddings else 0,
@@ -3449,6 +3465,7 @@ def update_compute_worker(wid: str, **fields: Any) -> dict | None:
     """Patch allowed fields on a worker. Returns the refreshed row."""
     allowed = {
         "label", "address", "ollama_port", "transport", "auth_token",
+        "ssh_host",
         "enabled", "use_for_chat", "use_for_embeddings", "use_for_subagents",
     }
     sets: list[str] = []
@@ -3465,6 +3482,10 @@ def update_compute_worker(wid: str, **fields: Any) -> dict | None:
             v = 1 if v else 0
         if k == "ollama_port":
             v = 11434 if v is None else max(1, min(int(v), 65535))
+        if k == "ssh_host":
+            # Empty string clears; None leaves alone (handled by skipping
+            # the key in the patch dict at the API layer).
+            v = (v or "").strip() or None
         sets.append(f"{k} = ?")
         values.append(v)
     if not sets:
@@ -3531,6 +3552,12 @@ def _row_to_compute_worker(row: sqlite3.Row) -> dict:
         caps = json.loads(caps_raw) if caps_raw else None
     except Exception:
         caps = None
+    # ssh_host may not exist on older DBs that haven't been migrated;
+    # sqlite3.Row raises IndexError on unknown columns. Use a safe access.
+    try:
+        ssh_host = row["ssh_host"]
+    except IndexError:
+        ssh_host = None
     return {
         "id": row["id"],
         "label": row["label"],
@@ -3542,6 +3569,7 @@ def _row_to_compute_worker(row: sqlite3.Row) -> dict:
         # exfiltration vector. Use `get_compute_worker_auth_token(wid)`
         # for the rare internal caller that needs it.
         "auth_token_set": bool(row["auth_token"]),
+        "ssh_host": ssh_host,
         "enabled": bool(row["enabled"]),
         "use_for_chat": bool(row["use_for_chat"]),
         "use_for_embeddings": bool(row["use_for_embeddings"]),

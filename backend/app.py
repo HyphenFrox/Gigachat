@@ -84,7 +84,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from . import agent, auth, compute_pool, db, mcp, ollama_runtime, push, split_lifecycle, split_runtime, sysdetect, tools
+from . import agent, auth, compute_pool, db, mcp, model_sync, ollama_runtime, push, split_lifecycle, split_runtime, sysdetect, tools
 
 ROOT = Path(__file__).resolve().parent.parent
 # In production, the frontend is built to `frontend/dist` by Vite.
@@ -3294,6 +3294,7 @@ class ComputeWorkerCreate(BaseModel):
     ollama_port: int = 11434
     transport: str = "lan"  # "lan" or "tailscale"
     auth_token: str | None = None
+    ssh_host: str | None = None  # optional SSH alias for LAN model copy
     enabled: bool = True
     use_for_chat: bool = True
     use_for_embeddings: bool = True
@@ -3307,6 +3308,7 @@ class ComputeWorkerPatch(BaseModel):
     ollama_port: int | None = None
     transport: str | None = None
     auth_token: str | None = None  # send "" to clear, null to leave alone
+    ssh_host: str | None = None    # send "" to clear, null to leave alone
     enabled: bool | None = None
     use_for_chat: bool | None = None
     use_for_embeddings: bool | None = None
@@ -3336,6 +3338,7 @@ def api_create_compute_worker(body: ComputeWorkerCreate) -> dict:
             ollama_port=body.ollama_port,
             transport=body.transport,
             auth_token=(body.auth_token or None),
+            ssh_host=(body.ssh_host or None),
             enabled=body.enabled,
             use_for_chat=body.use_for_chat,
             use_for_embeddings=body.use_for_embeddings,
@@ -3391,6 +3394,57 @@ async def api_probe_all_compute_workers() -> dict:
     from the Settings panel; returns a summary list (per-worker ok/error)
     and the heavy capability data is persisted on the rows themselves."""
     return {"results": await compute_pool.probe_all_enabled()}
+
+
+@app.post("/api/compute-workers/{wid}/push-model")
+async def api_push_model_to_worker(wid: str, model: str) -> dict:
+    """Copy an Ollama model from this host to the named worker via SCP.
+
+    Saves internet bandwidth: the worker doesn't pull from the public
+    Ollama registry, the bytes flow over the LAN. Requires the worker
+    row to have `ssh_host` set (an SSH alias the host can resolve via
+    its ~/.ssh/config — typically same alias the user already uses to
+    connect to that machine).
+    """
+    try:
+        return await model_sync.sync_model(model, wid)
+    except model_sync.ModelSyncError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/compute-workers/{wid}/push-model/plan")
+def api_push_model_plan(wid: str, model: str) -> dict:
+    """Preview what `push-model` would ship — number of blobs, total
+    bytes, manifest path. Lets the UI confirm before kicking off a
+    multi-GB transfer."""
+    try:
+        plan = model_sync.plan(model, wid)
+    except model_sync.ModelSyncError as e:
+        raise HTTPException(400, str(e))
+    return {
+        "manifest_path": str(plan.manifest_path),
+        "manifest_dest": plan.manifest_dest,
+        "blob_count": len(plan.blob_digests),
+        "total_bytes": plan.total_bytes,
+    }
+
+
+@app.get("/api/models/lan-source")
+def api_find_lan_source(model: str, exclude_worker_id: str | None = None) -> dict:
+    """Where on the LAN is this model already available?
+
+    Returns one of:
+      {"kind": "host"}                      — push from host (cheap LAN copy)
+      {"kind": "worker", "worker_id":...}   — a peer has it, but the host
+                                              doesn't yet (peer→peer push
+                                              not implemented; this is a
+                                              hint that the user should pull
+                                              the model on host first).
+      {"kind": null}                        — no LAN source; internet pull
+                                              is the only option.
+    """
+    src = model_sync.find_lan_source_for(model, exclude_worker_id=exclude_worker_id)
+    return {"source": src}
 
 
 # ---------------------------------------------------------------------------

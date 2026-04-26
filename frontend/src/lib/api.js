@@ -454,6 +454,33 @@ export const api = {
   probeAllComputeWorkers: () =>
     request('/api/compute-workers/probe-all', { method: 'POST' }),
 
+  /**
+   * LAN-first model copy: scp this host's Ollama-managed model blobs to
+   * the named worker. Requires the worker row to have `ssh_host` set.
+   * Returns a summary `{ok, blobs_total, blobs_already_present, blobs_shipped, bytes_shipped}`.
+   */
+  pushModelToWorker: (workerId, modelName) =>
+    request(
+      `/api/compute-workers/${workerId}/push-model?model=${encodeURIComponent(modelName)}`,
+      { method: 'POST' },
+    ),
+
+  /** Preview what `pushModelToWorker` would ship. */
+  pushModelPlan: (workerId, modelName) =>
+    request(
+      `/api/compute-workers/${workerId}/push-model/plan?model=${encodeURIComponent(modelName)}`,
+    ),
+
+  /**
+   * Where on the LAN is `model` already available? Returns
+   * `{source: {kind: 'host'|'worker', worker_id?, label?} | null}`.
+   */
+  findLanSource: (modelName, excludeWorkerId = null) => {
+    const q = new URLSearchParams({ model: modelName })
+    if (excludeWorkerId) q.set('exclude_worker_id', excludeWorkerId)
+    return request(`/api/models/lan-source?${q}`)
+  },
+
   /* -------------------- Split models (Phase 2) -------------------------- */
   /**
    * List every registered split model + the host's llama.cpp install

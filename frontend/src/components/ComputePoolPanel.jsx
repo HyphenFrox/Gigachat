@@ -85,6 +85,7 @@ export default function ComputePoolSection() {
       ollama_port: 11434,
       transport: transports[0] || 'lan',
       auth_token: '',
+      ssh_host: '',
       enabled: true,
       use_for_chat: true,
       use_for_embeddings: true,
@@ -108,6 +109,7 @@ export default function ComputePoolSection() {
       // "••••••" is rendered when the row already has one).
       auth_token: '',
       auth_token_was_set: !!w.auth_token_set,
+      ssh_host: w.ssh_host || '',
       enabled: !!w.enabled,
       use_for_chat: !!w.use_for_chat,
       use_for_embeddings: !!w.use_for_embeddings,
@@ -134,6 +136,7 @@ export default function ComputePoolSection() {
           address,
           ollama_port: port,
           transport: editing.transport,
+          ssh_host: editing.ssh_host || '',
           enabled: editing.enabled,
           use_for_chat: editing.use_for_chat,
           use_for_embeddings: editing.use_for_embeddings,
@@ -153,6 +156,7 @@ export default function ComputePoolSection() {
           ollama_port: port,
           transport: editing.transport,
           auth_token: editing.auth_token || null,
+          ssh_host: editing.ssh_host || null,
           enabled: editing.enabled,
           use_for_chat: editing.use_for_chat,
           use_for_embeddings: editing.use_for_embeddings,
@@ -454,6 +458,26 @@ export default function ComputePoolSection() {
                     </button>
                   )}
                 </div>
+              </div>
+
+              <div>
+                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                  SSH host (optional, for LAN model copy)
+                </label>
+                <Input
+                  value={editing.ssh_host}
+                  onChange={(e) =>
+                    setEditing({ ...editing, ssh_host: e.target.value })
+                  }
+                  placeholder="e.g. laptop (an alias from your ~/.ssh/config)"
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  When set, this host can scp Ollama model blobs to the
+                  worker over LAN instead of having the worker pull from
+                  the internet. Saves bandwidth on multi-GB models. Add
+                  the alias to <code className="rounded bg-muted px-1">~/.ssh/config</code>{' '}
+                  on this host first; the backend just reuses your existing SSH setup.
+                </p>
               </div>
 
               <div className="rounded-md border border-border bg-muted/30 p-3">
