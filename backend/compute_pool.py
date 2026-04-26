@@ -1729,8 +1729,28 @@ async def _acquire_override_files(model_name: str, spec: dict) -> dict:
                     log.info("compute_pool: surgery produced %s for %s",
                              main_path, model_name)
 
-        # Step 2: download main if surgery skipped / failed and a URL
-        # is registered.
+        # Step 2a: if no URL is registered (auto-synthesized spec for
+        # an unknown model) AND surgery didn't produce the file,
+        # try HuggingFace auto-discovery. Looks for a community
+        # GGUF (Unsloth/bartowski/mradermacher) matching the model
+        # name. Saves the user from having to add a registry entry
+        # for every new bundled-multimodal model they install.
+        if not main_path.is_file() and not spec.get("main_url"):
+            state.update({
+                "status": "running", "phase": "discovering-url",
+                "progress_pct": 25.0,
+            })
+            discovered = await _discover_hf_url(model_name)
+            if discovered:
+                spec = {**spec, "main_url": discovered["url"],
+                        "main_size_gb": discovered.get("size_gb", 0)}
+                log.info(
+                    "compute_pool: HF auto-discovery for %s: %s",
+                    model_name, discovered["url"],
+                )
+
+        # Step 2b: download main if surgery skipped / failed and a URL
+        # is registered (or just got auto-discovered).
         if not main_path.is_file() and spec.get("main_url"):
             state.update({
                 "status": "running", "phase": "downloading-main",
@@ -1994,27 +2014,213 @@ async def _distribute_override_to_workers(model_name: str) -> None:
                 )
 
 
-async def _download_to_path(url: str, dest: Path) -> None:
+async def _discover_hf_url(model_name: str) -> dict | None:
+    """Best-effort: search HuggingFace for a community GGUF matching
+    `model_name` (an Ollama-style name like `gemma4:26b`) and return
+    a direct download URL + estimated size, or None if no match.
+
+    Algorithm:
+      1. Build a few candidate query strings from the Ollama name
+         (strip `:tag`, swap `:` for ` `, etc.).
+      2. Call HuggingFace's public `/api/models` search endpoint
+         (no auth needed for public repos), filtered to GGUF.
+      3. Prefer well-known quantizers (unsloth, bartowski,
+         mradermacher) — they ship clean stock-llama.cpp-loadable
+         GGUFs.
+      4. From the chosen repo, list files and pick the one matching
+         `Q4_K_M` (Ollama's default quantization — preserves the
+         user's quality expectations) or fall back to `Q5_K_M`.
+      5. Return the resolve-main download URL.
+
+    Returns None on any failure (HF unreachable, no candidates, no
+    Q4_K_M / Q5_K_M file found). Caller falls through to a clean
+    error message.
+
+    Honest caveat: this is a heuristic. HuggingFace has many naming
+    conventions, and our pattern matching may pick the wrong repo
+    in edge cases. We bias toward the major quantizers (whose
+    repos are well-named and stable) to minimize that risk; if a
+    user installs a working but unusual model (e.g. a fine-tune
+    not on Unsloth), this will return None and the user gets a
+    clear error pointing them to the manual install path.
+    """
+    try:
+        bare = model_name.split(":", 1)[0]
+        tag = model_name.split(":", 1)[1] if ":" in model_name else ""
+    except Exception:
+        return None
+
+    # Candidate search strings, in order of preference.
+    queries = [
+        f"{bare} {tag}".strip(),
+        bare,
+        bare.replace("-", " "),
+    ]
+
+    # Trusted quantizer repos in priority order.
+    preferred_authors = ("unsloth", "bartowski", "mradermacher")
+
+    timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        candidate_repos: list[str] = []
+        for q in queries:
+            try:
+                r = await client.get(
+                    "https://huggingface.co/api/models",
+                    params={"search": q, "filter": "gguf", "limit": 30},
+                )
+                if r.status_code != 200:
+                    continue
+                hits = r.json() or []
+            except Exception:
+                continue
+            # Sort by preferred author, then popularity (downloads).
+            def _score(h):
+                ident = h.get("id") or ""
+                author = ident.split("/", 1)[0].lower() if "/" in ident else ""
+                pref_idx = (
+                    preferred_authors.index(author)
+                    if author in preferred_authors
+                    else len(preferred_authors)
+                )
+                return (pref_idx, -int(h.get("downloads") or 0))
+            hits.sort(key=_score)
+            for h in hits:
+                ident = h.get("id") or ""
+                if ident and ident not in candidate_repos:
+                    candidate_repos.append(ident)
+            if candidate_repos:
+                break
+
+        if not candidate_repos:
+            log.info("compute_pool: HF auto-discovery: no candidates for %s", model_name)
+            return None
+
+        # For each candidate repo, list files and find a Q4_K_M or
+        # Q5_K_M GGUF.
+        for repo in candidate_repos[:5]:  # cap to avoid infinite probing
+            try:
+                r = await client.get(
+                    f"https://huggingface.co/api/models/{repo}",
+                    params={"blobs": "true"},
+                )
+                if r.status_code != 200:
+                    continue
+                meta = r.json() or {}
+                siblings = meta.get("siblings") or []
+            except Exception:
+                continue
+
+            # Filter to GGUFs; prefer Q4_K_M (matches Ollama's default).
+            ggufs = [
+                s for s in siblings
+                if (s.get("rfilename") or "").endswith(".gguf")
+            ]
+            for quant_pat in ("Q4_K_M.gguf", "Q4_K_S.gguf",
+                              "Q5_K_M.gguf", "UD-Q4_K_M.gguf",
+                              "UD-Q5_K_M.gguf"):
+                pick = next(
+                    (s for s in ggufs
+                     if s.get("rfilename", "").endswith(quant_pat)),
+                    None,
+                )
+                if pick:
+                    fname = pick["rfilename"]
+                    url = f"https://huggingface.co/{repo}/resolve/main/{fname}"
+                    return {
+                        "url": url,
+                        "repo": repo,
+                        "filename": fname,
+                        "size_gb": float(pick.get("size") or 0) / (1024 ** 3),
+                    }
+        log.info(
+            "compute_pool: HF auto-discovery: candidates found but no "
+            "Q4_K_M/Q5_K_M file in %s for %s",
+            candidate_repos[:5], model_name,
+        )
+        return None
+
+
+async def _download_to_path(url: str, dest: Path, *, max_attempts: int = 4) -> None:
     """Stream a HuggingFace direct-download URL to `dest`, resuming
-    from `<dest>.part` if it already exists. Mirrors what
-    `scripts/install_gguf_override.py` does, in-process so we can
-    surface progress through `_ACQUISITION_STATE`. Raises on any
-    network or disk error.
+    from `<dest>.part` if it already exists. In-process so we can
+    surface progress through `_ACQUISITION_STATE`. Auto-retries on
+    transient failures (network drop, server 5xx, partial response)
+    with exponential backoff up to `max_attempts` total tries.
+
+    Raises on terminal failure (4xx that's not 416, max attempts
+    exhausted, content-length mismatch). Each retry resumes from the
+    last byte successfully written, so a 50%-complete download that
+    drops mid-flight only re-fetches the remainder.
+
+    Defends against three real-world failure modes:
+      1. Server returned 200 OK to a Range request (didn't honor the
+         resume) — discards the partial and starts fresh, otherwise
+         we'd append duplicate prefix bytes to the file.
+      2. Connection drops mid-chunk (network blip, server reset) —
+         exception caught, partial bytes already on disk, retry
+         picks up where we left off.
+      3. 5xx server error — wait + retry. 4xx (other than 416 Range
+         Not Satisfiable) is terminal: bad URL, no retry can fix it.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    start_byte = tmp.stat().st_size if tmp.is_file() else 0
-    headers = {"Range": f"bytes={start_byte}-"} if start_byte > 0 else {}
-    timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
-    mode = "ab" if start_byte > 0 else "wb"
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        async with client.stream("GET", url, headers=headers) as r:
-            if r.status_code not in (200, 206):
-                raise RuntimeError(f"download failed: HTTP {r.status_code} from {url}")
-            with tmp.open(mode) as f:
-                async for chunk in r.aiter_bytes(chunk_size=1024 * 1024):
-                    f.write(chunk)
-    tmp.rename(dest)
+    last_err: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        start_byte = tmp.stat().st_size if tmp.is_file() else 0
+        headers = {"Range": f"bytes={start_byte}-"} if start_byte > 0 else {}
+        timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                async with client.stream("GET", url, headers=headers) as r:
+                    if r.status_code == 416:
+                        # Range Not Satisfiable: our `.part` is bigger
+                        # than the file. Clear it and retry from 0.
+                        if tmp.exists():
+                            tmp.unlink()
+                        raise RuntimeError(f"HTTP 416; reset partial")
+                    if r.status_code not in (200, 206):
+                        msg = f"HTTP {r.status_code} from {url}"
+                        # 4xx is terminal — retrying won't help.
+                        if 400 <= r.status_code < 500:
+                            raise RuntimeError(msg)
+                        # 5xx is transient — fall through to retry.
+                        raise RuntimeError(msg)
+                    if start_byte > 0 and r.status_code == 200:
+                        # Server ignored our Range request and is
+                        # streaming the whole file. Reset partial so
+                        # we don't end up with duplicated prefix bytes.
+                        if tmp.exists():
+                            tmp.unlink()
+                        start_byte = 0
+                    mode = "ab" if start_byte > 0 else "wb"
+                    with tmp.open(mode) as f:
+                        async for chunk in r.aiter_bytes(chunk_size=1024 * 1024):
+                            f.write(chunk)
+            tmp.rename(dest)
+            return
+        except Exception as e:
+            last_err = e
+            # Don't retry on terminal 4xx — caller should see the
+            # error promptly so they can fix the URL / registry.
+            if "HTTP 4" in str(e) and "HTTP 416" not in str(e):
+                raise
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    f"download failed after {attempt} attempts: {e}"
+                ) from e
+            backoff_s = min(60.0, 2.0 ** attempt)
+            log.info(
+                "compute_pool: download attempt %d/%d failed for %s: %s; "
+                "retrying in %.0fs",
+                attempt, max_attempts, url, e, backoff_s,
+            )
+            await asyncio.sleep(backoff_s)
+
+    # Should not reach here — the loop either returns or raises.
+    if last_err:
+        raise last_err
 
 
 def _resolve_ollama_manifest(model_name: str) -> dict | None:
