@@ -179,6 +179,7 @@ def _build_command(
     port: int,
     rpc_endpoints: list[str],
     ngl: int = _DEFAULT_NGL,
+    mmproj_path: str | None = None,
 ) -> list[str]:
     """Assemble the argv for `llama-server`.
 
@@ -186,6 +187,15 @@ def _build_command(
     of validation (port range etc.) and supplying the binary path.
     Keeping this pure means the test suite can pin the exact flag
     layout without spawning a process.
+
+    `mmproj_path` is the path to a CLIP-format multimodal projector
+    GGUF. When provided, llama-server is launched with `--mmproj`
+    enabling vision/image inputs in `/v1/chat/completions`. Required
+    for multimodal models like gemma4:26b whose Ollama blob bundles
+    the vision tower — we extract it into a separate mmproj file
+    (or download Unsloth's pre-built one) and point llama-server at
+    both. Phase 2 RPC layer-split still applies to the LLM tensors;
+    the CLIP graph runs on the host backend by default.
     """
     cmd: list[str] = [
         str(llama_server),
@@ -231,6 +241,12 @@ def _build_command(
         # warmup before any traffic at all.
         "--no-warmup",
     ]
+    if mmproj_path:
+        # Multimodal projector: required for vision-capable inference
+        # of models whose Ollama blob bundles a vision tower.
+        # llama-server keeps the CLIP graph on its own backend (host
+        # by default) while the LLM tensors layer-split via --rpc.
+        cmd.extend(["--mmproj", mmproj_path])
     if rpc_endpoints:
         # llama-server takes --rpc as a comma-separated list of
         # `<host>:<port>` endpoints. Order controls layer assignment.
@@ -365,11 +381,16 @@ async def start(split_id: str) -> dict:
         db.update_split_model_status(split_id, status="error", last_error=str(e))
         return {"ok": False, "status": "error", "error": str(e)}
 
+    # mmproj_path is optional — when set, we pass --mmproj so vision
+    # input works. Older split rows (pre-migration) won't have the
+    # column; .get() returns None which the builder ignores.
+    mmproj = (row.get("mmproj_path") or "").strip() or None
     cmd = _build_command(
         llama_server=server,
         gguf_path=row["gguf_path"],
         port=row["llama_port"],
         rpc_endpoints=rpc_endpoints,
+        mmproj_path=mmproj,
     )
     log_path = _log_path_for(split_id)
 

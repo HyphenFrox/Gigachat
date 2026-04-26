@@ -1103,6 +1103,22 @@ def _override_gguf_path_for(model_name: str) -> Path:
     return _OVERRIDE_GGUF_DIR / f"{safe}.gguf"
 
 
+def _override_mmproj_path_for(model_name: str) -> Path:
+    """Map an Ollama model name to its multimodal projector path.
+
+    Same naming convention as the main override but with a `.mmproj`
+    infix: `gemma4:26b` → `gemma4-26b.mmproj.gguf`. When this file
+    exists alongside the main override, llama-server is launched
+    with `--mmproj <path>` enabling vision input. The mmproj is
+    distributed/produced separately from the main LLM GGUF; for
+    Ollama-bundled multimodal models the user can either run our
+    extraction script once or download a pre-built mmproj from the
+    upstream repo (e.g. Unsloth's `mmproj-BF16.gguf`).
+    """
+    safe = (model_name or "").strip().replace(":", "-").replace("/", "-")
+    return _OVERRIDE_GGUF_DIR / f"{safe}.mmproj.gguf"
+
+
 def _resolve_ollama_manifest(model_name: str) -> dict | None:
     """Locate the manifest JSON for an Ollama model name.
 
@@ -1196,12 +1212,18 @@ def resolve_ollama_model(model_name: str) -> dict | None:
             override_size = override.stat().st_size
         except OSError:
             override_size = 0
+        # Multimodal projector — surface its path if installed beside
+        # the main override. Phase 2 split (`split_lifecycle._build_command`)
+        # passes it as `--mmproj` so llama-server can serve image input.
+        mmproj = _override_mmproj_path_for(model_name)
+        mmproj_str = str(mmproj) if mmproj.is_file() else None
         return {
             "gguf_path": str(override),
             "size_bytes": override_size or int(model_layer.get("size") or 0),
             "manifest": manifest,
             "ollama_blob_path": str(blob_path),
             "override": True,
+            "mmproj_path": mmproj_str,
         }
 
     return {
@@ -1271,16 +1293,26 @@ def _eligible_split_workers() -> list[dict]:
 
 
 async def _ensure_split_running_for(
-    model_name: str, gguf_path: str, worker_ids: list[str],
+    model_name: str,
+    gguf_path: str,
+    worker_ids: list[str],
+    mmproj_path: str | None = None,
 ) -> str:
     """Idempotent: ensure a `split_models` row exists + is running for
-    this exact (model_name, gguf_path) pair, then return its base_url.
+    this exact (model_name, gguf_path[, mmproj_path]) tuple, then
+    return its base_url.
 
     Auto-creates the row keyed by model_name as label. If a row with the
-    same label already exists, we reuse it (updating worker_ids if the
-    user added/removed workers between turns). If a DIFFERENT split row
-    is currently running, we stop it first — only one big model hot at
-    a time.
+    same label already exists, we reuse it (updating worker_ids /
+    mmproj_path if the user added/removed workers or installed a new
+    multimodal projector since the previous turn). If a DIFFERENT split
+    row is currently running, we stop it first — only one big model
+    hot at a time.
+
+    `mmproj_path`, when non-None, is forwarded to llama-server's
+    `--mmproj` flag so vision-capable models (e.g. gemma4:26b after
+    its vision tower has been extracted into a separate GGUF) can
+    accept image input via Phase 2 split.
     """
     # Local import to dodge the circular dep — split_lifecycle imports
     # compute_pool indirectly via db / runtime.
@@ -1302,16 +1334,22 @@ async def _ensure_split_running_for(
         sid = db.create_split_model(
             label=model_name,
             gguf_path=gguf_path,
+            mmproj_path=mmproj_path,
             worker_ids=worker_ids,
         )
         target_row = db.get_split_model(sid)
     else:
-        # Refresh gguf_path + worker_ids in case the user changed
-        # things since the previous turn.
-        if target_row.get("gguf_path") != gguf_path or target_row.get("worker_ids") != worker_ids:
+        # Refresh gguf_path / mmproj_path / worker_ids in case the
+        # user changed things since the previous turn.
+        if (
+            target_row.get("gguf_path") != gguf_path
+            or target_row.get("mmproj_path") != mmproj_path
+            or target_row.get("worker_ids") != worker_ids
+        ):
             db.update_split_model(
                 target_row["id"],
                 gguf_path=gguf_path,
+                mmproj_path=mmproj_path,
                 worker_ids=worker_ids,
             )
             target_row = db.get_split_model(target_row["id"])
@@ -1478,7 +1516,12 @@ async def route_chat_for(model_name: str) -> dict:
         if engage_split:
             worker_ids = [w["id"] for w in rpc_workers]
             try:
-                base_url = await _ensure_split_running_for(model_name, info["gguf_path"], worker_ids)
+                base_url = await _ensure_split_running_for(
+                    model_name,
+                    info["gguf_path"],
+                    worker_ids,
+                    mmproj_path=info.get("mmproj_path"),
+                )
                 return {"engine": "llama_server", "base_url": base_url, "label": model_name}
             except Exception as e:
                 log.warning("compute_pool: split start failed (%s); falling back to host", e)
@@ -1505,7 +1548,12 @@ async def route_chat_for(model_name: str) -> dict:
         return {"engine": "ollama"}
 
     worker_ids = [w["id"] for w in workers]
-    base_url = await _ensure_split_running_for(model_name, info["gguf_path"], worker_ids)
+    base_url = await _ensure_split_running_for(
+        model_name,
+        info["gguf_path"],
+        worker_ids,
+        mmproj_path=info.get("mmproj_path"),
+    )
     return {"engine": "llama_server", "base_url": base_url, "label": model_name}
 
 

@@ -575,6 +575,13 @@ def init() -> None:
             # worker side. Typical value is the alias the user has
             # in ~/.ssh/config (e.g. "laptop").
             "ALTER TABLE compute_workers ADD COLUMN ssh_host TEXT",
+            # Phase 2 commit 24: optional path to a multimodal projector
+            # GGUF (mmproj). When set, llama-server is launched with
+            # `--mmproj <path>` so vision/image inputs work via Phase 2
+            # split. Required for models like gemma4:26b whose Ollama
+            # blob bundles a vision tower that stock llama-server can't
+            # load directly. NULL means text-only.
+            "ALTER TABLE split_models ADD COLUMN mmproj_path TEXT",
         ):
             try:
                 c.execute(ddl)
@@ -3626,6 +3633,7 @@ def create_split_model(
     worker_ids: list[str] | None = None,
     llama_port: int = SPLIT_MODEL_DEFAULT_PORT,
     enabled: bool = True,
+    mmproj_path: str | None = None,
 ) -> str:
     """Insert a new split-model definition and return its id.
 
@@ -3657,18 +3665,22 @@ def create_split_model(
     if port < 1 or port > 65535:
         raise ValueError("llama_port must be 1–65535")
 
+    # mmproj is optional — we only validate it's a non-empty string if set.
+    mmproj = (mmproj_path or "").strip() or None
+
     sid = uuid.uuid4().hex
     now = time.time()
     with _conn() as c:
         c.execute(
             "INSERT INTO split_models ("
-            "id, label, gguf_path, worker_ids_json, llama_port, "
+            "id, label, gguf_path, mmproj_path, worker_ids_json, llama_port, "
             "enabled, status, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, 'stopped', ?, ?)",
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?)",
             (
                 sid,
                 lbl,
                 path,
+                mmproj,
                 json.dumps(wids),
                 port,
                 1 if enabled else 0,
@@ -3710,7 +3722,7 @@ def update_split_model(sid: str, **fields: Any) -> dict | None:
     if not get_split_model(sid):
         return None
 
-    allowed = {"label", "gguf_path", "worker_ids", "llama_port", "enabled"}
+    allowed = {"label", "gguf_path", "mmproj_path", "worker_ids", "llama_port", "enabled"}
     cols: list[str] = []
     vals: list[Any] = []
     for k, v in fields.items():
@@ -3730,6 +3742,11 @@ def update_split_model(sid: str, **fields: Any) -> dict | None:
                 raise ValueError("gguf_path cannot be blank")
             cols.append("gguf_path = ?")
             vals.append(path)
+        elif k == "mmproj_path":
+            # Optional — empty string / None means "remove mmproj".
+            cleaned = (v or "").strip() or None
+            cols.append("mmproj_path = ?")
+            vals.append(cleaned)
         elif k == "worker_ids":
             wids = list(v or [])
             for i, w in enumerate(wids):
@@ -3812,10 +3829,21 @@ def _row_to_split_model(row: sqlite3.Row) -> dict:
         wids = json.loads(row["worker_ids_json"]) if row["worker_ids_json"] else []
     except Exception:
         wids = []
+    # `mmproj_path` was added in a later migration — older rows return
+    # the column as NULL, and the column itself didn't exist before
+    # the migration ran. Use sqlite3.Row.keys() to detect presence so
+    # the helper still works against an upgrade-in-progress DB.
+    mmproj = None
+    try:
+        if "mmproj_path" in row.keys():
+            mmproj = row["mmproj_path"]
+    except (IndexError, KeyError):
+        mmproj = None
     return {
         "id": row["id"],
         "label": row["label"],
         "gguf_path": row["gguf_path"],
+        "mmproj_path": mmproj,
         "worker_ids": wids,
         "llama_port": row["llama_port"],
         "enabled": bool(row["enabled"]),
