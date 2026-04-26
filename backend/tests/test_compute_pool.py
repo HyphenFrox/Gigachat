@@ -314,3 +314,153 @@ def test_probe_all_enabled_skips_disabled(isolated_db, monkeypatch):
     summaries = _run(compute_pool.probe_all_enabled())
     labels = {s["label"] for s in summaries}
     assert labels == {"A"}
+
+
+# --- model name matching --------------------------------------------------
+
+
+def test_model_matches_exact():
+    assert compute_pool._model_matches("nomic-embed-text", "nomic-embed-text") is True
+    assert compute_pool._model_matches("gemma4:e4b", "gemma4:e4b") is True
+
+
+def test_model_matches_latest_tag_implicit_either_side():
+    """`nomic-embed-text` (no tag) matches `nomic-embed-text:latest` (Ollama
+    appends `:latest` when listing) and vice-versa."""
+    assert compute_pool._model_matches("nomic-embed-text:latest", "nomic-embed-text") is True
+    assert compute_pool._model_matches("nomic-embed-text", "nomic-embed-text:latest") is True
+
+
+def test_model_matches_explicit_tags_must_match():
+    """An explicit tag mismatch is NOT coerced — `gemma4:e4b` must not be
+    routed to a worker that only has `gemma4:e2b`."""
+    assert compute_pool._model_matches("gemma4:e2b", "gemma4:e4b") is False
+    assert compute_pool._model_matches("gemma4:e4b", "gemma4:e2b") is False
+
+
+def test_model_matches_different_models_never_match():
+    assert compute_pool._model_matches("llama3.1:8b", "gemma4:e4b") is False
+
+
+# --- pick_embed_target ----------------------------------------------------
+
+
+def _seed_eligible_worker(
+    isolated_db,
+    *,
+    label: str = "A",
+    address: str = "a.local",
+    models=("nomic-embed-text:latest",),
+    use_for_embeddings: bool = True,
+    enabled: bool = True,
+    last_seen_age_sec: float = 30.0,
+    last_error: str = "",
+    auth_token: str | None = None,
+) -> str:
+    """Helper: create a worker AND simulate a successful recent probe."""
+    import time as _t
+    wid = isolated_db.create_compute_worker(
+        label=label,
+        address=address,
+        transport="lan",
+        enabled=enabled,
+        use_for_embeddings=use_for_embeddings,
+        auth_token=auth_token,
+    )
+    isolated_db.update_compute_worker_capabilities(
+        wid,
+        capabilities={
+            "version": "0.5.4",
+            "models": [{"name": m, "details": {}} for m in models],
+        },
+        last_seen=_t.time() - last_seen_age_sec,
+        last_error=last_error,
+    )
+    return wid
+
+
+def test_pick_embed_target_none_when_no_workers(isolated_db, monkeypatch):
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    assert compute_pool.pick_embed_target("nomic-embed-text") is None
+
+
+def test_pick_embed_target_picks_eligible_worker(isolated_db, monkeypatch):
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_worker(isolated_db, address="a.local", auth_token="hunter2")
+    target = compute_pool.pick_embed_target("nomic-embed-text")
+    assert target is not None
+    base, token = target
+    assert base == "http://a.local:11434"
+    assert token == "hunter2"
+
+
+def test_pick_embed_target_skips_disabled(isolated_db, monkeypatch):
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_worker(isolated_db, label="A", address="a.local", enabled=False)
+    assert compute_pool.pick_embed_target("nomic-embed-text") is None
+
+
+def test_pick_embed_target_skips_use_for_embeddings_false(isolated_db, monkeypatch):
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_worker(isolated_db, address="a.local", use_for_embeddings=False)
+    assert compute_pool.pick_embed_target("nomic-embed-text") is None
+
+
+def test_pick_embed_target_skips_workers_without_model(isolated_db, monkeypatch):
+    """Routing to a worker that doesn't have the embed model would force
+    Ollama there to pull it (slow + uses internet bandwidth). Skip those
+    workers — the host can serve the embed locally instead."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_worker(
+        isolated_db, address="a.local",
+        models=("gemma4:e4b",),  # chat model, no embedder
+    )
+    assert compute_pool.pick_embed_target("nomic-embed-text") is None
+
+
+def test_pick_embed_target_skips_stale_workers(isolated_db, monkeypatch):
+    """Last seen > 1 hour ago — treat as unhealthy until the next probe."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_worker(
+        isolated_db, address="a.local", last_seen_age_sec=2 * 60 * 60,
+    )
+    assert compute_pool.pick_embed_target("nomic-embed-text") is None
+
+
+def test_pick_embed_target_skips_workers_with_last_error(isolated_db, monkeypatch):
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_worker(
+        isolated_db, address="a.local", last_error="connection refused",
+    )
+    assert compute_pool.pick_embed_target("nomic-embed-text") is None
+
+
+def test_pick_embed_target_skips_never_probed(isolated_db, monkeypatch):
+    """A row the user just added but the periodic sweep hasn't touched
+    yet (last_seen=None). Don't route until we've confirmed it works."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    isolated_db.create_compute_worker(
+        label="A", address="a.local", transport="lan",
+    )
+    assert compute_pool.pick_embed_target("nomic-embed-text") is None
+
+
+def test_pick_embed_target_prefers_freshest_when_multiple(isolated_db, monkeypatch):
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_worker(
+        isolated_db, label="old", address="old.local", last_seen_age_sec=1800,
+    )
+    _seed_eligible_worker(
+        isolated_db, label="new", address="new.local", last_seen_age_sec=10,
+    )
+    target = compute_pool.pick_embed_target("nomic-embed-text")
+    assert target is not None
+    assert target[0] == "http://new.local:11434"
+
+
+def test_pick_embed_target_no_token_when_unset(isolated_db, monkeypatch):
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _seed_eligible_worker(isolated_db, address="a.local")  # no auth_token
+    target = compute_pool.pick_embed_target("nomic-embed-text")
+    assert target is not None
+    assert target[1] is None

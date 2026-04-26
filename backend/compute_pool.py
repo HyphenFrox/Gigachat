@@ -253,3 +253,109 @@ def stop_periodic_probe() -> None:
     if _PROBE_TASK and not _PROBE_TASK.done():
         _PROBE_TASK.cancel()
     _PROBE_TASK = None
+
+
+# ---------------------------------------------------------------------------
+# Routing: pick a worker for a given workload.
+#
+# These helpers translate "I need to run an embed / chat / subagent call"
+# into "send it to base URL X with bearer Y", or `None` to mean "no
+# eligible worker — the host should handle it locally". Everything is
+# read-only relative to the worker rows; the routing layer never mutates
+# state.
+#
+# Eligibility for any workload:
+#   * row is `enabled`
+#   * the workload-specific flag is on (`use_for_embeddings`, etc.)
+#   * the last probe succeeded — `last_seen` within `_FRESHNESS_SEC` AND
+#     `last_error` is empty. A worker that hasn't been probed yet (last_seen
+#     is None) is skipped: we don't want to trust a row the user just
+#     added until the periodic sweep — or a manual "Test connection" —
+#     confirms it can serve traffic.
+#   * if `model` is supplied, the worker's cached capabilities list it as
+#     installed (with or without a `:latest` tag suffix).
+# ---------------------------------------------------------------------------
+
+# How long after `last_seen` we still consider a worker "fresh enough" to
+# route to. The periodic probe runs every 5 min; this 1-hour window covers
+# 12 sweeps' worth of buffer for transient blips.
+_FRESHNESS_SEC = 60 * 60
+
+
+def _model_matches(installed_name: str, requested: str) -> bool:
+    """Compare an installed model name to a requested name, tolerant to
+    Ollama's `:latest` tag default.
+
+    `nomic-embed-text` matches `nomic-embed-text:latest`, and an explicit
+    tag (`gemma4:e4b`) matches itself. Mismatched explicit tags are NOT
+    coerced — `gemma4:e4b` does not match `gemma4:e2b`.
+    """
+    if not installed_name or not requested:
+        return False
+    if installed_name == requested:
+        return True
+    # Strip `:latest` from either side and compare bare names.
+    inst_bare = installed_name.split(":", 1)[0] if ":" in installed_name else installed_name
+    req_bare = requested.split(":", 1)[0] if ":" in requested else requested
+    inst_has_explicit_tag = ":" in installed_name and not installed_name.endswith(":latest")
+    req_has_explicit_tag = ":" in requested and not requested.endswith(":latest")
+    # If both sides have explicit tags, they had to match exactly above.
+    if inst_has_explicit_tag and req_has_explicit_tag:
+        return False
+    return inst_bare == req_bare
+
+
+def _worker_has_model(worker: dict, model: str) -> bool:
+    caps = worker.get("capabilities") or {}
+    for m in caps.get("models") or []:
+        if _model_matches(m.get("name") or "", model):
+            return True
+    return False
+
+
+def _is_fresh(worker: dict, now: float | None = None) -> bool:
+    """Last successful probe within `_FRESHNESS_SEC`."""
+    last_seen = worker.get("last_seen")
+    if not last_seen:
+        return False
+    if worker.get("last_error"):
+        return False
+    if now is None:
+        now = time.time()
+    return (now - float(last_seen)) < _FRESHNESS_SEC
+
+
+def _eligible_workers(flag: str, model: str | None = None) -> list[dict]:
+    """Return enabled+fresh workers whose `flag` is on and (optionally) have
+    `model` installed. Sorted newest-`last_seen` first so the picker grabs
+    the most-recently-confirmed-healthy worker."""
+    rows = db.list_compute_workers(enabled_only=True)
+    now = time.time()
+    out: list[dict] = []
+    for w in rows:
+        if not w.get(flag):
+            continue
+        if not _is_fresh(w, now=now):
+            continue
+        if model and not _worker_has_model(w, model):
+            continue
+        out.append(w)
+    out.sort(key=lambda w: float(w.get("last_seen") or 0), reverse=True)
+    return out
+
+
+def pick_embed_target(model: str) -> tuple[str, str | None] | None:
+    """Choose a worker to run an embed request against, or None for host.
+
+    Returns `(base_url, auth_token_or_None)`. `auth_token` is fetched
+    from the dedicated `get_compute_worker_auth_token` so the token never
+    sits on a row dict. Caller composes the URL as `f"{base}/api/embeddings"`
+    and adds `Authorization: Bearer …` when the token is set.
+    """
+    cands = _eligible_workers("use_for_embeddings", model=model)
+    if not cands:
+        return None
+    w = cands[0]
+    base = _worker_base_url(w)
+    token = db.get_compute_worker_auth_token(w["id"])
+    return (base, token)

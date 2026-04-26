@@ -39,7 +39,7 @@ from typing import Any, AsyncGenerator
 
 import httpx
 
-from . import db, mcp, sysdetect, tool_prompt_adapter, tools
+from . import compute_pool, db, mcp, sysdetect, tool_prompt_adapter, tools
 from .prompts import TOOL_SCHEMAS, build_system_prompt
 
 OLLAMA_URL = "http://localhost:11434"
@@ -1097,27 +1097,67 @@ async def _maybe_compact(
 # Embedding failures are non-fatal. If the user hasn't pulled
 # nomic-embed-text, recall silently degrades to a no-op.
 # ---------------------------------------------------------------------------
+async def _embed_via(base_url: str, auth_token: str | None, text: str) -> list[float] | None:
+    """POST one embed request and return the normalized vector.
+
+    Pulled out of `_embed_text` so we can hit either the host's local
+    Ollama or a registered compute worker through the same code path.
+    Returns None on any failure — the caller decides whether to fall back.
+    """
+    headers: dict[str, str] = {}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.post(
+            f"{base_url}/api/embeddings",
+            json={"model": EMBED_MODEL, "prompt": text[:8000]},
+            headers=headers,
+        )
+        r.raise_for_status()
+        data = r.json()
+    vec = data.get("embedding") or []
+    if not vec:
+        return None
+    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+    return [x / norm for x in vec]
+
+
 async def _embed_text(text: str) -> list[float] | None:
     """Ollama /api/embeddings → normalized float list, or None on failure.
 
-    We normalize on the way out so downstream similarity is a plain dot
-    product and we never have to re-divide by the norm.
+    Routing: we try a registered compute worker first (one with
+    `use_for_embeddings=True` and the embed model installed), then fall
+    back to the host's local Ollama. The fallback is silent — a worker
+    that's intermittently unreachable shouldn't break recall, and the
+    periodic probe will mark it `last_error` so the picker skips it on
+    the next call without us blacklisting state here.
     """
     if not text or not text.strip():
         return None
+
+    target = None
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.post(
-                f"{OLLAMA_URL}/api/embeddings",
-                json={"model": EMBED_MODEL, "prompt": text[:8000]},
-            )
-            r.raise_for_status()
-            data = r.json()
-        vec = data.get("embedding") or []
-        if not vec:
-            return None
-        norm = math.sqrt(sum(x * x for x in vec)) or 1.0
-        return [x / norm for x in vec]
+        target = compute_pool.pick_embed_target(EMBED_MODEL)
+    except Exception:
+        # Picker can't fail in practice (read-only DB query) but if the
+        # compute_pool module ever raises here we don't want to break
+        # the embedding path — silently route to host.
+        target = None
+
+    if target is not None:
+        base, token = target
+        try:
+            vec = await _embed_via(base, token, text)
+            if vec:
+                return vec
+            # Empty payload from worker — fall through to host.
+        except Exception:
+            # Worker unreachable / 5xx — fall through.
+            pass
+
+    # Host fallback. Same code path; auth_token is None on loopback Ollama.
+    try:
+        return await _embed_via(OLLAMA_URL, None, text)
     except Exception:
         return None
 
