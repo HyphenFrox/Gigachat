@@ -264,11 +264,15 @@ The split decision is automatic: if the model fits the strongest single node, Ph
 
 Some Ollama-distributed multimodal models bundle the vision tower into the same GGUF as the text LLM (e.g. `gemma4:26b`'s 16.75 GB blob includes 354 vision tensors that stock `llama-server` doesn't recognize). To handle these, the pool supports a generic GGUF override at `~/.gigachat/llama-cpp/models/<sanitized-model-name>.gguf` — when present, `resolve_ollama_model` returns this file instead of Ollama's blob.
 
-Override files are produced/acquired automatically the first time the user requests an affected model:
+Override files are produced/acquired automatically the first time the user requests an affected model. The strategy is per-entry in `_KNOWN_OVERRIDE_REGISTRY` (or auto-synthesized when an Ollama blob has the bundled-multimodal pattern):
 
 1. **LAN copy** — if any enabled worker (`ssh_host` set) already has the override file in its own `~/.gigachat/llama-cpp/models/` from a previous distribution, it's pulled via SCP. Zero internet bandwidth.
-2. **Local surgery** — if the user has the Ollama blob locally, `scripts/repack_text_only_gguf.py` extracts only the text LLM tensors (filter-and-copy at the byte level, no dequant/requant — bit-identical to the source). Zero internet bandwidth.
-3. **HuggingFace download** — fallback when steps 1–2 fail or aren't applicable. Pre-built mmproj GGUFs (CLIP format) always come from upstream.
+2. **Local surgery / metadata patch** — when the Ollama blob is mostly correct but a structural attribute needs fixing, a tiny repack script produces the override:
+   * `scripts/repack_text_only_gguf.py` — extracts the text LLM tensors from a bundled-multimodal blob (e.g. `gemma4:26b`, `gemma4:31b`). Filter-and-copy at the byte level, no dequant/requant — bit-identical.
+   * `scripts/repack_qwen3_rope_fix.py` — extends `qwen3.5`'s `rope.dimension_sections` array from length 3 → 4 to match stock llama.cpp's qwen35 loader. Lossless metadata patch.
+   * `scripts/repack_gemma3_norm_fix.py` — injects the missing `gemma3.attention.layer_norm_rms_epsilon = 1e-6` key Ollama's `gemma3:*` blobs ship without. Lossless metadata patch.
+   All three are zero-internet-bandwidth.
+3. **HuggingFace download** — fallback for cases that don't lend themselves to local surgery (e.g. `gemma4:e4b` / `gemma4:e2b` are really Gemma 3n with the wrong arch label and PLE structures Ollama can't trivially repack — Unsloth's clean `gemma-3n-E*B-it-GGUF` Q4_K_M is the source of truth). Pre-built mmproj GGUFs (CLIP format) also come from upstream.
 
 After each successful local acquisition, the override files are distributed to every enabled worker in the pool (fire-and-forget background SCP), so subsequent acquisitions on the same LAN take the cheap path.
 
@@ -282,16 +286,45 @@ llama.cpp has an open bug ([#21420](https://github.com/ggml-org/llama.cpp/issues
 
 The switch is dynamic and tracked in each worker's `capabilities.current_rpc_backend` so back-to-back split requests don't churn rpc-server unnecessarily.
 
+### Gemma 3n PLE multi-flag workaround
+
+Google's Gemma 3n E4B (Ollama-tagged `gemma4:e4b` / `gemma4:latest`) uses Per-Layer Embeddings + MatFormer + Gated Delta Net — a compute graph stock llama.cpp's RPC backend can't dispatch end-to-end. Three failure modes stack on top of each other:
+
+* `GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS)` in the auto-fit pre-pass ([#21730](https://github.com/ggml-org/llama.cpp/issues/21730)).
+* The same assertion fires later in `sched_reserve` whenever any layer stays on host CPU.
+* Worker rpc-server crashes during slot init's empty forward pass when Gated Delta Net + Flash Attention + multi-slot are all engaged.
+
+`split_lifecycle._build_command` detects E4B via `_model_needs_fit_off()` (arch ∈ `{gemma4, gemma3n}` AND PLE marker present AND `block_count > 30`) and stacks the workarounds **only for that case**:
+
+| Flag added | Reason |
+|---|---|
+| `-fit off` | Skip the auto-fit pre-pass. |
+| Forced `-ngl 99` | Push every layer to a GPU/RPC device so the second assertion can't fire. |
+| `-fa off` | Disable Flash Attention; its kernel has no RPC-serializable counterpart for GDN. |
+| `--parallel 1` | Single-slot dispatch — multi-slot init triggers the rpc-server crash. |
+| `-ot ".*(altup\|laurel\|per_layer\|inp_gate).*=<host_dev>"` | Pin Gemma 3n's PLE / AltUp / Laurel / InputGate tensors to the host (the host's primary backend, detected at runtime: `CUDA0`/`Vulkan0`/`SYCL0`/`Metal`/`CPU`). Gated Delta Net stays local; only standard transformer tensors cross RPC. |
+
+Smaller siblings — `gemma4:e2b` (block_count=30), `gemma4:26b`, `gemma4:31b` — share the family but skip the workaround stack entirely; their compute graphs don't trip the assertion. The detection cost is one cheap GGUF metadata read at spawn time.
+
+Honest performance note: even with the full workaround stack, E4B via pool runs slower than host-only for this specific model (RPC round-trips dominate when the model already fits in host VRAM). The pool engagement here exists for routing consistency — large models (26B, 31B) are where the pool delivers real wins.
+
+### Build version
+
+The host and every worker run llama.cpp **b8940** (the build that fixed recurrent-state RPC serialization). The `b8940-bin-win-cuda-12.4-x64.zip` lives on the host; workers run the equivalent SYCL build. Mixed builds across nodes can crash the RPC protocol when a `ggml_op` enum changes upstream — keep them aligned.
+
 Empirical results on our 1-host + 2-laptop pool:
 
-| Model | Without pool (host alone) | With pool (split path) | Speedup |
+| Model | Without pool (host alone) | With pool (split path) | Note |
 |---|---|---|---|
-| gemma4:31b (~17 GB) | 0.1 tok/s (heavy CPU offload) | 1.4 tok/s (split) | **14×** |
-| dolphin-mixtral:8x7b (24.6 GB) | 0.7 tok/s (CPU offload + disk paging) | 2.4 tok/s (split) | **3.6×** |
-| qwen3.5:9b (5.3 GB) | 15.0 tok/s (host fits) | 16.7 tok/s (router stays on host) | +11% |
-| gemma4:26b (16.7 GB) | 9.5 tok/s (Ollama mmap on host) | 8.4 tok/s (router still picks host) | -11% (state pressure) |
+| gemma4:31b (~18.5 GB) | host OOM | 1.85 tok/s | only viable via pool |
+| gemma4:26b A4B (~16.8 GB) | host OOM | 11.33 tok/s | only viable via pool |
+| dolphin-mixtral:8x7b (24.6 GB) | 0.7 tok/s (CPU offload + disk paging) | 2.4 tok/s | **3.6×** |
+| gemma4:e4b (4.7 GB Q4_K_M) | 26.25 tok/s (Ollama host) | 2.78 tok/s (PLE workaround stack) | pool slower; consistency only |
+| gemma4:e2b (3 GB) | host fits | 11.82 tok/s | pool engages cleanly |
+| qwen3.5:9b (5.3 GB) | 15.0 tok/s (host fits) | 16.7 tok/s | +11% |
+| gemma3:4b (3.1 GB) | 101.74 tok/s (Ollama host) | (N/A — fits host) | metadata-patch makes it loadable for split if invoked |
 
-The pool's value is the bottom two rows: models that were too big for the host alone now run at meaningful speed via layer-split across host + workers' RAM.
+The pool's value is the top three rows — large models that the host can't load on its own become possible at meaningful speed via layer-split. Small models (E2B, E4B, gemma3:4b, qwen3.5:9b) generally don't need the pool; the router keeps them host-only by default. The numbers above for those reflect what happens if pool engagement is forced.
 
 ### Setup, per machine
 

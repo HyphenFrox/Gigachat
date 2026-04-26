@@ -224,6 +224,101 @@ def _is_moe_model(gguf_path: str) -> bool:
     return False
 
 
+def _host_primary_backend() -> str:
+    """Map the host's detected GPU vendor to the llama.cpp backend
+    name suitable for `-ot <pattern>=<backend>`.
+
+    Used by the Gemma 3n PLE workaround to pin gemma3n-specific
+    tensors to the host (so Gated Delta Net stays local). On a host
+    without a recognized GPU we fall back to `CPU` — it still keeps
+    those ops off RPC, just on the host's CPU instead of its GPU.
+    """
+    try:
+        from . import sysdetect
+        kind = (sysdetect.detect_system() or {}).get("gpu_kind") or ""
+    except Exception:
+        kind = ""
+    return {
+        "nvidia": "CUDA0",
+        "amd": "Vulkan0",
+        "intel": "SYCL0",
+        "apple": "Metal",
+    }.get(kind, "CPU")
+
+
+def _model_needs_fit_off(gguf_path: str) -> bool:
+    """Return True only for Gemma 3n PLE variants whose forward graph
+    is wide enough to trip `GGML_ASSERT(n_inputs <
+    GGML_SCHED_MAX_SPLIT_INPUTS)` during llama-server's auto-fit
+    pre-pass (upstream issue
+    https://github.com/ggml-org/llama.cpp/issues/21730).
+
+    Empirically:
+      * E2B (block_count=30) loads cleanly with the default `-fit on`
+        path and produces tokens at full speed. We do NOT need
+        `-fit off` for it — adding it would suppress a genuinely
+        useful auto-context-fit feature.
+      * E4B (block_count=35) crashes the auto-fit pre-pass; only this
+        variant (and any future PLE Gemma 3n with even more blocks)
+        needs the workaround.
+
+    Detection rule:
+        arch in ("gemma4", "gemma3n")        # the model family
+        AND embedding_length_per_layer_input > 0    # PLE marker
+        AND block_count > 30                 # graph wide enough to trip
+
+    Standard dense Gemmas (gemma4:26b/31b) lack the PLE key entirely,
+    so they're never matched and keep llama-server's normal
+    adaptive-fit behavior.
+    """
+    try:
+        import gguf
+    except ImportError:
+        return False
+    try:
+        reader = gguf.GGUFReader(gguf_path)
+    except Exception:
+        return False
+    arch_field = reader.fields.get("general.architecture")
+    if not arch_field:
+        return False
+    try:
+        arch = arch_field.parts[arch_field.data[0]].tobytes().decode(
+            "utf-8", errors="replace",
+        )
+    except Exception:
+        return False
+    if arch not in ("gemma4", "gemma3n"):
+        return False
+    # PLE marker present?
+    has_ple = False
+    for key in (
+        f"{arch}.embedding_length_per_layer_input",
+        "gemma3n.embedding_length_per_layer_input",
+    ):
+        f = reader.fields.get(key)
+        if f and f.data:
+            try:
+                if int(f.parts[f.data[0]][0]) > 0:
+                    has_ple = True
+                    break
+            except Exception:
+                continue
+    if not has_ple:
+        return False
+    # Graph-width guard: E2B (block_count=30) is fine; E4B (35)+ trips it.
+    for key in (f"{arch}.block_count", "gemma3n.block_count",
+                "gemma4.block_count"):
+        f = reader.fields.get(key)
+        if f and f.data:
+            try:
+                blocks = int(f.parts[f.data[0]][0])
+                return blocks > 30
+            except Exception:
+                continue
+    return False
+
+
 def _build_command(
     *,
     llama_server: Path,
@@ -293,6 +388,58 @@ def _build_command(
         # warmup before any traffic at all.
         "--no-warmup",
     ]
+    # Gemma 3n PLE variants whose graph trips
+    # `GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS)` need TWO
+    # workarounds together (llama.cpp issue #21730):
+    #
+    #   1. `-fit off` — skip the auto-fit pre-pass that fires the
+    #      assertion early.
+    #   2. Force full-pool offload (`-ngl 99`). Empirically the
+    #      assertion ALSO fires later in `sched_reserve` whenever
+    #      llama-server keeps *any* layer on the host's CPU
+    #      (because that creates an extra graph split with a
+    #      different topology). Pushing every layer to a GPU
+    #      device (host CUDA + each worker's RPC backend) keeps
+    #      the split count low enough.
+    #
+    # Every other model keeps the normal adaptive `-fit on` path AND
+    # the adaptive `-ngl` we computed above — auto-fit is genuinely
+    # useful for them (sizes context to free memory, avoids OOM).
+    if _model_needs_fit_off(gguf_path):
+        cmd.extend(["-fit", "off"])
+        # Replace the adaptive -ngl with a high constant so all
+        # layers go to GPU/RPC devices.
+        for i, a in enumerate(cmd):
+            if a == "-ngl" and i + 1 < len(cmd):
+                cmd[i + 1] = "99"
+                break
+        # Disable Flash Attention and force single-slot dispatch.
+        # Gemma 3n's Gated Delta Net (recurrent linear-attention)
+        # crashes worker rpc-servers during multi-slot init when FA
+        # is enabled; both kernels rely on host-side fused paths
+        # that don't have an RPC-serialized equivalent. Falling back
+        # to the eager attention kernel + single slot keeps the
+        # compute graph on a code path the RPC backend can dispatch.
+        # Replace `-fa auto` with `-fa off`:
+        for i, a in enumerate(cmd):
+            if a == "-fa" and i + 1 < len(cmd):
+                cmd[i + 1] = "off"
+                break
+        cmd.extend(["--parallel", "1"])
+        # Pin Gemma 3n's PLE / MatFormer / AltUp / Laurel tensors to
+        # the host's primary backend. These tensors participate in the
+        # Gated Delta Net compute, which has no working RPC-dispatch
+        # path in stock llama.cpp — pushing them to the workers crashes
+        # rpc-server during slot init's warmup forward pass. Standard
+        # transformer tensors (attn_*, ffn_*) keep auto-distributing
+        # across the pool, so we still get pool memory benefits for
+        # the bulk of the model; only the gemma3n-specific paths stay
+        # host-local. The destination is chosen at runtime so AMD /
+        # Intel / CPU-only hosts work too — not just NVIDIA.
+        host_dev = _host_primary_backend()
+        cmd.extend([
+            "-ot", f".*(altup|laurel|per_layer|inp_gate).*={host_dev}",
+        ])
     if mmproj_path:
         # Multimodal projector: required for vision-capable inference
         # of models whose Ollama blob bundles a vision tower.

@@ -164,6 +164,8 @@ Three apps running concurrently — Gigachat (priority 200), Peerful extraction 
 * The SSH+WMI rpc-server lifecycle is **Windows-target-specific**. On Linux/macOS workers, run `rpc-server` yourself (e.g., as a systemd service); the host will simply use whatever backend it's currently bound to.
 * `gguf_path` is read from local disk — if your model file lives only on a worker, sync or mount it before calling `engage`.
 * `nvidia-smi` is the only host-VRAM probe. AMD/Intel hosts will be treated as 0 host-VRAM and lean entirely on worker memory + CPU.
+* **llama.cpp build alignment.** Mixed builds across host and workers can crash the RPC protocol when a `ggml_op` enum changes upstream. Keep host + every worker on the same release tag (we use `b8940` at time of writing).
+* **Gemma 3n E4B (Ollama tag `gemma4:e4b` / `gemma4:latest`).** Stock llama.cpp's RPC backend can't dispatch its Gated Delta Net + PLE compute end-to-end. The host application (e.g. Gigachat) carries its own per-model spawn-flag stack to make E4B work via RPC: `-fit off` + forced `-ngl 99` + `-fa off` + `--parallel 1` + `-ot ".*(altup\|laurel\|per_layer\|inp_gate).*=<host_dev>"`. Other apps using this runner that intend to support E4B will need similar handling until the upstream RPC dispatch lands. E2B and the dense Gemmas (26B, 31B) need none of it — they engage the pool cleanly.
 
 ## Integration prompt for an external AI agent
 

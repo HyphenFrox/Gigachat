@@ -1486,10 +1486,58 @@ _KNOWN_OVERRIDE_REGISTRY: dict[str, dict] = {
             "synthesizing missing tensors with arbitrary values."
         ),
     },
-    # gemma4:e4b is also bundled-multimodal, but small enough that the
-    # router's Tier 1 keeps it on host (Ollama's runtime handles its
-    # multimodal blob natively, so no override needed). Adding here
-    # would be defensive only.
+    # Gemma 3n E4B / E2B: Ollama labels these `gemma4:e4b` and `gemma4:e2b`,
+    # but they're really Google Gemma 3n with Per-Layer Embeddings +
+    # MatFormer architecture (audio + vision + text in the original).
+    # Stock llama.cpp expects arch string "gemma3n", not Ollama's
+    # internal "gemma4", and doesn't load Ollama's bundled audio/vision
+    # tensors at all. We download Unsloth's clean text-only Gemma 3n
+    # GGUF (matching Ollama's Q4_K_M quant level — no quality drop)
+    # so llama-server can engage the pool. Vision/audio are not
+    # available via this path (Unsloth doesn't publish an mmproj for
+    # Gemma 3n yet); for those modalities, Ollama's runtime continues
+    # to handle the model on host.
+    "gemma4:e4b": {
+        "needs_mmproj": False,
+        "main_strategy": "download",
+        "main_url": (
+            "https://huggingface.co/unsloth/gemma-3n-E4B-it-GGUF/resolve/main/"
+            "gemma-3n-E4B-it-Q4_K_M.gguf"
+        ),
+        "main_size_gb": 4.71,
+        "reason": (
+            "Ollama's gemma4:e4b is Gemma 3n E4B repackaged under the "
+            "wrong arch name; stock llama.cpp can't load it. Unsloth's "
+            "GGUF has the right metadata."
+        ),
+    },
+    # `gemma4:latest` shares the digest with `gemma4:e4b`. Register
+    # the same target so either Ollama tag resolves to the override.
+    "gemma4:latest": {
+        "needs_mmproj": False,
+        "main_strategy": "download",
+        "main_url": (
+            "https://huggingface.co/unsloth/gemma-3n-E4B-it-GGUF/resolve/main/"
+            "gemma-3n-E4B-it-Q4_K_M.gguf"
+        ),
+        "main_size_gb": 4.71,
+        "reason": "Alias of gemma4:e4b (same digest).",
+    },
+    "gemma4:e2b": {
+        "needs_mmproj": False,
+        "main_strategy": "download",
+        "main_url": (
+            "https://huggingface.co/unsloth/gemma-3n-E2B-it-GGUF/resolve/main/"
+            "gemma-3n-E2B-it-Q4_K_M.gguf"
+        ),
+        "main_size_gb": 3.00,
+        "reason": (
+            "Same root cause as gemma4:e4b — Ollama's blob uses the "
+            "internal `gemma4` arch name and bundles audio/vision "
+            "tensors stock llama.cpp can't load. Unsloth's text-only "
+            "Gemma 3n E2B GGUF works directly."
+        ),
+    },
 }
 
 

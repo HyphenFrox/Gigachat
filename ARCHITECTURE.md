@@ -320,19 +320,51 @@ across process restarts.
 `compute_pool.ensure_compatible_gguf(model_name)` is called from
 `route_chat_for` before engaging a Phase 2 split.
 `_KNOWN_OVERRIDE_REGISTRY` is a hardcoded dict of models that need
-overrides; for each, we know the acquisition strategy (lossless
-local surgery vs HuggingFace download) and the upstream URL. The
-acquisition runs as a background asyncio task with progress tracked
-in `_ACQUISITION_STATE[model_name]`. Strategy ordering, cheapest
-first: (1) LAN pull from any worker that already caches the file
-(`_lan_pull_override` via SSH+SCP), (2) local surgery via
-`scripts/repack_text_only_gguf.py` subprocess, (3) HuggingFace
-download via `_download_to_path`. After a successful acquisition,
-`_distribute_override_to_workers` fires-and-forgets an SCP push to
-every enabled worker so future acquisitions on the same LAN can
-take the cheap path. The chat layer surfaces a `preparing_model`
-SSE event with phase + progress so the UI renders an informative
-toast instead of a generic error.
+overrides; for each, we know the acquisition strategy and the
+upstream URL when applicable. The acquisition runs as a background
+asyncio task with progress tracked in `_ACQUISITION_STATE[model_name]`.
+Strategy ordering, cheapest first:
+
+1. **LAN pull** from any worker that already caches the file
+   (`_lan_pull_override` via SSH+SCP).
+2. **Local surgery / metadata patch** — one of three repack
+   subprocess scripts depending on the model:
+   * `scripts/repack_text_only_gguf.py` strips the bundled vision
+     tower for `gemma4:26b` / `gemma4:31b`.
+   * `scripts/repack_qwen3_rope_fix.py` extends `qwen3.5`'s
+     `rope.dimension_sections` from length 3 → 4.
+   * `scripts/repack_gemma3_norm_fix.py` injects the missing
+     `gemma3.attention.layer_norm_rms_epsilon = 1e-6` key Ollama's
+     `gemma3:*` blobs ship without.
+3. **HuggingFace download** via `_download_to_path` for cases that
+   don't lend themselves to local surgery — notably `gemma4:e4b` /
+   `gemma4:e2b` / `gemma4:latest`, which Ollama labels with the wrong
+   architecture (`gemma4` instead of `gemma3n`) and ship with PLE
+   structures stock llama.cpp can't trivially repack. The registry
+   points at Unsloth's clean `unsloth/gemma-3n-E*B-it-GGUF` Q4_K_M
+   variants.
+
+After a successful acquisition, `_distribute_override_to_workers`
+fires-and-forgets an SCP push to every enabled worker so future
+acquisitions on the same LAN can take the cheap path. The chat
+layer surfaces a `preparing_model` SSE event with phase + progress
+so the UI renders an informative toast instead of a generic error.
+
+**Per-model spawn-flag overrides (Scope D).** Some models need
+extra `llama-server` flags beyond pool-aware defaults to load at
+all. `split_lifecycle._build_command` consults
+`_model_needs_fit_off(gguf_path)` — currently True only for Gemma
+3n PLE variants where `arch ∈ {gemma4, gemma3n}` AND the PLE
+marker is present AND `block_count > 30` (matches E4B; E2B with
+block_count=30 falls through). When True, the spawn adds
+`-fit off`, forces `-ngl 99`, sets `-fa off`, `--parallel 1`, and
+`-ot ".*(altup|laurel|per_layer|inp_gate).*=<host_dev>"` (host
+backend resolved at runtime via `_host_primary_backend()` so
+NVIDIA / AMD / Intel / Apple / CPU-only hosts all work). These
+flags collectively dodge three distinct upstream llama.cpp issues
+([#21730](https://github.com/ggml-org/llama.cpp/issues/21730) and
+the Gated Delta Net RPC dispatch gap). All other models keep the
+adaptive `-fit on` + adaptive `-ngl` path unchanged.
 
 ---
 
