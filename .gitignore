@@ -30,7 +30,7 @@ vapid.json
 
 # Per-machine connection details (Tailscale IPs, SSH config notes).
 # Contains identifying network info — never commit.
-LAPTOP.md
+DEVICES.md
 
 # Claude Code local state
 .claude/

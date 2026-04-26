@@ -191,14 +191,71 @@ def _release_url(variant: str) -> str:
     )
 
 
-# Variants we know how to fetch. `host` is the build the host's
-# i5-12600KF + RTX 3060 Ti wants; `worker` is the Vulkan build that
-# accepts Intel/AMD iGPUs (and falls back to CPU if Vulkan init fails).
+# Variants we know how to fetch. The keys are LOGICAL roles; the
+# values are llama.cpp's release suffixes. Roles map to hardware:
+#
+#   host   = CUDA build for an NVIDIA host running the orchestrating
+#            llama-server. CUDA 12.4 covers any recent Nvidia driver.
+#   worker = Vulkan build for the worker's rpc-server. Cross-vendor
+#            (Intel iGPU, AMD iGPU, NVIDIA without CUDA toolkit, etc).
+#            Default for "I just want it to work" — universal.
+#   sycl   = Intel-native SYCL/oneAPI build. ~15-25% faster than
+#            Vulkan on Intel iGPUs and Intel Arc dGPUs because it
+#            uses Intel's native compute API. Bundles the oneAPI
+#            runtime DLLs (~150 MB zip) so no separate install
+#            needed. Pick this on Intel-only worker fleets.
+#   cpu    = pure-CPU build, last resort. Smaller zip, no GPU
+#            backend at all. Useful when the worker has no usable
+#            GPU and you'd rather not pull a Vulkan/SYCL DLL set
+#            you'll never use.
 _VARIANTS = {
-    "host": "cuda-12.4",     # RTX 3060 Ti — driver 591.86 supports CUDA 12.x
-    "worker": "vulkan",      # Intel iGPU / AMD iGPU / no-discrete
-    "cpu": "cpu",            # last-resort CPU build
+    "host": "cuda-12.4",
+    "worker": "vulkan",
+    "sycl": "sycl",
+    "cpu": "cpu",
 }
+
+
+def recommend_worker_variant(gpus: list[dict] | None) -> str:
+    """Pick the right llama.cpp worker variant for a worker's hardware.
+
+    `gpus` is the `gpus` array captured by `compute_pool._probe_worker_specs_via_ssh`
+    — a list of dicts with at least a `name` field. Decision rules,
+    in priority order:
+
+      * Any Intel GPU (iGPU or Arc dGPU) → `"sycl"`. The SYCL backend
+        uses Intel's native compute API and is ~15-25% faster than
+        Vulkan on Intel hardware. Bundled DPC++/oneAPI runtime DLLs
+        ship in the prebuilt zip — no separate Intel oneAPI install
+        needed on the worker.
+      * Any AMD or NVIDIA GPU (without dedicated CUDA toolkit) →
+        `"worker"` (Vulkan). Cross-vendor backend, ships with the
+        GPU driver on Windows.
+      * No GPUs detected → `"cpu"`. Smallest zip, no GPU backend
+        DLLs to ship.
+
+    Workers we have no spec data for (SSH probe never ran, ssh_host
+    unset, etc.) get `"worker"` — the safe universal default.
+    """
+    if not gpus:
+        return "worker"  # no signal — use universal Vulkan build
+    has_intel = False
+    has_other = False
+    for g in gpus:
+        name = ((g or {}).get("name") or "").lower()
+        if "intel" in name:
+            has_intel = True
+        elif name:
+            has_other = True
+    if has_intel and not has_other:
+        return "sycl"
+    if has_intel and has_other:
+        # Mixed Intel + something else (e.g. Intel iGPU + NVIDIA dGPU
+        # in a gaming laptop). Vulkan covers both.
+        return "worker"
+    if has_other:
+        return "worker"
+    return "cpu"
 
 
 ProgressCallback = Callable[[str, int, int], None]
