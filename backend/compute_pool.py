@@ -273,12 +273,8 @@ async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
     return data
 
 
-_DEFAULT_WORKER_BACKEND = "SYCL0,CPU"
-_SPLIT_WORKER_BACKEND = "CPU"
-
-
 async def _attempt_rpc_server_restart(
-    worker: dict, backend: str = _DEFAULT_WORKER_BACKEND,
+    worker: dict, backend: str = "SYCL0,CPU",
 ) -> bool:
     """SSH into the worker and re-spawn its rpc-server.
 
@@ -383,26 +379,86 @@ async def _attempt_rpc_server_restart(
     return True
 
 
-async def _set_workers_backend(workers: list[dict], backend: str) -> int:
-    """Ensure every worker's rpc-server is running with the given `-d`
-    backend flag. Restarts any worker whose current backend doesn't
-    match. Returns the count of workers successfully re-aligned.
+def _worker_gpu_vendor(worker: dict) -> str:
+    """Return the dominant GPU vendor for a worker, based on the SSH
+    spec probe's `gpus` list. One of "nvidia", "amd", "intel", "none".
 
-    Used by `_ensure_split_running_for` to dynamically switch between:
-      * `SYCL0,CPU` — full pool (iGPU + CPU). Default for non-MoE.
-      * `CPU` — drops SYCL exposure to dodge the upstream
-        `Remote RPC server crashed` bug that fires when MoE expert
-        tensors are pushed to SYCL devices.
+    Used by `_select_worker_backend` to pick a `-d` flag that matches
+    the worker's actual hardware. We can't blindly pass `SYCL0,CPU` to
+    a worker that has an NVIDIA GPU — SYCL on NVIDIA is unsupported
+    by stock llama.cpp's prebuilt SYCL binary, and the worker's CUDA
+    capability would go unused. Conversely, an Intel-only worker on
+    `-d CUDA0,CPU` would have no GPU device and fall back to CPU.
 
-    Tracks current backend in the worker's capabilities dict via
-    `current_rpc_backend` so we don't restart unnecessarily on every
-    spawn. First-time switches always restart; subsequent calls with
-    the same backend are no-ops.
+    Selection rule (priority order):
+      1. NVIDIA — strongest GPU acceleration, no known RPC bug
+      2. AMD    — Vulkan path on stock llama.cpp; mostly works
+      3. Intel  — SYCL on iGPU; subject to the upstream RPC crash
+      4. None   — CPU only (no GPU detected at all)
+    """
+    caps = worker.get("capabilities") or {}
+    gpus = caps.get("gpus") or []
+    names = [(g.get("name") or "").lower() for g in gpus]
+    if any("nvidia" in n or "geforce" in n or "rtx " in n or "gtx " in n for n in names):
+        return "nvidia"
+    if any("amd" in n or "radeon" in n for n in names):
+        return "amd"
+    if any("intel" in n or "iris" in n or "uhd" in n for n in names):
+        return "intel"
+    return "none"
+
+
+def _select_worker_backend(worker: dict, *, in_split: bool) -> str:
+    """Pick the right `-d` flag for this worker.
+
+    `in_split` distinguishes split-mode (where the SYCL+RPC bug fires
+    on Intel iGPUs) from non-split mode (where the worker's
+    iGPU/Ollama path is used directly without RPC layer push).
+
+    Per-vendor logic:
+      * NVIDIA — `CUDA0,CPU`. CUDA over RPC is stable; no workaround
+        needed even in split mode. Worker contributes both GPU
+        compute and system RAM via CPU device.
+      * AMD    — `Vulkan0,CPU`. Vulkan-on-AMD has fewer known issues
+        than Vulkan-on-Intel-iGPU (#21516 was Intel-specific).
+      * Intel  — `SYCL0,CPU` for non-split; `CPU` only in split to
+        dodge #21420 / #20259 / #21474. THIS is the only vendor
+        where the workaround applies.
+      * None   — `CPU` always (no GPU to expose).
+    """
+    vendor = _worker_gpu_vendor(worker)
+    if vendor == "nvidia":
+        return "CUDA0,CPU"
+    if vendor == "amd":
+        return "Vulkan0,CPU"
+    if vendor == "intel":
+        return "CPU" if in_split else "SYCL0,CPU"
+    # No GPU detected
+    return "CPU"
+
+
+async def _set_workers_backend(workers: list[dict], *, in_split: bool) -> int:
+    """Ensure every worker's rpc-server is running with the right
+    `-d` backend flag for its hardware AND the current routing mode.
+
+    Per-worker decision via `_select_worker_backend(worker, in_split=)`.
+    Workers tracked in `capabilities.current_rpc_backend` so we don't
+    restart unnecessarily; only mismatched workers get bounced.
+
+    `in_split=True` is set by `_ensure_split_running_for` before
+    spawning llama-server (so Intel workers drop SYCL to dodge the
+    upstream bug). `in_split=False` is set by `stop_all_running_splits`
+    to restore default backends (Intel SYCL for iGPU acceleration on
+    non-split paths).
+
+    Returns the count of workers successfully aligned (already-correct
+    + freshly-restarted).
     """
     aligned = 0
     for w in workers:
         if not (w.get("ssh_host") or "").strip():
             continue
+        backend = _select_worker_backend(w, in_split=in_split)
         caps = w.get("capabilities") or {}
         current = caps.get("current_rpc_backend", "unknown")
         if current == backend:
@@ -2216,7 +2272,7 @@ async def _ensure_split_running_for(
     # immediately gets SYCL again.
     workers_for_split = [db.get_compute_worker(wid) for wid in worker_ids]
     workers_for_split = [w for w in workers_for_split if w]
-    await _set_workers_backend(workers_for_split, _SPLIT_WORKER_BACKEND)
+    await _set_workers_backend(workers_for_split, in_split=True)
 
     sid = target_row["id"]
     if target_row.get("status") != "running":
@@ -2257,7 +2313,7 @@ async def stop_all_running_splits() -> None:
     # auto-restart will re-align state if a worker is unreachable.
     try:
         workers = db.list_compute_workers(enabled_only=True)
-        await _set_workers_backend(workers, _DEFAULT_WORKER_BACKEND)
+        await _set_workers_backend(workers, in_split=False)
     except Exception as e:
         log.warning(
             "compute_pool: restore default backend after stop failed: %s", e,

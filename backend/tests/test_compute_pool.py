@@ -1264,3 +1264,65 @@ def test_ensure_compatible_gguf_already_present(monkeypatch, tmp_path):
     assert result == {"ok": True, "status": "ready"}
     # No background task spawned.
     assert "gemma4:26b" not in compute_pool._ACQUISITION_TASKS
+
+
+# --- per-vendor worker backend selection -----------------------------------
+
+
+def _w(gpus):
+    """Helper: build a minimal worker dict with the given gpus list in
+    capabilities (mirrors what the SSH spec probe populates)."""
+    return {"capabilities": {"gpus": gpus}}
+
+
+def test_worker_gpu_vendor_intel():
+    assert compute_pool._worker_gpu_vendor(_w([{"name": "Intel(R) Graphics"}])) == "intel"
+    assert compute_pool._worker_gpu_vendor(_w([{"name": "Intel(R) Iris(R) Xe Graphics"}])) == "intel"
+    assert compute_pool._worker_gpu_vendor(_w([{"name": "Intel UHD 630"}])) == "intel"
+
+
+def test_worker_gpu_vendor_nvidia():
+    assert compute_pool._worker_gpu_vendor(_w([{"name": "NVIDIA GeForce RTX 3060 Ti"}])) == "nvidia"
+    assert compute_pool._worker_gpu_vendor(_w([{"name": "GeForce GTX 1080"}])) == "nvidia"
+    assert compute_pool._worker_gpu_vendor(_w([{"name": "RTX A5000"}])) == "nvidia"
+
+
+def test_worker_gpu_vendor_amd():
+    assert compute_pool._worker_gpu_vendor(_w([{"name": "AMD Radeon RX 6800"}])) == "amd"
+    assert compute_pool._worker_gpu_vendor(_w([{"name": "Radeon Pro WX 9100"}])) == "amd"
+
+
+def test_worker_gpu_vendor_none():
+    assert compute_pool._worker_gpu_vendor(_w([])) == "none"
+    assert compute_pool._worker_gpu_vendor({"capabilities": {}}) == "none"
+    assert compute_pool._worker_gpu_vendor({}) == "none"
+
+
+def test_select_worker_backend_intel_split_vs_normal():
+    """Intel iGPU workers drop SYCL only in split mode (the SYCL+RPC
+    bug doesn't fire in non-split paths)."""
+    intel_w = _w([{"name": "Intel(R) Graphics"}])
+    assert compute_pool._select_worker_backend(intel_w, in_split=True) == "CPU"
+    assert compute_pool._select_worker_backend(intel_w, in_split=False) == "SYCL0,CPU"
+
+
+def test_select_worker_backend_nvidia_keeps_cuda_in_both_modes():
+    """NVIDIA workers don't have the SYCL bug — keep CUDA acceleration
+    in BOTH split and non-split modes."""
+    nvidia_w = _w([{"name": "NVIDIA GeForce RTX 3060 Ti"}])
+    assert compute_pool._select_worker_backend(nvidia_w, in_split=True) == "CUDA0,CPU"
+    assert compute_pool._select_worker_backend(nvidia_w, in_split=False) == "CUDA0,CPU"
+
+
+def test_select_worker_backend_amd_keeps_vulkan_in_both_modes():
+    """AMD workers use Vulkan; not subject to the Intel-iGPU SYCL bug."""
+    amd_w = _w([{"name": "AMD Radeon RX 7900"}])
+    assert compute_pool._select_worker_backend(amd_w, in_split=True) == "Vulkan0,CPU"
+    assert compute_pool._select_worker_backend(amd_w, in_split=False) == "Vulkan0,CPU"
+
+
+def test_select_worker_backend_no_gpu():
+    """Worker without any detected GPU falls back to CPU only."""
+    no_gpu = _w([])
+    assert compute_pool._select_worker_backend(no_gpu, in_split=True) == "CPU"
+    assert compute_pool._select_worker_backend(no_gpu, in_split=False) == "CPU"
