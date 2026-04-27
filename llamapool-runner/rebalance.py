@@ -64,6 +64,7 @@ class RebalanceWatcher:
         interval_s: float = 60.0,
         threshold_layers: int = 3,
         cooldown_s: float = 300.0,
+        aggressive: bool = False,
     ) -> None:
         self.gguf_path = gguf_path
         self.claim_id = claim_id
@@ -72,6 +73,10 @@ class RebalanceWatcher:
         self.interval_s = interval_s
         self.threshold_layers = threshold_layers
         self.cooldown_s = cooldown_s
+        # Carry the same OS-cooperation mode the initial engage used
+        # — rebalance ticks must compute against the same memory
+        # source so the math stays consistent across respawns.
+        self.aggressive = aggressive
         # Seed last_ngl with what llama-server is actually running with;
         # first tick compares against this.
         self.last_ngl: int = int(initial_ngl)
@@ -135,6 +140,7 @@ class RebalanceWatcher:
                 reserved_bytes=reserved,
                 my_priority=self.priority,
                 other_priorities=other_priorities,
+                aggressive=self.aggressive,
             )
         except Exception as e:
             log.debug("ngl recompute failed: %s", e)

@@ -240,6 +240,7 @@ async def _amain(known: argparse.Namespace, passthrough: list[str]) -> int:
     port = _extract_port(passthrough, default=8080)
     gguf_path = _extract_model_path(passthrough)
 
+    aggressive = (known.pool_os_cooperative == "off")
     rpc_endpoints: list[str] = []
     ngl_value: int | None = None
     claim_id: str | None = None
@@ -249,12 +250,20 @@ async def _amain(known: argparse.Namespace, passthrough: list[str]) -> int:
                 gguf_path,
                 in_split=True,
                 priority=known.pool_priority,
+                aggressive=aggressive,
             )
         except Exception as e:
             print(
                 f"[pool] engagement raised: {e}; falling through to plain spawn",
                 file=sys.stderr,
             )
+    if aggressive:
+        print(
+            "[pool] OS cooperation: OFF (aggressive mode — pool sizes "
+            "from total memory and locks the allocation; rebalance "
+            "watcher disabled, no respawns)",
+            file=sys.stderr,
+        )
 
     # Cleanup hook fires on every exit path.
     def _release_claim_sync() -> None:
@@ -336,9 +345,17 @@ async def _amain(known: argparse.Namespace, passthrough: list[str]) -> int:
 
     # Start the rebalance watcher iff enabled + we actually have a
     # pool-computed ngl to compare against.
+    #
+    # Aggressive mode disables the watcher entirely. The contract is
+    # "take as much as possible AND stay that way" — no periodic
+    # re-evaluation, no respawn, no churn. Inter-pool sharing
+    # (claims registry, peer-aware initial ngl) still works because
+    # the registry update happens at engage() time once; aggressive
+    # mode just doesn't re-tick after that.
     watcher: RebalanceWatcher | None = None
     if (
-        known.pool_rebalance_interval > 0
+        not aggressive
+        and known.pool_rebalance_interval > 0
         and ngl_value is not None
         and ngl_value > 0
         and gguf_path is not None
@@ -354,6 +371,7 @@ async def _amain(known: argparse.Namespace, passthrough: list[str]) -> int:
             interval_s=known.pool_rebalance_interval,
             threshold_layers=known.pool_rebalance_threshold,
             cooldown_s=known.pool_rebalance_cooldown,
+            aggressive=aggressive,
         )
         await watcher.start()
 
@@ -435,6 +453,20 @@ def main(argv: list[str] | None = None) -> int:
         help="Minimum seconds between respawns (default 300 = 5 min). "
              "Protects against oscillation when free memory is bouncing "
              "around a boundary.",
+    )
+    parser.add_argument(
+        "--pool-os-cooperative", choices=["on", "off"], default="on",
+        help="`on` (default): pool sizes its memory budget from each "
+             "machine's currently-free RAM/VRAM, yields gracefully to "
+             "other OS apps, and the rebalance watcher periodically "
+             "re-evaluates -ngl as resources shift. `off`: aggressive "
+             "— pool sizes from total memory (host VRAM ×0.95, worker "
+             "RAM ×0.85), will displace OS page cache to take what it "
+             "wants, AND the rebalance watcher is disabled (take and "
+             "hold). Inter-pool sharing between llama-server tasks "
+             "(claims registry, priority-weighted initial -ngl) still "
+             "works in BOTH modes; this flag only controls the "
+             "boundary with non-pool OS apps.",
     )
     known, passthrough = parser.parse_known_args(argv)
 

@@ -19,7 +19,15 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 DEFAULT_NGL = 99
-SAFETY_FACTOR = 0.7  # leave 30% headroom for KV cache + work buffers
+# Cooperative mode: leave 30 % headroom for KV cache + work buffers
+# AND for fluctuations in other apps' working sets (so we don't
+# accidentally evict their pages).
+SAFETY_FACTOR_COOPERATIVE = 0.7
+# Aggressive mode: tighter margin since we're explicitly NOT yielding
+# to other apps. Still keep some headroom because KV cache + work
+# buffers are real even when the pool owns everything.
+SAFETY_FACTOR_AGGRESSIVE = 0.85
+SAFETY_FACTOR = SAFETY_FACTOR_COOPERATIVE  # back-compat default
 
 
 def _read_gguf_n_layers(gguf_path: str) -> int:
@@ -81,10 +89,11 @@ def compute_optimal_ngl(
     gguf_path: str,
     workers: list[dict[str, Any]] | None = None,
     *,
-    safety: float = SAFETY_FACTOR,
+    safety: float | None = None,
     reserved_bytes: int = 0,
     my_priority: int = 100,
     other_priorities: list[int] | None = None,
+    aggressive: bool = False,
 ) -> tuple[int, int]:
     """Decide how many layers to put on the pool, accounting for any
     other workloads currently using it.
@@ -95,24 +104,36 @@ def compute_optimal_ngl(
         consume (caller registers this with the claim so the *next*
         workload knows what's reserved).
 
+    Two memory-source modes
+    -----------------------
+    * **Cooperative** (`aggressive=False`, default) — pool budget is
+      built from each device's *currently free* memory and the host's
+      VRAM scaled by 0.8. Yields gracefully to whatever else the OS
+      is running. Safety factor 0.7 leaves headroom for KV cache +
+      work buffers + other-app fluctuations. **This is the right
+      mode for hosts where the user is also doing other things.**
+    * **Aggressive** (`aggressive=True`) — pool budget is built from
+      each device's *total* RAM (×0.85) and the host's VRAM (×0.95).
+      We don't yield to other apps; the pool will displace the OS
+      page cache to take what it wants. Safety factor 0.85 (still
+      keeping ~15 % for KV/buffers since those are real regardless
+      of OS cooperation). Use ONLY on dedicated machines or when the
+      operator explicitly accepts that other apps may slow down.
+
+    Inter-pool sharing (claims registry, priority-weighted shares)
+    works identically in both modes — `aggressive` only changes the
+    boundary between "the pool" and "everything else on the OS".
+
     Allocation policy
     -----------------
-    1. `pool_total = host_vram + sum(worker free RAM)` × safety
-       (default safety 0.7 = 30 % headroom for KV cache + buffers).
+    1. `pool_total = host_vram_bytes + sum(worker memory bytes)` —
+       sourced from `ram_free_gb` (cooperative) or `ram_total_gb`
+       (aggressive).
     2. `pool_free = pool_total - reserved_bytes` (subtract what other
-       active workloads have already claimed).
-    3. Under contention, split `pool_free` proportionally by priority:
-         my_share = pool_free × (my_priority /
-                                 (my_priority + sum(other_priorities)))
-       When uncontested, `my_share = pool_free`.
-    4. `ngl = floor(my_share / avg_layer_bytes)`, clamped to
-       `[0, n_layers]`.
-    5. Graceful degradation: if `ngl == 0` (pool can't fit even one
-       layer for our share), we return `(0, 0)` — caller skips `--rpc`
-       and runs host-only rather than overcommitting.
-    6. If GGUF metadata is unreadable / pool is empty, return
-       `(DEFAULT_NGL, 0)` — caller delegates to llama.cpp's default
-       "fit as many as possible" probe.
+       active claims have already budgeted — same in both modes).
+    3. Priority-weighted share when contested.
+    4. `ngl = floor(my_share × safety / avg_layer_bytes)`, clamped
+       to `[0, n_layers]`.
 
     Parameters
     ----------
@@ -121,11 +142,16 @@ def compute_optimal_ngl(
         `registry.total_reserved_bytes(exclude_pid=os.getpid())`.
     my_priority, other_priorities :
         Integer weights. Higher = more pool share when contested.
-        Default 100. Pass priorities from `registry.get_active_claims()`
-        for a fair split.
+    aggressive :
+        Toggle the mode described above.
+    safety :
+        Override the safety factor explicitly. When `None`, picks
+        0.7 (cooperative) or 0.85 (aggressive) automatically.
     """
     workers = workers or []
     other_priorities = other_priorities or []
+    if safety is None:
+        safety = SAFETY_FACTOR_AGGRESSIVE if aggressive else SAFETY_FACTOR_COOPERATIVE
 
     n_layers = _read_gguf_n_layers(gguf_path)
     if n_layers <= 0:
@@ -140,13 +166,22 @@ def compute_optimal_ngl(
 
     avg_layer_bytes = file_size / n_layers
 
+    # Build the pool budget. Aggressive uses total memory with high
+    # utilisation factors; cooperative uses currently-free memory.
     pool_total = 0
-    pool_total += int(_detect_host_vram_gb() * (1024 ** 3) * 0.8)
+    host_vram_factor = 0.95 if aggressive else 0.8
+    pool_total += int(_detect_host_vram_gb() * (1024 ** 3) * host_vram_factor)
     for w in workers:
         if not w.get("enabled", True):
             continue
-        free_gb = float(w.get("ram_free_gb") or 0)
-        pool_total += int(free_gb * (1024 ** 3))
+        if aggressive:
+            # Use worker's TOTAL RAM. Fall back to ram_free_gb if
+            # the snapshot doesn't include total (older configs).
+            total_gb = float(w.get("ram_total_gb") or w.get("ram_free_gb") or 0)
+            pool_total += int(total_gb * (1024 ** 3) * 0.85)
+        else:
+            free_gb = float(w.get("ram_free_gb") or 0)
+            pool_total += int(free_gb * (1024 ** 3))
 
     if pool_total <= 0:
         return DEFAULT_NGL, 0
@@ -164,10 +199,11 @@ def compute_optimal_ngl(
     fits = max(0, min(n_layers, fits))
     estimated = int(fits * avg_layer_bytes)
     log.info(
-        "adaptive ngl: file=%.2fGB n_layers=%d avg_layer=%.0fMiB "
+        "adaptive ngl (%s): file=%.2fGB n_layers=%d avg_layer=%.0fMiB "
         "pool_total=%.2fGB reserved=%.2fGB my_share=%.2fGB "
         "priority=%d/(self+%d others) safety=%.2f -> ngl=%d "
         "(reserves %.2fGB)",
+        "aggressive" if aggressive else "cooperative",
         file_size / (1024 ** 3), n_layers, avg_layer_bytes / (1024 ** 2),
         pool_total / (1024 ** 3), reserved_bytes / (1024 ** 3),
         my_share / (1024 ** 3),

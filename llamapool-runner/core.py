@@ -73,6 +73,7 @@ async def engage_async(
     *,
     in_split: bool = True,
     priority: int = 100,
+    aggressive: bool = False,
 ) -> tuple[list[str], int | None, str | None]:
     """Async core of `engage`. See `engage` for semantics.
 
@@ -83,6 +84,18 @@ async def engage_async(
         provided (caller should use llama.cpp's default).
       * `claim_id`: opaque token to pass to `disengage(claim_id)`.
         None if no claim was registered (e.g., empty pool).
+
+    `aggressive` toggles the pool's relationship with non-pool OS
+    apps:
+      * False (default) — cooperative. Budget = currently free
+        memory across the pool. Yields gracefully to whatever else
+        the user is running.
+      * True — aggressive. Budget = total memory across the pool
+        (× 0.85 host RAM, × 0.95 host VRAM). Will displace OS page
+        cache / other apps' working sets. Use only on dedicated
+        machines.
+    Inter-pool sharing (claims registry, priority weights) works
+    identically in both modes.
     """
     ws = config.list_workers(enabled_only=True)
     if not ws:
@@ -131,6 +144,7 @@ async def engage_async(
                 reserved_bytes=reserved,
                 my_priority=priority,
                 other_priorities=other_priorities,
+                aggressive=aggressive,
             )
         except Exception as e:
             log.warning("adaptive ngl computation failed: %s", e)
@@ -159,12 +173,19 @@ def engage(
     *,
     in_split: bool = True,
     priority: int = 100,
+    aggressive: bool = False,
 ) -> tuple[list[str], int | None, str | None]:
     """Synchronous wrapper around `engage_async` for callers not
-    already in an event loop. See `engage_async` for semantics.
+    already in an event loop. See `engage_async` for semantics
+    (including the `aggressive` flag's meaning).
     """
     return asyncio.run(
-        engage_async(gguf_path, in_split=in_split, priority=priority),
+        engage_async(
+            gguf_path,
+            in_split=in_split,
+            priority=priority,
+            aggressive=aggressive,
+        ),
     )
 
 

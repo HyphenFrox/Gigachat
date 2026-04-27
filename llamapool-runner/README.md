@@ -184,6 +184,25 @@ What rebalancing **doesn't** do (intentionally):
 
 Resource source: the watcher reads `~/.llamapool/config.json` for worker free-memory. That JSON is refreshed by whatever owns it — Gigachat's `backend/llamapool_sync.py` runs on every CRUD operation plus a 5-minute capability probe. For purely-standalone use without Gigachat, keep the JSON fresh via your own probe loop or pass live values into the worker dicts before calling `engage`.
 
+## Two modes: cooperative vs aggressive
+
+There are two layers of adaptive resource usage in this runner, and they're controlled separately:
+
+* **Inter-pool sharing** — between concurrent llama-server tasks that all use this runner. Always on. Each task registers a claim in `~/.llamapool/active.json` and gets a priority-weighted slice of the remaining pool memory. Cannot be disabled.
+* **OS-cooperation** — between the whole pool and other apps the operator is running on the same machines (browsers, IDEs, the user's foreground work). Toggle with `--pool-os-cooperative=on|off`.
+
+The toggle:
+
+| | `--pool-os-cooperative=on` (default) | `--pool-os-cooperative=off` |
+|---|---|---|
+| Memory source | each machine's *free* RAM/VRAM | each machine's *total* (host VRAM ×0.95, worker RAM ×0.85) |
+| Safety factor | 0.7 (30 % headroom) | 0.85 (15 % headroom — KV cache + buffers only) |
+| Yields to other apps? | Yes — won't displace their working sets | No — will evict OS page cache to take what it wants |
+| Rebalance watcher | On — periodically re-evaluates `-ngl` | **Off** — take what's available at start and hold it; no re-tick, no respawn |
+| Right when | Operator is also using the host/workers for other work | Dedicated machines, batch jobs, operator explicitly accepts other-app slowdown |
+
+Inter-pool sharing works identically in both modes. Two `--pool-os-cooperative=off` workloads still split the (now larger) pool memory between themselves by priority; they just both ignore non-pool OS apps. Mixing modes is allowed too — each workload's flag controls only its own engagement.
+
 ## How it works
 
 1. **Worker discovery:** read `~/.llamapool/config.json` for the registered workers, TCP-probe each rpc-server port, drop unreachable ones.
