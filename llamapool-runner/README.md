@@ -151,6 +151,39 @@ The "intelligent" part:
 
 Three apps running concurrently — Gigachat (priority 200), Peerful extraction (priority 100), a background batch (priority 50) — get pool memory roughly 4 : 2 : 1 with no manual coordination.
 
+## Periodic rebalancing — `-ngl` adjusts as resources change
+
+The wrapper runs a background **rebalance watcher** that re-evaluates the optimal `-ngl` on a configurable interval. When the value has drifted past a threshold AND a cooldown has elapsed, it gracefully respawns the underlying `llama-server` with the new value. The expensive part — terminate + cold-load + `/health` probe — is gated behind both checks so a noisy memory environment doesn't trigger a respawn storm.
+
+A respawn fires only when **all three** are true:
+
+1. `new_ngl` differs from the current value by at least `--pool-rebalance-threshold` layers (default **3**). A drift of 14 → 15 isn't worth a cold-load.
+2. At least `--pool-rebalance-cooldown` seconds have elapsed since the last respawn (default **300** = 5 min). Stops oscillation when free memory bounces around a layer-count boundary.
+3. The new value is non-zero — we don't tear down the running session into a "give up on the pool" state mid-flight; if the budget collapses completely, the workload keeps the layers it already has.
+
+CLI flags:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--pool-rebalance-interval=<seconds>` | 60 | How often the watcher ticks. `0` disables periodic rebalancing entirely. |
+| `--pool-rebalance-threshold=<layers>` | 3 | Minimum `-ngl` delta that triggers a respawn. Raise to be more conservative. |
+| `--pool-rebalance-cooldown=<seconds>` | 300 | Minimum time between respawns. Raise if you want fewer interruptions. |
+
+What triggers a meaningful change in practice:
+
+* A peer workload finishes (`disengage`) → its reservation returns to the pool → your share grows → ngl goes up next tick.
+* A peer workload starts → reservation reduces your share → ngl goes down.
+* A worker's free RAM changes (other apps quit / open on it) → next config-sync refreshes `ram_free_gb` → recompute reflects it.
+* Worker comes online / goes offline → pool budget changes accordingly.
+
+What rebalancing **doesn't** do (intentionally):
+
+* It can't hot-migrate already-placed layers — that's an upstream llama.cpp limitation. Adjustment requires a respawn.
+* It doesn't displace your other apps. The watcher reads what's free at tick time; it never asks the OS to evict another process's working set.
+* It doesn't run forever in tight loops on a busy system — the cooldown ensures at least N minutes between any two respawns, so even pathological memory churn caps wrapper-induced overhead at one cold-load per cooldown window.
+
+Resource source: the watcher reads `~/.llamapool/config.json` for worker free-memory. That JSON is refreshed by whatever owns it — Gigachat's `backend/llamapool_sync.py` runs on every CRUD operation plus a 5-minute capability probe. For purely-standalone use without Gigachat, keep the JSON fresh via your own probe loop or pass live values into the worker dicts before calling `engage`.
+
 ## How it works
 
 1. **Worker discovery:** read `~/.llamapool/config.json` for the registered workers, TCP-probe each rpc-server port, drop unreachable ones.
