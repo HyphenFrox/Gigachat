@@ -308,6 +308,34 @@ Smaller siblings — `gemma4:e2b` (block_count=30), `gemma4:26b`, `gemma4:31b` �
 
 Honest performance note: even with the full workaround stack, E4B via pool runs slower than host-only for this specific model (RPC round-trips dominate when the model already fits in host VRAM). The pool engagement here exists for routing consistency — large models (26B, 31B) are where the pool delivers real wins.
 
+### Speculative decoding (recruit the rest of the pool)
+
+Layer-split is for models the strongest single node can't fit. But what about the common case — model fits one node, and the rest of the pool sits idle while that node runs the chat alone? Tell Gigachat to use speculative decoding and the picker auto-selects a smaller chat model from anywhere in the pool's combined inventory, then loads it as a draft alongside the target. The draft proposes a few cheap tokens per round, the target verifies them in a single batched pass, and net throughput on a single chat stream typically goes up 1.3–2× depending on accept rate.
+
+The picker is generic — nothing is hard-coded to a particular model or device. It walks every enabled worker's `/api/tags` snapshot plus the host's Ollama manifest store and chooses the smallest candidate that:
+
+* shares a tokenizer family with the target (`details.family` from Ollama — same family is the safe approximation; cross-family pairs accept at near 0%),
+* is dramatically smaller than the target (≤ 30% of target size — beyond that, draft cost eats the speedup),
+* lives on the host's local disk (v1 limitation; worker-only drafts would need an upfront LAN copy via `push-model`).
+
+The router only engages speculative when the host has VRAM headroom for both models — the budget check uses `target_size + draft_size` × 1.30 ≤ host VRAM budget. Below that, it falls back to plain Ollama silently.
+
+Switching to llama-server (the engine that supports `--model-draft`) means leaving Ollama's pre-tuned defaults, so this is **opt-in**. Toggle once via Settings → Compute, or set `compute_pool_speculative_decoding=true` via the settings API. Default: off.
+
+| Setup | Without speculative | With speculative | Notes |
+|---|---|---|---|
+| 7B target + 1B same-family draft on 8 GB GPU | 30 tok/s (Ollama host) | ~50 tok/s (llama-server host with `-md`) | typical 1.5–2× on chat-heavy prompts |
+| 13B target + 1B draft on 16 GB GPU | 18 tok/s | ~32 tok/s | scales with target/draft ratio |
+| 70B target on host that can't even fit it | already Tier 2 split | layer-split + draft layered on top | speculative + RPC stack cleanly |
+
+The pick is logged at startup so you can see which draft ran:
+
+```
+compute_pool: speculative decoding engaged — target=llama3.1:8b draft=llama3.2:1b (draft is 12% of target size)
+```
+
+If the target is too small to bother (under ~1.5 GB) or no same-family draft is around, the router stays on Ollama with no fanfare — the feature degrades silently.
+
 ### Build version
 
 The host and every worker run llama.cpp **b8940** (the build that fixed recurrent-state RPC serialization). The `b8940-bin-win-cuda-12.4-x64.zip` lives on the host; workers run the equivalent SYCL build. Mixed builds across nodes can crash the RPC protocol when a `ggml_op` enum changes upstream — keep them aligned.

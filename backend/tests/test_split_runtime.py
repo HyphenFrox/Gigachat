@@ -17,6 +17,7 @@ offline. Filesystem is isolated via tmp_path so the developer's real
 from __future__ import annotations
 
 import io
+import platform
 import zipfile
 from pathlib import Path
 
@@ -26,6 +27,13 @@ import pytest
 from backend import split_runtime
 
 pytestmark = pytest.mark.smoke
+
+
+# `_resolve_binary` in split_runtime looks for `name.exe` on Windows and
+# bare `name` everywhere else. Mirror that here so the fake binaries the
+# tests drop on disk are discoverable by `find_llama_server` regardless of
+# which OS the CI runner happens to be on.
+_BINARY_SUFFIX = ".exe" if platform.system() == "Windows" else ""
 
 
 # --- helpers --------------------------------------------------------------
@@ -43,9 +51,10 @@ def _redirect_install_dir(monkeypatch, tmp_path: Path) -> Path:
 
 def _drop_fake_binary(install_dir: Path, name: str) -> Path:
     """Pretend an extracted llama.cpp install exists. Files are touched
-    empty — they only need to exist for `is_file()` checks."""
+    empty — they only need to exist for `is_file()` checks. Suffix is
+    OS-aware so the binary is discovered on every CI matrix entry."""
     install_dir.mkdir(parents=True, exist_ok=True)
-    p = install_dir / f"{name}.exe"
+    p = install_dir / f"{name}{_BINARY_SUFFIX}"
     p.write_bytes(b"")
     return p
 
@@ -81,7 +90,7 @@ def test_find_falls_through_to_path(monkeypatch, tmp_path):
     _redirect_install_dir(monkeypatch, tmp_path)
     path_dir = tmp_path / "elsewhere"
     path_dir.mkdir()
-    (path_dir / "llama-server.exe").write_bytes(b"")
+    (path_dir / f"llama-server{_BINARY_SUFFIX}").write_bytes(b"")
     monkeypatch.setenv("PATH", str(path_dir))
     found = split_runtime.find_llama_server()
     assert found is not None
@@ -96,7 +105,7 @@ def test_private_install_wins_over_path(monkeypatch, tmp_path):
     private = _drop_fake_binary(install, "llama-server")
     path_dir = tmp_path / "elsewhere"
     path_dir.mkdir()
-    (path_dir / "llama-server.exe").write_bytes(b"")
+    (path_dir / f"llama-server{_BINARY_SUFFIX}").write_bytes(b"")
     monkeypatch.setenv("PATH", str(path_dir))
     assert split_runtime.find_llama_server() == private
 
@@ -176,12 +185,16 @@ def test_download_rejects_unknown_variant(monkeypatch, tmp_path):
 
 def test_download_happy_path_extracts_and_finds(monkeypatch, tmp_path):
     """End-to-end: stub the GitHub release URL, return a fake zip
-    containing `llama-server.exe`, verify the install dir ends up with
-    the binary and `find_llama_server` resolves it."""
+    containing `llama-server` (with the OS-appropriate suffix), verify
+    the install dir ends up with the binary and `find_llama_server`
+    resolves it. The real downloads are Windows-only, but the extractor
+    plus discovery layer are platform-agnostic — this test runs on every
+    CI matrix entry, so the zip names match whatever `find_llama_server`
+    will actually look for on the current OS."""
     install = _redirect_install_dir(monkeypatch, tmp_path)
     fake_zip_bytes = _build_zip_in_memory([
-        ("llama-server.exe", b"binary"),
-        ("llama-cli.exe", b"binary"),
+        (f"llama-server{_BINARY_SUFFIX}", b"binary"),
+        (f"llama-cli{_BINARY_SUFFIX}", b"binary"),
     ])
 
     def handler(request: httpx.Request) -> httpx.Response:

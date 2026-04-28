@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# ----------------------------------------------------------------------
+# .githooks/pre-push — block `git push` when smoke tests fail locally.
+#
+# Activate once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# After that every `git push` runs the smoke-test tier. A non-zero exit
+# from `scripts/test.sh` aborts the push (git's pre-push contract). This
+# is the local replacement for the GitHub Actions smoke job — same
+# command, same failure surface, but the feedback loop is "before the
+# bad commit reaches the remote" instead of "after CI sends a red email".
+#
+# To bypass once (e.g. shipping a doc-only change you've already
+# verified): `git push --no-verify`.
+# ----------------------------------------------------------------------
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT="$ROOT/scripts/test.sh"
+
+if [ ! -x "$SCRIPT" ]; then
+    # First-time clone on Unix: ensure the runner is executable so
+    # subsequent invocations skip this branch.
+    chmod +x "$SCRIPT" 2>/dev/null || true
+fi
+
+echo "[pre-push] running smoke tests…" >&2
+if ! bash "$SCRIPT"; then
+    echo "[pre-push] smoke tests failed — push aborted." >&2
+    echo "[pre-push] re-run \`scripts/test.sh\` to debug, or pass --no-verify to skip." >&2
+    exit 1
+fi
+echo "[pre-push] smoke tests passed." >&2

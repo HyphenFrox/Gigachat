@@ -327,6 +327,7 @@ def _build_command(
     rpc_endpoints: list[str],
     ngl: int = _DEFAULT_NGL,
     mmproj_path: str | None = None,
+    draft_gguf_path: str | None = None,
 ) -> list[str]:
     """Assemble the argv for `llama-server`.
 
@@ -343,6 +344,17 @@ def _build_command(
     (or download Unsloth's pre-built one) and point llama-server at
     both. Phase 2 RPC layer-split still applies to the LLM tensors;
     the CLIP graph runs on the host backend by default.
+
+    `draft_gguf_path` is the path to a smaller GGUF that llama-server
+    runs as a speculative-decoding draft alongside the main model.
+    When provided, llama-server is launched with `-md <path>` plus
+    tuning flags (`--draft-max 8 --draft-min 1`) so it proposes a
+    short run of cheap tokens from the draft and verifies them in a
+    single batched pass on the main model. Net effect: 1.3-2× single-
+    stream throughput on a same-family target/draft pair, at the cost
+    of holding both models in memory. The picker in
+    `compute_pool.pick_draft_for` enforces the family/size constraints
+    that make speculative decoding actually win.
     """
     cmd: list[str] = [
         str(llama_server),
@@ -446,6 +458,23 @@ def _build_command(
         # llama-server keeps the CLIP graph on its own backend (host
         # by default) while the LLM tensors layer-split via --rpc.
         cmd.extend(["--mmproj", mmproj_path])
+    if draft_gguf_path:
+        # Speculative decoding: draft model runs alongside the target
+        # in the same llama-server process. `--draft-max 8` caps the
+        # number of tokens the draft proposes per round (8 is the
+        # llama.cpp default and a balanced choice — higher values
+        # benefit only when the draft accepts at >80% rate); `--draft-min 1`
+        # lets short, low-confidence draft runs still try one token
+        # rather than skip the round entirely. `-ngld 99` mirrors
+        # `-ngl 99` for the draft so its layers also offload to GPU
+        # when there's room — speculative decoding only wins when the
+        # draft generates faster than the target verifies.
+        cmd.extend([
+            "-md", draft_gguf_path,
+            "--draft-max", "8",
+            "--draft-min", "1",
+            "-ngld", "99",
+        ])
     # No `-ot` flag here. The MoE+SYCL+RPC bug is dodged at a higher
     # layer: `compute_pool._ensure_split_running_for` switches each
     # worker's rpc-server to `-d CPU` (no SYCL exposure) before
@@ -720,12 +749,18 @@ async def start(split_id: str) -> dict:
     worker_ids = row.get("worker_ids") or []
     ngl = _compute_optimal_ngl(row["gguf_path"], worker_ids)
 
+    # Speculative-decoding draft: optional, set by the router when a
+    # smaller same-family chat model is available somewhere in the pool.
+    # `_build_command` adds `-md <path>` + tuning flags when present.
+    draft = (row.get("draft_gguf_path") or "").strip() or None
+
     cmd = _build_command(
         llama_server=server,
         gguf_path=row["gguf_path"],
         port=row["llama_port"],
         rpc_endpoints=rpc_endpoints,
         mmproj_path=mmproj,
+        draft_gguf_path=draft,
         ngl=ngl,
     )
     log_path = _log_path_for(split_id)

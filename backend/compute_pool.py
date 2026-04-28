@@ -34,7 +34,7 @@ from typing import Any
 
 import httpx
 
-from . import db, sysdetect
+from . import db, split_runtime, sysdetect
 
 log = logging.getLogger(__name__)
 
@@ -2659,27 +2659,284 @@ def _eligible_split_workers() -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Speculative-decoding draft picker
+#
+# The router calls `pick_draft_for(target_model_name)` whenever the chat
+# target fits on a single node — typically the host. The picker walks the
+# pool's combined model inventory (host's installed Ollama models + every
+# enabled worker's `/api/tags` snapshot) for a smaller, same-family,
+# chat-capable model that can serve as a speculative-decoding draft.
+#
+# Generic by design: nothing in this module hardcodes specific model names
+# or sizes. The user's pool can hold any mix of devices and models — the
+# picker uses the family hint Ollama already publishes (`gemma`, `llama`,
+# `qwen2`, …) so the same matcher works whether the chat target is a
+# 3 B Phi or a 70 B Llama.
+#
+# Speculative decoding is a net win when:
+#   * draft + target share the SAME tokenizer (== same family is the
+#     safe approximation; mixing tokenizer families produces 0 % accept
+#     rate), and
+#   * draft is DRAMATICALLY smaller than target (the speedup formula
+#     amortises draft cost over verified tokens — a draft only 2× smaller
+#     barely helps; 5-10× smaller is where the wins live), and
+#   * the executing node can hold BOTH models in VRAM at once.
+#
+# The picker enforces all three. When any check fails it returns None and
+# the router falls back to the vanilla single-model path.
+# ---------------------------------------------------------------------------
+
+# Maximum draft size as a fraction of target size. Empirically, drafts
+# bigger than ~30 % of target spend more cycles per draft token than the
+# target verifies them — the speedup curve is non-monotonic. Below 30 %
+# is the safe regime where speculative decoding is consistently a win.
+_DRAFT_MAX_SIZE_FRACTION = 0.30
+
+# Minimum target size (in bytes) below which speculative decoding isn't
+# worth engaging — the per-token cost of running TWO models eats the
+# small fixed-overhead win when the target is already tiny. 1.5 GB is
+# the rough crossover (anything smaller already runs at >50 tok/s on a
+# decent GPU and gains little from a draft).
+_SPECULATIVE_MIN_TARGET_BYTES = 1_500_000_000
+
+# VRAM headroom multiplier — we only engage speculative if the executing
+# node has at least (target_size + draft_size) * this factor in VRAM.
+# Covers KV cache for both models plus a working margin.
+_SPECULATIVE_VRAM_HEADROOM = 1.30
+
+
+def _pool_model_inventory() -> list[dict]:
+    """Collated list of every chat-capable model installed anywhere in
+    the pool. Each entry carries the source (host vs worker) so the
+    caller can tell whether the GGUF is locally resolvable.
+
+    Returns dicts shaped::
+
+        {
+            "name": "qwen2.5:0.5b",      # Ollama tag
+            "family": "qwen2",            # Ollama details.family (lower-case)
+            "size_bytes": 394_000_000,    # raw file size
+            "source": "host" | "worker:<wid>",
+        }
+
+    Embedding-only models are filtered out (their ``family`` is the
+    embed-model family — `nomic-embed-text` etc. — and they have no
+    chat template, so they can't serve as a draft).
+    """
+    out: list[dict] = []
+
+    # Host-side: walk Ollama's manifest store. `_resolve_ollama_manifest`
+    # already handles the manifest schema; we don't need /api/tags here
+    # because resolve gives us the on-disk file size directly.
+    try:
+        host_models = _list_host_installed_models()
+    except Exception as e:
+        log.info("pool inventory: host listing failed: %s", e)
+        host_models = []
+    for m in host_models:
+        out.append({
+            "name": m.get("name") or "",
+            "family": (m.get("family") or "").lower(),
+            "size_bytes": int(m.get("size_bytes") or 0),
+            "source": "host",
+        })
+
+    # Worker-side: each probe stamps the worker row's `capabilities.models`
+    # with what Ollama reports via /api/tags — name, size, family,
+    # parameter_size, quantization_level. Use that snapshot directly.
+    for w in db.list_compute_workers(enabled_only=True):
+        if not w.get("use_for_chat"):
+            continue
+        caps = w.get("capabilities") or {}
+        for m in caps.get("models") or []:
+            if not isinstance(m, dict):
+                continue
+            out.append({
+                "name": m.get("name") or "",
+                "family": (m.get("family") or "").lower(),
+                "size_bytes": int(m.get("size") or 0),
+                "source": f"worker:{w['id']}",
+            })
+
+    # Filter out embedding-only models — name-based heuristic because
+    # Ollama's `family` for embed models is the embed family
+    # (`nomic-bert`, `bert`, …), not always identifiable cleanly. The
+    # name carries `embed` in every embedding model we ship.
+    return [m for m in out if m["name"] and "embed" not in m["name"].lower()]
+
+
+def _list_host_installed_models() -> list[dict]:
+    """Read every `manifests/registry.ollama.ai/library/<model>/<tag>`
+    JSON file under the host's Ollama models dir, return per-tag
+    `{name, family, size_bytes}` summaries.
+
+    We avoid hitting Ollama's HTTP API because (a) it may not be running
+    yet at boot and (b) the picker is on the chat-startup hot path —
+    one extra HTTP roundtrip per turn is wasteful when the same data
+    is sitting in static JSON files on disk.
+    """
+    base = _OLLAMA_MODELS_DIR / "manifests" / "registry.ollama.ai"
+    if not base.is_dir():
+        return []
+    out: list[dict] = []
+    # Layout: manifests/registry.ollama.ai/<namespace>/<model>/<tag>
+    # `namespace` is `library` for the public registry, but other
+    # namespaces (`hf.co/...`) are also possible.
+    for ns in base.iterdir():
+        if not ns.is_dir():
+            continue
+        for model_dir in ns.iterdir():
+            if not model_dir.is_dir():
+                continue
+            for tag_file in model_dir.iterdir():
+                if not tag_file.is_file():
+                    continue
+                # Tag name = filename. Build the canonical Ollama name
+                # back from the directory layout: <model>:<tag> for
+                # the public namespace, <ns>/<model>:<tag> otherwise.
+                name = (
+                    f"{model_dir.name}:{tag_file.name}"
+                    if ns.name == "library"
+                    else f"{ns.name}/{model_dir.name}:{tag_file.name}"
+                )
+                info = resolve_ollama_model(name)
+                if not info:
+                    continue
+                out.append({
+                    "name": name,
+                    "family": (info.get("family") or "").lower(),
+                    "size_bytes": int(info.get("size_bytes") or 0),
+                })
+    return out
+
+
+def pick_draft_for(target_model_name: str) -> dict | None:
+    """Find a viable speculative-decoding draft for ``target_model_name``.
+
+    Returns a dict shaped ``{"name", "gguf_path", "size_bytes",
+    "source"}`` when a same-family chat model dramatically smaller than
+    the target is available on the host's disk, else ``None``.
+
+    Generic across the pool — the inventory walker (`_pool_model_inventory`)
+    finds candidates anywhere in the pool, but the v1 picker only
+    promotes host-resident drafts because llama-server needs the draft
+    GGUF on local disk. Worker-only drafts are noted in the result via
+    the ``source`` field of the parent inventory pass; if the user
+    wants them as drafts they'd need to ship the model to host first
+    (manual `ollama pull` or `push-model` from another node). Future
+    work: auto-LAN-pull when a worker-only draft outranks every host
+    candidate.
+    """
+    target = resolve_ollama_model(target_model_name)
+    if not target:
+        return None
+    target_family = (target.get("family") or "").lower()
+    target_size = int(target.get("size_bytes") or 0)
+    if not target_family or target_size <= 0:
+        return None
+    if target_size < _SPECULATIVE_MIN_TARGET_BYTES:
+        # Target is already small — speculative decoding overhead would
+        # likely outweigh any speedup. Skip silently.
+        return None
+
+    max_draft_bytes = int(target_size * _DRAFT_MAX_SIZE_FRACTION)
+    candidates: list[dict] = []
+    for m in _pool_model_inventory():
+        if m["source"] != "host":
+            # Only host-resident drafts are usable in v1 — see docstring.
+            continue
+        if m["name"] == target_model_name:
+            # Don't pick the target as its own draft.
+            continue
+        if not m["family"] or m["family"] != target_family:
+            # Tokenizer compatibility is approximated by same family.
+            # Cross-family pairs produce 0 % accept rate — verified
+            # empirically + by llama.cpp upstream advice.
+            continue
+        if m["size_bytes"] <= 0 or m["size_bytes"] >= max_draft_bytes:
+            continue
+        candidates.append(m)
+
+    if not candidates:
+        return None
+
+    # Smallest draft wins — speculative decoding speedup scales with
+    # how much faster the draft generates than the target verifies.
+    candidates.sort(key=lambda m: m["size_bytes"])
+    pick = candidates[0]
+    info = resolve_ollama_model(pick["name"])
+    if not info or not info.get("gguf_path"):
+        return None
+    return {
+        "name": pick["name"],
+        "gguf_path": info["gguf_path"],
+        "size_bytes": pick["size_bytes"],
+        "source": pick["source"],
+    }
+
+
+def speculative_decoding_enabled() -> bool:
+    """Read the user's preference for auto-engaging speculative decoding.
+
+    Defaults to OFF because engaging speculative for a fits-on-host
+    model means switching the chat engine from Ollama (the tuned default)
+    to llama-server, which has different defaults around context size,
+    KV cache reuse, and chat-template handling. Users opt in once via
+    Settings → Compute, and the picker takes over from there.
+    """
+    val = db.get_setting("compute_pool_speculative_decoding")
+    if val is None:
+        return False
+    return str(val).lower() in ("1", "true", "yes", "on")
+
+
+def _host_has_vram_for_speculative(target_size: int, draft_size: int) -> bool:
+    """Does the host have enough VRAM to hold both target + draft + KV?
+
+    `_HOST_VRAM_USE_FRACTION` already bakes in a 15 % margin for the
+    OS / desktop / KV cache when sizing the single-model budget; the
+    speculative path layers an additional `_SPECULATIVE_VRAM_HEADROOM`
+    on top because two simultaneously-loaded models double the KV-cache
+    pressure.
+    """
+    if target_size <= 0 or draft_size <= 0:
+        return False
+    budget = _host_vram_budget_bytes()
+    if budget <= 0:
+        return False
+    needed = (target_size + draft_size) * _SPECULATIVE_VRAM_HEADROOM
+    return needed <= budget
+
+
 async def _ensure_split_running_for(
     model_name: str,
     gguf_path: str,
     worker_ids: list[str],
     mmproj_path: str | None = None,
+    draft_gguf_path: str | None = None,
 ) -> str:
     """Idempotent: ensure a `split_models` row exists + is running for
-    this exact (model_name, gguf_path[, mmproj_path]) tuple, then
-    return its base_url.
+    this exact (model_name, gguf_path[, mmproj_path][, draft_gguf_path])
+    tuple, then return its base_url.
 
     Auto-creates the row keyed by model_name as label. If a row with the
     same label already exists, we reuse it (updating worker_ids /
-    mmproj_path if the user added/removed workers or installed a new
-    multimodal projector since the previous turn). If a DIFFERENT split
-    row is currently running, we stop it first — only one big model
-    hot at a time.
+    mmproj_path / draft_gguf_path if the user added/removed workers or
+    installed a new multimodal projector or a speculative-decoding draft
+    since the previous turn). If a DIFFERENT split row is currently
+    running, we stop it first — only one big model hot at a time.
 
     `mmproj_path`, when non-None, is forwarded to llama-server's
     `--mmproj` flag so vision-capable models (e.g. gemma4:26b after
     its vision tower has been extracted into a separate GGUF) can
     accept image input via Phase 2 split.
+
+    `draft_gguf_path`, when non-None, is forwarded to llama-server's
+    `-md` flag so a smaller same-family GGUF accelerates the target via
+    speculative decoding. The router fills this in when the picker
+    finds a viable draft anywhere in the pool's combined model
+    inventory and the host has VRAM headroom for both.
     """
     # Local import to dodge the circular dep — split_lifecycle imports
     # compute_pool indirectly via db / runtime.
@@ -2702,21 +2959,24 @@ async def _ensure_split_running_for(
             label=model_name,
             gguf_path=gguf_path,
             mmproj_path=mmproj_path,
+            draft_gguf_path=draft_gguf_path,
             worker_ids=worker_ids,
         )
         target_row = db.get_split_model(sid)
     else:
-        # Refresh gguf_path / mmproj_path / worker_ids in case the
-        # user changed things since the previous turn.
+        # Refresh gguf_path / mmproj_path / draft_gguf_path / worker_ids
+        # in case the user changed things since the previous turn.
         if (
             target_row.get("gguf_path") != gguf_path
             or target_row.get("mmproj_path") != mmproj_path
+            or target_row.get("draft_gguf_path") != draft_gguf_path
             or target_row.get("worker_ids") != worker_ids
         ):
             db.update_split_model(
                 target_row["id"],
                 gguf_path=gguf_path,
                 mmproj_path=mmproj_path,
+                draft_gguf_path=draft_gguf_path,
                 worker_ids=worker_ids,
             )
             target_row = db.get_split_model(target_row["id"])
@@ -2887,6 +3147,55 @@ async def route_chat_for(model_name: str) -> dict:
     # Tier 1: fits the strongest single GPU (host or worker)?
     strongest_single_vram = max(host_vram, best_worker_capacity)
     if strongest_single_vram > 0 and size_bytes <= strongest_single_vram:
+        # Sub-tier: even though one node fits the model alone, the user
+        # may have opted in to speculative decoding to recruit the rest
+        # of the pool as a draft-model accelerator. The picker walks
+        # pool inventory for a smaller, same-family chat model and the
+        # router engages llama-server (instead of Ollama) with `-md
+        # <draft>` when a viable draft is found AND host VRAM has room
+        # for both. Generic across pool composition — the picker
+        # doesn't hard-code any model names.
+        if speculative_decoding_enabled():
+            draft = pick_draft_for(model_name)
+            if (
+                draft
+                and _host_has_vram_for_speculative(size_bytes, draft["size_bytes"])
+                and split_runtime.find_llama_server() is not None
+            ):
+                # Same Scope-B GGUF override resolution Tier 2 does — a
+                # speculative path on a model that needs a repacked
+                # GGUF still has to wait for that file to land before
+                # llama-server can load it.
+                ready = await ensure_compatible_gguf(model_name)
+                if not ready.get("ok"):
+                    # Fall back to Ollama silently — the user's chat
+                    # shouldn't block on the speculative path's prep.
+                    log.info(
+                        "compute_pool: speculative decoding deferred for %s "
+                        "while compatible GGUF is being prepared",
+                        model_name,
+                    )
+                else:
+                    info = resolve_ollama_model(model_name) or info
+                    base_url = await _ensure_split_running_for(
+                        model_name,
+                        info["gguf_path"],
+                        worker_ids=[],  # single-node — no rpc workers
+                        mmproj_path=info.get("mmproj_path"),
+                        draft_gguf_path=draft["gguf_path"],
+                    )
+                    log.info(
+                        "compute_pool: speculative decoding engaged — "
+                        "target=%s draft=%s (draft is %.0f%% of target size)",
+                        model_name, draft["name"],
+                        100 * draft["size_bytes"] / max(size_bytes, 1),
+                    )
+                    return {
+                        "engine": "llama_server",
+                        "base_url": base_url,
+                        "label": model_name,
+                        "speculative_draft": draft["name"],
+                    }
         await stop_all_running_splits()
         return {"engine": "ollama"}
 

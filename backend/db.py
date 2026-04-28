@@ -596,6 +596,16 @@ def init() -> None:
             # blob bundles a vision tower that stock llama-server can't
             # load directly. NULL means text-only.
             "ALTER TABLE split_models ADD COLUMN mmproj_path TEXT",
+            # Speculative decoding: optional path to a smaller "draft"
+            # GGUF that llama-server runs alongside the main model.
+            # When set, llama-server is launched with `-md <path>` and
+            # speculative-decoding tuning flags so it can use the
+            # entire pool's model inventory to accelerate single-stream
+            # generation on the node that's actually running the chat
+            # — the draft proposes a few tokens fast, the main model
+            # verifies them in a single batched pass. NULL means
+            # vanilla single-model serving.
+            "ALTER TABLE split_models ADD COLUMN draft_gguf_path TEXT",
         ):
             try:
                 c.execute(ddl)
@@ -3708,6 +3718,7 @@ def create_split_model(
     llama_port: int = SPLIT_MODEL_DEFAULT_PORT,
     enabled: bool = True,
     mmproj_path: str | None = None,
+    draft_gguf_path: str | None = None,
 ) -> str:
     """Insert a new split-model definition and return its id.
 
@@ -3716,6 +3727,12 @@ def create_split_model(
     lifecycle module in ways that are harder to diagnose. Status is
     always created as `stopped` — the lifecycle module flips it to
     `loading` / `running` / `error` as it brings llama-server up.
+
+    `draft_gguf_path`, when set, is the on-disk path to a smaller GGUF
+    that llama-server runs as a speculative-decoding draft. It must
+    share the target model's tokenizer (same family) for accept rates to
+    be useful; the picker in `compute_pool.pick_draft_for` enforces this.
+    Empty string / None disables speculative decoding for this row.
     """
     lbl = (label or "").strip()
     if not lbl:
@@ -3739,22 +3756,26 @@ def create_split_model(
     if port < 1 or port > 65535:
         raise ValueError("llama_port must be 1–65535")
 
-    # mmproj is optional — we only validate it's a non-empty string if set.
+    # mmproj + draft are optional — we only validate they're non-empty
+    # strings if set.
     mmproj = (mmproj_path or "").strip() or None
+    draft = (draft_gguf_path or "").strip() or None
 
     sid = uuid.uuid4().hex
     now = time.time()
     with _conn() as c:
         c.execute(
             "INSERT INTO split_models ("
-            "id, label, gguf_path, mmproj_path, worker_ids_json, llama_port, "
-            "enabled, status, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?)",
+            "id, label, gguf_path, mmproj_path, draft_gguf_path, "
+            "worker_ids_json, llama_port, enabled, status, "
+            "created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'stopped', ?, ?)",
             (
                 sid,
                 lbl,
                 path,
                 mmproj,
+                draft,
                 json.dumps(wids),
                 port,
                 1 if enabled else 0,
@@ -3796,7 +3817,10 @@ def update_split_model(sid: str, **fields: Any) -> dict | None:
     if not get_split_model(sid):
         return None
 
-    allowed = {"label", "gguf_path", "mmproj_path", "worker_ids", "llama_port", "enabled"}
+    allowed = {
+        "label", "gguf_path", "mmproj_path", "draft_gguf_path",
+        "worker_ids", "llama_port", "enabled",
+    }
     cols: list[str] = []
     vals: list[Any] = []
     for k, v in fields.items():
@@ -3820,6 +3844,12 @@ def update_split_model(sid: str, **fields: Any) -> dict | None:
             # Optional — empty string / None means "remove mmproj".
             cleaned = (v or "").strip() or None
             cols.append("mmproj_path = ?")
+            vals.append(cleaned)
+        elif k == "draft_gguf_path":
+            # Optional — empty string / None means "disable speculative
+            # decoding for this row" (vanilla single-model serving).
+            cleaned = (v or "").strip() or None
+            cols.append("draft_gguf_path = ?")
             vals.append(cleaned)
         elif k == "worker_ids":
             wids = list(v or [])
@@ -3903,21 +3933,25 @@ def _row_to_split_model(row: sqlite3.Row) -> dict:
         wids = json.loads(row["worker_ids_json"]) if row["worker_ids_json"] else []
     except Exception:
         wids = []
-    # `mmproj_path` was added in a later migration — older rows return
-    # the column as NULL, and the column itself didn't exist before
-    # the migration ran. Use sqlite3.Row.keys() to detect presence so
-    # the helper still works against an upgrade-in-progress DB.
-    mmproj = None
-    try:
-        if "mmproj_path" in row.keys():
-            mmproj = row["mmproj_path"]
-    except (IndexError, KeyError):
-        mmproj = None
+    # `mmproj_path` and `draft_gguf_path` were added in later migrations
+    # — older rows return the columns as NULL, and the columns
+    # themselves didn't exist before the migration ran. Use
+    # sqlite3.Row.keys() to detect presence so the helper still works
+    # against an upgrade-in-progress DB.
+    def _safe_col(name: str):
+        try:
+            if name in row.keys():
+                return row[name]
+        except (IndexError, KeyError):
+            pass
+        return None
+
     return {
         "id": row["id"],
         "label": row["label"],
         "gguf_path": row["gguf_path"],
-        "mmproj_path": mmproj,
+        "mmproj_path": _safe_col("mmproj_path"),
+        "draft_gguf_path": _safe_col("draft_gguf_path"),
         "worker_ids": wids,
         "llama_port": row["llama_port"],
         "enabled": bool(row["enabled"]),

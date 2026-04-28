@@ -243,6 +243,7 @@ A handful of tables defined in `backend/db.py`'s schema block:
 | Wire a new MCP server                        | `mcp.py` + `mcp_servers` table             |
 | Tweak the chat-routing policy (host vs worker vs split) | `compute_pool.py` (`route_chat_for`, `pick_chat_target`, `_capability_score`, `_host_capability_score`) |
 | Adjust the per-worker probe (new capability hint) | `compute_pool._probe_one` (returns dict merged into `capabilities_json`) |
+| Tune the speculative-decoding picker (size threshold, family heuristic) | `compute_pool.py` (`pick_draft_for`, `_DRAFT_MAX_SIZE_FRACTION`, `_SPECULATIVE_MIN_TARGET_BYTES`) |
 | Add a new `llama-server` CLI flag            | `split_lifecycle._build_command`           |
 
 ---
@@ -262,6 +263,21 @@ ties go local (no LAN hop, KV cache stays warm). Workers ineligible
 because they're missing the model auto-trigger an SCP from host
 (`_maybe_kickoff_lan_sync`) when `ssh_host` is configured — fully
 non-blocking, future turns route to the now-loaded worker.
+
+**Speculative-decoding overlay (Phase 1+).** When a fits-on-host model
+would normally route to plain Ollama on host AND the user has opted
+into `compute_pool_speculative_decoding`, `route_chat_for` calls
+`pick_draft_for(target)` to walk the pool's combined model inventory
+for a same-family chat model dramatically smaller than the target
+(≤ 30 % size). On a hit, the router engages llama-server with
+`-md <draft.gguf>` and a single-node spawn (no `--rpc` workers) so
+the draft+target pair runs on host, accelerating the chat stream
+1.3-2× without changing what the model produces. The draft itself
+can come from anywhere in the pool's combined inventory; v1 only
+promotes host-resident drafts (worker-only drafts would need a
+prior LAN copy via `model_sync.sync_model`). VRAM headroom is gated
+by `_host_has_vram_for_speculative` so engagement is silently
+skipped when both models can't co-reside.
 
 All worker traffic — Ollama HTTP, scp model copy, rpc-server probes —
 flows over the LAN address stored on the row. An optional

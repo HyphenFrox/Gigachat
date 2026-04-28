@@ -54,6 +54,7 @@ import secrets
 import sys
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -116,7 +117,65 @@ ALLOWED_DOCUMENT_TYPES = {
 # PDF from nuking the context window.
 DOCUMENT_EXTRACT_MAX_CHARS = 40000
 
-app = FastAPI(title="Gigachat")
+# ---------------------------------------------------------------------------
+# Lifespan event handler
+#
+# Replaces the legacy `@app.on_event("startup")` / `@app.on_event("shutdown")`
+# decorators that FastAPI deprecated in favour of an async context manager.
+# Everything that used to live behind a per-event decorator is invoked here in
+# a single explicit sequence: setup runs before `yield`, teardown runs after.
+#
+# The handler functions referenced below (`_configure_structured_logging`,
+# `_start_scheduler`, etc.) are defined further down in this module. Python
+# resolves those names at call time, not at function-definition time, so
+# forward references work as long as the lifespan body never runs before the
+# module finishes importing — which is exactly the case (uvicorn invokes the
+# context manager when the server actually boots).
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # ----- startup ---------------------------------------------------------
+    # Structured logging first so subsequent hooks emit JSON-formatted lines.
+    await _configure_structured_logging()
+    # Capture the running event loop so threadpool endpoints can schedule
+    # background work via `run_coroutine_threadsafe`.
+    await _capture_main_loop()
+    # Background daemons that watchdog state and reclaim resources.
+    await _start_scheduler()
+    await _start_retention_sweeper()
+    await _start_stale_watchdog()
+    # Crash-resilience: re-fire any conversation that was mid-turn last
+    # process. Runs as its own task with a 3-second delay so Ollama has a
+    # chance to come up first.
+    await _start_resumer()
+    # Bring Ollama up before MCP, which may have servers that depend on it.
+    await _auto_start_ollama()
+    # Pull the auto-tuned default chat + embedding models in the background;
+    # the UI stays responsive while the multi-GB download streams.
+    await _auto_tune_ollama_models()
+    # Compute-pool liveness sweep (5-min cadence) and split-model boot
+    # reconcile (clears stale `running` rows from the previous process).
+    await _start_compute_pool_probe()
+    await _reconcile_split_models()
+    # MCP servers last so they can talk to Ollama + the compute pool when
+    # they need to.
+    await _start_mcp()
+
+    yield
+
+    # ----- shutdown --------------------------------------------------------
+    # Reverse-ish order: stop the things that depend on Ollama / split
+    # processes first, then the daemons. Each handler is independently
+    # robust — failures during shutdown are swallowed inside each helper so
+    # uvicorn always exits cleanly.
+    await _stop_mcp()
+    await _stop_split_models()
+    await _stop_compute_pool_probe()
+    await _stop_stale_watchdog()
+    await _stop_scheduler()
+
+
+app = FastAPI(title="Gigachat", lifespan=lifespan)
 db.init()
 
 # Mirror compute-pool workers into the standalone llamapool config
@@ -502,7 +561,6 @@ async def _scheduled_tasks_daemon() -> None:
         await asyncio.sleep(SCHED_POLL_SEC)
 
 
-@app.on_event("startup")
 async def _configure_structured_logging() -> None:
     """Install the JSON log formatter before any other startup hook runs.
 
@@ -515,7 +573,6 @@ async def _configure_structured_logging() -> None:
     configure_logging()
 
 
-@app.on_event("startup")
 async def _capture_main_loop() -> None:
     """Stash the main event loop so sync endpoints on the threadpool can
     schedule background work via `run_coroutine_threadsafe`. Must run before
@@ -527,7 +584,6 @@ async def _capture_main_loop() -> None:
     _MAIN_LOOP = asyncio.get_running_loop()
 
 
-@app.on_event("startup")
 async def _start_scheduler() -> None:
     """Kick off the background scheduler once the event loop is running."""
     global _SCHED_TASK
@@ -538,7 +594,6 @@ async def _start_scheduler() -> None:
 _RETENTION_TASK: asyncio.Task | None = None
 
 
-@app.on_event("startup")
 async def _start_retention_sweeper() -> None:
     """Kick off the disk-retention daemon.
 
@@ -624,7 +679,6 @@ async def _stale_turn_watchdog() -> None:
         await asyncio.sleep(_STALE_POLL_SEC)
 
 
-@app.on_event("startup")
 async def _start_stale_watchdog() -> None:
     """Kick off the stale-turn watchdog."""
     global _STALE_WATCHDOG_TASK
@@ -767,7 +821,6 @@ async def _drive_resumed_turn(cid: str) -> None:
         print(f"[resume] turn for {cid!r} crashed again: {e}", file=sys.stderr)
 
 
-@app.on_event("startup")
 async def _start_resumer() -> None:
     """Fire the interrupted-conversation resumer once after startup settles.
 
@@ -780,7 +833,6 @@ async def _start_resumer() -> None:
     asyncio.create_task(_wait_and_resume())
 
 
-@app.on_event("startup")
 async def _auto_start_ollama() -> None:
     """Bring Ollama up automatically if the user hasn't already.
 
@@ -801,7 +853,6 @@ async def _auto_start_ollama() -> None:
         print(f"[ollama] auto-start crashed: {e}", file=sys.stderr)
 
 
-@app.on_event("startup")
 async def _auto_tune_ollama_models() -> None:
     """Pick the best Gemma 4 variant for this hardware and pull it + the
     embedding model if they're missing.
@@ -813,7 +864,6 @@ async def _auto_tune_ollama_models() -> None:
     asyncio.create_task(ollama_runtime.startup_autotune_background())
 
 
-@app.on_event("startup")
 async def _start_compute_pool_probe() -> None:
     """Kick off the background liveness/capability sweep for compute workers.
 
@@ -827,7 +877,6 @@ async def _start_compute_pool_probe() -> None:
         print(f"[compute_pool] periodic probe failed to start: {e}", file=sys.stderr)
 
 
-@app.on_event("startup")
 async def _reconcile_split_models() -> None:
     """Reset stale `running`/`loading` rows on boot.
 
@@ -843,7 +892,6 @@ async def _reconcile_split_models() -> None:
         print(f"[split] boot reconcile failed: {e}", file=sys.stderr)
 
 
-@app.on_event("startup")
 async def _start_mcp() -> None:
     """Spawn every enabled MCP server once the event loop is running.
 
@@ -857,7 +905,6 @@ async def _start_mcp() -> None:
         print(f"[mcp] startup failed: {e}", file=sys.stderr)
 
 
-@app.on_event("shutdown")
 async def _stop_scheduler() -> None:
     """Cancel the scheduler so uvicorn can exit cleanly."""
     global _SCHED_TASK
@@ -869,7 +916,6 @@ async def _stop_scheduler() -> None:
             pass
 
 
-@app.on_event("shutdown")
 async def _stop_stale_watchdog() -> None:
     """Cancel the stale-turn watchdog so uvicorn can exit cleanly."""
     global _STALE_WATCHDOG_TASK
@@ -881,7 +927,6 @@ async def _stop_stale_watchdog() -> None:
             pass
 
 
-@app.on_event("shutdown")
 async def _stop_compute_pool_probe() -> None:
     """Cancel the compute-pool sweep so uvicorn exits cleanly and the test
     runner doesn't see a stranded task."""
@@ -891,7 +936,6 @@ async def _stop_compute_pool_probe() -> None:
         pass
 
 
-@app.on_event("shutdown")
 async def _stop_split_models() -> None:
     """Terminate every running llama-server child on app shutdown so
     GPU memory is reclaimed cleanly and uvicorn doesn't leave orphan
@@ -902,7 +946,6 @@ async def _stop_split_models() -> None:
         pass
 
 
-@app.on_event("shutdown")
 async def _stop_mcp() -> None:
     """Terminate every MCP subprocess before uvicorn exits."""
     try:
@@ -3198,7 +3241,17 @@ async def api_mcp_refresh() -> dict:
 # ---------------------------------------------------------------------------
 # Keys we expose to the UI. Any other key posted to PATCH is ignored so a
 # rogue request can't pollute the store with arbitrary entries.
-_ALLOWED_SETTING_KEYS = {"default_chat_model"}
+_ALLOWED_SETTING_KEYS = {
+    "default_chat_model",
+    # Compute-pool: opt-in flag for engaging llama-server with
+    # `--model-draft` (speculative decoding) when a fits-on-host model
+    # has a viable smaller same-family chat model anywhere in the
+    # pool's combined inventory. Default OFF — switching engines from
+    # Ollama to llama-server has different defaults around context
+    # size + KV cache reuse, so users opt in once after reading the
+    # docs. Read by `compute_pool.speculative_decoding_enabled`.
+    "compute_pool_speculative_decoding",
+}
 
 
 class SettingsPatch(BaseModel):
