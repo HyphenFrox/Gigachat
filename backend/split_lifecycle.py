@@ -319,6 +319,366 @@ def _model_needs_fit_off(gguf_path: str) -> bool:
     return False
 
 
+def _read_gguf_int(reader, arch: str, *keys: str) -> int | None:
+    """Look up the first available integer field in a GGUF reader.
+
+    Tries each fully-qualified key in order (architecture-prefixed first,
+    bare-architecture fallback last). Returns None when no key is
+    present or the field doesn't decode to an int.
+    """
+    for key in keys:
+        f = reader.fields.get(key)
+        if f and f.data:
+            try:
+                return int(f.parts[f.data[0]][0])
+            except Exception:
+                continue
+    return None
+
+
+def _estimate_kv_bytes_per_slot(gguf_path: str, ctx_size: int = 4096) -> int:
+    """Estimate the KV-cache size for ONE parallel slot at the given context.
+
+    Each `--parallel` slot pre-allocates its own KV cache, so the per-slot
+    size sets the upper bound on how many slots fit in remaining VRAM.
+    Formula:
+
+        2 (K+V) × n_layers × n_kv_heads × head_dim × ctx_size × 2 bytes (FP16)
+
+    GQA-aware: `n_kv_heads` differs from `n_heads` on Llama 3 / Qwen 2 /
+    most modern checkpoints. We read `<arch>.attention.head_count_kv` when
+    present and fall back to `<arch>.attention.head_count` (MHA) when it
+    isn't.
+
+    Returns 0 on any metadata miss so callers fall back to a conservative
+    `--parallel 1`.
+    """
+    try:
+        import gguf
+    except ImportError:
+        return 0
+    try:
+        reader = gguf.GGUFReader(gguf_path)
+    except Exception:
+        return 0
+
+    arch_field = reader.fields.get("general.architecture")
+    if not arch_field or not arch_field.types:
+        return 0
+    try:
+        arch = arch_field.parts[arch_field.data[0]].tobytes().decode(
+            "utf-8", errors="replace",
+        )
+    except Exception:
+        return 0
+
+    n_layers = _read_gguf_int(
+        reader, arch, f"{arch}.block_count", "llama.block_count",
+    )
+    embedding_length = _read_gguf_int(
+        reader, arch, f"{arch}.embedding_length", "llama.embedding_length",
+    )
+    n_heads = _read_gguf_int(
+        reader, arch, f"{arch}.attention.head_count", "llama.attention.head_count",
+    )
+    if not n_layers or not embedding_length or not n_heads:
+        return 0
+
+    n_kv_heads = _read_gguf_int(
+        reader, arch,
+        f"{arch}.attention.head_count_kv",
+        "llama.attention.head_count_kv",
+    ) or n_heads
+
+    head_dim = embedding_length // n_heads
+    if head_dim <= 0:
+        return 0
+
+    # 2 (K+V) × layers × kv_heads × head_dim × bytes_per_element (FP16=2)
+    kv_per_token = 2 * n_layers * n_kv_heads * head_dim * 2
+    return int(kv_per_token * max(ctx_size, 1))
+
+
+# How much VRAM headroom to leave free after target + draft + KV slots.
+# 15% mirrors the safety margin sysdetect already bakes into vram budgeting
+# elsewhere — covers OS / display / driver overhead and small allocations
+# llama.cpp does outside the headline buffers.
+_PARALLEL_VRAM_HEADROOM = 0.15
+
+# Hard cap on `--parallel`. llama-server's batched-verify is most efficient
+# at 4-8 slots; beyond that, scheduling overhead and sub-slot cache
+# pressure typically erode the win. 8 is also Ollama's default ceiling
+# in recent releases — keeping the two engines in sync makes the chat
+# experience consistent regardless of which one route_chat_for picks.
+_PARALLEL_MAX_SLOTS = 8
+
+
+def _compute_optimal_parallel(
+    gguf_path: str,
+    worker_ids: list[str],
+    *,
+    ctx_size: int = 4096,
+    target_size_bytes: int | None = None,
+    draft_size_bytes: int = 0,
+) -> int:
+    """Decide how many `--parallel` decoding slots to allocate.
+
+    Saturates GPU compute when multiple streams are in flight (concurrent
+    chats, `delegate_parallel` subagents, speculative verify+draft) without
+    paying KV-cache for slots we'll never use. Auto-adapts to whatever
+    free memory the executing node actually has — no per-vendor / per-OS
+    branches in the call sites.
+
+    Algorithm:
+      * Estimate KV-per-slot from the GGUF (architecture-aware, GQA-aware).
+      * Sum free memory across the executing pool. For host-only paths
+        (no rpc workers) that's host VRAM minus target+draft weights.
+        For split paths (rpc workers present) the constraint becomes
+        `min(host_free, every worker's free RAM)` — the slowest device
+        bounds parallel slot count, since llama-server replicates the
+        slot KV layout on each rpc-server.
+      * Apply `_PARALLEL_VRAM_HEADROOM` so OS / driver / scratch
+        allocations have room to grow.
+      * Clamp to `[1, _PARALLEL_MAX_SLOTS]`.
+
+    Returns 1 on any metadata miss (KV size unknown) so behavior matches
+    the legacy single-slot path when we can't make an informed call.
+    """
+    kv_per_slot = _estimate_kv_bytes_per_slot(gguf_path, ctx_size)
+    if kv_per_slot <= 0:
+        return 1
+
+    if target_size_bytes is None:
+        try:
+            target_size_bytes = os.path.getsize(gguf_path)
+        except OSError:
+            target_size_bytes = 0
+
+    # Host VRAM via sysdetect (vendor-agnostic — covers NVIDIA / AMD /
+    # Intel / Apple / unified-memory / CPU-only).
+    try:
+        from . import sysdetect
+        spec = sysdetect.detect_system()
+        host_vram_total = int(float(spec.get("vram_gb") or 0) * (1024 ** 3))
+        host_ram_total = int(float(spec.get("ram_gb") or 0) * (1024 ** 3))
+    except Exception:
+        host_vram_total = 0
+        host_ram_total = 0
+
+    # Effective per-node budget. CPU-only hosts (vram=0) use system RAM
+    # for KV; GPU hosts use VRAM. Apple Silicon's unified memory shows up
+    # as `vram_gb` already (sysdetect maps the unified pool there).
+    host_budget = host_vram_total if host_vram_total > 0 else host_ram_total
+    if host_budget <= 0:
+        return 1
+
+    host_free = int(host_budget * (1.0 - _PARALLEL_VRAM_HEADROOM))
+    host_free -= int(target_size_bytes or 0)
+    host_free -= int(draft_size_bytes or 0)
+    if host_free <= 0:
+        return 1
+
+    bottleneck_free = host_free
+
+    # Split path: each rpc-server replicates the slot KV layout for its
+    # assigned layer chunk, so the worker with the smallest free RAM
+    # gates the slot count. Walk every enabled worker; skip the ones
+    # without spec data (probe hasn't filled them in yet) so absence
+    # doesn't pin us to 1 slot needlessly.
+    if worker_ids:
+        for wid in worker_ids:
+            w = db.get_compute_worker(wid)
+            if not w or not w.get("enabled"):
+                continue
+            caps = w.get("capabilities") or {}
+            free_gb = float(caps.get("ram_free_gb") or 0)
+            if free_gb <= 0:
+                continue
+            worker_free = int(free_gb * (1024 ** 3) * (1.0 - _PARALLEL_VRAM_HEADROOM))
+            if worker_free < bottleneck_free:
+                bottleneck_free = worker_free
+
+    slots = max(1, bottleneck_free // kv_per_slot)
+    slots = min(_PARALLEL_MAX_SLOTS, int(slots))
+    log.info(
+        "split_lifecycle: adaptive parallel: kv_per_slot=%.0f MiB "
+        "host_free=%.2f GB bottleneck_free=%.2f GB -> --parallel %d",
+        kv_per_slot / (1024 ** 2),
+        host_free / (1024 ** 3),
+        bottleneck_free / (1024 ** 3),
+        slots,
+    )
+    return slots
+
+
+# Heterogeneity threshold — only emit `-ts` (per-device layer weights)
+# when the pool is meaningfully uneven. Below this ratio, llama.cpp's
+# internal per-device memory query already produces near-optimal splits
+# and forcing weights can hurt by overriding its real-time view of free
+# memory. 1.5× = strongest device has 50%+ more headroom than the
+# weakest; that's the floor where weighted distribution is empirically
+# better than equal split.
+_TS_HETEROGENEITY_RATIO = 1.5
+
+# Wired-LAN latency floor for engaging `--split-mode row` (tensor-parallel
+# row dispatch). Row mode synchronizes per-layer matmul partial sums
+# across devices, so per-token RPC chatter is much higher than layer-
+# pipeline mode. Empirically wins on Gigabit-Ethernet (typ. 1-3 ms probe
+# round-trip) and loses on Wi-Fi (typ. 8-30 ms). The check is
+# conservative — when in doubt we stay on layer-pipeline.
+_ROW_SPLIT_LATENCY_CEILING_MS = 4
+
+
+def _compute_tensor_split_ratios(
+    gguf_path: str, worker_ids: list[str],
+) -> list[int] | None:
+    """Compute per-device weights for `-ts` based on real free memory.
+
+    When the pool is heterogeneous (e.g. host=24 GB GPU + worker=4 GB
+    iGPU + worker=8 GB iGPU), equal-split sends 1/3 of the layers to
+    each — but the smallest device OOMs. Weighted distribution sized
+    by each node's actual free pool memory keeps every node within its
+    budget while pushing as many layers onto fast devices as possible.
+
+    Returns a list of integer weights `[host, worker_1, worker_2, ...]`
+    in the SAME order `_resolve_rpc_endpoints` produces — so llama.cpp
+    pairs them to `--rpc` endpoints correctly. Host weight is always
+    first because llama-server enumerates the local backend before any
+    RPC backends.
+
+    Returns ``None`` when:
+      * No RPC workers (no point — `-ts` only matters with multiple
+        devices).
+      * Pool is roughly homogeneous (max/min ≤ `_TS_HETEROGENEITY_RATIO`).
+        llama.cpp's built-in per-device free-memory query handles even
+        pools well enough that overriding can hurt.
+      * Any device's free-memory data is missing — falls back to
+        llama.cpp's defaults rather than assigning a guess.
+    """
+    if not worker_ids:
+        return None
+
+    # Host capacity: prefer VRAM (GPU is faster than CPU+RAM); fall back
+    # to RAM for CPU-only hosts. Apple Silicon's unified pool already
+    # shows up in vram_gb so this single-axis read covers all vendors.
+    try:
+        from . import sysdetect
+        spec = sysdetect.detect_system()
+        host_vram_gb = float(spec.get("vram_gb") or 0)
+        host_ram_gb = float(spec.get("ram_gb") or 0)
+    except Exception:
+        return None
+    host_capacity_gb = host_vram_gb if host_vram_gb > 0 else host_ram_gb
+    if host_capacity_gb <= 0:
+        return None
+
+    weights: list[float] = [host_capacity_gb]
+    for wid in worker_ids:
+        w = db.get_compute_worker(wid)
+        if not w or not w.get("enabled"):
+            return None  # missing worker — can't size; let llama.cpp pick
+        caps = w.get("capabilities") or {}
+        # Worker capacity prefers `max_vram_seen_bytes` (proven GPU memory
+        # from `/api/ps`) and falls back to `ram_free_gb` from the SSH
+        # spec probe. iGPUs draw from system RAM so ram_free_gb is the
+        # right ceiling for them; dGPUs report VRAM via /api/ps.
+        vram_bytes = int(caps.get("max_vram_seen_bytes") or 0)
+        ram_free_gb = float(caps.get("ram_free_gb") or 0)
+        capacity_gb = max(vram_bytes / (1024 ** 3), ram_free_gb)
+        if capacity_gb <= 0:
+            return None
+        weights.append(capacity_gb)
+
+    if len(weights) < 2:
+        return None
+
+    smallest = min(weights)
+    largest = max(weights)
+    if smallest <= 0:
+        return None
+    if largest / smallest < _TS_HETEROGENEITY_RATIO:
+        return None  # roughly homogeneous — let llama.cpp's auto handle
+
+    # Convert to integer ratios — llama.cpp accepts `-ts a/b/c` with
+    # whatever scale you pick. Multiply by 10 and round so a weight
+    # of 7.4 GB becomes 74 (vs 7), preserving relative proportions
+    # better at the rounding boundary.
+    return [max(1, int(round(w * 10))) for w in weights]
+
+
+def _should_pin_experts_to_cpu(gguf_path: str) -> bool:
+    """Return True for MoE models whose expert tensors plausibly won't
+    fit host GPU VRAM, so they're better placed on CPU+RAM (host or
+    via RPC workers).
+
+    MoE models (Mixtral, DeepSeek-V3, Qwen 2.5 MoE) carry expert
+    sub-networks that dominate the model's on-disk size — typically
+    70-90 % of the file. Stock llama.cpp tries to put experts on GPU
+    by default, which OOMs the moment target_size > host_vram. Pinning
+    experts to CPU keeps the attention path on GPU (where matmul
+    speedups matter) while expert weights ride host RAM + every
+    worker's RAM via the existing `-d CPU` RPC distribution.
+
+    Heuristic: model is MoE (`_is_moe_model`) AND file_size > host
+    VRAM. The constant `0.85` matches the safety factor used elsewhere
+    for the OS / display / driver overhead. Models that fit comfortably
+    in VRAM keep llama.cpp's default placement (no override here).
+    Returns False on any read error so non-MoE models are unaffected.
+    """
+    try:
+        if not _is_moe_model(gguf_path):
+            return False
+    except Exception:
+        return False
+    try:
+        file_size = os.path.getsize(gguf_path)
+    except OSError:
+        return False
+
+    try:
+        from . import sysdetect
+        spec = sysdetect.detect_system()
+        host_vram_bytes = int(float(spec.get("vram_gb") or 0) * (1024 ** 3))
+    except Exception:
+        return False
+
+    # Pin only when experts genuinely won't fit GPU. Threshold is
+    # generous (file_size includes attn weights + KV scratch + overhead,
+    # not just experts), so a model that's bigger than host VRAM almost
+    # certainly has experts that won't either.
+    return host_vram_bytes > 0 and file_size > int(host_vram_bytes * 0.85)
+
+
+def _should_use_row_split(worker_ids: list[str]) -> bool:
+    """Return True when the LAN is fast enough that `--split-mode row`
+    might beat the default layer-pipeline.
+
+    Row-mode tensor-parallel synchronizes partial sums per layer, so
+    every token requires several round-trips per RPC worker. On a
+    Gigabit-Ethernet LAN (typ. 1-3 ms RTT) the extra chatter is fast
+    enough to amortize against the row-parallel matmul speedup; on
+    typical Wi-Fi (8-30 ms RTT) the synchronization cost dominates and
+    pipeline-layer wins.
+
+    We use the worker-probe latency as a real-time bandwidth proxy —
+    `_probe_one` already records `probe_latency_ms` on every sweep, so
+    no extra measurement traffic is needed. When ANY worker exceeds
+    the latency ceiling we stay on layer mode, since row-mode's slowest
+    sync gates the whole thing.
+    """
+    if not worker_ids:
+        return False
+    for wid in worker_ids:
+        w = db.get_compute_worker(wid)
+        if not w or not w.get("enabled"):
+            return False
+        caps = w.get("capabilities") or {}
+        latency_ms = int(caps.get("probe_latency_ms") or 999)
+        if latency_ms > _ROW_SPLIT_LATENCY_CEILING_MS:
+            return False
+    return True
+
+
 def _build_command(
     *,
     llama_server: Path,
@@ -328,6 +688,9 @@ def _build_command(
     ngl: int = _DEFAULT_NGL,
     mmproj_path: str | None = None,
     draft_gguf_path: str | None = None,
+    parallel: int = 1,
+    tensor_split: list[int] | None = None,
+    split_mode: str | None = None,
 ) -> list[str]:
     """Assemble the argv for `llama-server`.
 
@@ -412,6 +775,15 @@ def _build_command(
         # skip the path. Default is 0 (disabled) upstream; we enable
         # always.
         "--cache-reuse", "256",
+        # Continuous batching — N concurrent decoding slots sharing the
+        # same warm engine. Each slot pre-allocates its own KV cache, so
+        # the size is auto-tuned by `_compute_optimal_parallel` from
+        # GGUF metadata + actual free pool memory (vendor-agnostic).
+        # Wins when multiple streams hit the same llama-server (parallel
+        # subagents, concurrent chats, target+draft verification);
+        # single-stream cost is identical to `--parallel 1` since the
+        # other slots stay quiescent.
+        "--parallel", str(max(1, int(parallel))),
     ]
     # Gemma 3n PLE variants whose graph trips
     # `GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS)` need TWO
@@ -450,7 +822,13 @@ def _build_command(
             if a == "-fa" and i + 1 < len(cmd):
                 cmd[i + 1] = "off"
                 break
-        cmd.extend(["--parallel", "1"])
+        # Force single-slot dispatch — multi-slot init triggers the
+        # rpc-server crash on Gated Delta Net + Flash Attention.
+        # Replace whatever the adaptive picker selected with 1.
+        for i, a in enumerate(cmd):
+            if a == "--parallel" and i + 1 < len(cmd):
+                cmd[i + 1] = "1"
+                break
         # Pin Gemma 3n's PLE / MatFormer / AltUp / Laurel tensors to
         # the host's primary backend. These tensors participate in the
         # Gated Delta Net compute, which has no working RPC-dispatch
@@ -465,6 +843,20 @@ def _build_command(
         cmd.extend([
             "-ot", f".*(altup|laurel|per_layer|inp_gate).*={host_dev}",
         ])
+    # MoE expert auto-pin to CPU when GPU VRAM clearly can't fit
+    # them. Engages only for MoE models whose file size exceeds host
+    # VRAM (`_should_pin_experts_to_cpu`); the existing pool-side
+    # `-d CPU` RPC distribution then fans the expert tensors across
+    # host RAM + every worker's RAM. Attention layers stay on GPU.
+    # Pattern matches the standard MoE expert tensor names
+    # (`*_exps.weight`, `*_experts.weight`) used by Mixtral / DeepSeek-V3 /
+    # Qwen 2.5 MoE family GGUFs.
+    if _should_pin_experts_to_cpu(gguf_path):
+        cmd.extend(["-ot", r".*_(exps|experts)\.weight=CPU"])
+        log.info(
+            "split_lifecycle: MoE expert tensors pinned to CPU for "
+            "%s (file size > host VRAM)", gguf_path,
+        )
     if mmproj_path:
         # Multimodal projector: required for vision-capable inference
         # of models whose Ollama blob bundles a vision tower.
@@ -502,6 +894,22 @@ def _build_command(
         # llama-server takes --rpc as a comma-separated list of
         # `<host>:<port>` endpoints. Order controls layer assignment.
         cmd.extend(["--rpc", ",".join(rpc_endpoints)])
+    if tensor_split:
+        # Per-device layer weights for heterogeneous pools. Format is
+        # `a/b/c/...` where each entry corresponds to a device in the
+        # order llama.cpp enumerates them: host backend(s) first, then
+        # each --rpc endpoint. `_compute_tensor_split_ratios` returns
+        # None for homogeneous pools so equal split (llama.cpp default)
+        # stays in effect there.
+        cmd.extend(["-ts", "/".join(str(int(w)) for w in tensor_split)])
+    if split_mode and split_mode in ("layer", "row", "none"):
+        # `--split-mode row` enables tensor-parallel matmul dispatch
+        # (vs. the default sequential layer pipeline). Requires fast
+        # interconnect — we engage only when `_should_use_row_split`
+        # confirmed every RPC worker is below the latency ceiling.
+        # `none` is single-device — included for completeness; we
+        # don't engage it from the auto path.
+        cmd.extend(["--split-mode", split_mode])
     return cmd
 
 
@@ -767,6 +1175,38 @@ async def start(split_id: str) -> dict:
     # `_build_command` adds `-md <path>` + tuning flags when present.
     draft = (row.get("draft_gguf_path") or "").strip() or None
 
+    # Adaptive --parallel: KV-cost per slot * number of slots ≤ free
+    # memory across the bottleneck node (host VRAM for host-only paths,
+    # min(host, every worker free RAM) for split paths). Auto-scales
+    # from 1 (CPU-only laptops, tight setups) up to 8 (workstations
+    # with plenty of headroom). Speculative draft size is folded in so
+    # parallel + speculative don't double-count free VRAM.
+    draft_size = 0
+    if draft:
+        try:
+            draft_size = os.path.getsize(draft)
+        except OSError:
+            draft_size = 0
+    parallel = _compute_optimal_parallel(
+        row["gguf_path"], worker_ids,
+        target_size_bytes=os.path.getsize(row["gguf_path"]) if Path(row["gguf_path"]).is_file() else None,
+        draft_size_bytes=draft_size,
+    )
+
+    # Heterogeneous-pool weighting: when host VRAM and worker capacities
+    # differ by more than `_TS_HETEROGENEITY_RATIO`, push more layers
+    # onto the bigger nodes via `-ts`. Returns None for homogeneous
+    # pools so llama.cpp's per-device free-memory query stays in
+    # control there.
+    tensor_split = _compute_tensor_split_ratios(row["gguf_path"], worker_ids)
+
+    # Tensor-parallel row dispatch — engaged only on Gigabit-Ethernet-
+    # class LANs (every worker probe latency below the ceiling). On
+    # typical home Wi-Fi we stay on layer-pipeline (the default), since
+    # row mode's per-layer sync chatter loses to plain pipeline above
+    # ~5 ms RTT.
+    split_mode = "row" if _should_use_row_split(worker_ids) else None
+
     cmd = _build_command(
         llama_server=server,
         gguf_path=row["gguf_path"],
@@ -775,6 +1215,9 @@ async def start(split_id: str) -> dict:
         mmproj_path=mmproj,
         draft_gguf_path=draft,
         ngl=ngl,
+        parallel=parallel,
+        tensor_split=tensor_split,
+        split_mode=split_mode,
     )
     log_path = _log_path_for(split_id)
 

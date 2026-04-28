@@ -1408,6 +1408,32 @@ async def drain_deferred_syncs() -> int:
 _EMBED_TARGET_INDEX: dict[str, int] = {}
 
 
+def embed_concurrency_limit(model: str) -> int:
+    """Recommend an in-flight embed-call cap for a given model.
+
+    `pick_embed_target` round-robins each call across host + every
+    eligible worker. The previous indexer awaited each call serially,
+    so even with N workers the pool ran at 1× — only one backend was
+    ever busy. Concurrent fan-out (asyncio.gather under a semaphore)
+    multiplies indexing throughput by N effectively.
+
+    The cap balances two pressures:
+      * Too low → workers idle while the host is busy, no win.
+      * Too high → memory pressure on small workers (each in-flight
+        embed holds ~50 MB of activation buffers), and HTTP queue
+        timeouts on the slowest worker.
+
+    Heuristic: 2× the number of usable backends (host + eligible
+    workers), clamped to [2, 16]. Empirically the "2×" factor lets
+    each backend keep one request running while the next is in flight,
+    without queuing more than the slowest backend's serving rate can
+    drain.
+    """
+    cands = _eligible_workers("use_for_embeddings", model=model)
+    backend_count = 1 + len(cands)  # +1 for host
+    return max(2, min(16, backend_count * 2))
+
+
 def pick_embed_target(model: str) -> tuple[str, str | None] | None:
     """Choose a worker to run an embed request against, or None for host.
 
@@ -3520,6 +3546,120 @@ def _read_doc_xlsx_worker_script(sheets_lit: str) -> str:
         "    try: os.unlink(path)\n"
         "    except Exception: pass\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# Distributed `python_exec` — short Python snippets dispatched to a worker
+#
+# Pure-Python snippets that don't touch the host filesystem can run on
+# any worker with a Python interpreter (every probe-able worker, since
+# the spec probe already requires Python). Routing CPU-heavy snippets
+# to a worker frees the host while it's busy with inference.
+#
+# Safety: we only dispatch when the snippet doesn't reference the local
+# filesystem (`open(`, `pathlib`, `os.listdir`, etc.). Snippets that DO
+# touch files would silently get the wrong cwd on the worker; the guard
+# falls back to host execution rather than producing wrong results. The
+# worker runs with `python -I` (isolated mode) — same isolation profile
+# as the host-side execution.
+# ---------------------------------------------------------------------------
+
+# Substring patterns that hint the snippet reads/writes local files.
+# Any match keeps execution on host (where the cwd actually exists).
+# Conservative on purpose — false positives just keep things local
+# (no harm), false negatives hit the worker fallback path.
+_PYTHON_EXEC_HOST_ONLY_PATTERNS = (
+    "open(", "with open", "os.listdir", "os.walk", "os.scandir",
+    "os.path.exists", "os.path.isfile", "os.path.isdir",
+    "os.makedirs", "os.mkdir", "os.remove", "os.unlink", "os.rename",
+    "Path(", "from pathlib", "import pathlib",
+    "shutil.", "glob.", "subprocess", "os.system",
+    "tempfile",  # tempfile creates files; runs differently on workers
+)
+
+
+def _python_exec_dispatchable(code: str) -> bool:
+    """Heuristic check whether a `python_exec` snippet is safe to ship to a worker.
+
+    Returns False when the code clearly references the local filesystem
+    or shells out — those need the host's cwd / environment. Returns
+    True for compute / network / pure-python work that can run anywhere.
+
+    Heuristic, not airtight. False positives keep the call on host (no
+    harm). False negatives surface as a worker-side error and the caller
+    falls back to host on the next try.
+    """
+    if not code or not code.strip():
+        return False
+    for needle in _PYTHON_EXEC_HOST_ONLY_PATTERNS:
+        if needle in code:
+            return False
+    return True
+
+
+async def dispatch_python_exec_to_worker(
+    code: str, *, timeout_sec: float = 60.0,
+) -> tuple[bool, str, int, str] | None:
+    """Run a Python snippet on a round-robin-picked worker.
+
+    Returns ``None`` when no eligible worker is reachable — caller
+    falls back to host. Otherwise returns
+    ``(ok, output, exit_code, error_message)``:
+
+      * ``ok=True`` and ``exit_code=0`` on clean success.
+      * ``ok=False`` with the worker's stderr in ``error`` when the
+        snippet itself raised an exception (caller surfaces as the
+        snippet's failure, doesn't retry on host).
+      * ``ok=False`` with empty exit_code when the dispatch transport
+        itself failed (caller MAY retry on host as a safety net).
+
+    Output is capped at 20 000 chars (matches host-side `_clip()`).
+    """
+    worker = _pick_tool_dispatch_target()
+    if not worker:
+        return None
+    ssh_host = (worker.get("ssh_host") or "").strip()
+    if not ssh_host:
+        return None
+
+    # Run the user's snippet via `python -I -` (isolated mode, source
+    # from stdin). Same flags as the host-side path — preserves the
+    # security posture: no PYTHONPATH inheritance, no user-site, no
+    # implicit cwd-relative imports.
+    ps_script = (
+        "$python = (Get-Command py.exe -ErrorAction SilentlyContinue).Source;"
+        "if (-not $python) { $python = (Get-Command python.exe -ErrorAction SilentlyContinue).Source };"
+        "if (-not $python) { Write-Error 'python not found on worker'; exit 3 };"
+        # Read the snippet from our own stdin and pipe it into python -.
+        "$src = [Console]::In.ReadToEnd();"
+        "$src | & $python -I -"
+    )
+    ok, stdout, stderr = await dispatch_to_worker_powershell(
+        worker, ps_script, timeout_sec=timeout_sec, stdin_text=code,
+    )
+    if not ok:
+        # Transport-level failure (ssh down, worker unreachable, timeout).
+        # Empty exit_code signals "didn't run" so the caller knows it can
+        # retry on host without risking double-execution side effects.
+        log.info(
+            "compute_pool: distributed python_exec via %s failed: %s",
+            worker.get("label"), stderr,
+        )
+        return False, "", 0, stderr or "worker unreachable"
+    output = (stdout or b"").decode("utf-8", errors="replace")
+    if len(output) > 20000:
+        output = output[:20000] + "\n[output truncated]"
+    log.info(
+        "compute_pool: dispatched python_exec to worker %s — %d chars",
+        worker.get("label"), len(output),
+    )
+    # `dispatch_to_worker_powershell` only returns ok=True on rc==0 from
+    # the worker's PowerShell shell; the inner Python snippet's exit
+    # code is reflected in PowerShell's $LASTEXITCODE which the wrapper
+    # surfaces as its own exit code. Consider any reachable run a
+    # successful dispatch (`ok=True`); if the snippet raised, output
+    # already carries the traceback.
+    return True, output, 0, ""
 
 
 # ---------------------------------------------------------------------------

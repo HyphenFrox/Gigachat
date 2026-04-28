@@ -250,6 +250,14 @@ A handful of tables defined in `backend/db.py`'s schema block:
 | Tune the worker-side llama-server lifecycle | `compute_pool.py` (`ensure_worker_chat_server`, `_pick_worker_resident_draft`, `_worker_has_vram_for_pair`) |
 | Adjust adaptive split-vs-host TPS thresholds | `compute_pool.py` (`_ROUTE_TPS_CACHE_TTL_SEC`, `_record_route_tps`) |
 | Add a new `llama-server` CLI flag            | `split_lifecycle._build_command`           |
+| Tune adaptive `--parallel` slot count        | `split_lifecycle.py` (`_estimate_kv_bytes_per_slot`, `_compute_optimal_parallel`, `_PARALLEL_VRAM_HEADROOM`, `_PARALLEL_MAX_SLOTS`) |
+| Tune Ollama `OLLAMA_NUM_PARALLEL` ladder     | `ollama_runtime._recommend_ollama_num_parallel` |
+| Tune heterogeneous-pool tensor-split (`-ts`) | `split_lifecycle.py` (`_compute_tensor_split_ratios`, `_TS_HETEROGENEITY_RATIO`) |
+| Tune the row-split engagement threshold      | `split_lifecycle.py` (`_should_use_row_split`, `_ROW_SPLIT_LATENCY_CEILING_MS`) |
+| Tune the MoE expert auto-pin heuristic       | `split_lifecycle._should_pin_experts_to_cpu` |
+| Tune embed fan-out concurrency               | `compute_pool.embed_concurrency_limit` |
+| Add a new distributed-tool dispatcher        | `compute_pool.py` (`_pick_tool_dispatch_target`, `dispatch_to_worker_powershell`, `dispatch_python_exec_to_worker` as a template) |
+| Adjust `python_exec` host-vs-worker guard    | `compute_pool._PYTHON_EXEC_HOST_ONLY_PATTERNS` |
 
 ---
 

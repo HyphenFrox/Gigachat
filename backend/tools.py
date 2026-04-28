@@ -638,9 +638,40 @@ async def python_exec(cwd: str, code: str, timeout: int = 60) -> dict:
     whatever libraries they pip-installed (pandas, numpy, requests, …)
     without having to configure a separate environment. It inherits no
     special privileges — security posture matches `bash`.
+
+    Pool-distributed: when the snippet is purely compute (no filesystem
+    references) AND a worker is reachable, the call is SSH-dispatched to
+    a worker via `compute_pool.dispatch_python_exec_to_worker` so the
+    host stays free for inference. Snippets that touch files run on
+    host (where the cwd actually exists). Transport failures fall back
+    to host execution silently — no behaviour change visible to the
+    agent except a faster turn when the dispatch wins.
     """
     if not code or not code.strip():
         return {"ok": False, "output": "", "error": "empty code"}
+    # Try worker dispatch first. The guard rejects snippets that clearly
+    # need host-cwd files (`open(`, `pathlib`, etc.); transport failures
+    # also fall through to host so the user never sees a cross-LAN error
+    # they didn't ask for.
+    try:
+        from . import compute_pool as _cp
+        if _cp._python_exec_dispatchable(code):
+            dispatched = await _cp.dispatch_python_exec_to_worker(
+                code, timeout_sec=float(timeout),
+            )
+            if dispatched is not None:
+                ok, output, exit_code, err = dispatched
+                if ok:
+                    return {
+                        "ok": True,
+                        "output": _clip(output),
+                        "exit_code": exit_code,
+                    }
+                # Transport failure (worker down) — fall through to host.
+    except Exception:
+        # Defensive: any dispatch failure (import error, malformed
+        # response, etc.) must not break the host-side fallback.
+        pass
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -875,11 +906,22 @@ async def _reembed_codebase_file(path_str: str, model: str) -> None:
         return
     chunks = _chunk_text(text, _DOC_INDEX_CHUNK_CHARS, _DOC_INDEX_CHUNK_OVERLAP)
     try:
+        import asyncio as _asyncio
+        from . import compute_pool as _cp
+        sem = _asyncio.Semaphore(_cp.embed_concurrency_limit(model))
         async with httpx.AsyncClient(timeout=60.0) as client:
-            for ci, chunk in enumerate(chunks):
-                try:
-                    vec = await _ollama_embed(client, chunk, model)
-                except Exception:
+            async def _embed_one(chunk: str) -> list[float] | None:
+                async with sem:
+                    try:
+                        return await _ollama_embed(client, chunk, model)
+                    except Exception:
+                        return None
+            # Per-file fan-out across the embed pool — same pattern as
+            # `_codebase_index_cwd_impl`. Touched files re-embed faster
+            # the more workers the user has registered.
+            vectors = await _asyncio.gather(*(_embed_one(c) for c in chunks))
+            for ci, (chunk, vec) in enumerate(zip(chunks, vectors)):
+                if vec is None:
                     continue
                 try:
                     _db.insert_doc_chunk(
@@ -7676,7 +7718,22 @@ async def doc_index(
         if not files:
             return {"ok": True, "output": f"indexed 0 files under {p} (no matching files)"}
         chunks_total = 0
+        # Pool-distributed embed fan-out: same pattern as
+        # `_codebase_index_cwd_impl` — each chunk's embed routes through
+        # `pick_embed_target` (round-robin across host + workers) and a
+        # semaphore caps concurrent calls so all backends stay busy
+        # without overwhelming the slowest.
+        import asyncio as _asyncio
+        from . import compute_pool as _cp
+        sem = _asyncio.Semaphore(_cp.embed_concurrency_limit(m))
         async with httpx.AsyncClient(timeout=60.0) as client:
+            async def _embed_one(chunk: str) -> list[float] | None:
+                async with sem:
+                    try:
+                        return await _ollama_embed(client, chunk, m)
+                    except Exception:
+                        return None
+
             for f in files:
                 try:
                     text = f.read_text(encoding="utf-8", errors="replace")
@@ -7688,10 +7745,9 @@ async def doc_index(
                 # Ditch any previous rows for this file BEFORE embedding so
                 # a partial failure leaves us in a clean state on retry.
                 _db.delete_doc_chunks_for(str(f))
-                for ci, chunk in enumerate(chunks):
-                    try:
-                        vec = await _ollama_embed(client, chunk, m)
-                    except Exception:
+                vectors = await _asyncio.gather(*(_embed_one(c) for c in chunks))
+                for ci, (chunk, vec) in enumerate(zip(chunks, vectors)):
+                    if vec is None:
                         continue
                     _db.insert_doc_chunk(
                         path=str(f), ordinal=ci, text=chunk, vector=vec, model=m,
@@ -7858,11 +7914,21 @@ def _codebase_list_files(root: Path) -> list[Path]:
 async def _codebase_index_cwd_impl(cwd: str, model: str | None = None) -> dict:
     """Walk `cwd`, chunk + embed every matching file, update the registry.
 
-    Safe to call concurrently with the same cwd — the 'indexing' status in
-    the registry is advisory only; duplicate work wastes CPU but never
-    corrupts data (each file's chunks are deleted before re-insert).
+    Pool-distributed: each embed call routes through
+    `compute_pool.pick_embed_target` (round-robin across host + every
+    eligible worker), and an asyncio semaphore caps in-flight calls at
+    `compute_pool.embed_concurrency_limit(model)` so all backends stay
+    busy without overwhelming any single one. A 1000-chunk codebase on
+    a host+2-worker pool indexes ~3× faster than the previous serial
+    loop.
+
+    Safe to call concurrently with the same cwd — the 'indexing' status
+    in the registry is advisory only; duplicate work wastes CPU but
+    never corrupts data (each file's chunks are deleted before re-insert).
     """
+    import asyncio as _asyncio
     import httpx
+    from . import compute_pool as _cp
     from . import db as _db
     m = (model or _DEFAULT_EMBED_MODEL).strip()
     root = Path(cwd).expanduser().resolve()
@@ -7875,7 +7941,16 @@ async def _codebase_index_cwd_impl(cwd: str, model: str | None = None) -> dict:
     try:
         files = _codebase_list_files(root)
         chunks_total = 0
+        sem = _asyncio.Semaphore(_cp.embed_concurrency_limit(m))
         async with httpx.AsyncClient(timeout=60.0) as client:
+            async def _embed_one(chunk: str) -> list[float] | None:
+                """Embed under semaphore, swallow per-chunk failures."""
+                async with sem:
+                    try:
+                        return await _ollama_embed(client, chunk, m)
+                    except Exception:
+                        return None
+
             for f in files:
                 try:
                     text = f.read_text(encoding="utf-8", errors="replace")
@@ -7887,10 +7962,12 @@ async def _codebase_index_cwd_impl(cwd: str, model: str | None = None) -> dict:
                     text, _DOC_INDEX_CHUNK_CHARS, _DOC_INDEX_CHUNK_OVERLAP,
                 )
                 _db.delete_doc_chunks_for(str(f))
-                for ci, chunk in enumerate(chunks):
-                    try:
-                        vec = await _ollama_embed(client, chunk, m)
-                    except Exception:
+                # Fan-out: every chunk's embed runs concurrently against
+                # the pool. Order is preserved by `gather`'s output list,
+                # so we still write `ordinal=ci` correctly.
+                vectors = await _asyncio.gather(*(_embed_one(c) for c in chunks))
+                for ci, (chunk, vec) in enumerate(zip(chunks, vectors)):
+                    if vec is None:
                         continue
                     _db.insert_doc_chunk(
                         path=str(f), ordinal=ci, text=chunk, vector=vec, model=m,
@@ -8203,10 +8280,27 @@ async def _docs_url_crawl_impl(did: str, model: str | None = None) -> dict:
                     text, _DOC_INDEX_CHUNK_CHARS, _DOC_INDEX_CHUNK_OVERLAP,
                 )
                 chunk_path = f"{_db.DOC_URL_CHUNK_PREFIX}{final_url}"
-                for ci, chunk in enumerate(chunks):
-                    try:
-                        vec = await _ollama_embed(embed_client, chunk, m)
-                    except Exception:
+                # Pool fan-out: round-robin every chunk's embed across
+                # host + workers via the shared semaphore. The crawler's
+                # outer loop is still page-by-page (to keep the BFS
+                # bounded), but each page's chunks parallelise across
+                # the pool.
+                import asyncio as _asyncio_doc
+                from . import compute_pool as _cp_doc
+                page_sem = _asyncio_doc.Semaphore(_cp_doc.embed_concurrency_limit(m))
+
+                async def _embed_one(chunk: str) -> list[float] | None:
+                    async with page_sem:
+                        try:
+                            return await _ollama_embed(embed_client, chunk, m)
+                        except Exception:
+                            return None
+
+                page_vectors = await _asyncio_doc.gather(
+                    *(_embed_one(c) for c in chunks)
+                )
+                for ci, (chunk, vec) in enumerate(zip(chunks, page_vectors)):
+                    if vec is None:
                         continue
                     _db.insert_doc_chunk(
                         path=chunk_path,

@@ -23,3 +23,5 @@ Don't leave any useless code. Remove it.
 After making changes, check if README.md file needs to be upadated.
 
 The code must be efficient
+
+Don't add any personal or sensitive stuff in commits

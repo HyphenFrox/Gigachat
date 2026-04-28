@@ -110,6 +110,42 @@ def find_ollama() -> str | None:
     return None
 
 
+def _recommend_ollama_num_parallel() -> int:
+    """Pick a reasonable `OLLAMA_NUM_PARALLEL` based on host VRAM.
+
+    Each parallel slot pre-allocates its own KV cache, so more slots
+    means more VRAM consumed at model load. Tuned to match what
+    `split_lifecycle._compute_optimal_parallel` would produce for the
+    typical chat model on the same hardware:
+
+      * <  6 GB VRAM (or no GPU)        → 1 slot   — tight, single-stream
+      * 6 – 12 GB VRAM (4-7 B Q4 fits)  → 2 slots  — small headroom for one batched draft / subagent
+      * 12 – 20 GB VRAM (8-13 B Q4)     → 4 slots  — comfortable for delegate_parallel
+      * ≥ 20 GB VRAM (workstation tier) → 8 slots  — saturates compute
+
+    Auto-adapts across NVIDIA / AMD / Intel iGPU / Apple Silicon /
+    CPU-only because sysdetect normalizes all of them to a single
+    `vram_gb` (for unified-memory / iGPU it reports the shared pool
+    that's actually available to llama.cpp). Returning 1 on detection
+    failure preserves the legacy single-slot behaviour.
+    """
+    try:
+        from . import sysdetect
+        spec = sysdetect.detect_system()
+        vram_gb = float(spec.get("vram_gb") or 0)
+    except Exception:
+        return 1
+    if vram_gb <= 0:
+        return 1
+    if vram_gb < 6:
+        return 1
+    if vram_gb < 12:
+        return 2
+    if vram_gb < 20:
+        return 4
+    return 8
+
+
 def _spawn_ollama(executable: str) -> subprocess.Popen | None:
     """Launch `ollama serve` in a detached subprocess.
 
@@ -121,12 +157,23 @@ def _spawn_ollama(executable: str) -> subprocess.Popen | None:
 
     Stdio is redirected to DEVNULL because we don't consume it and leaving
     it attached would fill OS pipe buffers over long sessions.
+
+    Environment: we set `OLLAMA_NUM_PARALLEL` to a hardware-tuned value
+    so concurrent chats (subagent fan-out, multiple browser tabs)
+    actually batch in Ollama's runner instead of serializing on a
+    single decoding slot. The user's existing env wins — we only set
+    the var when it isn't already configured, so explicit overrides
+    aren't clobbered.
     """
+    env = os.environ.copy()
+    if not env.get("OLLAMA_NUM_PARALLEL"):
+        env["OLLAMA_NUM_PARALLEL"] = str(_recommend_ollama_num_parallel())
     kwargs: dict = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
         "close_fds": True,
+        "env": env,
     }
     if sys.platform == "win32":
         # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP tells Windows to spawn
