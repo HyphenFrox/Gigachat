@@ -215,13 +215,28 @@ async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
         "    driver_version = $_.DriverVersion"
         "  }"
         "};"
+        # Detect llama-server availability on the worker. The same
+        # binary set ships rpc-server, llama-cli, AND llama-server, so
+        # any worker that hosts rpc-server probably also has llama-
+        # server — but we check explicitly so future v2 routing
+        # (worker-side speculative spawn) can rely on this signal.
+        "$llama_server = $null;"
+        "$candidates = @("
+        "  \"$env:USERPROFILE\\.gigachat\\llama-cpp\\llama-server.exe\","
+        "  \"llama-server.exe\""
+        ");"
+        "foreach ($c in $candidates) {"
+        "  $resolved = Get-Command $c -ErrorAction SilentlyContinue;"
+        "  if ($resolved) { $llama_server = $resolved.Source; break }"
+        "};"
         "$out = [pscustomobject]@{"
         "  cpu_name = $cpu.Name;"
         "  cpu_cores = $cpu.NumberOfCores;"
         "  cpu_threads = $cpu.NumberOfLogicalProcessors;"
         "  ram_total_gb = [math]::Round($cs.TotalPhysicalMemory/1GB, 1);"
         "  ram_free_gb = [math]::Round($os.FreePhysicalMemory/1MB, 1);"
-        "  gpus = $gpus"
+        "  gpus = $gpus;"
+        "  llama_server_path = $llama_server"
         "};"
         "$out | ConvertTo-Json -Compress -Depth 4"
     )
@@ -2888,6 +2903,161 @@ def _gguf_tokenizer_fingerprint(gguf_path: str) -> str | None:
 
     _TOKENIZER_FINGERPRINT_CACHE[gguf_path] = (mtime, fingerprint)
     return fingerprint
+
+
+# ---------------------------------------------------------------------------
+# Pool-wide model-inventory summary
+#
+# `pool_inventory_summary()` consolidates the per-node model lists into a
+# single per-model view: which nodes hold each model, how much disk that
+# model occupies in aggregate across the pool, and how much of that is
+# redundant (same blob duplicated on multiple nodes). The Settings UI
+# uses this for a "pool storage" panel and the dedup advisor surfaces
+# concrete reclaim targets without prescribing removal.
+#
+# Shipping this as a read-only summary first — the operator decides what
+# to delete based on their own routing preferences. Auto-deletion would
+# need to confirm the model isn't currently the chat target on the node
+# in question, which the inventory itself can't see.
+# ---------------------------------------------------------------------------
+
+
+def pool_inventory_summary() -> dict:
+    """Return a per-model breakdown of where every chat-capable model
+    sits in the pool, plus aggregate disk-pressure totals.
+
+    Shape::
+
+        {
+          "models": [
+            {
+              "name": "llama3:8b",
+              "family": "llama",
+              "size_bytes": 4_500_000_000,
+              "locations": ["host", "worker:wid-A", "worker:wid-B"],
+              "copies": 3,
+              "redundant_bytes": 9_000_000_000,  # (copies - 1) * size_bytes
+            },
+            ...
+          ],
+          "total_unique_bytes": 24_300_000_000,
+          "total_pool_bytes": 39_500_000_000,
+          "total_redundant_bytes": 15_200_000_000,
+        }
+
+    A model is "redundant" when more than one node holds it. The user
+    might still want all those copies (e.g. each worker is a chat
+    target for that model), so the summary doesn't prescribe deletion
+    — `pool_dedup_recommendations()` does that with explicit
+    safe-to-remove logic.
+    """
+    by_name: dict[str, dict] = {}
+    for entry in _pool_model_inventory():
+        bucket = by_name.setdefault(
+            entry["name"],
+            {
+                "name": entry["name"],
+                "family": entry["family"],
+                "size_bytes": entry["size_bytes"],
+                "locations": [],
+            },
+        )
+        # Take the largest size_bytes any node reports — workers may
+        # under-count for an in-flight transfer; we want the real
+        # blob size for the dedup math.
+        if entry["size_bytes"] > bucket["size_bytes"]:
+            bucket["size_bytes"] = entry["size_bytes"]
+        if entry["source"] not in bucket["locations"]:
+            bucket["locations"].append(entry["source"])
+
+    models: list[dict] = []
+    total_pool_bytes = 0
+    total_unique_bytes = 0
+    total_redundant_bytes = 0
+    for entry in by_name.values():
+        copies = len(entry["locations"])
+        size = entry["size_bytes"]
+        redundant = (copies - 1) * size if copies > 1 else 0
+        models.append({
+            **entry,
+            "copies": copies,
+            "redundant_bytes": redundant,
+        })
+        total_pool_bytes += copies * size
+        total_unique_bytes += size
+        total_redundant_bytes += redundant
+
+    # Sort by redundant-bytes descending so the heaviest dedup wins
+    # surface first in the Settings UI.
+    models.sort(key=lambda m: m["redundant_bytes"], reverse=True)
+
+    return {
+        "models": models,
+        "total_unique_bytes": total_unique_bytes,
+        "total_pool_bytes": total_pool_bytes,
+        "total_redundant_bytes": total_redundant_bytes,
+    }
+
+
+def pool_dedup_recommendations() -> list[dict]:
+    """Suggest which redundant copies are *safe* to delete.
+
+    Heuristic: for each model with copies > 1, recommend keeping the
+    copy on the strongest node (host wins ties; among workers,
+    `_capability_score` ranks). Other copies are listed as removable
+    with the disk savings they'd reclaim.
+
+    Returns a list of dicts shaped::
+
+        {
+          "model": "llama3:8b",
+          "size_bytes": 4_500_000_000,
+          "keep_at": "host",
+          "remove_from": ["worker:wid-B", "worker:wid-C"],
+          "bytes_reclaimed": 9_000_000_000,
+        }
+
+    Empty list when nothing is dedup-able. The recommendation is
+    advisory — operator decides whether their routing pattern wants
+    to keep redundant copies (e.g. for fail-over or for cases where
+    the worker's local model serves its own chat target).
+    """
+    workers = {w["id"]: w for w in db.list_compute_workers(enabled_only=True)}
+    summary = pool_inventory_summary()
+    out: list[dict] = []
+    for entry in summary["models"]:
+        if entry["copies"] <= 1:
+            continue
+        locations = list(entry["locations"])
+        # Rank locations: host first, then workers by capability score
+        # (strongest worker wins so we keep the copy where chat is
+        # most likely to be routed anyway).
+
+        def _rank(loc: str) -> tuple:
+            if loc == "host":
+                return (0,)  # host wins
+            wid = loc.split(":", 1)[1] if ":" in loc else ""
+            w = workers.get(wid)
+            if not w:
+                # Unknown worker — keep at the back of the queue.
+                return (3,)
+            score = _capability_score(w)
+            # Negate the tuple's numeric components so larger scores
+            # sort to the front (after the host's leading 0).
+            return (1, -float(score[0] or 0), -float(score[1] or 0))
+
+        locations.sort(key=_rank)
+        keep = locations[0]
+        remove = locations[1:]
+        out.append({
+            "model": entry["name"],
+            "size_bytes": entry["size_bytes"],
+            "keep_at": keep,
+            "remove_from": remove,
+            "bytes_reclaimed": entry["size_bytes"] * len(remove),
+        })
+    out.sort(key=lambda r: r["bytes_reclaimed"], reverse=True)
+    return out
 
 
 # ---------------------------------------------------------------------------

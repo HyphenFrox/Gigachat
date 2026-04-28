@@ -552,6 +552,73 @@ def test_pick_embed_target_returns_none_when_no_eligible_workers(monkeypatch):
     assert compute_pool.pick_embed_target("nomic-embed-text") is None
 
 
+# --- Pool inventory + dedup advisor --------------------------------------
+
+
+def test_pool_inventory_summary_aggregates_per_model(monkeypatch):
+    """Two nodes hold the same model → summary reports it once with
+    `copies=2` and `redundant_bytes = size_bytes`."""
+    _stub_inventory(monkeypatch, [
+        {"name": "llama3:8b", "family": "llama", "size_bytes": 5_000_000_000, "source": "host"},
+        {"name": "llama3:8b", "family": "llama", "size_bytes": 5_000_000_000, "source": "worker:wA"},
+        {"name": "qwen2.5:0.5b", "family": "qwen2", "size_bytes": 400_000_000, "source": "host"},
+    ])
+    summary = compute_pool.pool_inventory_summary()
+    by_name = {m["name"]: m for m in summary["models"]}
+    assert by_name["llama3:8b"]["copies"] == 2
+    assert by_name["llama3:8b"]["redundant_bytes"] == 5_000_000_000
+    assert sorted(by_name["llama3:8b"]["locations"]) == ["host", "worker:wA"]
+    assert by_name["qwen2.5:0.5b"]["copies"] == 1
+    assert by_name["qwen2.5:0.5b"]["redundant_bytes"] == 0
+
+
+def test_pool_inventory_totals_account_for_all_copies(monkeypatch):
+    """`total_pool_bytes` counts every copy; `total_unique_bytes`
+    counts each model once; `total_redundant_bytes` is the difference
+    between them — the disk footprint a perfect dedup would reclaim."""
+    _stub_inventory(monkeypatch, [
+        {"name": "A:1", "family": "fam", "size_bytes": 1_000_000_000, "source": "host"},
+        {"name": "A:1", "family": "fam", "size_bytes": 1_000_000_000, "source": "worker:wA"},
+        {"name": "A:1", "family": "fam", "size_bytes": 1_000_000_000, "source": "worker:wB"},
+        {"name": "B:1", "family": "fam", "size_bytes": 500_000_000, "source": "host"},
+    ])
+    s = compute_pool.pool_inventory_summary()
+    assert s["total_unique_bytes"] == 1_500_000_000
+    assert s["total_pool_bytes"] == 3_500_000_000
+    assert s["total_redundant_bytes"] == 2_000_000_000
+
+
+def test_pool_dedup_recommends_keeping_host_copy(monkeypatch, isolated_db):
+    """Dedup advisor prefers keeping host's copy because it's the
+    most-likely chat target and a Phase 1 chat from another node would
+    have to round-trip back anyway."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _stub_inventory(monkeypatch, [
+        {"name": "A:1", "family": "fam", "size_bytes": 1_000_000_000, "source": "host"},
+        {"name": "A:1", "family": "fam", "size_bytes": 1_000_000_000, "source": "worker:wA"},
+        {"name": "A:1", "family": "fam", "size_bytes": 1_000_000_000, "source": "worker:wB"},
+    ])
+    # Workers exist for the dedup advisor to rank.
+    isolated_db.create_compute_worker(label="wA", address="a", enabled=True)
+    isolated_db.create_compute_worker(label="wB", address="b", enabled=True)
+
+    recs = compute_pool.pool_dedup_recommendations()
+    assert len(recs) == 1
+    assert recs[0]["model"] == "A:1"
+    assert recs[0]["keep_at"] == "host"
+    assert sorted(recs[0]["remove_from"]) == ["worker:wA", "worker:wB"]
+    assert recs[0]["bytes_reclaimed"] == 2_000_000_000
+
+
+def test_pool_dedup_skips_models_with_single_copy(monkeypatch):
+    """Models that exist on only one node have nothing to reclaim —
+    dedup advisor omits them entirely."""
+    _stub_inventory(monkeypatch, [
+        {"name": "solo:1", "family": "fam", "size_bytes": 1_000_000_000, "source": "host"},
+    ])
+    assert compute_pool.pool_dedup_recommendations() == []
+
+
 def test_pick_embed_target_excludes_dramatically_slower_worker(monkeypatch):
     """A worker measured at <50 % of the leader's TPS is excluded from
     the rotation — including it would slow the whole pool to its pace."""

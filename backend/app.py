@@ -3476,6 +3476,30 @@ def api_push_model_plan(wid: str, model: str) -> dict:
     }
 
 
+@app.get("/api/compute-pool/inventory")
+def api_pool_inventory() -> dict:
+    """Pool-wide model inventory + dedup recommendations.
+
+    Body shape::
+
+        {
+          "summary": <pool_inventory_summary output>,
+          "dedup_recommendations": <pool_dedup_recommendations output>,
+        }
+
+    The Settings UI's "Pool storage" panel renders this — the user can
+    see how much disk each model occupies across the pool, where every
+    copy lives, and which redundant copies could be safely removed.
+    Read-only: the API never deletes anything; the operator triggers
+    deletes through the existing Ollama CLI per node, or uses the
+    `pushModelToWorker` flow to redistribute.
+    """
+    return {
+        "summary": compute_pool.pool_inventory_summary(),
+        "dedup_recommendations": compute_pool.pool_dedup_recommendations(),
+    }
+
+
 @app.get("/api/compute-pool/acquisition/{model_name:path}")
 def api_acquisition_status(model_name: str) -> dict:
     """Return the live override-file acquisition status for `model_name`.
