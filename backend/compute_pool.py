@@ -1561,32 +1561,22 @@ _HOST_VRAM_USE_FRACTION = 0.85
 # (Ollama). Above → engage split path with workers.
 _HOST_TOTAL_USE_FRACTION = 0.70
 
-# Adaptive routing — per-model TPS history so the router can compare
-# host-vs-split throughput on a per-model basis. Schema:
-#     {model_name: {"host_tps": float|None, "split_tps": float|None,
-#                   "host_measured_at": float, "split_measured_at": float}}
-# Both samples carry timestamps so a stale measurement (e.g. host hardware
-# changed, a worker was added) ages out and triggers a re-bench.
+# Adaptive routing — pool-capacity heuristic for engaging Phase 2 even
+# when the model fits the host alone. We use a static threshold instead
+# of a measured-TPS bake-off because the chat layer doesn't currently
+# wire realised tokens-per-second back to the router; until that's
+# instrumented, "engage when the pool is meaningfully bigger than host"
+# is the safest proxy. The threshold below is conservative — pool VRAM
+# must exceed host VRAM by 50 % before we engage split, which avoids
+# regressing setups where pool ≈ host but split LAN-cost dominates.
+_POOL_VRAM_OUTSCALE_FACTOR = 1.5
+
+# Adaptive routing — per-model TPS history. Reserved for a future
+# commit that wires post-turn realised-TPS recording from agent.py;
+# until then the cache stays empty and the static
+# `_POOL_VRAM_OUTSCALE_FACTOR` heuristic above is what fires.
 _ROUTE_TPS_CACHE_TTL_SEC = 24 * 3600
 _ROUTE_TPS_CACHE: dict[str, dict] = {}
-
-
-def _aggressive_split_enabled() -> bool:
-    """When True, the router considers Phase 2 (layer-split) for every
-    model that has eligible rpc workers — even when the model fits the
-    host alone — and engages it whenever the cached TPS shows the split
-    path beats host-only. Default OFF: opt-in.
-
-    The setting is the user's "use the entire pool, even when it isn't
-    strictly necessary" lever. Turn on if your pool has fast LAN +
-    workers with proven VRAM (`max_vram_seen_bytes` populated) — that's
-    when split actually wins for fits-on-host models. Turn off if you've
-    measured a regression on your specific topology.
-    """
-    val = db.get_setting("compute_pool_aggressive_split")
-    if val is None or str(val).strip() == "":
-        return False
-    return str(val).lower() in ("1", "true", "yes", "on")
 
 
 def _record_route_tps(model_name: str, *, kind: str, tps: float) -> None:
@@ -1594,9 +1584,9 @@ def _record_route_tps(model_name: str, *, kind: str, tps: float) -> None:
 
     `kind` is `"host"` or `"split"`. Only TPS > 0 are recorded — a
     failed bench leaves the previous entry alone so a transient probe
-    error doesn't clobber valid data. Called from the chat layer when
-    a turn finishes (so the cache reflects realised throughput, not a
-    synthetic micro-bench).
+    error doesn't clobber valid data. Currently called from nowhere
+    (post-turn TPS recording is a future commit); shipped now so the
+    chat layer can be wired without a routing-policy change.
     """
     if tps <= 0 or kind not in ("host", "split"):
         return
@@ -1615,6 +1605,49 @@ def _route_tps_for(model_name: str, kind: str) -> float | None:
     if time.time() - measured_at > _ROUTE_TPS_CACHE_TTL_SEC:
         return None
     return float(val)
+
+
+def _should_force_split_for(
+    model_name: str,
+    *,
+    strongest_single_vram: int,
+    pool_vram_total: int,
+) -> bool:
+    """Decide whether to engage Phase 2 for a model that fits one node.
+
+    The comparison anchor is the **strongest single node** (host OR
+    a worker) — not just host. When a worker has more VRAM than host
+    AND can hold the model alone, Phase 1 routing already sends the
+    chat to that worker; engaging Phase 2 on top would just add LAN
+    overhead with no capacity win. So the heuristic only kicks in
+    when the pool is meaningfully bigger than the strongest single
+    node — which is when split actually adds memory the chat would
+    not otherwise have.
+
+    Two-step decision, with the measured-TPS cache preferred when
+    both samples exist; otherwise falls back to the pool-capacity
+    heuristic.
+
+    1. **Measured verdict.** When both host_tps and split_tps for
+       this model are in the cache and the cached samples are fresh,
+       engage split iff split_tps > host_tps. Ground truth.
+    2. **Heuristic verdict.** When TPS data is missing (cold start,
+       or the chat layer hasn't been wired to record TPS yet),
+       engage split iff `pool_vram_total ≥ strongest_single_vram *
+       _POOL_VRAM_OUTSCALE_FACTOR` (1.5×) AND there's at least one
+       eligible rpc worker. The 1.5× threshold avoids engaging when
+       the pool is barely bigger than the strongest single node —
+       LAN per-token cost would dominate the small capacity win.
+    """
+    split_tps = _route_tps_for(model_name, "split")
+    host_tps = _route_tps_for(model_name, "host")
+    if split_tps is not None and host_tps is not None:
+        return split_tps > host_tps
+    if not _eligible_split_workers():
+        return False
+    if strongest_single_vram <= 0:
+        return False
+    return pool_vram_total >= strongest_single_vram * _POOL_VRAM_OUTSCALE_FACTOR
 
 # Path to Ollama's on-disk model store. Default location on every
 # platform Ollama supports; matches what `ollama_runtime` assumes.
@@ -2929,18 +2962,6 @@ _TOOL_DISPATCH_INDEX: dict[str, int] = {}
 _DISPATCH_FETCH_TIMEOUT_SEC = 30.0
 
 
-def distributed_tools_enabled() -> bool:
-    """Read the user's `compute_pool_distribute_tools` setting.
-
-    Default OFF: opt-in. SSH dispatch is a clear win when host CPU is
-    saturated (mid-inference + concurrent fetches), and a small
-    regression otherwise. Users opt in once they've measured the win
-    on their own pool.
-    """
-    val = db.get_setting("compute_pool_distribute_tools")
-    if val is None or str(val).strip() == "":
-        return False
-    return str(val).lower() in ("1", "true", "yes", "on")
 
 
 def _pick_tool_dispatch_target() -> dict | None:
@@ -2986,9 +3007,12 @@ async def dispatch_fetch_url_to_worker(url: str) -> tuple[bool, bytes, str] | No
     this function is the security gate — we don't repeat it on the
     worker side because the URL crossed the trust boundary already
     vetted.
+
+    Engagement: always-on. If no eligible worker is reachable the
+    function returns ``None`` and the caller fetches on host. The win
+    appears when the host is busy with inference and a worker is
+    idle; the cost (one SSH dial) is bounded by `ConnectTimeout=30`.
     """
-    if not distributed_tools_enabled():
-        return None
     worker = _pick_tool_dispatch_target()
     if not worker:
         return None
@@ -3870,46 +3894,25 @@ async def route_chat_for(model_name: str) -> dict:
         # was loaded so far, not the worker's true VRAM ceiling).
         pool_vram_total = host_vram + sum(worker_vrams)
 
-    # Adaptive routing override: even when the model would fit one node,
-    # `compute_pool_aggressive_split` may force engaging the pool. The
-    # decision algorithm:
-    #
-    #   * If we've never sampled split for this model → engage split
-    #     once so the cache gets a measurement (the post-turn hook
-    #     records realised TPS).
-    #   * If we have both measurements → engage split only when its
-    #     TPS strictly exceeds host's; that's the "split actually
-    #     wins" condition.
-    #   * If we only have a host measurement → still try split once
-    #     to populate the missing sample. Single sampling cost; the
-    #     comparison kicks in on the next turn.
-    #   * If we only have a split measurement → continue using split;
-    #     comparison is meaningful once host is sampled (which the
-    #     legacy / non-aggressive default path will eventually do).
-    force_split_engagement = False
-    if _aggressive_split_enabled():
-        split_tps = _route_tps_for(model_name, "split")
-        host_tps = _route_tps_for(model_name, "host")
-        wants_split = False
-        if split_tps is None:
-            # No split sample yet — try once.
-            wants_split = True
-        elif host_tps is not None and split_tps > host_tps:
-            # Both measured; split won the bake-off.
-            wants_split = True
-        elif host_tps is None:
-            # Only split is measured — already using it; keep going.
-            wants_split = True
-        if wants_split and _eligible_split_workers():
-            log.info(
-                "compute_pool: aggressive_split engaged for %s "
-                "(host_tps=%s split_tps=%s)",
-                model_name, host_tps, split_tps,
-            )
-            force_split_engagement = True
-
     # Tier 1: fits the strongest single GPU (host or worker)?
     strongest_single_vram = max(host_vram, best_worker_capacity)
+
+    # Adaptive split engagement: even when one node fits the model,
+    # engage Phase 2 if the pool is MEANINGFULLY bigger than the
+    # strongest single node. Always-on — `_should_force_split_for`
+    # gates engagement on its own heuristics so setups where pool ≈
+    # strongest single node stay on the host path.
+    force_split_engagement = _should_force_split_for(
+        model_name,
+        strongest_single_vram=strongest_single_vram,
+        pool_vram_total=pool_vram_total,
+    )
+    if force_split_engagement:
+        log.info(
+            "compute_pool: adaptive split engaged for fits-on-host %s "
+            "(strongest_single_vram=%d pool_vram=%d)",
+            model_name, strongest_single_vram, pool_vram_total,
+        )
     if (
         not force_split_engagement
         and strongest_single_vram > 0

@@ -372,13 +372,13 @@ The override is consulted before the auto picker, and it skips every safety chec
 
 ### Other pool-saturation features
 
-Three opt-in / on-by-default knobs that recruit more of the pool's capacity for inference:
+All three are always-on. Each has its own engagement gate so it kicks in only when the pool would actually win — no flag to flip, no setting to tune.
 
-**Adaptive split-vs-host routing** (opt-in). Setting key `compute_pool_aggressive_split`. When ON, `route_chat_for` engages Phase 2 (layer-split) even for models that would fit a single node — but only when measured TPS shows split actually beats host on this exact model, OR when no measurement exists yet (first-time engagement is sampling). Per-model TPS history lives in `compute_pool._ROUTE_TPS_CACHE` with a 24-hour TTL. Useful for setups where the LAN + worker GPUs collectively beat single-host CPU offload — flip it on and let the cache settle on a verdict over the next few turns.
+**Adaptive split-vs-host routing.** When a model fits one node, `route_chat_for` still considers Phase 2 (layer-split). It engages iff the pool VRAM is ≥ 1.5× the strongest single node's VRAM — meaning split would unlock memory the chat couldn't otherwise reach. If the pool is barely bigger than the strongest single node, the LAN-cost overhead would dominate, so the heuristic stays off. Once realised TPS is recorded for both paths (post-turn measurement instrumentation is a future commit), the heuristic is bypassed and the comparison uses ground truth.
 
-**Round-robin embeddings** (always on). `pick_embed_target` now rotates across every worker that has the embedding model loaded and benches within 50 % of the leader's TPS. Codebase + document indexing (`tools._ollama_embed`) routes through this picker, so a 1000-chunk repo build parallelises across N workers instead of pinning to one. Outliers (a clearly-slower worker) are excluded from the rotation so the slow link doesn't drag the pool's effective throughput down.
+**Round-robin embeddings.** `pick_embed_target` rotates across every worker that has the embedding model loaded and benches within 50 % of the leader's TPS. Codebase + document indexing (`tools._ollama_embed`) routes through this picker, so a 1000-chunk repo build parallelises across N workers instead of pinning to one. Outliers (a clearly-slower worker) are excluded from the rotation so the slow link doesn't drag the pool's effective throughput down.
 
-**Distributed tool execution** (opt-in). Setting key `compute_pool_distribute_tools`. When ON, eligible tool calls (currently `fetch_url`) SSH into a round-robin-picked worker and run via PowerShell's `Invoke-WebRequest`. The worker's CPU/IO absorbs the fetch, freeing the host to keep generating tokens. Works without any worker-side install — just OpenSSH + PowerShell (both ship with Windows 10+ by default). The host still does trafilatura extraction locally because that step is pure-CPU and Python-dep-heavy; only the bytes-fetch is dispatched. SSRF and DNS-resolution checks happen on the host BEFORE the URL crosses the SSH boundary.
+**Distributed `fetch_url` dispatch.** Eligible tool calls SSH into a round-robin-picked worker and run via PowerShell's `Invoke-WebRequest`. The worker's CPU/IO absorbs the fetch, freeing the host to keep generating tokens. Engagement is automatic — when at least one worker has `ssh_host` configured and recently probed, fetches dispatch there; otherwise the host fetches as the safety-net fallback. Works without any worker-side install — just OpenSSH + PowerShell (both ship with Windows 10+ by default). The host still does trafilatura extraction locally because that step is pure-CPU and Python-dep-heavy; only the bytes-fetch is dispatched. SSRF and DNS-resolution checks happen on the host BEFORE the URL crosses the SSH boundary.
 
 #### Pool inventory + dedup advisor
 
@@ -607,14 +607,17 @@ A pytest suite covers the database layer, agent input queue, upload-name travers
 
 Three markers (`pytest.ini`):
 
-- **`smoke`** — fast, offline, platform-agnostic. Runs on every push in CI (`.github/workflows/ci.yml`).
+- **`smoke`** — fast, offline, platform-agnostic. The `pre-push` git hook (`.githooks/pre-push`) runs this tier before every push so regressions never reach the remote. There's no GitHub Actions workflow — local is the sole gate.
 - **`deep`** — slower or needs live services (Ollama / real HTTP). Run locally or nightly.
 - **`windows`** — needs Windows UIA / pyautogui; auto-skipped elsewhere.
 
 ```
 python -m pip install -r backend/requirements.txt
-python -m pytest -m smoke         # fast tier, ~15 s, 95 tests
+python -m pytest -m smoke         # fast tier, ~60 s, 419 tests
 python -m pytest                  # everything (drops Windows-only on Linux)
+
+# One-time setup so `git push` runs the smoke tier automatically:
+git config core.hooksPath .githooks
 ```
 
 The `isolated_db` fixture rewires `db.DB_PATH` to a tmp file per test, so the suite never touches `data/app.db`.

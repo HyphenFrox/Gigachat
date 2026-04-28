@@ -461,21 +461,54 @@ def test_pick_draft_prefers_host_when_worker_candidate_is_larger(monkeypatch):
 # --- Adaptive split-vs-host routing --------------------------------------
 
 
-def test_aggressive_split_default_off(isolated_db, monkeypatch):
-    """`compute_pool_aggressive_split` defaults to OFF — we don't want
-    the router silently flipping fits-on-host models onto a slower
-    path without measurement evidence."""
-    monkeypatch.setattr(compute_pool, "db", isolated_db)
-    assert compute_pool._aggressive_split_enabled() is False
+def test_should_force_split_uses_measured_verdict(monkeypatch):
+    """When both host and split TPS are cached and fresh, the heuristic
+    is bypassed and the router engages split iff split_tps > host_tps."""
+    compute_pool._ROUTE_TPS_CACHE.clear()
+    compute_pool._record_route_tps("llama3:8b", kind="host", tps=20.0)
+    compute_pool._record_route_tps("llama3:8b", kind="split", tps=35.0)
+    monkeypatch.setattr(compute_pool, "_eligible_split_workers", lambda: [{"id": "w"}])
+    # Heuristic-irrelevant: both samples present, split is faster.
+    assert compute_pool._should_force_split_for(
+        "llama3:8b", strongest_single_vram=8_000_000_000, pool_vram_total=8_500_000_000,
+    ) is True
 
 
-def test_aggressive_split_round_trip(isolated_db, monkeypatch):
-    """Persisting the setting flips the helper's verdict."""
-    monkeypatch.setattr(compute_pool, "db", isolated_db)
-    isolated_db.set_setting("compute_pool_aggressive_split", "true")
-    assert compute_pool._aggressive_split_enabled() is True
-    isolated_db.set_setting("compute_pool_aggressive_split", "0")
-    assert compute_pool._aggressive_split_enabled() is False
+def test_should_force_split_respects_measured_loss(monkeypatch):
+    """Measured split slower than host → don't engage even if pool
+    capacity heuristic would otherwise want it."""
+    compute_pool._ROUTE_TPS_CACHE.clear()
+    compute_pool._record_route_tps("llama3:8b", kind="host", tps=40.0)
+    compute_pool._record_route_tps("llama3:8b", kind="split", tps=15.0)
+    monkeypatch.setattr(compute_pool, "_eligible_split_workers", lambda: [{"id": "w"}])
+    assert compute_pool._should_force_split_for(
+        "llama3:8b", strongest_single_vram=8_000_000_000, pool_vram_total=40_000_000_000,
+    ) is False
+
+
+def test_should_force_split_falls_back_to_capacity_heuristic(monkeypatch):
+    """No TPS cache → engage when pool VRAM ≥ 1.5× host VRAM and rpc
+    workers are eligible."""
+    compute_pool._ROUTE_TPS_CACHE.clear()
+    monkeypatch.setattr(compute_pool, "_eligible_split_workers", lambda: [{"id": "w"}])
+    # Pool 16GB vs host 8GB → 2× factor → engage.
+    assert compute_pool._should_force_split_for(
+        "llama3:8b", strongest_single_vram=8_000_000_000, pool_vram_total=16_000_000_000,
+    ) is True
+    # Pool 9GB vs host 8GB → 1.125× factor → below threshold, skip.
+    assert compute_pool._should_force_split_for(
+        "llama3:8b", strongest_single_vram=8_000_000_000, pool_vram_total=9_000_000_000,
+    ) is False
+
+
+def test_should_force_split_returns_false_without_rpc_workers(monkeypatch):
+    """Even with measured split-wins or capacity-wins, no rpc workers =
+    no engagement. Phase 2 needs at least one `--rpc` target."""
+    compute_pool._ROUTE_TPS_CACHE.clear()
+    monkeypatch.setattr(compute_pool, "_eligible_split_workers", lambda: [])
+    assert compute_pool._should_force_split_for(
+        "llama3:8b", strongest_single_vram=8_000_000_000, pool_vram_total=40_000_000_000,
+    ) is False
 
 
 def test_route_tps_cache_round_trips_recent_measurement():
@@ -622,35 +655,11 @@ def test_pool_dedup_skips_models_with_single_copy(monkeypatch):
 # --- Distributed tool execution (fetch_url SSH dispatch) -----------------
 
 
-def test_distributed_tools_default_off(isolated_db, monkeypatch):
-    """Default OFF — opt-in. SSH dispatch's overhead is only worth it
-    when host CPU is saturated; otherwise it's a regression."""
-    monkeypatch.setattr(compute_pool, "db", isolated_db)
-    assert compute_pool.distributed_tools_enabled() is False
-
-
-def test_distributed_tools_round_trip(isolated_db, monkeypatch):
-    """Setting controls the helper's verdict in both directions."""
-    monkeypatch.setattr(compute_pool, "db", isolated_db)
-    isolated_db.set_setting("compute_pool_distribute_tools", "true")
-    assert compute_pool.distributed_tools_enabled() is True
-    isolated_db.set_setting("compute_pool_distribute_tools", "false")
-    assert compute_pool.distributed_tools_enabled() is False
-
-
-async def test_dispatch_fetch_returns_none_when_disabled(isolated_db, monkeypatch):
-    """`compute_pool_distribute_tools=false` short-circuits before any
-    worker enumeration — caller falls back to host fetch silently."""
-    monkeypatch.setattr(compute_pool, "db", isolated_db)
-    result = await compute_pool.dispatch_fetch_url_to_worker("https://example.com")
-    assert result is None
-
-
 async def test_dispatch_fetch_returns_none_when_no_eligible_workers(isolated_db, monkeypatch):
-    """Setting on but no workers configured → `None` so the host falls
-    back. We never block the chat on a missing pool."""
+    """No workers configured → `None` so the caller falls back to host.
+    We never block the chat on a missing pool. (Always-on by design;
+    the gate is whether an eligible worker exists, not a setting flag.)"""
     monkeypatch.setattr(compute_pool, "db", isolated_db)
-    isolated_db.set_setting("compute_pool_distribute_tools", "true")
     result = await compute_pool.dispatch_fetch_url_to_worker("https://example.com")
     assert result is None
 
