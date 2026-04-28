@@ -255,16 +255,36 @@ async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
         "    } catch {}"
         "  }"
         "};"
+        # Disk space on the system drive — primarily used to gate
+        # storage-pool decisions (where to land a new model pull,
+        # whether a worker can absorb a 17 GB GGUF override). Returns
+        # both total and free so the inventory UI can show usage
+        # progress per worker.
+        "$drive = Get-PSDrive -Name ($env:SystemDrive.TrimEnd(':')) -ErrorAction SilentlyContinue;"
+        "$disk_total_gb = if ($drive) { [math]::Round(($drive.Used + $drive.Free)/1GB, 1) } else { 0 };"
+        "$disk_free_gb = if ($drive) { [math]::Round($drive.Free/1GB, 1) } else { 0 };"
+        # Cached override-GGUF files under our private install dir.
+        # Surfaces which models the worker can serve without an
+        # over-the-LAN re-stream from host on the next spawn.
+        "$cached = @();"
+        "$cache_dir = \"$env:USERPROFILE\\.gigachat\\llama-cpp\\models\";"
+        "if (Test-Path $cache_dir) {"
+        "  Get-ChildItem -Path $cache_dir -Filter *.gguf -ErrorAction SilentlyContinue |"
+        "    ForEach-Object { $cached += $_.Name }"
+        "};"
         "$out = [pscustomobject]@{"
         "  cpu_name = $cpu.Name;"
         "  cpu_cores = $cpu.NumberOfCores;"
         "  cpu_threads = $cpu.NumberOfLogicalProcessors;"
         "  ram_total_gb = [math]::Round($cs.TotalPhysicalMemory/1GB, 1);"
         "  ram_free_gb = [math]::Round($os.FreePhysicalMemory/1MB, 1);"
+        "  disk_total_gb = $disk_total_gb;"
+        "  disk_free_gb = $disk_free_gb;"
         "  gpus = $gpus;"
         "  llama_server_path = $llama_server;"
         "  read_doc_libs = $read_doc_libs;"
-        "  has_ddgs = $has_ddgs"
+        "  has_ddgs = $has_ddgs;"
+        "  cached_overrides = $cached"
         "};"
         "$out | ConvertTo-Json -Compress -Depth 4"
     )
@@ -1062,6 +1082,100 @@ async def probe_all_enabled() -> list[dict]:
 _PROBE_TASK: asyncio.Task | None = None
 
 
+# How many files to re-embed in a single idle sweep. Caps the cost so
+# one sweep can't dominate a 5-min cycle and starve the next probe.
+# At ~10 chunks per file × ~200 ms per embed (worker on Wi-Fi), 20
+# files is ~40 s of work — comfortable inside a 300 s window.
+_IDLE_REINDEX_MAX_FILES_PER_RUN = 20
+
+
+async def _drain_idle_reindex() -> int:
+    """Reembed files modified since their last index, during pool idle time.
+
+    Source files edited externally (IDE writes, git checkouts, build
+    artifacts) bypass the post-`write_file` invalidation that runs
+    inline. This sweep catches those by walking every `status=ready`
+    codebase index and reembedding any file whose mtime is newer than
+    the index's `last_indexed_at`.
+
+    Skips when ANY conversation is mid-turn anywhere in the pool —
+    we don't want to compete with the active chat for embed workers.
+    Caps at `_IDLE_REINDEX_MAX_FILES_PER_RUN` per sweep so one cycle
+    can't starve the next probe.
+
+    Returns the number of files reembedded so the caller can log.
+    """
+    # Skip when any chat turn is active. The active-turn counter is
+    # populated by `register_turn_start` from the agent loop; if any
+    # node has count > 0, somebody is actively chatting and we should
+    # not steal embed bandwidth.
+    if any(c > 0 for c in _ACTIVE_TURNS_PER_NODE.values()):
+        return 0
+
+    try:
+        indexes = db.list_codebase_indexes()
+    except Exception:
+        return 0
+    ready = [i for i in indexes if i.get("status") == "ready"]
+    if not ready:
+        return 0
+
+    # Local imports — `tools` imports `compute_pool` at module scope,
+    # so we defer the reverse import until call time to avoid a cycle.
+    from . import tools as _tools
+    from pathlib import Path as _Path
+
+    files_processed = 0
+    for idx in ready:
+        if files_processed >= _IDLE_REINDEX_MAX_FILES_PER_RUN:
+            break
+        cwd = idx.get("cwd")
+        last_indexed = float(idx.get("last_indexed_at") or 0)
+        if not cwd or not last_indexed:
+            continue
+        try:
+            root_path = _Path(cwd)
+            if not root_path.is_dir():
+                continue
+            files = _tools._codebase_list_files(root_path)
+        except Exception:
+            continue
+        for f in files:
+            if files_processed >= _IDLE_REINDEX_MAX_FILES_PER_RUN:
+                break
+            try:
+                if f.stat().st_mtime <= last_indexed:
+                    continue
+            except OSError:
+                continue
+            # Reembed this file — `_reembed_codebase_file` deletes its
+            # existing chunks first so a partial failure leaves the
+            # row in a recoverable state.
+            try:
+                db.delete_doc_chunks_for(str(f))
+                await _tools._reembed_codebase_file(
+                    str(f), _tools._DEFAULT_EMBED_MODEL,
+                )
+                files_processed += 1
+            except Exception:
+                continue
+        # Stamp last_indexed_at so the next sweep doesn't redo what
+        # we just covered — only files modified AFTER this stamp will
+        # match next time.
+        if files_processed > 0:
+            try:
+                db.upsert_codebase_index(cwd, last_indexed_at=time.time())
+            except Exception:
+                pass
+
+    if files_processed:
+        log.info(
+            "compute_pool: idle re-index reembedded %d modified file(s)",
+            files_processed,
+        )
+    return files_processed
+
+
 async def _periodic_loop() -> None:
     """Internal: sweep every `_SWEEP_INTERVAL_SEC`. Started/stopped via
     `start_periodic_probe` / `stop_periodic_probe` on app lifecycle.
@@ -1070,6 +1184,9 @@ async def _periodic_loop() -> None:
     routing calls deferred. Doing it here (rather than from the
     routing call) keeps SCP off the chat hot path — bench-confirmed
     win in commit 18.
+
+    Background idle re-index runs LAST so it sees fresh worker probe
+    data and doesn't compete with the SCP drain for SSH bandwidth.
     """
     while True:
         try:
@@ -1087,6 +1204,13 @@ async def _periodic_loop() -> None:
                 log.info("compute_pool: started %d deferred LAN-copy task(s)", n)
         except Exception as e:
             log.warning("compute_pool: drain_deferred_syncs failed: %s", e)
+        # Idle pool re-index — uses spare embed bandwidth to keep RAG
+        # vectors fresh without blocking active chats. Skipped when a
+        # chat is in flight.
+        try:
+            await _drain_idle_reindex()
+        except Exception as e:
+            log.warning("compute_pool: _drain_idle_reindex failed: %s", e)
         try:
             await asyncio.sleep(_SWEEP_INTERVAL_SEC)
         except asyncio.CancelledError:
@@ -1408,6 +1532,121 @@ async def drain_deferred_syncs() -> int:
 _EMBED_TARGET_INDEX: dict[str, int] = {}
 
 
+# ---------------------------------------------------------------------------
+# Per-conversation worker affinity
+#
+# Without affinity, every turn re-runs `pick_chat_target` and routes to
+# the strongest node — but two simultaneously-active conversations both
+# pile onto the same strongest node, queueing serially even though the
+# rest of the pool sits idle. With affinity, the first turn lands on
+# whichever node is least-loaded among eligible candidates and that
+# (conversation, node) pair sticks for subsequent turns. KV cache stays
+# warm per-conversation, AND multiple concurrent conversations naturally
+# spread across the pool.
+#
+# In-memory state — affinity is best-effort; a backend restart resets
+# every pairing and the next turn re-picks. The KV cache is process-
+# local on each node anyway, so a restart was going to lose the warmth
+# regardless. Active-turn counters are also in-memory; they undercount
+# briefly across a restart but recover on the first new turn.
+# ---------------------------------------------------------------------------
+
+# conv_id → "host" | "worker:<wid>"
+_CONV_AFFINITY: dict[str, str] = {}
+
+# node_id → count of currently-running chat turns. Used to break ties
+# when two equally-strong nodes are both eligible — the least-busy
+# wins so concurrent conversations spread automatically.
+_ACTIVE_TURNS_PER_NODE: dict[str, int] = {}
+
+
+def _node_id_for_target(target: tuple[str, str | None] | None) -> str:
+    """Translate a `pick_chat_target` return value into a node identifier.
+
+    `pick_chat_target` returns ``(base_url, token)`` for a worker or
+    ``None`` for host. We collapse to a string so affinity / active-
+    turn tables can key uniformly.
+    """
+    if target is None:
+        return "host"
+    base_url = (target[0] or "").rstrip("/")
+    # Look up the worker row matching this base_url so the node_id
+    # ties to a stable identifier (worker IDs are durable; URLs may
+    # change across DHCP rebinds).
+    for w in db.list_compute_workers(enabled_only=False):
+        if _worker_base_url(w).rstrip("/") == base_url:
+            return f"worker:{w['id']}"
+    return "host"
+
+
+def register_turn_start(conv_id: str, node_id: str) -> None:
+    """Record that ``conv_id`` is now actively running a turn on ``node_id``.
+
+    Updates two structures:
+      * `_CONV_AFFINITY[conv_id] = node_id` — sticks the conversation
+        to this node for subsequent turns so KV cache stays warm.
+      * `_ACTIVE_TURNS_PER_NODE[node_id] += 1` — load counter that
+        future picks consult to break ties between equally-eligible
+        nodes.
+
+    Idempotent: calling twice for the same (conv, node) bumps the
+    counter twice. Caller MUST balance every start with `register_turn_end`.
+    """
+    if not conv_id or not node_id:
+        return
+    _CONV_AFFINITY[conv_id] = node_id
+    _ACTIVE_TURNS_PER_NODE[node_id] = _ACTIVE_TURNS_PER_NODE.get(node_id, 0) + 1
+
+
+def register_turn_end(conv_id: str, node_id: str) -> None:
+    """Counterpart to `register_turn_start`. Decrement the load counter.
+
+    Affinity persists past turn end on purpose — the next turn for
+    this conversation should land on the same node. Affinity is only
+    cleared when the node goes ineligible (worker disabled / probe
+    failing) or by an explicit `forget_conv_affinity` call.
+    """
+    if not node_id:
+        return
+    cur = _ACTIVE_TURNS_PER_NODE.get(node_id, 0)
+    _ACTIVE_TURNS_PER_NODE[node_id] = max(0, cur - 1)
+
+
+def forget_conv_affinity(conv_id: str) -> None:
+    """Drop the affinity record for ``conv_id``. Called when the
+    conversation is deleted so the in-memory dict doesn't grow forever.
+    """
+    _CONV_AFFINITY.pop(conv_id, None)
+
+
+_COMPACTION_TARGET_INDEX: dict[str, int] = {}
+
+
+def pick_compaction_target(model: str) -> tuple[str, str | None] | None:
+    """Choose a node to run an auto-compaction summarization, preferring
+    workers over host.
+
+    Why: compaction is a real LLM call against the chat model; running
+    it on the host while the chat is also hot on host slows down the
+    user's ongoing turn. When a worker has the model installed, route
+    compaction there — host stays free for the active chat.
+
+    Round-robins across eligible workers so back-to-back compactions
+    spread across the pool. Returns ``None`` (host fallback) when no
+    worker has the model — preserves the previous host-only behavior
+    on single-node setups.
+    """
+    cands = _eligible_workers("use_for_chat", model=model)
+    if not cands:
+        return None
+    idx = _COMPACTION_TARGET_INDEX.get(model, 0)
+    pick = cands[idx % len(cands)]
+    _COMPACTION_TARGET_INDEX[model] = (idx + 1) % len(cands)
+    base = _worker_base_url(pick)
+    token = db.get_compute_worker_auth_token(pick["id"])
+    return base, token
+
+
 def embed_concurrency_limit(model: str) -> int:
     """Recommend an in-flight embed-call cap for a given model.
 
@@ -1505,7 +1744,9 @@ def _scaled_score_threshold(top_score: tuple) -> tuple:
     return (halved,) + tuple(top_score[1:])
 
 
-def pick_chat_target(model: str) -> tuple[str, str | None] | None:
+def pick_chat_target(
+    model: str, conv_id: str | None = None,
+) -> tuple[str, str | None] | None:
     """Choose where the chat turn runs — return (base_url, token) for a
     worker, or None to keep it on host.
 
@@ -1522,11 +1763,75 @@ def pick_chat_target(model: str) -> tuple[str, str | None] | None:
       * both have a GPU but the worker has loaded a model larger than
         the host's total VRAM (max_vram_seen_bytes > host_vram_bytes),
         which is a hard lower-bound proof of more capacity.
+
+    When ``conv_id`` is supplied AND a previous turn for the same
+    conversation already landed on a node, the router prefers that
+    node (KV cache stays warm). Affinity is overridden when the
+    sticky node has gone ineligible (worker disabled / probe failing)
+    or is more than one active turn behind the next-strongest node —
+    at which point we re-pick and update the affinity.
+
+    Tie-breaking (when two equally-strong nodes are eligible) prefers
+    the one with FEWER currently-running turns so concurrent
+    conversations spread across the pool instead of stacking on the
+    strongest single node.
     """
     cands = _eligible_workers("use_for_chat", model=model)
+
+    # Affinity short-circuit: if this conversation already has a sticky
+    # node and that node is still eligible AND not heavily loaded vs.
+    # the alternatives, return the affinity choice without re-scoring.
+    sticky = _CONV_AFFINITY.get(conv_id) if conv_id else None
+    if sticky:
+        sticky_load = _ACTIVE_TURNS_PER_NODE.get(sticky, 0)
+        if sticky == "host":
+            # Affinity to host — return None unless a worker has become
+            # dramatically more capable since we last picked. Cheap
+            # comparison: if no eligible worker exists, host wins.
+            if not cands:
+                return None
+            # Otherwise fall through to the standard host-vs-worker
+            # comparison below; the affinity hint is a tiebreaker, not
+            # an override of the strength rule.
+        else:
+            wid = sticky.split(":", 1)[1] if ":" in sticky else ""
+            sticky_w = next((w for w in cands if w["id"] == wid), None)
+            if sticky_w is not None:
+                # Sticky worker still eligible — return it unless a
+                # MUCH less-loaded alternative exists (load delta ≥ 2).
+                # The threshold prevents thrashing affinity on every
+                # tiny load fluctuation while still spreading load
+                # when one node is genuinely overwhelmed.
+                better = next(
+                    (
+                        w for w in cands
+                        if w["id"] != wid
+                        and _ACTIVE_TURNS_PER_NODE.get(f"worker:{w['id']}", 0)
+                            <= sticky_load - 2
+                    ),
+                    None,
+                )
+                if better is None:
+                    return (
+                        _worker_base_url(sticky_w),
+                        db.get_compute_worker_auth_token(sticky_w["id"]),
+                    )
+                # else fall through to fresh pick — affinity stale.
+
     if not cands:
         return None
-    w = cands[0]
+    # Tie-aware selection: among workers whose capability score equals
+    # the leader's, pick the least-busy. Concurrent turns from
+    # different conversations spread across the pool.
+    top_score = _capability_score(cands[0])
+    tied = [c for c in cands if _capability_score(c) == top_score]
+    if len(tied) > 1:
+        tied.sort(
+            key=lambda c: _ACTIVE_TURNS_PER_NODE.get(f"worker:{c['id']}", 0),
+        )
+        w = tied[0]
+    else:
+        w = cands[0]
     # Schedule a background bench of the host on this exact model so
     # the cache is populated for the next routing call. We can't await
     # here (this function is sync), so the FIRST call falls through
@@ -3902,6 +4207,39 @@ def pool_inventory_summary() -> dict:
     ]
     quant_groups.sort(key=lambda b: b["total_bytes"], reverse=True)
 
+    # Per-node disk + cache report. Lets the inventory UI render
+    # "host SSD: 280 / 500 GB" + "worker-A: 60 / 250 GB", so the user
+    # can spot where there's room to land more model pulls. Falls
+    # back to zero values when probe data isn't yet available.
+    nodes: list[dict] = []
+    try:
+        from . import sysdetect as _sysdetect
+        host_spec = _sysdetect.detect_system()
+    except Exception:
+        host_spec = {}
+    nodes.append({
+        "id": "host",
+        "label": "host",
+        "ram_total_gb": float(host_spec.get("ram_gb") or 0),
+        "vram_gb": float(host_spec.get("vram_gb") or 0),
+        # Host disk free is best-effort: shutil.disk_usage on the
+        # workspace drive. Empty when the call fails so the UI can
+        # fall back to "—".
+        "disk_total_gb": _host_disk_total_gb(),
+        "disk_free_gb": _host_disk_free_gb(),
+    })
+    for w in db.list_compute_workers(enabled_only=False):
+        caps = w.get("capabilities") or {}
+        nodes.append({
+            "id": f"worker:{w['id']}",
+            "label": w.get("label") or w.get("address"),
+            "ram_total_gb": float(caps.get("ram_total_gb") or 0),
+            "ram_free_gb": float(caps.get("ram_free_gb") or 0),
+            "disk_total_gb": float(caps.get("disk_total_gb") or 0),
+            "disk_free_gb": float(caps.get("disk_free_gb") or 0),
+            "cached_overrides": list(caps.get("cached_overrides") or []),
+        })
+
     return {
         "models": models,
         "total_unique_bytes": total_unique_bytes,
@@ -3911,7 +4249,34 @@ def pool_inventory_summary() -> dict:
         # don't need a "group" view since the flat models[] list
         # already covers them.
         "quant_groups": quant_groups,
+        # Per-node storage / RAM picture so the UI can render an
+        # accurate "where to put what" view of the pool.
+        "nodes": nodes,
     }
+
+
+def _host_disk_total_gb() -> float:
+    """Best-effort host disk capacity for the Gigachat data dir.
+    Returns 0 on any read failure (Windows / Linux cross-platform).
+    """
+    try:
+        import shutil as _shutil
+        from pathlib import Path as _Path
+        usage = _shutil.disk_usage(str(_Path.home()))
+        return round(usage.total / (1024 ** 3), 1)
+    except Exception:
+        return 0.0
+
+
+def _host_disk_free_gb() -> float:
+    """Best-effort host disk free space, mirrors `_host_disk_total_gb`."""
+    try:
+        import shutil as _shutil
+        from pathlib import Path as _Path
+        usage = _shutil.disk_usage(str(_Path.home()))
+        return round(usage.free / (1024 ** 3), 1)
+    except Exception:
+        return 0.0
 
 
 def pool_dedup_recommendations() -> list[dict]:
@@ -4047,6 +4412,107 @@ def _maybe_kickoff_draft_lan_sync(
             loop.create_task(_bg())
     except RuntimeError:
         pass
+
+
+# Synchronous draft SCP threshold. When no host candidate exists for a
+# target, we'll BLOCK on a worker→host SCP for drafts smaller than
+# this. Above the cap, the SCP cost exceeds the speculative speedup
+# benefit and we stay on the (slower, non-speculative) path.
+# 2 GB ≈ a Q4_K_M 1B-3B draft over Gigabit-Ethernet completes in
+# ~20-40 s — comfortably inside one chat-turn's tolerance for a
+# one-time setup cost that benefits every following turn.
+_SYNC_DRAFT_SCP_MAX_BYTES = 2 * 1024 ** 3
+_SYNC_DRAFT_SCP_TIMEOUT_SEC = 120.0
+
+
+async def await_draft_for(target_model_name: str) -> dict | None:
+    """Async version of `pick_draft_for` that can synchronously SCP a
+    viable worker-only draft when no host candidate exists.
+
+    The sync `pick_draft_for` only promotes host-resident drafts and
+    fires a background SCP for worker-only candidates that won't help
+    the current turn. This async wrapper closes that gap: when there's
+    no host draft AND a worker has a small same-family candidate,
+    we BLOCK on a worker→host SCP so this very turn benefits from
+    speculative decoding.
+
+    Constraints:
+      * Worker draft must be < `_SYNC_DRAFT_SCP_MAX_BYTES` (2 GB).
+        Above that the SCP exceeds the chat user's tolerance for
+        first-token latency.
+      * SCP timeout caps the wait at `_SYNC_DRAFT_SCP_TIMEOUT_SEC`
+        — failed pulls fall through to the no-speculative path.
+
+    Returns the same dict shape as `pick_draft_for`, or None when
+    neither a host candidate nor a viable worker draft exists.
+    """
+    immediate = pick_draft_for(target_model_name)
+    if immediate is not None:
+        return immediate
+
+    # No host draft. Walk pool inventory for a worker-only candidate
+    # that's small enough to be worth a sync SCP.
+    target = resolve_ollama_model(target_model_name)
+    if not target:
+        return None
+    target_family = (target.get("family") or "").lower()
+    target_size = int(target.get("size_bytes") or 0)
+    if target_size < _SPECULATIVE_MIN_TARGET_BYTES:
+        return None  # target too small for speculative to help
+    max_draft_bytes = int(target_size * _DRAFT_MAX_SIZE_FRACTION)
+
+    # Find the smallest same-family worker candidate within the sync
+    # SCP size budget. Tokenizer-fingerprint matching needs the GGUF
+    # locally (we're trying to GET it locally), so we limit to the
+    # cheap family check here.
+    best: dict | None = None
+    for m in _pool_model_inventory():
+        if m["name"] == target_model_name:
+            continue
+        if m["source"] == "host":
+            continue  # already covered by pick_draft_for
+        if m["size_bytes"] <= 0:
+            continue
+        if m["size_bytes"] > min(max_draft_bytes, _SYNC_DRAFT_SCP_MAX_BYTES):
+            continue
+        if not (m["family"] and target_family and m["family"] == target_family):
+            continue
+        if best is None or m["size_bytes"] < best["size_bytes"]:
+            best = m
+
+    if best is None:
+        return None
+
+    # Pull synchronously (SCP from worker to host). The pull function
+    # is best-effort; on failure we fall through to the no-speculative
+    # path so the user still gets their chat.
+    try:
+        from . import model_sync
+        puller = getattr(model_sync, "pull_model_to_host", None)
+        if puller is None:
+            return None
+        wid = best["source"].split(":", 1)[1] if ":" in best["source"] else ""
+        if not wid:
+            return None
+        log.info(
+            "compute_pool: sync-pulling draft %r from worker %s for "
+            "speculative on %r (%.2f GB)",
+            best["name"], wid, target_model_name,
+            best["size_bytes"] / (1024 ** 3),
+        )
+        await asyncio.wait_for(
+            puller(best["name"], wid),
+            timeout=_SYNC_DRAFT_SCP_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        log.info(
+            "compute_pool: sync draft pull failed for %r: %s",
+            best["name"], e,
+        )
+        return None
+
+    # Re-pick with the now-host-resident draft in scope.
+    return pick_draft_for(target_model_name)
 
 
 def _draft_override_for(target_model_name: str) -> str | None:
@@ -5027,8 +5493,15 @@ async def route_chat_for(model_name: str) -> dict:
         # smaller, same-family chat model and engages llama-server
         # (instead of Ollama) with `-md <draft>` when a viable draft
         # is found AND host VRAM has room for both.
+        #
+        # `await_draft_for` extends `pick_draft_for` with a
+        # synchronous worker→host SCP path: when no host-resident
+        # draft exists but a worker has one that's small enough to
+        # SCP quickly (< 2 GB), we BLOCK on that pull so this very
+        # turn benefits from speculative decoding. Falls back to no-
+        # speculative on SCP failure.
         if speculative_decoding_enabled():
-            draft = pick_draft_for(model_name)
+            draft = await await_draft_for(model_name)
             if (
                 draft
                 and _host_has_vram_for_speculative(size_bytes, draft["size_bytes"])

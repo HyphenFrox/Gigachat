@@ -927,6 +927,11 @@ async def _summarize_block_with_ollama(model: str, history_block: list[dict]) ->
 
     Returns just the compressed string. Non-streaming request — we don't need
     to surface these tokens to the UI; they're internal bookkeeping.
+
+    Pool-distributed: when a worker has the chat model installed,
+    compaction routes there via `compute_pool.pick_compaction_target`
+    so the host's KV cache stays warm for the active chat. Falls back
+    to host Ollama when no worker is eligible.
     """
     ask = (
         "You are compressing an older portion of a chat history to save "
@@ -950,9 +955,27 @@ async def _summarize_block_with_ollama(model: str, history_block: list[dict]) ->
         "stream": False,
         "options": {"temperature": 0.2, "num_ctx": NUM_CTX},
     }
+    # Route compaction to a worker so it doesn't compete with the
+    # active chat for host GPU. Falls back to host when no worker
+    # has the model.
+    base_url = OLLAMA_URL
+    headers: dict[str, str] = {}
+    try:
+        from . import compute_pool
+        target = compute_pool.pick_compaction_target(model)
+        if target is not None:
+            base_url, token = target
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+    except Exception:
+        # Defensive: any picker failure must not break compaction itself.
+        base_url = OLLAMA_URL
+        headers = {}
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+            r = await client.post(
+                f"{base_url}/api/chat", json=payload, headers=headers,
+            )
             r.raise_for_status()
             data = r.json()
         return (data.get("message") or {}).get("content") or ""
@@ -1566,6 +1589,16 @@ async def run_turn(
         # Clear the stop flag no matter how the turn ended — it only applies
         # to the turn that was running when it was set, not future ones.
         _clear_stop(conversation_id)
+        # Decrement the active-turn count on whichever node served this
+        # conversation. The affinity record itself stays so the next
+        # turn can re-land on the same node (KV cache stays warm).
+        try:
+            from . import compute_pool as _cp
+            sticky = _cp._CONV_AFFINITY.get(conversation_id)
+            if sticky:
+                _cp.register_turn_end(conversation_id, sticky)
+        except Exception:
+            pass
         # Remove from the active set LAST so the watchdog doesn't see a
         # brief "running-but-not-active" window on the way out.
         _ACTIVE_TURN_IDS.discard(conversation_id)
@@ -1900,11 +1933,29 @@ async def _run_turn_impl(
         chat_auth_token: str | None = None
         if split_target is None:
             try:
-                chat_target = compute_pool.pick_chat_target(conv["model"])
+                # Pass conv_id so the picker honors per-conversation
+                # affinity: a chat that landed on worker-A on its
+                # previous turn keeps landing there as long as A is
+                # eligible — KV cache survives across follow-up
+                # turns. Concurrent conversations naturally spread
+                # across the pool because the picker breaks ties on
+                # active-turn count.
+                chat_target = compute_pool.pick_chat_target(
+                    conv["model"], conv_id=conversation_id,
+                )
             except Exception:
                 chat_target = None
             if chat_target is not None:
                 chat_base_url, chat_auth_token = chat_target
+            # Register this turn against the chosen node so future
+            # picks see accurate load. The matching `register_turn_end`
+            # runs in `run_turn`'s finally block — we read the node id
+            # back from `_CONV_AFFINITY[conversation_id]` there.
+            try:
+                _node = compute_pool._node_id_for_target(chat_target)
+                compute_pool.register_turn_start(conversation_id, _node)
+            except Exception:
+                pass
 
         # Prompt-space tool adapter: some Ollama models advertise the
         # `tools` capability but ship a passthrough chat template

@@ -420,6 +420,7 @@ def _compute_optimal_parallel(
     ctx_size: int = 4096,
     target_size_bytes: int | None = None,
     draft_size_bytes: int = 0,
+    kv_size_multiplier: float = 1.0,
 ) -> int:
     """Decide how many `--parallel` decoding slots to allocate.
 
@@ -447,6 +448,10 @@ def _compute_optimal_parallel(
     kv_per_slot = _estimate_kv_bytes_per_slot(gguf_path, ctx_size)
     if kv_per_slot <= 0:
         return 1
+    # KV quantization (Q8 ≈ 50%, Q4 ≈ 25%) shrinks per-slot KV by the
+    # multiplier, so caller can simulate slot count under different
+    # cache types. Default 1.0 = FP16 baseline.
+    kv_per_slot = max(1, int(kv_per_slot * max(0.1, float(kv_size_multiplier))))
 
     if target_size_bytes is None:
         try:
@@ -509,6 +514,165 @@ def _compute_optimal_parallel(
         slots,
     )
     return slots
+
+
+# KV cache quantization. Q8 halves the per-slot KV cost vs FP16 for a
+# small accuracy drop (typ. < 1 % on public benchmarks). When the
+# pool is memory-pressured (FP16 forces `--parallel 1` or 2), switching
+# to Q8 lets us pack 2-4× more slots in the same VRAM — strictly more
+# throughput on concurrent workloads (subagent fan-out, multi-conv).
+# Pools that already fit `_PARALLEL_MAX_SLOTS` at FP16 stay on FP16.
+_KV_QUANT_PARALLEL_FLOOR = 4
+
+# Adaptive context-window upper bound. We never set `-c` above the
+# model's own training-time max (read from GGUF metadata), and never
+# below the chat baseline of 4096 tokens (the legacy hard-coded value
+# — preserves behavior on tiny pools that can't pay for more).
+_CTX_SIZE_FLOOR = 4096
+_CTX_SIZE_CEILING = 131072  # 128 K — even huge pools stop here
+
+
+def _decide_kv_precision_and_parallel(
+    gguf_path: str,
+    worker_ids: list[str],
+    *,
+    target_size_bytes: int,
+    draft_size_bytes: int = 0,
+    ctx_size: int = 4096,
+) -> tuple[str | None, int]:
+    """Joint decision: pick KV cache type AND `--parallel` slot count.
+
+    Returns ``(cache_type, parallel)`` where ``cache_type`` is either
+    ``None`` (FP16 — llama.cpp default) or ``"q8_0"`` (Q8 — half the
+    KV memory). The slot count is computed against whichever precision
+    we picked, so callers see a coherent (precision, slots) pair.
+
+    Decision: try FP16 first. If the pool is memory-pressured enough
+    that fewer than ``_KV_QUANT_PARALLEL_FLOOR`` slots fit in FP16,
+    re-check at Q8 and switch when Q8 unlocks meaningfully more slots.
+    Pools with plenty of headroom stay on FP16 (no precision penalty
+    when there's no bottleneck to break).
+    """
+    fp16_parallel = _compute_optimal_parallel(
+        gguf_path, worker_ids,
+        ctx_size=ctx_size,
+        target_size_bytes=target_size_bytes,
+        draft_size_bytes=draft_size_bytes,
+    )
+    if fp16_parallel >= _KV_QUANT_PARALLEL_FLOOR:
+        # Plenty of slots already at FP16 — keep precision, skip the
+        # Q8 ladder.
+        return None, fp16_parallel
+
+    q8_parallel = _compute_optimal_parallel(
+        gguf_path, worker_ids,
+        ctx_size=ctx_size,
+        target_size_bytes=target_size_bytes,
+        draft_size_bytes=draft_size_bytes,
+        kv_size_multiplier=0.5,
+    )
+    if q8_parallel > fp16_parallel:
+        log.info(
+            "split_lifecycle: KV quantized to q8_0 — fp16 fit %d slot(s), "
+            "q8_0 fits %d", fp16_parallel, q8_parallel,
+        )
+        return "q8_0", q8_parallel
+    return None, fp16_parallel
+
+
+def _compute_optimal_ctx_size(
+    gguf_path: str,
+    worker_ids: list[str],
+    *,
+    parallel: int,
+    cache_type: str | None,
+    target_size_bytes: int,
+    draft_size_bytes: int = 0,
+) -> int:
+    """Pick the largest context window the pool can hold.
+
+    KV cache scales linearly with context size, so on a rich pool
+    (host with 80 GB combined memory after target weights) we can
+    afford 32 K-128 K context windows; on a tight pool we stick with
+    the legacy 4 K floor.
+
+    Algorithm:
+      * Read GGUF's training-time max context (`<arch>.context_length`).
+      * Compute KV bytes per token from `_estimate_kv_bytes_per_slot`
+        at ctx=1, then scale by `parallel` and the cache-type multiplier.
+      * Sum free pool memory (host + worker-min, same logic as
+        `_compute_optimal_parallel`'s bottleneck).
+      * Return ``min(model_max, free_mem // (kv_per_token *
+        parallel))`` clamped to ``[_CTX_SIZE_FLOOR, _CTX_SIZE_CEILING]``.
+
+    Returns ``_CTX_SIZE_FLOOR`` (4 K) when metadata is missing —
+    matches the legacy hard-coded value so behavior is unchanged when
+    we can't make an informed call.
+    """
+    kv_per_token = _estimate_kv_bytes_per_slot(gguf_path, ctx_size=1)
+    if kv_per_token <= 0:
+        return _CTX_SIZE_FLOOR
+    if cache_type == "q8_0":
+        kv_per_token = max(1, kv_per_token // 2)
+
+    # Read model's training-time max context (don't exceed it — the
+    # weights only learned positional encodings up to that length).
+    try:
+        import gguf
+        reader = gguf.GGUFReader(gguf_path)
+        arch_field = reader.fields.get("general.architecture")
+        arch = (
+            arch_field.parts[arch_field.data[0]].tobytes().decode("utf-8", errors="replace")
+            if arch_field and arch_field.types
+            else None
+        )
+        model_max_ctx = (
+            _read_gguf_int(reader, arch, f"{arch}.context_length", "llama.context_length")
+            if arch else None
+        ) or _CTX_SIZE_CEILING
+    except Exception:
+        model_max_ctx = _CTX_SIZE_CEILING
+
+    # Bottleneck-node free memory (same shape as parallel computation).
+    try:
+        from . import sysdetect
+        spec = sysdetect.detect_system()
+        host_vram = int(float(spec.get("vram_gb") or 0) * (1024 ** 3))
+        host_ram = int(float(spec.get("ram_gb") or 0) * (1024 ** 3))
+    except Exception:
+        return _CTX_SIZE_FLOOR
+    host_budget = host_vram if host_vram > 0 else host_ram
+    if host_budget <= 0:
+        return _CTX_SIZE_FLOOR
+
+    free_after_target = int(host_budget * (1.0 - _PARALLEL_VRAM_HEADROOM))
+    free_after_target -= int(target_size_bytes or 0) + int(draft_size_bytes or 0)
+    if free_after_target <= 0:
+        return _CTX_SIZE_FLOOR
+
+    bottleneck_free = free_after_target
+    for wid in worker_ids:
+        w = db.get_compute_worker(wid)
+        if not w or not w.get("enabled"):
+            continue
+        caps = w.get("capabilities") or {}
+        free_gb = float(caps.get("ram_free_gb") or 0)
+        if free_gb <= 0:
+            continue
+        worker_free = int(free_gb * (1024 ** 3) * (1.0 - _PARALLEL_VRAM_HEADROOM))
+        if worker_free < bottleneck_free:
+            bottleneck_free = worker_free
+
+    fits = bottleneck_free // (kv_per_token * max(1, parallel))
+    fits = min(fits, model_max_ctx, _CTX_SIZE_CEILING)
+    fits = max(_CTX_SIZE_FLOOR, int(fits))
+    log.info(
+        "split_lifecycle: adaptive ctx: kv_per_token=%d parallel=%d "
+        "bottleneck_free=%.2f GB model_max=%d -> -c %d",
+        kv_per_token, parallel, bottleneck_free / (1024 ** 3),
+        model_max_ctx, fits,
+    )
+    return fits
 
 
 # Heterogeneity threshold — only emit `-ts` (per-device layer weights)
@@ -691,6 +855,9 @@ def _build_command(
     parallel: int = 1,
     tensor_split: list[int] | None = None,
     split_mode: str | None = None,
+    cache_type: str | None = None,
+    ctx_size: int = _CTX_SIZE_FLOOR,
+    prompt_cache_path: str | None = None,
 ) -> list[str]:
     """Assemble the argv for `llama-server`.
 
@@ -744,15 +911,14 @@ def _build_command(
         # means "as many as fit". Layers that don't fit GPUs cascade
         # to CPU+RAM.
         "-ngl", str(ngl),
-        # Context size: cap at 4096 tokens. llama-server otherwise
-        # allocates the model's full native context (e.g. llama3.1
-        # defaults to 131k tokens / 54k effective with 4 seqs), which
-        # blows up KV-cache memory on small workers — the actual
-        # crash mode in early bench runs was OOM during KV buffer
-        # allocation on a laptop, AFTER the model layers had already
-        # loaded successfully across the pool. 4096 is plenty for
-        # chat turns and keeps KV memory bounded.
-        "-c", "4096",
+        # Context size: adaptive — `_compute_optimal_ctx_size` picks
+        # the largest window the pool can hold given the model's KV
+        # geometry, the chosen `--parallel` slot count, and the
+        # bottleneck-node free memory. Floors at 4096 (legacy default,
+        # safe for tiny pools) and ceils at 128 K (enough for any
+        # production chat). Wins on rich pools that previously
+        # capped at 4 K despite having 80 GB of combined memory.
+        "-c", str(max(_CTX_SIZE_FLOOR, int(ctx_size))),
         # Skip the empty-run warmup. By default llama-server does one
         # forward pass on an empty input to JIT-compile kernels and
         # prime caches. Across an RPC pool with 32 layers × 3 nodes
@@ -910,7 +1076,55 @@ def _build_command(
         # `none` is single-device — included for completeness; we
         # don't engage it from the auto path.
         cmd.extend(["--split-mode", split_mode])
+    if cache_type:
+        # KV cache quantization. `q8_0` halves the per-slot KV cost
+        # vs FP16 with < 1 % accuracy loss on standard benchmarks.
+        # Engaged by `_decide_kv_precision_and_parallel` only when
+        # FP16 fits fewer than `_KV_QUANT_PARALLEL_FLOOR` slots — at
+        # that point Q8 is strictly more throughput.
+        cmd.extend(["-ctk", cache_type, "-ctv", cache_type])
+    if prompt_cache_path:
+        # Prompt-cache-to-disk: persists decoded KV state across
+        # llama-server restarts. On the next spawn with the same
+        # path, llama-server loads the cache and skips re-tokenising
+        # / re-decoding any matching prompt prefix. Massive win for
+        # the system-prompt + tool-schema prefix that's stable per
+        # (model, permission_mode) — every chat after a model switch
+        # starts hot instead of cold.
+        cmd.extend(["--prompt-cache", prompt_cache_path, "--prompt-cache-all"])
     return cmd
+
+
+def _resolve_prompt_cache_path(gguf_path: str, cache_type: str | None) -> str | None:
+    """Return a deterministic prompt-cache file path for this (model, KV
+    precision) combination, or ``None`` when the cache shouldn't be used.
+
+    Cache files live under ``~/.gigachat/llama-cpp/prompt-cache/`` keyed
+    by a short hash of the GGUF path + cache-type so different precisions
+    don't collide. llama-server overwrites the file on each save; reuse
+    is automatic when the same path is passed on the next spawn.
+
+    Returns ``None`` for paths that can't be resolved (e.g. no GGUF on
+    disk yet) so the caller falls back to the no-cache code path —
+    behavior matches the legacy spawn there.
+    """
+    try:
+        if not Path(gguf_path).is_file():
+            return None
+    except (OSError, ValueError):
+        return None
+    try:
+        import hashlib
+        key = f"{gguf_path}:{cache_type or 'fp16'}"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return None
+    cache_dir = split_runtime.LLAMA_CPP_INSTALL_DIR / "prompt-cache"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return str(cache_dir / f"{digest}.bin")
 
 
 def _log_path_for(split_id: str) -> Path:
@@ -1187,9 +1401,32 @@ async def start(split_id: str) -> dict:
             draft_size = os.path.getsize(draft)
         except OSError:
             draft_size = 0
-    parallel = _compute_optimal_parallel(
+    target_size_bytes = (
+        os.path.getsize(row["gguf_path"]) if Path(row["gguf_path"]).is_file()
+        else 0
+    )
+
+    # Joint precision + slot-count decision. FP16 is preferred when
+    # the pool can afford it; under memory pressure the helper
+    # transparently switches to Q8 KV (½ the memory per slot, < 1 %
+    # accuracy drop) so we keep more concurrent decoding slots than
+    # FP16 would allow.
+    cache_type, parallel = _decide_kv_precision_and_parallel(
         row["gguf_path"], worker_ids,
-        target_size_bytes=os.path.getsize(row["gguf_path"]) if Path(row["gguf_path"]).is_file() else None,
+        target_size_bytes=target_size_bytes,
+        draft_size_bytes=draft_size,
+    )
+
+    # Adaptive context window. With (cache_type, parallel) decided we
+    # know the per-token KV cost; sized against the bottleneck-node
+    # free memory it tells us how big a context the pool can serve
+    # without OOM. Floors at 4 K (legacy default) and ceils at the
+    # model's training-time max.
+    ctx_size = _compute_optimal_ctx_size(
+        row["gguf_path"], worker_ids,
+        parallel=parallel,
+        cache_type=cache_type,
+        target_size_bytes=target_size_bytes,
         draft_size_bytes=draft_size,
     )
 
@@ -1207,6 +1444,12 @@ async def start(split_id: str) -> dict:
     # ~5 ms RTT.
     split_mode = "row" if _should_use_row_split(worker_ids) else None
 
+    # Prompt-cache-to-disk path — keyed by GGUF filename + cache_type
+    # so different precisions get different caches. Persists across
+    # llama-server restarts; first turn after a model-switch reloads
+    # the cached system-prompt KV instead of re-decoding from scratch.
+    prompt_cache_path = _resolve_prompt_cache_path(row["gguf_path"], cache_type)
+
     cmd = _build_command(
         llama_server=server,
         gguf_path=row["gguf_path"],
@@ -1218,6 +1461,9 @@ async def start(split_id: str) -> dict:
         parallel=parallel,
         tensor_split=tensor_split,
         split_mode=split_mode,
+        cache_type=cache_type,
+        ctx_size=ctx_size,
+        prompt_cache_path=prompt_cache_path,
     )
     log_path = _log_path_for(split_id)
 

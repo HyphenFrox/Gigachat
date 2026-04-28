@@ -258,6 +258,14 @@ A handful of tables defined in `backend/db.py`'s schema block:
 | Tune embed fan-out concurrency               | `compute_pool.embed_concurrency_limit` |
 | Add a new distributed-tool dispatcher        | `compute_pool.py` (`_pick_tool_dispatch_target`, `dispatch_to_worker_powershell`, `dispatch_python_exec_to_worker` as a template) |
 | Adjust `python_exec` host-vs-worker guard    | `compute_pool._PYTHON_EXEC_HOST_ONLY_PATTERNS` |
+| Tune KV-quant engagement threshold           | `split_lifecycle.py` (`_decide_kv_precision_and_parallel`, `_KV_QUANT_PARALLEL_FLOOR`) |
+| Tune adaptive `-c` context-size policy       | `split_lifecycle.py` (`_compute_optimal_ctx_size`, `_CTX_SIZE_FLOOR`, `_CTX_SIZE_CEILING`) |
+| Change prompt-cache file location / keying   | `split_lifecycle._resolve_prompt_cache_path` |
+| Tune per-conversation worker affinity        | `compute_pool.py` (`_CONV_AFFINITY`, `_ACTIVE_TURNS_PER_NODE`, `register_turn_start`, `register_turn_end`, load-delta threshold in `pick_chat_target`) |
+| Adjust idle re-index cadence / cap           | `compute_pool.py` (`_IDLE_REINDEX_MAX_FILES_PER_RUN`, `_drain_idle_reindex`) |
+| Change compaction-target selection           | `compute_pool.pick_compaction_target` |
+| Tune sync-draft-SCP size / timeout           | `compute_pool.py` (`_SYNC_DRAFT_SCP_MAX_BYTES`, `_SYNC_DRAFT_SCP_TIMEOUT_SEC`, `await_draft_for`) |
+| Add a new per-worker capability flag         | `compute_pool._probe_worker_specs_via_ssh` PowerShell payload — extend the `$out` JSON shape (e.g. `cached_overrides`, `disk_free_gb`) |
 
 ---
 

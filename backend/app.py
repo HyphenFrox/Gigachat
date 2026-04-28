@@ -1579,6 +1579,12 @@ def api_delete(cid: str) -> dict:
     # wouldn't inherit stale file-read tracking. This is tiny but avoids
     # a slow memory leak over many deletes.
     tools.clear_read_state_for_conversation(cid)
+    # Drop the worker-affinity entry for this conversation so the
+    # in-memory map doesn't grow forever across many deletes.
+    try:
+        compute_pool.forget_conv_affinity(cid)
+    except Exception:
+        pass
     return {"ok": True}
 
 
