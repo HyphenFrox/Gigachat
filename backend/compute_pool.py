@@ -229,6 +229,32 @@ async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
         "  $resolved = Get-Command $c -ErrorAction SilentlyContinue;"
         "  if ($resolved) { $llama_server = $resolved.Source; break }"
         "};"
+        # Detect Python + the optional libraries the distributed-tool
+        # paths need. Used by the `read_doc` and `web_search`
+        # dispatchers to skip workers that can't actually serve the
+        # request (saves a round-trip + an obvious error).
+        "$python = (Get-Command py.exe -ErrorAction SilentlyContinue).Source;"
+        "if (-not $python) { $python = (Get-Command python.exe -ErrorAction SilentlyContinue).Source };"
+        "$read_doc_libs = @();"
+        "$has_ddgs = $false;"
+        "if ($python) {"
+        "  $libs_check = & $python -c 'import json,sys"
+        "`nout={\\\"libs\\\":[],\\\"ddgs\\\":False}"
+        "`nfor m in (\\\"pymupdf\\\",\\\"docx\\\",\\\"openpyxl\\\"):"
+        "`n  try: __import__(m); out[\\\"libs\\\"].append(m)"
+        "`n  except Exception: pass"
+        "`ntry:"
+        "`n  __import__(\\\"ddgs\\\"); out[\\\"ddgs\\\"]=True"
+        "`nexcept Exception: pass"
+        "`njson.dump(out,sys.stdout)' 2>$null;"
+        "  if ($libs_check) {"
+        "    try {"
+        "      $parsed = $libs_check | ConvertFrom-Json;"
+        "      $read_doc_libs = @($parsed.libs);"
+        "      $has_ddgs = [bool]$parsed.ddgs"
+        "    } catch {}"
+        "  }"
+        "};"
         "$out = [pscustomobject]@{"
         "  cpu_name = $cpu.Name;"
         "  cpu_cores = $cpu.NumberOfCores;"
@@ -236,7 +262,9 @@ async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
         "  ram_total_gb = [math]::Round($cs.TotalPhysicalMemory/1GB, 1);"
         "  ram_free_gb = [math]::Round($os.FreePhysicalMemory/1MB, 1);"
         "  gpus = $gpus;"
-        "  llama_server_path = $llama_server"
+        "  llama_server_path = $llama_server;"
+        "  read_doc_libs = $read_doc_libs;"
+        "  has_ddgs = $has_ddgs"
         "};"
         "$out | ConvertTo-Json -Compress -Depth 4"
     )
@@ -2939,6 +2967,78 @@ def _gguf_tokenizer_fingerprint(gguf_path: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Generic SSH-PowerShell dispatch helper
+#
+# `dispatch_to_worker_powershell(worker, ps_script, timeout_sec, stdin_bytes)`
+# is the shared transport every distributed-tool path uses: encode the
+# PowerShell script as UTF-16-LE base64 (bypasses every cmdline-quoting
+# nightmare), invoke `ssh worker powershell -EncodedCommand <b64>`,
+# stream back stdout. Optional `stdin_bytes` is base64-encoded and the
+# script can decode it via `[Console]::In.ReadToEnd()`.
+#
+# This stays minimal on purpose — workers need only OpenSSH + PowerShell
+# (defaults on Windows 10+) to participate in the basic dispatch layer.
+# Specific tool dispatchers (read_doc, web_search) layer their
+# Python/library requirements on top and probe for them at call time.
+# ---------------------------------------------------------------------------
+
+
+async def dispatch_to_worker_powershell(
+    worker: dict,
+    ps_script: str,
+    *,
+    timeout_sec: float = 30.0,
+    stdin_text: str = "",
+) -> tuple[bool, bytes, str]:
+    """Run ``ps_script`` on the worker via SSH + PowerShell.
+
+    Returns ``(ok, stdout_bytes, stderr_message)``. ``ok`` is True when
+    the SSH call returned exit 0; on failure ``stderr_message`` carries
+    a short diagnostic and ``stdout_bytes`` is empty. Caller is in
+    charge of interpreting stdout (typically base64-decoding a JSON
+    payload the script wrote).
+
+    `stdin_text`, when non-empty, is fed to the SSH process's stdin so
+    PowerShell scripts can read large inputs without blowing past
+    cmdline length limits. Bind it inside the script with
+    ``[Console]::In.ReadToEnd()``.
+    """
+    ssh_host = (worker.get("ssh_host") or "").strip()
+    if not ssh_host:
+        return False, b"", "worker has no ssh_host configured"
+
+    import base64
+    encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+    cmd = [
+        "ssh", "-o", "BatchMode=yes",
+        "-o", f"ConnectTimeout={int(min(timeout_sec, 30))}",
+        ssh_host,
+        "powershell", "-NoProfile", "-EncodedCommand", encoded,
+    ]
+    import subprocess as _sp
+
+    def _run() -> tuple[int, bytes, bytes]:
+        try:
+            r = _sp.run(
+                cmd,
+                input=stdin_text.encode("utf-8") if stdin_text else None,
+                capture_output=True,
+                timeout=timeout_sec + 10,
+            )
+            return r.returncode, r.stdout, r.stderr
+        except _sp.TimeoutExpired:
+            return -1, b"", b"timeout"
+        except Exception as e:
+            return -2, b"", repr(e).encode()
+
+    rc, stdout, stderr = await asyncio.to_thread(_run)
+    if rc != 0:
+        err = (stderr or b"").decode("utf-8", errors="replace").strip()[:300]
+        return False, b"", err or "no stderr"
+    return True, stdout or b"", ""
+
+
+# ---------------------------------------------------------------------------
 # Distributed tool execution — dispatch eligible tool calls to workers
 #
 # Some tool calls (HTTP fetches today; doc parsing in a future commit)
@@ -3080,6 +3180,436 @@ async def dispatch_fetch_url_to_worker(url: str) -> tuple[bool, bytes, str] | No
         url, worker.get("label"), len(body),
     )
     return True, body, ""
+
+
+# ---------------------------------------------------------------------------
+# Distributed `web_search` — DuckDuckGo via worker's `ddgs` Python
+#
+# Worker requirement: Python on PATH + the `ddgs` package installed
+# (`pip install ddgs`). The setup script `scripts/install-worker-tools.ps1`
+# handles this; the dispatcher silently falls back to host when the
+# worker doesn't have ddgs available (the SSH script's import error
+# surfaces as a non-zero exit and the caller treats that as a graceful
+# fallback signal).
+# ---------------------------------------------------------------------------
+
+
+def _pick_web_search_target() -> dict | None:
+    """Return the next worker that has the `ddgs` Python library.
+
+    Probe-time `capabilities.has_ddgs` flag is the gate — workers
+    without ddgs are skipped so we don't dispatch a request that
+    can't possibly succeed.
+    """
+    rows = db.list_compute_workers(enabled_only=True)
+    eligible = [
+        w for w in rows
+        if (w.get("ssh_host") or "").strip()
+        and w.get("last_seen") is not None
+        and (w.get("capabilities") or {}).get("has_ddgs")
+    ]
+    if not eligible:
+        return None
+    eligible.sort(key=lambda w: float(w.get("last_seen") or 0), reverse=True)
+    idx = _TOOL_DISPATCH_INDEX.get("web_search", 0)
+    pick = eligible[idx % len(eligible)]
+    _TOOL_DISPATCH_INDEX["web_search"] = (idx + 1) % len(eligible)
+    return pick
+
+
+async def dispatch_web_search_to_worker(
+    query: str, max_results: int, region: str | None,
+) -> tuple[bool, list[dict], str] | None:
+    """Run a DDG search on a worker via SSH and return the parsed hits.
+
+    Returns:
+      * ``None`` when no eligible worker is reachable — caller falls
+        back to host-side `_ddg_search_sync`.
+      * ``(True, hits, "")`` on success.
+      * ``(False, [], error)`` when distribution was attempted but the
+        worker errored. Caller MAY fall back to host as the safety
+        net so a transient worker hiccup never breaks the chat.
+    """
+    worker = _pick_web_search_target()
+    if not worker:
+        return None
+
+    # Build a Python one-liner the worker runs. `ddgs` exposes a
+    # `DDGS` context manager whose `.text(query, max_results=N,
+    # region=...)` returns list[dict]. We dump the result as JSON to
+    # stdout so the host can parse it back. stderr surfaces the
+    # exception message on failure.
+    safe_query = query.replace('"', '\\"').replace("$", "`$")
+    region_arg = (
+        f", region='{region}'" if region and region.replace("-", "").isalnum() else ""
+    )
+    py = (
+        "import json,sys\n"
+        "from ddgs import DDGS\n"
+        f"with DDGS() as d:\n"
+        f"    hits = list(d.text(\"{safe_query}\", max_results={int(max_results)}{region_arg}))\n"
+        "json.dump(hits, sys.stdout)\n"
+    )
+    # `python -c <script>` is awkward to encode through PowerShell; far
+    # cleaner to write the script via stdin and run `python -`. The
+    # PowerShell wrapper just streams stdin into the python process.
+    ps_script = (
+        # Resolve the worker's Python interpreter — `py.exe` (the
+        # Python launcher, ships with the installer) takes precedence
+        # over a bare `python.exe` on PATH because it survives the
+        # PATH ordering hazards of corporate machines.
+        "$python = (Get-Command py.exe -ErrorAction SilentlyContinue).Source;"
+        "if (-not $python) { $python = (Get-Command python.exe -ErrorAction SilentlyContinue).Source };"
+        "if (-not $python) { Write-Error 'python not found on worker'; exit 3 };"
+        # Read the python source from stdin and pipe it into python -.
+        "$src = [Console]::In.ReadToEnd();"
+        "$src | & $python -"
+    )
+    ok, stdout, stderr = await dispatch_to_worker_powershell(
+        worker, ps_script, timeout_sec=30.0, stdin_text=py,
+    )
+    if not ok:
+        log.info(
+            "compute_pool: distributed web_search via %s failed: %s",
+            worker.get("label"), stderr,
+        )
+        return False, [], stderr
+    try:
+        hits = json.loads((stdout or b"").decode("utf-8", errors="replace") or "[]")
+    except json.JSONDecodeError as e:
+        return False, [], f"worker returned non-JSON: {e}"
+    if not isinstance(hits, list):
+        return False, [], "worker returned non-list payload"
+    log.info(
+        "compute_pool: dispatched web_search(%r) to worker %s — %d hit(s)",
+        query, worker.get("label"), len(hits),
+    )
+    return True, hits, ""
+
+
+# ---------------------------------------------------------------------------
+# Distributed `read_doc` — PDF / DOCX / XLSX parsing offloaded to a worker
+#
+# The host uploads the raw file bytes via SSH stdin (base64-encoded for
+# binary safety), the worker decodes to a temp path, parses with the
+# requested library (pymupdf / python-docx / openpyxl), and emits the
+# extracted text on stdout. The host trims and returns to the agent
+# unchanged — preserves the same shape `read_doc` already produces.
+#
+# Worker requirements: Python + the parser libraries. The probe-time
+# detection (added below) fills `capabilities.read_doc_libs` with the
+# subset the worker has, so the dispatcher only routes formats the
+# worker can actually handle.
+# ---------------------------------------------------------------------------
+
+# Per-format → library name mapping the dispatcher uses to filter
+# eligible workers based on what's installed.
+_READ_DOC_FORMAT_LIBS = {
+    ".pdf": "pymupdf",
+    ".docx": "docx",        # python-docx imports as `docx`
+    ".xlsx": "openpyxl",
+    ".xlsm": "openpyxl",
+}
+
+
+def _pick_read_doc_target(suffix: str) -> dict | None:
+    """Return the next worker that has the parser library for ``suffix``.
+
+    Reads `capabilities.read_doc_libs` (populated at probe time) to
+    skip workers missing the right library — falling back to host is
+    cheaper than dispatching to a worker that's just going to error
+    out on `import pymupdf` / `import docx` / `import openpyxl`.
+    """
+    needed = _READ_DOC_FORMAT_LIBS.get(suffix)
+    if not needed:
+        return None
+    rows = db.list_compute_workers(enabled_only=True)
+    eligible = [
+        w for w in rows
+        if (w.get("ssh_host") or "").strip()
+        and w.get("last_seen") is not None
+        and needed in ((w.get("capabilities") or {}).get("read_doc_libs") or [])
+    ]
+    if not eligible:
+        return None
+    eligible.sort(key=lambda w: float(w.get("last_seen") or 0), reverse=True)
+    idx = _TOOL_DISPATCH_INDEX.get(f"read_doc:{needed}", 0)
+    pick = eligible[idx % len(eligible)]
+    _TOOL_DISPATCH_INDEX[f"read_doc:{needed}"] = (idx + 1) % len(eligible)
+    return pick
+
+
+async def dispatch_read_doc_to_worker(
+    file_path: str, *, pages: str | None = None, sheets: str | None = None,
+) -> tuple[bool, str, str] | None:
+    """Stream a doc file to a worker, parse there, return the text.
+
+    Returns ``None`` when no eligible worker is reachable for the
+    file's format. Returns ``(True, text, "")`` on success or
+    ``(False, "", error)`` on attempted-but-failed dispatch (caller
+    falls back to host).
+
+    File size cap: 30 MB on the wire. Anything bigger is rejected on
+    the host side before SSH — we don't want to ship hundreds of MB
+    to a worker over the LAN per dispatch.
+    """
+    from pathlib import Path
+    p = Path(file_path)
+    suffix = p.suffix.lower()
+    worker = _pick_read_doc_target(suffix)
+    if not worker:
+        return None
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return None
+    if size > 30 * 1024 * 1024:
+        # Too big to ship; let the host parser handle it locally.
+        return None
+    try:
+        raw = p.read_bytes()
+    except OSError as e:
+        return False, "", f"could not read source file: {e}"
+
+    import base64
+    b64 = base64.b64encode(raw).decode("ascii")
+
+    # Each format gets its own Python script so the dispatcher only
+    # imports what's needed (no point pulling pymupdf into a docx
+    # parse). Pages / sheets are inlined as Python literals.
+    pages_lit = "None" if pages is None else repr(pages)
+    sheets_lit = "None" if sheets is None else repr(sheets)
+    if suffix == ".pdf":
+        worker_script = _read_doc_pdf_worker_script(pages_lit)
+    elif suffix == ".docx":
+        worker_script = _read_doc_docx_worker_script()
+    elif suffix in {".xlsx", ".xlsm"}:
+        worker_script = _read_doc_xlsx_worker_script(sheets_lit)
+    else:
+        return None
+
+    # Worker reads stdin as `<base64>\n<source>` — first line is the
+    # file payload, subsequent lines are the parser script. The
+    # PowerShell wrapper splits them and feeds the source to python.
+    payload = b64 + "\n" + worker_script
+    ps_script = (
+        "$python = (Get-Command py.exe -ErrorAction SilentlyContinue).Source;"
+        "if (-not $python) { $python = (Get-Command python.exe -ErrorAction SilentlyContinue).Source };"
+        "if (-not $python) { Write-Error 'python not found on worker'; exit 3 };"
+        # Read the full stdin, split on first newline: header is the
+        # base64 payload, body is the python source.
+        "$all = [Console]::In.ReadToEnd();"
+        "$nl = $all.IndexOf(\"`n\");"
+        "if ($nl -lt 0) { Write-Error 'malformed input'; exit 4 };"
+        "$payload_b64 = $all.Substring(0, $nl).TrimEnd(\"`r\");"
+        "$src = $all.Substring($nl + 1);"
+        # Pipe both pieces in: env var for the payload, stdin for source.
+        "$env:_GIGACHAT_DOC_PAYLOAD = $payload_b64;"
+        "$src | & $python -"
+    )
+    ok, stdout, stderr = await dispatch_to_worker_powershell(
+        worker, ps_script, timeout_sec=60.0, stdin_text=payload,
+    )
+    if not ok:
+        log.info(
+            "compute_pool: distributed read_doc(%s) via %s failed: %s",
+            suffix, worker.get("label"), stderr,
+        )
+        return False, "", stderr
+    text = (stdout or b"").decode("utf-8", errors="replace")
+    log.info(
+        "compute_pool: dispatched read_doc(%s) to worker %s — %d chars",
+        suffix, worker.get("label"), len(text),
+    )
+    return True, text, ""
+
+
+def _read_doc_pdf_worker_script(pages_lit: str) -> str:
+    """Python source the worker runs to parse a PDF and emit text.
+
+    The host's `_read_pdf_sync` does similar work — we replicate the
+    page-range parser here (instead of importing it cross-process)
+    because the worker's Python doesn't know about Gigachat.
+    """
+    return (
+        "import os, sys, base64, tempfile, pymupdf\n"
+        "payload = base64.b64decode(os.environ['_GIGACHAT_DOC_PAYLOAD'])\n"
+        "with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as fh:\n"
+        "    fh.write(payload)\n"
+        "    path = fh.name\n"
+        "try:\n"
+        "    doc = pymupdf.open(path)\n"
+        "    n = len(doc)\n"
+        f"    pages_spec = {pages_lit}\n"
+        "    if pages_spec:\n"
+        "        idxs = []\n"
+        "        for chunk in str(pages_spec).split(','):\n"
+        "            chunk = chunk.strip()\n"
+        "            if '-' in chunk:\n"
+        "                a, b = chunk.split('-', 1)\n"
+        "                try: idxs.extend(range(int(a) - 1, min(int(b), n)))\n"
+        "                except ValueError: pass\n"
+        "            else:\n"
+        "                try: idxs.append(int(chunk) - 1)\n"
+        "                except ValueError: pass\n"
+        "        idxs = [i for i in idxs if 0 <= i < n]\n"
+        "    else:\n"
+        "        idxs = list(range(min(20, n)))\n"
+        "    parts = []\n"
+        "    for i in idxs:\n"
+        "        page = doc.load_page(i)\n"
+        "        text = page.get_text('text') or ''\n"
+        "        parts.append(f'--- page {i+1} ---\\n' + text)\n"
+        "    sys.stdout.write('\\n'.join(parts))\n"
+        "finally:\n"
+        "    try: doc.close()\n"
+        "    except Exception: pass\n"
+        "    try: os.unlink(path)\n"
+        "    except Exception: pass\n"
+    )
+
+
+def _read_doc_docx_worker_script() -> str:
+    """Python source the worker runs to parse a .docx and emit text."""
+    return (
+        "import os, sys, base64, tempfile\n"
+        "from docx import Document\n"
+        "payload = base64.b64decode(os.environ['_GIGACHAT_DOC_PAYLOAD'])\n"
+        "with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as fh:\n"
+        "    fh.write(payload)\n"
+        "    path = fh.name\n"
+        "try:\n"
+        "    doc = Document(path)\n"
+        "    parts = [p.text for p in doc.paragraphs]\n"
+        "    for table in doc.tables:\n"
+        "        for row in table.rows:\n"
+        "            cells = [c.text.strip() for c in row.cells]\n"
+        "            parts.append(' | '.join(cells))\n"
+        "    sys.stdout.write('\\n'.join(p for p in parts if p))\n"
+        "finally:\n"
+        "    try: os.unlink(path)\n"
+        "    except Exception: pass\n"
+    )
+
+
+def _read_doc_xlsx_worker_script(sheets_lit: str) -> str:
+    """Python source the worker runs to parse a .xlsx and emit text."""
+    return (
+        "import os, sys, base64, tempfile, openpyxl\n"
+        "payload = base64.b64decode(os.environ['_GIGACHAT_DOC_PAYLOAD'])\n"
+        "with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as fh:\n"
+        "    fh.write(payload)\n"
+        "    path = fh.name\n"
+        "try:\n"
+        "    wb = openpyxl.load_workbook(path, data_only=True)\n"
+        f"    spec = {sheets_lit}\n"
+        "    sheets = (\n"
+        "        [s.strip() for s in str(spec).split(',') if s.strip()]\n"
+        "        if spec else wb.sheetnames[:3]\n"
+        "    )\n"
+        "    parts = []\n"
+        "    for name in sheets:\n"
+        "        if name not in wb.sheetnames: continue\n"
+        "        ws = wb[name]\n"
+        "        parts.append(f'--- sheet {name} ---')\n"
+        "        for row in ws.iter_rows(values_only=True):\n"
+        "            cells = [str(c) if c is not None else '' for c in row]\n"
+        "            parts.append('\\t'.join(cells))\n"
+        "    sys.stdout.write('\\n'.join(parts))\n"
+        "finally:\n"
+        "    try: os.unlink(path)\n"
+        "    except Exception: pass\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Active dedup execution — run `ollama rm` on redundant copies
+#
+# The advisor (`pool_dedup_recommendations`) tells us which copies are
+# safely removable; this helper actually executes them via SSH. Each
+# action is independent — a failure on one worker doesn't block the
+# rest. Returns a per-action result list so the API can surface
+# success/failure.
+# ---------------------------------------------------------------------------
+
+
+async def execute_dedup_recommendations(
+    *, model_filter: str | None = None,
+) -> list[dict]:
+    """Walk `pool_dedup_recommendations` and SSH-run `ollama rm` on
+    each redundant copy. Returns a list of per-action result dicts::
+
+        [
+          {"model": "llama3:8b", "worker_id": "wid-A",
+           "ok": True, "bytes_reclaimed": 4_500_000_000,
+           "error": None},
+          ...
+        ]
+
+    `model_filter`, when set, restricts execution to that model only.
+    """
+    recs = pool_dedup_recommendations()
+    if model_filter:
+        recs = [r for r in recs if r.get("model") == model_filter]
+    workers_by_id = {w["id"]: w for w in db.list_compute_workers(enabled_only=False)}
+    results: list[dict] = []
+    for rec in recs:
+        model = rec["model"]
+        size = rec.get("size_bytes") or 0
+        for loc in rec.get("remove_from") or []:
+            if not loc.startswith("worker:"):
+                # Host removals are not supported via this API on
+                # purpose — host's Ollama is the operator's primary
+                # surface and they should run `ollama rm` themselves.
+                results.append({
+                    "model": model, "location": loc,
+                    "ok": False, "bytes_reclaimed": 0,
+                    "error": "skipped: host removals are operator-driven",
+                })
+                continue
+            wid = loc.split(":", 1)[1]
+            worker = workers_by_id.get(wid)
+            if not worker:
+                results.append({
+                    "model": model, "worker_id": wid,
+                    "ok": False, "bytes_reclaimed": 0,
+                    "error": "worker not found",
+                })
+                continue
+            ssh_host = (worker.get("ssh_host") or "").strip()
+            if not ssh_host:
+                results.append({
+                    "model": model, "worker_id": wid,
+                    "ok": False, "bytes_reclaimed": 0,
+                    "error": "worker has no ssh_host",
+                })
+                continue
+            # `ollama rm <name>` removes the model on the worker. We
+            # feed the model name through PowerShell single quotes so
+            # `$` / backticks aren't expanded; only `'` itself needs
+            # escaping (doubled).
+            safe_model = model.replace("'", "''")
+            ps_script = (
+                # Resolve the ollama binary; bail if missing.
+                "$ollama = (Get-Command ollama.exe -ErrorAction SilentlyContinue).Source;"
+                "if (-not $ollama) { Write-Error 'ollama not found on worker'; exit 3 };"
+                f"& $ollama rm '{safe_model}'"
+            )
+            ok, stdout, stderr = await dispatch_to_worker_powershell(
+                worker, ps_script, timeout_sec=60.0,
+            )
+            results.append({
+                "model": model, "worker_id": wid,
+                "ok": ok, "bytes_reclaimed": size if ok else 0,
+                "error": None if ok else (stderr or "unknown failure"),
+            })
+            if ok:
+                log.info(
+                    "compute_pool: dedup removed %s from worker %s — "
+                    "reclaimed %.2f GB",
+                    model, worker.get("label"), size / (1024 ** 3),
+                )
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -3659,6 +4189,311 @@ def _host_has_vram_for_speculative(target_size: int, draft_size: int) -> bool:
     return needed <= budget
 
 
+# ---------------------------------------------------------------------------
+# Worker-side llama-server lifecycle
+#
+# When `pick_chat_target` would route a chat to a worker (because the
+# worker is meaningfully more capable than host), the default path uses
+# the worker's Ollama. That works fine for vanilla single-stream chat,
+# but it means speculative decoding can't be engaged on that worker —
+# Ollama doesn't expose `--model-draft` / `-md`.
+#
+# Spawning a llama-server PROCESS on the worker — directly serving the
+# target + a draft GGUF — closes that gap. The host orchestrates
+# (start / stop / health-check) over SSH; the chat-time HTTP traffic
+# goes worker → worker (everything stays in the worker's VRAM, no
+# RPC layer-pulls). Worker-side llama-server only kicks in when:
+#   * the worker is the strongest-single-node winner,
+#   * the worker has `llama_server_path` populated by the probe,
+#   * speculative_decoding_enabled() is True,
+#   * a viable draft GGUF is already on the worker (no upfront LAN
+#     copy on the chat-startup hot path).
+#
+# State is kept in process memory (`_WORKER_CHAT_SERVERS`) because the
+# llama-server process actually runs on the worker — host restart has
+# no effect on the worker. On host startup the cache is empty; the
+# next chat turn either reuses an existing worker process (verified
+# via /health) or stops/respawns to pick up our config.
+# ---------------------------------------------------------------------------
+_WORKER_CHAT_SERVERS: dict[str, dict] = {}
+
+# Default port for worker-side llama-server. Sits above Ollama's 11434
+# and the host-side llama-server's 11500 so a single-machine dev setup
+# (host + worker on same box) doesn't collide.
+_WORKER_LLAMA_PORT = 11600
+
+# Worker VRAM headroom factor for the target + draft pair. Same idea
+# as `_SPECULATIVE_VRAM_HEADROOM` for host: leave room for KV cache
+# and the OS / any background processes.
+_WORKER_SPECULATIVE_VRAM_HEADROOM = 1.30
+
+
+def _worker_has_model_locally(worker: dict, model_name: str) -> bool:
+    """Did the periodic probe see ``model_name`` in this worker's
+    `/api/tags`? Strict name match; tag-as-typed is enough."""
+    caps = worker.get("capabilities") or {}
+    for m in caps.get("models") or []:
+        if not isinstance(m, dict):
+            continue
+        if (m.get("name") or "") == model_name:
+            return True
+    return False
+
+
+def _pick_worker_resident_draft(
+    worker: dict, target_model_name: str,
+) -> dict | None:
+    """Find a viable speculative-decoding draft already on this worker.
+
+    Same family / size constraints as the host picker, except the
+    inventory is restricted to models the worker reports installed.
+    Returns ``None`` if no candidate fits — the caller falls back to
+    the worker's Ollama (no speculative).
+    """
+    target = resolve_ollama_model(target_model_name)
+    if not target:
+        return None
+    target_family = (target.get("family") or "").lower()
+    target_size = int(target.get("size_bytes") or 0)
+    if target_size < _SPECULATIVE_MIN_TARGET_BYTES:
+        return None
+    max_draft_bytes = int(target_size * _DRAFT_MAX_SIZE_FRACTION)
+    caps = worker.get("capabilities") or {}
+    candidates = []
+    for m in caps.get("models") or []:
+        if not isinstance(m, dict):
+            continue
+        name = m.get("name") or ""
+        if not name or name == target_model_name:
+            continue
+        family = (m.get("family") or "").lower()
+        size = int(m.get("size") or 0)
+        if not family or family != target_family:
+            continue
+        if size <= 0 or size >= max_draft_bytes:
+            continue
+        candidates.append({"name": name, "family": family, "size_bytes": size})
+    if not candidates:
+        return None
+    candidates.sort(key=lambda m: m["size_bytes"])
+    return candidates[0]
+
+
+def _worker_has_vram_for_pair(
+    worker: dict, target_size: int, draft_size: int,
+) -> bool:
+    """Best-effort VRAM headroom check on the worker.
+
+    `max_vram_seen_bytes` is a hard lower bound from the probe. If a
+    larger model has actually been loaded on the worker, that's our
+    best evidence of available VRAM. Without that signal we conserve
+    by refusing — better to fall back to plain Ollama than to OOM the
+    worker mid-load.
+    """
+    if target_size <= 0 or draft_size <= 0:
+        return False
+    caps = worker.get("capabilities") or {}
+    proven_vram = int(caps.get("max_vram_seen_bytes") or 0)
+    if proven_vram <= 0:
+        return False
+    needed = (target_size + draft_size) * _WORKER_SPECULATIVE_VRAM_HEADROOM
+    return needed <= proven_vram
+
+
+async def _wait_for_worker_chat_health(
+    base_url: str, timeout_sec: float = 60.0,
+) -> bool:
+    """Poll the worker's llama-server `/health` until it reports OK or
+    timeout. Returns True on success, False on timeout."""
+    deadline = time.monotonic() + timeout_sec
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        while time.monotonic() < deadline:
+            try:
+                r = await client.get(f"{base_url}/health")
+                if r.status_code < 500:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(2.0)
+    return False
+
+
+async def stop_worker_chat_server(worker: dict) -> None:
+    """SSH-kill any llama-server running on the worker. Best-effort —
+    failures are logged and swallowed so a flaky worker can't block
+    the routing layer's pivot to host-only."""
+    wid = worker.get("id")
+    if wid:
+        _WORKER_CHAT_SERVERS.pop(wid, None)
+    ps_script = (
+        "Get-Process -Name llama-server -ErrorAction SilentlyContinue "
+        "| Stop-Process -Force;"
+        "Start-Sleep -Milliseconds 500"
+    )
+    try:
+        await dispatch_to_worker_powershell(
+            worker, ps_script, timeout_sec=10.0,
+        )
+    except Exception as e:
+        log.info(
+            "compute_pool: worker llama-server stop failed for %s: %s",
+            worker.get("label"), e,
+        )
+
+
+async def ensure_worker_chat_server(
+    worker: dict,
+    model_name: str,
+    *,
+    target_gguf_path: str,
+    draft_model_name: str,
+) -> str:
+    """Spawn (or confirm running) llama-server on the worker for the
+    given target + draft pair. Returns the base URL the host uses to
+    issue chat requests.
+
+    Idempotent: re-spawning for the same (target, draft) pair is a
+    no-op if /health on the existing process responds. Switching to
+    a different model stops the previous llama-server first.
+
+    Raises ``RuntimeError`` on any unrecoverable spawn failure — the
+    caller falls back to the worker's plain Ollama URL.
+    """
+    wid = worker["id"]
+
+    # Same target + draft already running? Re-verify health then
+    # short-circuit. /health is cheap; re-running it costs less than
+    # an unnecessary stop+spawn cycle.
+    state = _WORKER_CHAT_SERVERS.get(wid)
+    if (
+        state
+        and state.get("model") == model_name
+        and state.get("draft") == draft_model_name
+    ):
+        if await _wait_for_worker_chat_health(state["url"], timeout_sec=2.0):
+            return state["url"]
+        # Health failed — clear stale state and fall through to
+        # respawn.
+        _WORKER_CHAT_SERVERS.pop(wid, None)
+
+    # Stop any other llama-server first (different model running, or
+    # a stale process from a previous session).
+    await stop_worker_chat_server(worker)
+
+    caps = worker.get("capabilities") or {}
+    llama_server_path = caps.get("llama_server_path")
+    if not llama_server_path:
+        raise RuntimeError("worker has no llama-server installed")
+
+    # Resolve the target + draft GGUF paths via Ollama's manifest store
+    # ON THE WORKER. Each worker keeps its own ~/.ollama/models tree
+    # populated via `ollama pull`; the SSH-bench script below extracts
+    # the on-disk path for both models in one round trip.
+    safe_target = model_name.replace("'", "''")
+    safe_draft = draft_model_name.replace("'", "''")
+    resolve_ps = (
+        "$python = (Get-Command py.exe -ErrorAction SilentlyContinue).Source;"
+        "if (-not $python) { $python = (Get-Command python.exe -ErrorAction SilentlyContinue).Source };"
+        "if (-not $python) { Write-Error 'python not found on worker'; exit 3 };"
+        "$src = @\"\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "models = ('" + safe_target + "', '" + safe_draft + "')\n"
+        "out = {}\n"
+        "for name in models:\n"
+        "    base = Path.home() / '.ollama' / 'models'\n"
+        "    if ':' in name:\n"
+        "        ns_model, tag = name.rsplit(':', 1)\n"
+        "        if '/' in ns_model:\n"
+        "            ns, model = ns_model.split('/', 1)\n"
+        "        else:\n"
+        "            ns, model = 'library', ns_model\n"
+        "    else:\n"
+        "        ns, model, tag = 'library', name, 'latest'\n"
+        "    manifest = base / 'manifests' / 'registry.ollama.ai' / ns / model / tag\n"
+        "    if not manifest.exists():\n"
+        "        out[name] = None\n"
+        "        continue\n"
+        "    try:\n"
+        "        m = json.loads(manifest.read_text())\n"
+        "    except Exception:\n"
+        "        out[name] = None\n"
+        "        continue\n"
+        "    digest = None\n"
+        "    for layer in m.get('layers', []):\n"
+        "        if layer.get('mediaType') == 'application/vnd.ollama.image.model':\n"
+        "            digest = layer.get('digest')\n"
+        "            break\n"
+        "    if not digest:\n"
+        "        out[name] = None\n"
+        "        continue\n"
+        "    blob = base / 'blobs' / digest.replace(':', '-')\n"
+        "    out[name] = str(blob) if blob.exists() else None\n"
+        "json.dump(out, sys.stdout)\n"
+        "\"@;"
+        "$src | & $python -"
+    )
+    ok, stdout, stderr = await dispatch_to_worker_powershell(
+        worker, resolve_ps, timeout_sec=15.0,
+    )
+    if not ok:
+        raise RuntimeError(f"worker model resolve failed: {stderr}")
+    try:
+        paths = json.loads((stdout or b"").decode("utf-8", errors="replace") or "{}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"worker returned non-JSON resolve payload: {e}")
+    target_on_worker = paths.get(model_name)
+    draft_on_worker = paths.get(draft_model_name)
+    if not target_on_worker or not draft_on_worker:
+        raise RuntimeError(
+            f"worker missing GGUF — target={target_on_worker}, "
+            f"draft={draft_on_worker}"
+        )
+
+    # Build the spawn command. Worker-side llama-server runs the same
+    # CLI as host's, just with target + draft both local. The flags
+    # mirror split_lifecycle._build_command's defaults so the chat
+    # behaviour matches what the rest of the app expects.
+    spawn_cmd = (
+        f'"{llama_server_path}" '
+        f'--model "{target_on_worker}" '
+        '--host 0.0.0.0 '
+        f'--port {_WORKER_LLAMA_PORT} '
+        '-fa auto --jinja -ngl 99 -c 4096 --no-warmup '
+        f'-md "{draft_on_worker}" --draft-max 8 --draft-min 1 -ngld 99'
+    )
+    # Win32_Process.Create makes the spawned llama-server outlive the
+    # SSH session — same trick rpc-server restart already uses.
+    spawn_ps = (
+        f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+        f"-Arguments @{{CommandLine='{spawn_cmd}'}} | Select-Object -ExpandProperty ProcessId"
+    )
+    ok, stdout, stderr = await dispatch_to_worker_powershell(
+        worker, spawn_ps, timeout_sec=15.0,
+    )
+    if not ok:
+        raise RuntimeError(f"worker llama-server spawn failed: {stderr}")
+
+    base_url = f"http://{_worker_host(worker)}:{_WORKER_LLAMA_PORT}"
+    if not await _wait_for_worker_chat_health(base_url, timeout_sec=120.0):
+        # Best-effort cleanup so the dead process doesn't sit around
+        # holding a port.
+        await stop_worker_chat_server(worker)
+        raise RuntimeError("worker llama-server didn't pass /health in 120s")
+
+    _WORKER_CHAT_SERVERS[wid] = {
+        "model": model_name,
+        "draft": draft_model_name,
+        "url": base_url,
+        "port": _WORKER_LLAMA_PORT,
+    }
+    log.info(
+        "compute_pool: worker-side llama-server up on %s — target=%s draft=%s",
+        worker.get("label"), model_name, draft_model_name,
+    )
+    return base_url
+
+
 async def _ensure_split_running_for(
     model_name: str,
     gguf_path: str,
@@ -3918,14 +4753,72 @@ async def route_chat_for(model_name: str) -> dict:
         and strongest_single_vram > 0
         and size_bytes <= strongest_single_vram
     ):
-        # Sub-tier: even though one node fits the model alone, the user
-        # may have opted in to speculative decoding to recruit the rest
-        # of the pool as a draft-model accelerator. The picker walks
-        # pool inventory for a smaller, same-family chat model and the
-        # router engages llama-server (instead of Ollama) with `-md
-        # <draft>` when a viable draft is found AND host VRAM has room
-        # for both. Generic across pool composition — the picker
-        # doesn't hard-code any model names.
+        # Worker-side llama-server sub-tier: if the strongest single
+        # node is a worker (not host) AND that worker has llama-server
+        # installed AND a same-family draft is already on the worker,
+        # spawn llama-server on the worker so speculative decoding
+        # works for chats that would otherwise route to plain
+        # worker-side Ollama. Compute happens entirely on the worker
+        # (no LAN per-token cost), and the draft accelerates verify
+        # the same way it does on host.
+        if (
+            best_worker_capacity > host_vram
+            and chat_workers
+            and speculative_decoding_enabled()
+        ):
+            # Pick the strongest worker by capability score.
+            strongest_worker = max(
+                chat_workers, key=lambda w: _capability_score(w),
+            )
+            caps = strongest_worker.get("capabilities") or {}
+            if caps.get("llama_server_path"):
+                draft = _pick_worker_resident_draft(strongest_worker, model_name)
+                if (
+                    draft
+                    and _worker_has_vram_for_pair(
+                        strongest_worker, size_bytes, draft["size_bytes"],
+                    )
+                ):
+                    try:
+                        # Resolve target path for the spawn — though
+                        # the actual GGUF resolution happens worker-
+                        # side via the SSH script, we still need to
+                        # know the model is real on the host's view.
+                        if info and info.get("gguf_path"):
+                            base_url = await ensure_worker_chat_server(
+                                strongest_worker,
+                                model_name,
+                                target_gguf_path=info["gguf_path"],
+                                draft_model_name=draft["name"],
+                            )
+                            await stop_all_running_splits()
+                            log.info(
+                                "compute_pool: worker-side speculative "
+                                "engaged — worker=%s target=%s draft=%s",
+                                strongest_worker.get("label"),
+                                model_name, draft["name"],
+                            )
+                            return {
+                                "engine": "llama_server",
+                                "base_url": base_url,
+                                "label": model_name,
+                                "host_node": f"worker:{strongest_worker['id']}",
+                                "speculative_draft": draft["name"],
+                                "speculative_match": "family",
+                            }
+                    except Exception as e:
+                        log.info(
+                            "compute_pool: worker-side llama-server spawn "
+                            "failed for %s; falling back to plain Ollama: %s",
+                            strongest_worker.get("label"), e,
+                        )
+
+        # Host-side speculative sub-tier: even though one node fits
+        # the model alone, recruit the rest of the pool as a draft-
+        # model accelerator on host. Walks pool inventory for a
+        # smaller, same-family chat model and engages llama-server
+        # (instead of Ollama) with `-md <draft>` when a viable draft
+        # is found AND host VRAM has room for both.
         if speculative_decoding_enabled():
             draft = pick_draft_for(model_name)
             if (

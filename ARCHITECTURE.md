@@ -245,7 +245,9 @@ A handful of tables defined in `backend/db.py`'s schema block:
 | Adjust the per-worker probe (new capability hint) | `compute_pool._probe_one` (returns dict merged into `capabilities_json`) |
 | Tune the speculative-decoding picker (size threshold, family heuristic) | `compute_pool.py` (`pick_draft_for`, `_DRAFT_MAX_SIZE_FRACTION`, `_SPECULATIVE_MIN_TARGET_BYTES`) |
 | Tune the embedding round-robin pool selection | `compute_pool.py` (`pick_embed_target`, `_scaled_score_threshold`) |
-| Wire a new tool to the SSH-dispatch path (worker-side execution) | `compute_pool.py` (`dispatch_fetch_url_to_worker` for the pattern) + the tool's call site |
+| Wire a new tool to the SSH-dispatch path (worker-side execution) | `compute_pool.py` — start with `dispatch_to_worker_powershell` as the transport, then the per-tool dispatcher (`dispatch_fetch_url_to_worker`, `dispatch_web_search_to_worker`, `dispatch_read_doc_to_worker`) + the tool's call site |
+| Add a probe-time capability flag for a new worker library | `compute_pool._probe_worker_specs_via_ssh` PowerShell payload — extend the Python check + the `$out` JSON shape |
+| Tune the worker-side llama-server lifecycle | `compute_pool.py` (`ensure_worker_chat_server`, `_pick_worker_resident_draft`, `_worker_has_vram_for_pair`) |
 | Adjust adaptive split-vs-host TPS thresholds | `compute_pool.py` (`_ROUTE_TPS_CACHE_TTL_SEC`, `_record_route_tps`) |
 | Add a new `llama-server` CLI flag            | `split_lifecycle._build_command`           |
 

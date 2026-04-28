@@ -2892,16 +2892,28 @@ async def web_search(query: str, max_results: int = 5, region: str | None = None
 
     Returns one numbered hit per line with title + URL + snippet so the
     model can pick a promising result and pass it to `fetch_url`.
+
+    Routing: tries a pool worker first when one has the `ddgs` Python
+    library installed (capability probe surfaces that). Falls back to
+    a host-side DDGS call on dispatch failure or when no eligible
+    worker is reachable. The fallback path keeps chats unbroken on
+    pools that haven't run the worker-tools install script yet.
     """
     q = (query or "").strip()
     if not q:
         return {"ok": False, "output": "", "error": "empty query"}
     # Clamp so the model can't pull hundreds of results into context.
     n = max(1, min(int(max_results or 5), 20))
-    try:
-        hits = await asyncio.to_thread(_ddg_search_sync, q, n, region)
-    except Exception as e:
-        return {"ok": False, "output": "", "error": f"search failed: {type(e).__name__}: {e}"}
+    hits: list[dict] | None = None
+    from . import compute_pool
+    dispatch = await compute_pool.dispatch_web_search_to_worker(q, n, region)
+    if dispatch is not None and dispatch[0]:
+        hits = dispatch[1]
+    if hits is None:
+        try:
+            hits = await asyncio.to_thread(_ddg_search_sync, q, n, region)
+        except Exception as e:
+            return {"ok": False, "output": "", "error": f"search failed: {type(e).__name__}: {e}"}
     if not hits:
         return {"ok": True, "output": f"(no results for {q!r})"}
     lines: list[str] = []
@@ -6193,6 +6205,15 @@ async def read_doc(
         if not p.is_file():
             return {"ok": False, "output": "", "error": f"file not found: {p}"}
         suffix = p.suffix.lower()
+        # Try worker dispatch first when an eligible pool member can
+        # parse this format. Saves host CPU during inference; the
+        # dispatcher falls back to host on any worker-side failure.
+        from . import compute_pool
+        dispatch = await compute_pool.dispatch_read_doc_to_worker(
+            str(p), pages=pages, sheets=sheets,
+        )
+        if dispatch is not None and dispatch[0]:
+            return {"ok": True, "output": dispatch[1] or "(empty document)"}
         if suffix == ".pdf":
             r = await asyncio.to_thread(_read_pdf_sync, str(p), pages)
         elif suffix == ".docx":

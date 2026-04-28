@@ -3476,6 +3476,36 @@ def api_push_model_plan(wid: str, model: str) -> dict:
     }
 
 
+class DedupExecuteBody(BaseModel):
+    """Body for POST /api/compute-pool/dedup/execute. Optional `model`
+    filter restricts execution to that model only — useful when the
+    user wants to dry-run one model first before broad-stroke deletes."""
+    model: str | None = None
+
+
+@app.post("/api/compute-pool/dedup/execute")
+async def api_compute_pool_dedup_execute(body: DedupExecuteBody) -> dict:
+    """Execute the dedup advisor's recommendations.
+
+    SSHes into each worker named by `pool_dedup_recommendations` and
+    runs `ollama rm <model>` on it. Skips host (host removals are
+    operator-driven by design — the operator's primary surface is
+    Ollama, and we don't want a destructive API silently mutating
+    the host's local state).
+
+    Returns a per-action result list. Failures on individual workers
+    don't abort the run; the caller sees which removes succeeded.
+    """
+    results = await compute_pool.execute_dedup_recommendations(
+        model_filter=body.model,
+    )
+    bytes_reclaimed = sum(r.get("bytes_reclaimed", 0) for r in results if r.get("ok"))
+    return {
+        "results": results,
+        "total_bytes_reclaimed": bytes_reclaimed,
+    }
+
+
 @app.get("/api/compute-pool/inventory")
 def api_pool_inventory() -> dict:
     """Pool-wide model inventory + dedup recommendations.

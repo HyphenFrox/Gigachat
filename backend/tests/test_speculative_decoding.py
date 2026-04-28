@@ -716,6 +716,188 @@ def test_pick_tool_dispatch_target_skips_workers_without_ssh(isolated_db, monkey
     assert compute_pool._pick_tool_dispatch_target() is None
 
 
+# --- Web-search worker selection -----------------------------------------
+
+
+def test_pick_web_search_target_filters_by_ddgs(monkeypatch):
+    """Workers without `ddgs` installed (capability flag missing) are
+    skipped — dispatching to them would just error out on import."""
+    import time as _time
+    fresh = _time.time()
+    workers = [
+        {
+            "id": "w-ready", "label": "w-ready", "ssh_host": "ready",
+            "last_seen": fresh, "enabled": True,
+            "capabilities": {"has_ddgs": True},
+        },
+        {
+            "id": "w-no-ddgs", "label": "w-no-ddgs", "ssh_host": "noddgs",
+            "last_seen": fresh, "enabled": True,
+            "capabilities": {"has_ddgs": False},
+        },
+    ]
+    monkeypatch.setattr(
+        compute_pool.db, "list_compute_workers",
+        lambda enabled_only=False: workers,
+    )
+    compute_pool._TOOL_DISPATCH_INDEX.clear()
+    pick = compute_pool._pick_web_search_target()
+    assert pick is not None
+    assert pick["id"] == "w-ready"
+
+
+# --- Read-doc worker selection -------------------------------------------
+
+
+def test_pick_read_doc_target_filters_by_lib(monkeypatch):
+    """Each format requires a specific library. Worker missing it gets
+    skipped so we don't dispatch a doomed parse request."""
+    import time as _time
+    fresh = _time.time()
+    workers = [
+        {
+            "id": "w-pdf", "label": "w-pdf", "ssh_host": "pdf",
+            "last_seen": fresh, "enabled": True,
+            "capabilities": {"read_doc_libs": ["pymupdf"]},
+        },
+        {
+            "id": "w-docx", "label": "w-docx", "ssh_host": "docx",
+            "last_seen": fresh, "enabled": True,
+            "capabilities": {"read_doc_libs": ["docx"]},
+        },
+    ]
+    monkeypatch.setattr(
+        compute_pool.db, "list_compute_workers",
+        lambda enabled_only=False: workers,
+    )
+    compute_pool._TOOL_DISPATCH_INDEX.clear()
+    # PDF dispatch → pymupdf worker
+    pdf_pick = compute_pool._pick_read_doc_target(".pdf")
+    assert pdf_pick is not None and pdf_pick["id"] == "w-pdf"
+    compute_pool._TOOL_DISPATCH_INDEX.clear()
+    # DOCX dispatch → docx worker
+    docx_pick = compute_pool._pick_read_doc_target(".docx")
+    assert docx_pick is not None and docx_pick["id"] == "w-docx"
+    # XLSX dispatch → no eligible worker
+    compute_pool._TOOL_DISPATCH_INDEX.clear()
+    assert compute_pool._pick_read_doc_target(".xlsx") is None
+
+
+def test_pick_read_doc_target_returns_none_for_unknown_suffix():
+    """Unknown extension → None. read_doc on host handles the error
+    response itself."""
+    assert compute_pool._pick_read_doc_target(".weird") is None
+
+
+# --- Worker-side llama-server lifecycle ----------------------------------
+
+
+def test_pick_worker_resident_draft_finds_smaller_same_family(monkeypatch):
+    """Worker has both target and a smaller same-family model in its
+    Ollama inventory — picker returns the smaller as draft."""
+    _stub_resolve(monkeypatch, {
+        "llama3.1:8b": {
+            "family": "llama", "size_bytes": 5_000_000_000,
+            "gguf_path": "/host/target.gguf",
+        },
+    })
+    worker = {
+        "id": "w", "label": "w",
+        "capabilities": {
+            "models": [
+                {"name": "llama3.1:8b", "family": "llama", "size": 5_000_000_000},
+                {"name": "llama3.2:1b", "family": "llama", "size": 1_000_000_000},
+                {"name": "llama3.2:3b", "family": "llama", "size": 3_000_000_000},
+            ],
+        },
+    }
+    pick = compute_pool._pick_worker_resident_draft(worker, "llama3.1:8b")
+    assert pick is not None
+    # Smallest viable wins.
+    assert pick["name"] == "llama3.2:1b"
+
+
+def test_pick_worker_resident_draft_rejects_cross_family(monkeypatch):
+    """Worker has a smaller model but it's a different family → no
+    pick. Same tokenizer-vocab requirement as the host picker."""
+    _stub_resolve(monkeypatch, {
+        "llama3.1:8b": {
+            "family": "llama", "size_bytes": 5_000_000_000,
+            "gguf_path": "/host/target.gguf",
+        },
+    })
+    worker = {
+        "id": "w",
+        "capabilities": {
+            "models": [
+                {"name": "qwen2.5:0.5b", "family": "qwen2", "size": 400_000_000},
+            ],
+        },
+    }
+    assert compute_pool._pick_worker_resident_draft(worker, "llama3.1:8b") is None
+
+
+def test_worker_has_vram_for_pair_uses_proven_vram():
+    """The headroom check uses `max_vram_seen_bytes` as the upper
+    bound. A worker that's never loaded enough → can't host both."""
+    worker = {"capabilities": {"max_vram_seen_bytes": 16_000_000_000}}
+    # 5 GB target + 1 GB draft → 6 GB × 1.30 = 7.8 GB ≤ 16 GB.
+    assert compute_pool._worker_has_vram_for_pair(worker, 5_000_000_000, 1_000_000_000) is True
+    # 12 GB target + 1 GB draft → 13 GB × 1.30 = 16.9 GB > 16 GB.
+    assert compute_pool._worker_has_vram_for_pair(worker, 12_000_000_000, 1_000_000_000) is False
+
+
+def test_worker_has_vram_for_pair_refuses_unbenched_worker():
+    """No probe data on max_vram_seen → can't verify, refuse rather
+    than guess. Host-only path is the safe fallback."""
+    worker = {"capabilities": {}}
+    assert compute_pool._worker_has_vram_for_pair(
+        worker, 1_000_000_000, 100_000_000,
+    ) is False
+
+
+# --- Active dedup execution ----------------------------------------------
+
+
+async def test_execute_dedup_skips_host_locations(monkeypatch, isolated_db):
+    """Recommendations include `host` as a remove-from candidate would
+    be a no-op error path; the executor explicitly skips those.
+    Operator handles host removals via Ollama directly."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    # Stub the recommendations to include a host-only removal.
+    monkeypatch.setattr(
+        compute_pool, "pool_dedup_recommendations",
+        lambda: [{
+            "model": "M:1", "size_bytes": 1_000_000_000,
+            "keep_at": "worker:w1", "remove_from": ["host"],
+            "bytes_reclaimed": 1_000_000_000,
+        }],
+    )
+    results = await compute_pool.execute_dedup_recommendations()
+    # The host-only entry produces a "skipped" result, not a success.
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "host" in results[0]["error"].lower()
+
+
+async def test_execute_dedup_filters_to_specific_model(monkeypatch, isolated_db):
+    """`model_filter` restricts execution to one model; other recs
+    are dropped before any SSH dispatch."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    monkeypatch.setattr(
+        compute_pool, "pool_dedup_recommendations",
+        lambda: [
+            {"model": "A:1", "size_bytes": 1_000_000_000, "keep_at": "host",
+             "remove_from": ["host"], "bytes_reclaimed": 1_000_000_000},
+            {"model": "B:1", "size_bytes": 2_000_000_000, "keep_at": "host",
+             "remove_from": ["host"], "bytes_reclaimed": 2_000_000_000},
+        ],
+    )
+    results = await compute_pool.execute_dedup_recommendations(model_filter="B:1")
+    assert len(results) == 1
+    assert results[0]["model"] == "B:1"
+
+
 def test_pick_embed_target_excludes_dramatically_slower_worker(monkeypatch):
     """A worker measured at <50 % of the leader's TPS is excluded from
     the rotation — including it would slow the whole pool to its pace."""
