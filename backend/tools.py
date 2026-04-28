@@ -2954,34 +2954,62 @@ async def fetch_url(url: str, max_chars: int = FETCH_DEFAULT_MAX_CHARS) -> dict:
         if not resolves_public:
             return {"ok": False, "output": "", "error": f"blocked: {hostname} resolves to a non-public IP"}
 
-    try:
-        headers = {
-            "User-Agent": FETCH_USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.8",
-        }
-        async with httpx.AsyncClient(
-            timeout=FETCH_TIMEOUT_SEC,
-            follow_redirects=True,
-            headers=headers,
-        ) as client:
-            # Stream so we can enforce a hard byte cap on pathological pages.
-            async with client.stream("GET", u) as r:
-                r.raise_for_status()
-                ctype = r.headers.get("content-type", "").lower()
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in r.aiter_bytes():
-                    total += len(chunk)
-                    if total > FETCH_MAX_BYTES:
-                        break
-                    chunks.append(chunk)
-                raw = b"".join(chunks)
-                final_url = str(r.url)
-    except httpx.HTTPError as e:
-        return {"ok": False, "output": "", "error": f"HTTP error: {e}"}
-    except Exception as e:
-        return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
+    # Distributed-tools fast path: if the user opted into pool tool
+    # dispatch AND a worker is eligible, run the bytes-fetch on the
+    # worker via SSH+PowerShell. The host stays free for inference;
+    # the trafilatura extraction below still runs locally because that
+    # part is pure-CPU and Python-dependent. SSRF check above is
+    # already complete so the URL crossing the SSH boundary is vetted.
+    raw: bytes | None = None
+    final_url = u
+    ctype = ""
+    from . import compute_pool
+    dispatch = await compute_pool.dispatch_fetch_url_to_worker(u)
+    if dispatch is not None and dispatch[0]:
+        raw = dispatch[1]
+        # Worker doesn't surface the redirected URL or content-type
+        # back to host. Best-effort guess: assume HTML (the
+        # trafilatura extractor below is robust to non-HTML — it
+        # returns empty and we fall to plain-text mode). The header
+        # line in the result reads as the original URL, accurate
+        # given we don't have the redirect chain.
+        ctype = "text/html"
+    elif dispatch is not None and not dispatch[0]:
+        # Distributed dispatch tried but the worker errored. Quietly
+        # fall through to the host fetch so the chat doesn't fail on
+        # a transient worker hiccup. (compute_pool's dispatcher logs
+        # the error itself; no second log here.)
+        pass
+
+    if raw is None:
+        try:
+            headers = {
+                "User-Agent": FETCH_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.8",
+            }
+            async with httpx.AsyncClient(
+                timeout=FETCH_TIMEOUT_SEC,
+                follow_redirects=True,
+                headers=headers,
+            ) as client:
+                # Stream so we can enforce a hard byte cap on pathological pages.
+                async with client.stream("GET", u) as r:
+                    r.raise_for_status()
+                    ctype = r.headers.get("content-type", "").lower()
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in r.aiter_bytes():
+                        total += len(chunk)
+                        if total > FETCH_MAX_BYTES:
+                            break
+                        chunks.append(chunk)
+                    raw = b"".join(chunks)
+                    final_url = str(r.url)
+        except httpx.HTTPError as e:
+            return {"ok": False, "output": "", "error": f"HTTP error: {e}"}
+        except Exception as e:
+            return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
 
     # Decode — httpx would do this for us, but we streamed raw bytes so we
     # handle encoding manually. UTF-8 with replacement is fine for the model.
@@ -7547,10 +7575,27 @@ def _chunk_text(text: str, size: int, overlap: int) -> list[str]:
 
 
 async def _ollama_embed(client, text: str, model: str) -> list[float]:
-    """Call Ollama's /api/embeddings and return the vector."""
+    """Call Ollama's /api/embeddings and return the vector.
+
+    Routes through `compute_pool.pick_embed_target` so a pool of workers
+    eligible for embeddings (`use_for_embeddings` flag) absorbs
+    indexing traffic in parallel via round-robin. Falls back to host
+    Ollama when no worker is eligible. Net effect for codebase /
+    document indexing: throughput scales with the number of workers,
+    not bottlenecked by a single node.
+    """
+    from . import compute_pool
+    base_url = "http://127.0.0.1:11434"
+    headers: dict[str, str] = {}
+    target = compute_pool.pick_embed_target(model)
+    if target is not None:
+        base_url, token = target
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
     r = await client.post(
-        "http://127.0.0.1:11434/api/embeddings",
+        f"{base_url}/api/embeddings",
         json={"model": model, "prompt": text},
+        headers=headers,
     )
     r.raise_for_status()
     data = r.json()

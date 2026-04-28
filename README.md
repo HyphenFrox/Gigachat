@@ -329,7 +329,11 @@ The picker is generic — nothing is hard-coded to a particular model or device.
 A candidate that passes any tier still has to satisfy:
 
 * dramatically smaller than the target (≤ 30 % of target size — beyond that, draft cost eats the speedup),
-* lives on the host's local disk (v1 limitation; worker-only drafts would need an upfront LAN copy via `push-model`).
+* lives on the host's local disk OR is auto-syncable from a worker (the picker now schedules a background `model_sync.pull_model_to_host` when a worker-only candidate beats every host-resident option, so a future turn promotes it to host-resident; the current turn falls back to the best host candidate).
+
+#### Stacking speculative onto Phase 2 (layer-split)
+
+When the model is too big for any single node and the router engages Phase 2 (layer-split across `--rpc` workers), the speculative picker still runs and stacks `-md <draft.gguf>` on top of the split. The draft loads on the orchestrator host alongside whatever target layers stay host-resident; verification rides the same layer-split path the target does. Net win is 1.3-1.7× on top of plain layer-split throughput when a viable draft exists in the pool.
 
 #### When the router actually engages speculative
 
@@ -365,6 +369,20 @@ POST /api/settings
 ```
 
 The override is consulted before the auto picker, and it skips every safety check — bad pairs just won't accept many tokens. Use sparingly. Stale entries (override targets a model you've since deleted) fall through to the auto picker rather than crashing the chat.
+
+### Other pool-saturation features
+
+Three opt-in / on-by-default knobs that recruit more of the pool's capacity for inference:
+
+**Adaptive split-vs-host routing** (opt-in). Setting key `compute_pool_aggressive_split`. When ON, `route_chat_for` engages Phase 2 (layer-split) even for models that would fit a single node — but only when measured TPS shows split actually beats host on this exact model, OR when no measurement exists yet (first-time engagement is sampling). Per-model TPS history lives in `compute_pool._ROUTE_TPS_CACHE` with a 24-hour TTL. Useful for setups where the LAN + worker GPUs collectively beat single-host CPU offload — flip it on and let the cache settle on a verdict over the next few turns.
+
+**Round-robin embeddings** (always on). `pick_embed_target` now rotates across every worker that has the embedding model loaded and benches within 50 % of the leader's TPS. Codebase + document indexing (`tools._ollama_embed`) routes through this picker, so a 1000-chunk repo build parallelises across N workers instead of pinning to one. Outliers (a clearly-slower worker) are excluded from the rotation so the slow link doesn't drag the pool's effective throughput down.
+
+**Distributed tool execution** (opt-in). Setting key `compute_pool_distribute_tools`. When ON, eligible tool calls (currently `fetch_url`) SSH into a round-robin-picked worker and run via PowerShell's `Invoke-WebRequest`. The worker's CPU/IO absorbs the fetch, freeing the host to keep generating tokens. Works without any worker-side install — just OpenSSH + PowerShell (both ship with Windows 10+ by default). The host still does trafilatura extraction locally because that step is pure-CPU and Python-dep-heavy; only the bytes-fetch is dispatched. SSRF and DNS-resolution checks happen on the host BEFORE the URL crosses the SSH boundary.
+
+#### Pool inventory + dedup advisor
+
+`GET /api/compute-pool/inventory` returns a per-model breakdown of the entire pool's combined inventory: where each model lives, how much disk it occupies in aggregate, and how much of that is redundant (same blob duplicated on multiple nodes). Plus a `dedup_recommendations` array listing safe-to-remove copies (keep host's, then strongest worker, drop the rest) with the disk savings each removal would reclaim. Read-only — the API never deletes; the operator triggers `ollama rm` per node based on the advice.
 
 ### Build version
 

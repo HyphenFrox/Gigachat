@@ -244,6 +244,9 @@ A handful of tables defined in `backend/db.py`'s schema block:
 | Tweak the chat-routing policy (host vs worker vs split) | `compute_pool.py` (`route_chat_for`, `pick_chat_target`, `_capability_score`, `_host_capability_score`) |
 | Adjust the per-worker probe (new capability hint) | `compute_pool._probe_one` (returns dict merged into `capabilities_json`) |
 | Tune the speculative-decoding picker (size threshold, family heuristic) | `compute_pool.py` (`pick_draft_for`, `_DRAFT_MAX_SIZE_FRACTION`, `_SPECULATIVE_MIN_TARGET_BYTES`) |
+| Tune the embedding round-robin pool selection | `compute_pool.py` (`pick_embed_target`, `_scaled_score_threshold`) |
+| Wire a new tool to the SSH-dispatch path (worker-side execution) | `compute_pool.py` (`dispatch_fetch_url_to_worker` for the pattern) + the tool's call site |
+| Adjust adaptive split-vs-host TPS thresholds | `compute_pool.py` (`_ROUTE_TPS_CACHE_TTL_SEC`, `_record_route_tps`) |
 | Add a new `llama-server` CLI flag            | `split_lifecycle._build_command`           |
 
 ---

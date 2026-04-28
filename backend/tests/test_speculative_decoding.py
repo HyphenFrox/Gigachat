@@ -619,6 +619,94 @@ def test_pool_dedup_skips_models_with_single_copy(monkeypatch):
     assert compute_pool.pool_dedup_recommendations() == []
 
 
+# --- Distributed tool execution (fetch_url SSH dispatch) -----------------
+
+
+def test_distributed_tools_default_off(isolated_db, monkeypatch):
+    """Default OFF — opt-in. SSH dispatch's overhead is only worth it
+    when host CPU is saturated; otherwise it's a regression."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    assert compute_pool.distributed_tools_enabled() is False
+
+
+def test_distributed_tools_round_trip(isolated_db, monkeypatch):
+    """Setting controls the helper's verdict in both directions."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    isolated_db.set_setting("compute_pool_distribute_tools", "true")
+    assert compute_pool.distributed_tools_enabled() is True
+    isolated_db.set_setting("compute_pool_distribute_tools", "false")
+    assert compute_pool.distributed_tools_enabled() is False
+
+
+async def test_dispatch_fetch_returns_none_when_disabled(isolated_db, monkeypatch):
+    """`compute_pool_distribute_tools=false` short-circuits before any
+    worker enumeration — caller falls back to host fetch silently."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    result = await compute_pool.dispatch_fetch_url_to_worker("https://example.com")
+    assert result is None
+
+
+async def test_dispatch_fetch_returns_none_when_no_eligible_workers(isolated_db, monkeypatch):
+    """Setting on but no workers configured → `None` so the host falls
+    back. We never block the chat on a missing pool."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    isolated_db.set_setting("compute_pool_distribute_tools", "true")
+    result = await compute_pool.dispatch_fetch_url_to_worker("https://example.com")
+    assert result is None
+
+
+def test_pick_tool_dispatch_target_round_robins(isolated_db, monkeypatch):
+    """Three eligible workers → three back-to-back picks rotate. Same
+    pattern as embedding round-robin (#5)."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    import time as _time
+    fresh = _time.time()
+    fake_workers = [
+        {
+            "id": f"w{i}", "label": f"w{i}",
+            "ssh_host": f"alias{i}",
+            "address": f"w{i}.local",
+            "ollama_port": 11434,
+            "last_seen": fresh,
+            "enabled": True,
+            "use_for_chat": True,
+            "use_for_embeddings": True,
+            "use_for_subagents": True,
+        }
+        for i in range(3)
+    ]
+    monkeypatch.setattr(
+        compute_pool.db, "list_compute_workers",
+        lambda enabled_only=False: list(fake_workers),
+    )
+    compute_pool._TOOL_DISPATCH_INDEX.clear()
+    seen = []
+    for _ in range(6):
+        pick = compute_pool._pick_tool_dispatch_target()
+        assert pick is not None
+        seen.append(pick["id"])
+    # All three workers hit, each twice.
+    assert sorted(set(seen)) == ["w0", "w1", "w2"]
+
+
+def test_pick_tool_dispatch_target_skips_workers_without_ssh(isolated_db, monkeypatch):
+    """A worker without `ssh_host` configured can't be a dispatch
+    target — there's no transport. Picker drops them."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    import time as _time
+    fresh = _time.time()
+    rows = [
+        {"id": "no-ssh", "ssh_host": "", "last_seen": fresh, "label": "no-ssh", "enabled": True},
+        {"id": "no-probe", "ssh_host": "alias", "last_seen": None, "label": "no-probe", "enabled": True},
+    ]
+    monkeypatch.setattr(
+        compute_pool.db, "list_compute_workers",
+        lambda enabled_only=False: rows,
+    )
+    compute_pool._TOOL_DISPATCH_INDEX.clear()
+    assert compute_pool._pick_tool_dispatch_target() is None
+
+
 def test_pick_embed_target_excludes_dramatically_slower_worker(monkeypatch):
     """A worker measured at <50 % of the leader's TPS is excluded from
     the rotation — including it would slow the whole pool to its pace."""

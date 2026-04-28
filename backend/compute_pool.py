@@ -2906,6 +2906,159 @@ def _gguf_tokenizer_fingerprint(gguf_path: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Distributed tool execution — dispatch eligible tool calls to workers
+#
+# Some tool calls (HTTP fetches today; doc parsing in a future commit)
+# don't need host-only state — they can run on any worker that's
+# reachable over SSH. Routing them away from host frees host CPU/IO for
+# the inference path, which matters when the agent is mid-stream and
+# also pulling in remote context (e.g. a `fetch_url` during chat).
+#
+# Protocol is intentionally minimal: SSH the worker and execute one
+# `powershell -EncodedCommand` invocation per call. The worker only
+# needs OpenSSH server + PowerShell, both of which ship by default on
+# Windows 10+. No Python on the worker, no extra service.
+#
+# Round-robin across eligible workers so multi-fetch turns parallelise
+# across the pool. Opt-in via the `compute_pool_distribute_tools`
+# setting because SSH dispatch carries ~50-100 ms overhead per call;
+# pools without spare worker capacity get a regression rather than a
+# win.
+# ---------------------------------------------------------------------------
+_TOOL_DISPATCH_INDEX: dict[str, int] = {}
+_DISPATCH_FETCH_TIMEOUT_SEC = 30.0
+
+
+def distributed_tools_enabled() -> bool:
+    """Read the user's `compute_pool_distribute_tools` setting.
+
+    Default OFF: opt-in. SSH dispatch is a clear win when host CPU is
+    saturated (mid-inference + concurrent fetches), and a small
+    regression otherwise. Users opt in once they've measured the win
+    on their own pool.
+    """
+    val = db.get_setting("compute_pool_distribute_tools")
+    if val is None or str(val).strip() == "":
+        return False
+    return str(val).lower() in ("1", "true", "yes", "on")
+
+
+def _pick_tool_dispatch_target() -> dict | None:
+    """Return the next eligible worker for tool dispatch.
+
+    Eligible = enabled, has `ssh_host` configured (the dispatch
+    protocol uses SSH), and was probed successfully recently. Round-
+    robins via `_TOOL_DISPATCH_INDEX` so a burst of tool calls fans
+    across the whole pool instead of pinning to the strongest worker.
+    """
+    rows = db.list_compute_workers(enabled_only=True)
+    eligible = [
+        w for w in rows
+        if (w.get("ssh_host") or "").strip()
+        and w.get("last_seen") is not None
+    ]
+    if not eligible:
+        return None
+    # Newest probe first so a worker we just confirmed alive ranks
+    # above one whose last_seen is stale.
+    eligible.sort(key=lambda w: float(w.get("last_seen") or 0), reverse=True)
+    idx = _TOOL_DISPATCH_INDEX.get("any", 0)
+    pick = eligible[idx % len(eligible)]
+    _TOOL_DISPATCH_INDEX["any"] = (idx + 1) % len(eligible)
+    return pick
+
+
+async def dispatch_fetch_url_to_worker(url: str) -> tuple[bool, bytes, str] | None:
+    """SSH a URL fetch onto a worker via PowerShell's `Invoke-WebRequest`.
+
+    Returns:
+      * ``None`` when distribution is disabled or no eligible worker is
+        available — caller falls back to host-side fetch.
+      * ``(True, body_bytes, "")`` when the worker fetched the URL
+        successfully. Body is the raw response bytes (binary-safe via
+        base64 transport).
+      * ``(False, b"", error_msg)`` when distribution was attempted but
+        the worker returned an error. Caller MAY fall back to host as a
+        safety net (the distributed-tools setting governs whether to
+        retry locally vs. surface the error).
+
+    The SSRF / DNS check the host-side `fetch_url` runs BEFORE calling
+    this function is the security gate — we don't repeat it on the
+    worker side because the URL crossed the trust boundary already
+    vetted.
+    """
+    if not distributed_tools_enabled():
+        return None
+    worker = _pick_tool_dispatch_target()
+    if not worker:
+        return None
+    ssh_host = (worker.get("ssh_host") or "").strip()
+    if not ssh_host:
+        return None
+
+    # PowerShell single-quoted string is literal — no `$` expansion,
+    # no backtick escapes. Doubling embedded apostrophes is the only
+    # quote-injection vector to handle.
+    safe_url = url.replace("'", "''")
+    ps_cmd = (
+        # Cap response size so a multi-GB body doesn't OOM the worker.
+        # 8 MB matches the host-side `FETCH_MAX_BYTES` (in tools.py).
+        "[System.Net.ServicePointManager]::SecurityProtocol = "
+        "[System.Net.SecurityProtocolType]::Tls12;"
+        "try {"
+        f"  $resp = Invoke-WebRequest -UseBasicParsing -Uri '{safe_url}'"
+        f"    -TimeoutSec {int(_DISPATCH_FETCH_TIMEOUT_SEC)}"
+        "     -MaximumRedirection 5 -ErrorAction Stop;"
+        "  $bytes = $resp.RawContentStream.ToArray();"
+        "  if ($bytes.Length -gt 8388608) { $bytes = $bytes[0..8388607] };"
+        "  [Console]::Out.Write([System.Convert]::ToBase64String($bytes))"
+        "} catch {"
+        "  [Console]::Error.Write($_.Exception.Message);"
+        "  exit 2"
+        "}"
+    )
+    import base64
+    encoded = base64.b64encode(ps_cmd.encode("utf-16-le")).decode("ascii")
+    cmd = [
+        "ssh", "-o", "BatchMode=yes",
+        "-o", f"ConnectTimeout={int(_DISPATCH_FETCH_TIMEOUT_SEC)}",
+        ssh_host,
+        "powershell", "-NoProfile", "-EncodedCommand", encoded,
+    ]
+    import subprocess as _sp
+
+    def _run() -> tuple[int, bytes, bytes]:
+        try:
+            r = _sp.run(
+                cmd, capture_output=True,
+                timeout=_DISPATCH_FETCH_TIMEOUT_SEC + 10,
+            )
+            return r.returncode, r.stdout, r.stderr
+        except _sp.TimeoutExpired:
+            return -1, b"", b"timeout"
+        except Exception as e:
+            return -2, b"", repr(e).encode()
+
+    rc, stdout, stderr = await asyncio.to_thread(_run)
+    if rc != 0:
+        err = (stderr or b"").decode("utf-8", errors="replace").strip()[:200]
+        log.info(
+            "compute_pool: distributed fetch via %s failed (rc=%d): %s",
+            ssh_host, rc, err or "no stderr",
+        )
+        return False, b"", f"worker fetch failed: {err or 'unknown'}"
+    try:
+        body = base64.b64decode((stdout or b"").strip())
+    except Exception as e:
+        return False, b"", f"worker returned malformed base64: {e}"
+    log.info(
+        "compute_pool: dispatched fetch_url(%r) to worker %s — %d bytes",
+        url, worker.get("label"), len(body),
+    )
+    return True, body, ""
+
+
+# ---------------------------------------------------------------------------
 # Pool-wide model-inventory summary
 #
 # `pool_inventory_summary()` consolidates the per-node model lists into a

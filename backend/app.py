@@ -3245,6 +3245,16 @@ _ALLOWED_SETTING_KEYS = {
     # reject. Misuse just produces low accept rates, so it's
     # documented in the README rather than gated.
     "compute_pool_speculative_overrides",
+    # Compute-pool: opt-in flag for engaging Phase 2 (layer-split)
+    # even when the model fits the host's VRAM alone. Adaptive
+    # routing uses measured TPS to decide whether split actually
+    # wins; first-time engagement is a sampling pass.
+    "compute_pool_aggressive_split",
+    # Compute-pool: opt-in flag for SSH-dispatching eligible tool
+    # calls (currently `fetch_url`) onto a worker so host CPU stays
+    # free for inference. Default OFF — SSH adds ~50-100 ms overhead
+    # per call which is a regression on hosts with spare capacity.
+    "compute_pool_distribute_tools",
 }
 
 
