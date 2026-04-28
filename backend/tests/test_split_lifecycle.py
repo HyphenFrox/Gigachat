@@ -57,6 +57,11 @@ def test_build_command_minimal_no_rpc():
     assert str(split_lifecycle._DEFAULT_NGL) in cmd
     # Jinja chat templates on (most modern GGUFs ship one).
     assert "--jinja" in cmd
+    # KV-cache reuse across turns: enabled with a 256-token minimum
+    # prefix match. Below that, recompute is comparable to the
+    # cache-lookup cost; above, it's a real win on follow-up messages.
+    assert "--cache-reuse" in cmd
+    assert cmd[cmd.index("--cache-reuse") + 1] == "256"
 
 
 def test_build_command_with_rpc_endpoints_in_order():

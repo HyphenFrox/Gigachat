@@ -880,6 +880,47 @@ async def test_execute_dedup_skips_host_locations(monkeypatch, isolated_db):
     assert "host" in results[0]["error"].lower()
 
 
+# --- Quant-variant grouping ----------------------------------------------
+
+
+def test_strip_quant_suffix_extracts_known_quants():
+    """Recognise the common Ollama / GGUF quant suffixes — Q4_0,
+    Q4_K_M, Q5_K_S, Q8_0, IQ3_XS — and uppercase the result so the
+    UI can group case-insensitively."""
+    assert compute_pool._strip_quant_suffix("llama3:8b-q4_K_M") == ("llama3:8b", "Q4_K_M")
+    assert compute_pool._strip_quant_suffix("qwen2.5:0.5b-q8_0") == ("qwen2.5:0.5b", "Q8_0")
+    assert compute_pool._strip_quant_suffix("mistral:7b-iq3_xs") == ("mistral:7b", "IQ3_XS")
+    assert compute_pool._strip_quant_suffix("gemma:2b-q4_0") == ("gemma:2b", "Q4_0")
+
+
+def test_strip_quant_suffix_preserves_names_without_suffix():
+    """A name with no recognisable quant (e.g. just `llama3:8b`)
+    returns the original + ``None``."""
+    assert compute_pool._strip_quant_suffix("llama3:8b") == ("llama3:8b", None)
+    assert compute_pool._strip_quant_suffix("custom:my-tag") == ("custom:my-tag", None)
+    # The underscore-but-not-quant case shouldn't match.
+    assert compute_pool._strip_quant_suffix("model:special-edition") == ("model:special-edition", None)
+
+
+def test_pool_inventory_groups_quant_variants(monkeypatch):
+    """Two quant variants of the same base appear as one group with
+    both variants listed; single-quant models don't show up in
+    `quant_groups`."""
+    _stub_inventory(monkeypatch, [
+        {"name": "llama3:8b-q4_K_M", "family": "llama", "size_bytes": 5_000_000_000, "source": "host"},
+        {"name": "llama3:8b-q8_0", "family": "llama", "size_bytes": 8_500_000_000, "source": "worker:wA"},
+        # Single-quant model — no group expected.
+        {"name": "qwen2.5:0.5b-q4_0", "family": "qwen2", "size_bytes": 400_000_000, "source": "host"},
+    ])
+    summary = compute_pool.pool_inventory_summary()
+    groups = summary.get("quant_groups", [])
+    assert len(groups) == 1
+    g = groups[0]
+    assert g["base"] == "llama3:8b"
+    quants = sorted(v["quant"] for v in g["variants"])
+    assert quants == ["Q4_K_M", "Q8_0"]
+
+
 async def test_execute_dedup_filters_to_specific_model(monkeypatch, isolated_db):
     """`model_filter` restricts execution to one model; other recs
     are dropped before any SSH dispatch."""

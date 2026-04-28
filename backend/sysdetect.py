@@ -125,6 +125,60 @@ def _detect_amd_gpu() -> tuple[float, str]:
     return vram_bytes / (1024 ** 3), name or "AMD GPU"
 
 
+def _detect_intel_gpu() -> tuple[float, str]:
+    """Return (vram_gb, gpu_name) for an Intel GPU (iGPU or Arc dGPU)
+    on Windows via WMI, else (0, "").
+
+    nvidia-smi and rocm-smi don't see Intel hardware. WMI's
+    Win32_VideoController class is the same probe the worker-side
+    capability check uses, so the host's Intel detection is
+    consistent with what we report for workers.
+
+    For iGPUs the reported `AdapterRAM` is the BIOS-allocated shared
+    memory pool (typically 128 MB - 1 GB), which understates the
+    actual usable memory because Intel iGPUs dynamically grow into
+    system RAM. Treat the reported number as the conservative
+    floor — `recommend_num_ctx` already falls back to RAM tiers
+    when VRAM is small.
+    """
+    if sys.platform != "win32":
+        return 0.0, ""
+    # Using PowerShell + Get-CimInstance avoids pulling the heavy
+    # `wmi` Python package into requirements.txt for one-off probes.
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                # Filter to Intel adapters; emit "<ram>|<name>" so we
+                # parse without invoking JSON for one row.
+                "Get-CimInstance Win32_VideoController "
+                "| Where-Object { $_.Name -match 'Intel' } "
+                "| Select-Object -First 1 "
+                "| ForEach-Object { \"$($_.AdapterRAM)|$($_.Name)\" }",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=4.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return 0.0, ""
+    if result.returncode != 0:
+        return 0.0, ""
+    line = (result.stdout or "").strip().splitlines()
+    if not line:
+        return 0.0, ""
+    parts = line[0].split("|", 1)
+    if not parts or not parts[0].strip().isdigit():
+        return 0.0, ""
+    vram_bytes = int(parts[0].strip())
+    name = parts[1].strip() if len(parts) > 1 else "Intel GPU"
+    if vram_bytes <= 0:
+        return 0.0, ""
+    return vram_bytes / (1024 ** 3), name
+
+
 def _detect_apple_silicon() -> tuple[float, str]:
     """Return (unified_ram_gb, chip_name) on Apple Silicon Macs, else (0,"").
 
@@ -163,9 +217,14 @@ def detect_system() -> dict:
     don't re-shell-out to nvidia-smi every time. Hardware doesn't change mid
     process, so one probe at import time is plenty.
 
-    GPU detection order: NVIDIA (most common on Windows + Linux desktops),
-    then AMD (ROCm-capable Radeons), then Apple Silicon unified memory.
-    The first one that reports nonzero memory wins.
+    GPU detection order:
+      1. NVIDIA (nvidia-smi)            — most common on Windows + Linux desktops
+      2. AMD (rocm-smi)                  — ROCm-capable Radeons
+      3. Apple Silicon (sysctl)          — arm64 macOS unified memory
+      4. Intel (Win32_VideoController)   — iGPUs + Arc dGPUs on Windows
+    The first one that reports nonzero memory wins. `gpu_kind` ∈
+    {"nvidia", "amd", "apple", "intel", ""}; the empty string means
+    no usable GPU detected (CPU-only host).
     """
     ram_gb = _detect_ram_gb()
     # Try each backend in turn. Apple Silicon is Mac-only and free (no shell
@@ -181,6 +240,10 @@ def detect_system() -> dict:
         vram_gb, gpu_name = _detect_apple_silicon()
         if vram_gb > 0:
             gpu_kind = "apple"
+    if vram_gb == 0:
+        vram_gb, gpu_name = _detect_intel_gpu()
+        if vram_gb > 0:
+            gpu_kind = "intel"
     return {
         "ram_gb": round(ram_gb, 1),
         "vram_gb": round(vram_gb, 1),

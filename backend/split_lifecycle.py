@@ -399,6 +399,19 @@ def _build_command(
         # extra TTFT), which is dramatically less than waiting for
         # warmup before any traffic at all.
         "--no-warmup",
+        # Reuse decoded KV cache across turns when the new prompt
+        # shares a prefix with the previous one. `--cache-reuse N` is
+        # the minimum prefix length (in tokens) we'll bother
+        # rebinding — below 256 tokens the recompute cost is comparable
+        # to the cache-lookup cost, so the win shows up only on
+        # longer conversations. For chat-with-context turns this is
+        # huge: each follow-up message reuses the system prompt + the
+        # whole prior conversation, recomputing only the new tail.
+        # llama-server matches as much of the in-flight context as
+        # the cache holds, so capping at 256 just means short prompts
+        # skip the path. Default is 0 (disabled) upstream; we enable
+        # always.
+        "--cache-reuse", "256",
     ]
     # Gemma 3n PLE variants whose graph trips
     # `GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS)` need TWO

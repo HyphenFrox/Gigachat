@@ -3629,6 +3629,39 @@ async def execute_dedup_recommendations(
 # ---------------------------------------------------------------------------
 
 
+# Match the trailing quant suffix on Ollama tags / GGUF filenames.
+# Examples that match: ``-q4_0``, ``-q4_K_M``, ``-q5_K_S``, ``-q8_0``,
+# ``-iq3_xs``, ``-iq2_m`` (case-insensitive). The picker uses this to
+# group models that share a base name but ship in different quant
+# levels — the user can see at a glance "I have llama3:8b in both
+# Q4_K_M and Q8_0" and the dedup advisor surfaces the redundancy.
+import re as _re_quant
+_QUANT_SUFFIX_RE = _re_quant.compile(
+    r"[-_:](i?q\d+(?:_(?:[\w]+))?)$",
+    _re_quant.IGNORECASE,
+)
+
+
+def _strip_quant_suffix(name: str) -> tuple[str, str | None]:
+    """Split a model name into (base, quant) — quant is None when
+    the name doesn't carry a recognisable suffix.
+
+    Example::
+
+        _strip_quant_suffix("llama3:8b-q4_K_M")   -> ("llama3:8b", "Q4_K_M")
+        _strip_quant_suffix("llama3:8b")          -> ("llama3:8b", None)
+        _strip_quant_suffix("qwen2.5:0.5b-iq3_xs")-> ("qwen2.5:0.5b", "IQ3_XS")
+    """
+    if not name:
+        return name, None
+    m = _QUANT_SUFFIX_RE.search(name)
+    if not m:
+        return name, None
+    base = name[: m.start()]
+    quant = m.group(1).upper()
+    return base, quant
+
+
 def pool_inventory_summary() -> dict:
     """Return a per-model breakdown of where every chat-capable model
     sits in the pool, plus aggregate disk-pressure totals.
@@ -3698,11 +3731,46 @@ def pool_inventory_summary() -> dict:
     # surface first in the Settings UI.
     models.sort(key=lambda m: m["redundant_bytes"], reverse=True)
 
+    # Quant-variant grouping: every model name has its trailing quant
+    # suffix stripped; entries that share a base get bucketed under
+    # the base. Lets the user see "for llama3:8b family I have Q4_K_M
+    # on host AND Q8_0 on worker-A" without paging through the flat
+    # list. Models without a recognisable quant suffix become single-
+    # member groups.
+    by_base: dict[str, dict] = {}
+    for entry in models:
+        base, quant = _strip_quant_suffix(entry["name"])
+        bucket = by_base.setdefault(
+            base,
+            {
+                "base": base,
+                "family": entry.get("family"),
+                "variants": [],
+                "total_bytes": 0,
+            },
+        )
+        bucket["variants"].append({
+            "name": entry["name"],
+            "quant": quant,
+            "size_bytes": entry["size_bytes"],
+            "locations": entry["locations"],
+        })
+        bucket["total_bytes"] += entry["size_bytes"] * entry["copies"]
+
+    quant_groups = [
+        b for b in by_base.values() if len(b["variants"]) > 1
+    ]
+    quant_groups.sort(key=lambda b: b["total_bytes"], reverse=True)
+
     return {
         "models": models,
         "total_unique_bytes": total_unique_bytes,
         "total_pool_bytes": total_pool_bytes,
         "total_redundant_bytes": total_redundant_bytes,
+        # Only multi-variant bases land here — single-quant models
+        # don't need a "group" view since the flat models[] list
+        # already covers them.
+        "quant_groups": quant_groups,
     }
 
 

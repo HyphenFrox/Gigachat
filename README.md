@@ -390,6 +390,28 @@ All three are always-on. Each has its own engagement gate so it kicks in only wh
 
 The dedup advisor exposed at `/api/compute-pool/inventory` now has a companion `POST /api/compute-pool/dedup/execute` endpoint that SSH-runs `ollama rm <model>` on each worker the advisor flagged as redundant. Optional `model` field restricts execution to one model. Host removals are intentionally NOT executed by the API — the operator's primary surface is the Ollama CLI on the host machine, and the API doesn't silently mutate that.
 
+#### Native vendor backends per host
+
+The host's llama.cpp install variant is now picked automatically from the detected GPU vendor:
+
+| GPU vendor | Variant | Backend |
+|---|---|---|
+| NVIDIA | `cuda-12.4` | CUDA — fastest on NVIDIA, covers any recent driver |
+| AMD | `hip` | ROCm/HIP — faster than Vulkan on consumer Radeons (Windows ROCm support is patchy; falls back to Vulkan when missing) |
+| Intel (iGPU + Arc dGPU) | `sycl` | oneAPI/SYCL — Intel's native compute API, ~15-25% faster than Vulkan on Intel hardware |
+| Apple Silicon (macOS arm64) | `metal` | Metal-bundled artifact, well-tuned for M-series chips |
+| No GPU | `cpu` | Pure-CPU build, smallest zip |
+
+`split_runtime.recommend_host_variant()` is the single source of truth; the Settings UI's "Install llama.cpp" button consumes it. Workers continue to be selected per-vendor via `_select_worker_backend` — NVIDIA workers run rpc-server with `-d CUDA0,CPU`, AMD with `-d Vulkan0,CPU`, Intel iGPU with `-d SYCL0,CPU`.
+
+#### KV cache reuse across turns
+
+`split_lifecycle._build_command` now passes `--cache-reuse 256` so llama-server reuses decoded KV cache between turns whenever the new prompt shares a 256-token-or-longer prefix with the previous one. Big win for chat-with-context turns: each follow-up message reuses the system prompt + the entire prior conversation, recomputing only the new tail. Below 256 tokens the recompute cost is comparable to the cache-lookup cost — that's the floor that keeps short prompts on the simple path.
+
+#### Quant-variant grouping
+
+`pool_inventory_summary()` now exposes a `quant_groups` array alongside the flat `models` list. Models that share a base name but differ in quant suffix (`llama3:8b-q4_K_M` vs `llama3:8b-q8_0`) are bucketed together so the Settings UI can render "for `llama3:8b` you have Q4_K_M on host AND Q8_0 on worker-A" as a single group. Single-quant models stay flat. Quant detection is regex-based (`-q4_K_M`, `-q8_0`, `-iq3_xs`, etc., case-insensitive); models with non-standard suffixes appear as their own single-member group. No automatic quant-switching — the user picks the quant they want via the Ollama tag, the grouping is informational.
+
 #### Pool inventory + dedup advisor
 
 `GET /api/compute-pool/inventory` returns a per-model breakdown of the entire pool's combined inventory: where each model lives, how much disk it occupies in aggregate, and how much of that is redundant (same blob duplicated on multiple nodes). Plus a `dedup_recommendations` array listing safe-to-remove copies (keep host's, then strongest worker, drop the rest) with the disk savings each removal would reclaim. Read-only — the API never deletes; the operator triggers `ollama rm` per node based on the advice.
@@ -415,7 +437,7 @@ The pool's value is the top three rows — large models that the host can't load
 ### Setup, per machine
 
 - **Worker side** — Ollama installed and listening on `0.0.0.0:11434` (set `OLLAMA_HOST` env var, allow port 11434 on the Private firewall profile). Optional but enables Phase 2: install [llama.cpp's prebuilt Vulkan build](https://github.com/ggml-org/llama.cpp/releases) at `~/.gigachat/llama-cpp/`, run `rpc-server.exe --host 0.0.0.0 --port 50052`. Allow port 50052 on the Private firewall profile.
-- **Host side** — register each worker via Settings → Compute → Add device. Fill in the LAN address (mDNS `.local` or a private IPv4 like `192.168.x.x`). Set `ssh_host` to your `~/.ssh/config` alias for that machine if you want LAN-first model copy. Optionally set `tailscale_host` to a stable Tailscale identifier (MagicDNS name or CGNAT IPv4) so the LAN address self-heals via Tailscale rediscovery whenever DHCP gives the worker a new lease — Tailscale is used **only** for that one query, never for ongoing chat / embeddings / model-copy traffic. One-click "Install llama.cpp" in the Compute panel fetches the host's CUDA build (~150 MB).
+- **Host side** — register each worker via Settings → Compute → Add device. Fill in the LAN address (mDNS `.local` or a private IPv4 like `192.168.x.x`). Set `ssh_host` to your `~/.ssh/config` alias for that machine if you want LAN-first model copy. Optionally set `tailscale_host` to a stable Tailscale identifier (MagicDNS name or CGNAT IPv4) so the LAN address self-heals via Tailscale rediscovery whenever DHCP gives the worker a new lease — Tailscale is used **only** for that one query, never for ongoing chat / embeddings / model-copy traffic. One-click "Install llama.cpp" in the Compute panel auto-detects the host's GPU vendor and fetches the matching upstream build: CUDA on NVIDIA, ROCm/HIP on AMD, oneAPI/SYCL on Intel iGPUs/Arc, Metal on Apple Silicon (macOS arm64), or CPU-only when no GPU is detected. ~150 MB zip per variant.
 
 The Settings panel shows live status pills per worker (Ollama version, model count, RPC reachability, GPU detection). The panel polls capabilities every 5 minutes; click the 🔄 on any row to probe immediately.
 

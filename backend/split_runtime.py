@@ -113,9 +113,12 @@ def _candidate_dirs() -> Iterable[Path]:
 
 
 def _resolve_binary(name: str) -> Path | None:
-    """Find the named binary in any candidate dir. Windows-only path
-    extension handling — we don't support Linux/macOS for now since the
-    host this app runs on is Windows."""
+    """Find the named binary in any candidate dir.
+
+    Windows binaries carry the ``.exe`` suffix; macOS / Linux drop it.
+    The candidate-dir walk tries both so a binary the user dropped
+    manually under a different convention still resolves.
+    """
     suffixes = (".exe",) if platform.system() == "Windows" else ("",)
     for d in _candidate_dirs():
         for suffix in suffixes:
@@ -141,17 +144,32 @@ def find_rpc_server() -> Path | None:
 
 
 def _platform_support() -> tuple[bool, str | None]:
-    """Phase 2's auto-install path is Windows-only for now.
+    """Which host platforms have a prebuilt llama.cpp variant we can
+    auto-install. Returns ``(True, None)`` when supported, else
+    ``(False, <reason>)``.
 
-    Linux / macOS hosts can still USE the feature by building llama.cpp
-    themselves and dropping `llama-server` onto PATH — `find_llama_server`
-    will pick it up. But the auto-download flow targets the host this
-    app actually ships on (Windows desktop)."""
-    if platform.system() != "Windows":
-        return False, f"auto-install only supports Windows; got {platform.system()}"
-    if platform.machine().lower() not in ("amd64", "x86_64"):
-        return False, f"only x86_64 supported; got {platform.machine()}"
-    return True, None
+    Supported today:
+      * Windows x64        — multiple GPU variants (CUDA / ROCm / SYCL /
+                              Vulkan / CPU)
+      * macOS arm64        — Apple Silicon, Metal-accelerated build
+
+    Other platforms (Windows arm64, Linux, macOS Intel) can still use
+    the compute pool by building llama.cpp themselves and dropping
+    ``llama-server`` onto PATH — `find_llama_server` walks PATH so a
+    self-built binary works fine. The auto-download flow just targets
+    the platforms most users actually run on.
+    """
+    sysname = platform.system()
+    machine = platform.machine().lower()
+    if sysname == "Windows":
+        if machine in ("amd64", "x86_64"):
+            return True, None
+        return False, f"Windows on {machine} isn't supported; need x86_64"
+    if sysname == "Darwin":
+        if machine in ("arm64", "aarch64"):
+            return True, None
+        return False, f"macOS on {machine} isn't supported; need arm64 (Apple Silicon)"
+    return False, f"auto-install supports Windows x64 and macOS arm64; got {sysname} {machine}"
 
 
 def get_install_status() -> InstallStatus:
@@ -175,16 +193,28 @@ def get_install_status() -> InstallStatus:
 # ---------------------------------------------------------------------------
 
 def _release_url(variant: str) -> str:
-    """Build the GitHub releases zip URL for one of the prebuilt
-    Windows variants.
+    """Build the GitHub-releases zip URL for one of the prebuilt
+    llama.cpp artifacts.
 
-    `variant` is the suffix llama.cpp uses on its release artifacts —
-    e.g. `cuda-12.4` for the host's RTX, `vulkan` for the laptop's
-    iGPU, `cpu` for a fallback. The release filename schema has been
-    stable for ~30 releases as of `b5174`; if a future bump breaks
-    this, it's a one-line edit.
+    `variant` is the suffix llama.cpp uses on its release artifact
+    filenames. The naming convention differs by OS:
+
+      * Windows: ``llama-<ver>-bin-win-<variant>-x64.zip`` where
+        ``variant`` is e.g. ``cuda-12.4``, ``hip``, ``sycl``,
+        ``vulkan``, or ``cpu``.
+      * macOS arm64: ``llama-<ver>-bin-macos-arm64.zip`` (single
+        prebuilt — Metal is bundled).
+
+    `variant` for macOS is the literal string ``"metal"`` which we
+    map to the macOS arm64 artifact (no per-variant differentiation
+    upstream — Metal IS the macOS GPU backend).
     """
-    fname = f"llama-{LLAMA_CPP_VERSION}-bin-win-{variant}-x64.zip"
+    sysname = platform.system()
+    if sysname == "Darwin":
+        # Apple Silicon: one universal artifact, Metal-bundled.
+        fname = f"llama-{LLAMA_CPP_VERSION}-bin-macos-arm64.zip"
+    else:
+        fname = f"llama-{LLAMA_CPP_VERSION}-bin-win-{variant}-x64.zip"
     return (
         f"https://github.com/ggml-org/llama.cpp/releases/download/"
         f"{LLAMA_CPP_VERSION}/{fname}"
@@ -192,28 +222,97 @@ def _release_url(variant: str) -> str:
 
 
 # Variants we know how to fetch. The keys are LOGICAL roles; the
-# values are llama.cpp's release suffixes. Roles map to hardware:
+# values are llama.cpp's release suffixes (Windows) or the literal
+# Apple-Metal label (macOS, where there's only one artifact).
 #
 #   host   = CUDA build for an NVIDIA host running the orchestrating
-#            llama-server. CUDA 12.4 covers any recent Nvidia driver.
+#            llama-server. CUDA 12.4 covers any recent NVIDIA driver.
+#            On Apple Silicon this maps to the macOS arm64 artifact
+#            via `_release_url`'s OS branch.
 #   worker = Vulkan build for the worker's rpc-server. Cross-vendor
 #            (Intel iGPU, AMD iGPU, NVIDIA without CUDA toolkit, etc).
 #            Default for "I just want it to work" — universal.
-#   sycl   = Intel-native SYCL/oneAPI build. ~15-25% faster than
+#   sycl   = Intel-native SYCL/oneAPI build. ~15-25 % faster than
 #            Vulkan on Intel iGPUs and Intel Arc dGPUs because it
 #            uses Intel's native compute API. Bundles the oneAPI
 #            runtime DLLs (~150 MB zip) so no separate install
 #            needed. Pick this on Intel-only worker fleets.
+#   hip    = AMD ROCm/HIP build. Faster than Vulkan on consumer
+#            Radeons but Windows ROCm support is patchy — fall back
+#            to vulkan when the AMD card isn't ROCm-listed.
+#   metal  = macOS arm64 build with Metal. Apple's native GPU API,
+#            well-tuned for M-series chips. Single artifact for
+#            both host and worker roles on Mac.
 #   cpu    = pure-CPU build, last resort. Smaller zip, no GPU
-#            backend at all. Useful when the worker has no usable
+#            backend at all. Useful when the host has no usable
 #            GPU and you'd rather not pull a Vulkan/SYCL DLL set
 #            you'll never use.
 _VARIANTS = {
     "host": "cuda-12.4",
     "worker": "vulkan",
     "sycl": "sycl",
+    "hip": "hip",
+    "metal": "metal",
     "cpu": "cpu",
 }
+
+
+# Map the `gpu_kind` reported by `sysdetect.detect_system()` (and the
+# OS) to a llama.cpp variant key. Keeps the install path generic across
+# every platform we support — `download_llama_cpp_for_host()` just
+# asks `recommend_host_variant()` and grabs whatever variant the
+# host's hardware actually wants.
+_GPU_KIND_TO_VARIANT_WIN = {
+    "nvidia": "host",      # CUDA build
+    "amd": "hip",          # ROCm/HIP build (falls back to vulkan if missing)
+    "intel": "sycl",       # Intel-native oneAPI build
+    "":      "cpu",        # No GPU detected → CPU-only
+}
+
+
+def recommend_host_variant() -> str:
+    """Pick the right llama.cpp variant for the host's hardware.
+
+    Reads `sysdetect.detect_system().gpu_kind` and the OS to decide:
+      * macOS arm64 → ``"metal"`` (Metal-bundled artifact)
+      * Windows + NVIDIA → ``"host"`` (CUDA 12.4)
+      * Windows + AMD → ``"hip"`` (ROCm)
+      * Windows + Intel → ``"sycl"``
+      * Windows + no GPU → ``"cpu"``
+      * Anything else → ``"worker"`` (Vulkan, the safe universal default)
+
+    Used by `download_llama_cpp_for_host` to default the variant
+    rather than hardcoding CUDA. Safe to call before install — it's
+    pure detection, no network.
+    """
+    if platform.system() == "Darwin":
+        return "metal"
+    # Lazy import to avoid a circular dep with sysdetect's own
+    # subprocess machinery during testing.
+    try:
+        from . import sysdetect
+        kind = (sysdetect.detect_system().get("gpu_kind") or "").lower()
+    except Exception:
+        kind = ""
+    if platform.system() == "Windows":
+        return _GPU_KIND_TO_VARIANT_WIN.get(kind, "worker")
+    return "worker"
+
+
+def download_llama_cpp_for_host(
+    *, on_progress: ProgressCallback | None = None,
+) -> Path:
+    """Download the variant matching the host's hardware.
+
+    Convenience over `download_llama_cpp(variant=...)` so callers
+    that just want "the right build for this machine" don't have to
+    map vendor → variant themselves. Used by the Settings UI's
+    one-click installer.
+    """
+    return download_llama_cpp(
+        variant=recommend_host_variant(),
+        on_progress=on_progress,
+    )
 
 
 def recommend_worker_variant(gpus: list[dict] | None) -> str:
@@ -323,13 +422,17 @@ def download_llama_cpp(
     *,
     on_progress: ProgressCallback | None = None,
 ) -> Path:
-    """Download and extract one of the known llama.cpp Windows variants
+    """Download and extract one of the known llama.cpp build variants
     into our private install dir.
 
-    `variant` ∈ {host, worker, cpu}. Returns the install dir on
-    success; raises on any failure (network, zip corruption, missing
-    binary post-extract). Idempotent on repeat calls — re-extracting
-    just overwrites in place.
+    `variant` ∈ {host, worker, sycl, hip, metal, cpu}. Returns the
+    install dir on success; raises on any failure (network, zip
+    corruption, missing binary post-extract). Idempotent on repeat
+    calls — re-extracting just overwrites in place.
+
+    Use `download_llama_cpp_for_host()` instead when you want
+    auto-detect: it picks the right variant for the host's GPU
+    vendor before calling this.
     """
     supported, reason = _platform_support()
     if not supported:
@@ -339,6 +442,11 @@ def download_llama_cpp(
             f"unknown llama.cpp variant {variant!r}; "
             f"valid: {sorted(_VARIANTS)}"
         )
+    # macOS gets a single artifact regardless of variant string —
+    # collapse to the canonical "metal" key so the zip cache filename
+    # stays predictable.
+    if platform.system() == "Darwin":
+        variant = "metal"
 
     LLAMA_CPP_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     url = _release_url(_VARIANTS[variant])
@@ -360,9 +468,24 @@ def download_llama_cpp(
     except OSError:
         pass
 
-    # Verify the variant put down what we expected — different builds
-    # ship different DLL sets but `llama-server` is in every variant.
-    expected = HOST_BINARIES if variant in ("host", "cpu") else ("rpc-server",)
+    # macOS / Linux: zipfile.extract loses POSIX exec bits, so
+    # `llama-server` and `llama-cli` come out as 0644 (non-executable).
+    # Restore +x on every binary we recognise so they actually run.
+    if platform.system() != "Windows":
+        for f in written:
+            stem = f.stem
+            if stem in {"llama-server", "llama-cli", "rpc-server"}:
+                try:
+                    f.chmod(f.stat().st_mode | 0o111)
+                except OSError:
+                    pass
+
+    # Verify the variant put down what we expected. Host-role variants
+    # ship `llama-server` + `llama-cli`; worker variants ship
+    # `rpc-server`. The macOS Metal artifact is single-purpose and
+    # contains both — treat it like a host build for verification.
+    HOST_VARIANTS = {"host", "cpu", "sycl", "hip", "metal"}
+    expected = HOST_BINARIES if variant in HOST_VARIANTS else ("rpc-server",)
     for binname in expected:
         if not _resolve_binary(binname):
             paths = ", ".join(str(p) for p in written[:5])

@@ -183,6 +183,105 @@ def test_download_rejects_unknown_variant(monkeypatch, tmp_path):
         split_runtime.download_llama_cpp(variant="bogus")
 
 
+# --- recommend_host_variant ----------------------------------------------
+
+
+def test_recommend_host_variant_picks_cuda_for_nvidia(monkeypatch):
+    """Detected NVIDIA GPU on Windows → CUDA build (`host` variant)."""
+    monkeypatch.setattr(split_runtime.platform, "system", lambda: "Windows")
+    from backend import sysdetect
+    monkeypatch.setattr(
+        sysdetect, "detect_system",
+        lambda: {"gpu_kind": "nvidia", "vram_gb": 8.0, "ram_gb": 32.0,
+                 "gpu_name": "NVIDIA GeForce RTX 3060 Ti", "cpu_count": 12},
+    )
+    assert split_runtime.recommend_host_variant() == "host"
+
+
+def test_recommend_host_variant_picks_hip_for_amd(monkeypatch):
+    """Detected AMD GPU on Windows → ROCm/HIP build."""
+    monkeypatch.setattr(split_runtime.platform, "system", lambda: "Windows")
+    from backend import sysdetect
+    monkeypatch.setattr(
+        sysdetect, "detect_system",
+        lambda: {"gpu_kind": "amd", "vram_gb": 16.0, "ram_gb": 32.0,
+                 "gpu_name": "Radeon RX 7900 XT", "cpu_count": 12},
+    )
+    assert split_runtime.recommend_host_variant() == "hip"
+
+
+def test_recommend_host_variant_picks_sycl_for_intel(monkeypatch):
+    """Detected Intel GPU on Windows → SYCL/oneAPI build, ~15-25 %
+    faster than Vulkan on Intel hardware."""
+    monkeypatch.setattr(split_runtime.platform, "system", lambda: "Windows")
+    from backend import sysdetect
+    monkeypatch.setattr(
+        sysdetect, "detect_system",
+        lambda: {"gpu_kind": "intel", "vram_gb": 1.0, "ram_gb": 16.0,
+                 "gpu_name": "Intel(R) Iris(R) Xe Graphics", "cpu_count": 8},
+    )
+    assert split_runtime.recommend_host_variant() == "sycl"
+
+
+def test_recommend_host_variant_picks_cpu_for_no_gpu(monkeypatch):
+    """No detectable GPU on Windows → CPU build, smallest zip with
+    no GPU backend DLLs."""
+    monkeypatch.setattr(split_runtime.platform, "system", lambda: "Windows")
+    from backend import sysdetect
+    monkeypatch.setattr(
+        sysdetect, "detect_system",
+        lambda: {"gpu_kind": "", "vram_gb": 0.0, "ram_gb": 16.0,
+                 "gpu_name": "", "cpu_count": 8},
+    )
+    assert split_runtime.recommend_host_variant() == "cpu"
+
+
+def test_recommend_host_variant_picks_metal_on_macos(monkeypatch):
+    """macOS arm64 → Metal-bundled artifact regardless of GPU
+    detection (Metal IS the macOS GPU backend)."""
+    monkeypatch.setattr(split_runtime.platform, "system", lambda: "Darwin")
+    assert split_runtime.recommend_host_variant() == "metal"
+
+
+def test_release_url_uses_macos_naming_on_darwin(monkeypatch):
+    """macOS gets the single arm64 artifact; the variant string is
+    ignored on the URL path."""
+    monkeypatch.setattr(split_runtime.platform, "system", lambda: "Darwin")
+    url = split_runtime._release_url("metal")
+    assert "macos-arm64" in url
+    assert "win-" not in url
+
+
+def test_release_url_uses_windows_naming_on_windows(monkeypatch):
+    """Windows builds use the per-variant URL — `cuda-12.4`,
+    `hip`, `sycl`, etc."""
+    monkeypatch.setattr(split_runtime.platform, "system", lambda: "Windows")
+    cuda_url = split_runtime._release_url("cuda-12.4")
+    assert "win-cuda-12.4-x64" in cuda_url
+    sycl_url = split_runtime._release_url("sycl")
+    assert "win-sycl-x64" in sycl_url
+
+
+def test_platform_support_accepts_macos_arm64(monkeypatch):
+    """Apple Silicon is now a supported install platform — Metal is
+    bundled in the macOS arm64 artifact upstream."""
+    monkeypatch.setattr(split_runtime.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(split_runtime.platform, "machine", lambda: "arm64")
+    ok, reason = split_runtime._platform_support()
+    assert ok is True
+    assert reason is None
+
+
+def test_platform_support_rejects_macos_intel(monkeypatch):
+    """Intel Macs aren't covered by the bundled Metal artifact —
+    fall back to the user building llama.cpp themselves."""
+    monkeypatch.setattr(split_runtime.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(split_runtime.platform, "machine", lambda: "x86_64")
+    ok, reason = split_runtime._platform_support()
+    assert ok is False
+    assert "arm64" in reason.lower()
+
+
 def test_download_happy_path_extracts_and_finds(monkeypatch, tmp_path):
     """End-to-end: stub the GitHub release URL, return a fake zip
     containing `llama-server` (with the OS-appropriate suffix), verify
