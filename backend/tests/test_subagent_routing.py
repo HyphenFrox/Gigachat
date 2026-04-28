@@ -36,8 +36,7 @@ def _run(coro):
 def _seed_subagent_worker(isolated_db, *, label, address, model="gemma4:e4b", auth_token=None) -> str:
     """Helper: register a worker eligible for subagents with a fresh probe."""
     wid = isolated_db.create_compute_worker(
-        label=label, address=address, transport="lan",
-        use_for_subagents=True, auth_token=auth_token,
+        label=label, address=address, use_for_subagents=True, auth_token=auth_token,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,

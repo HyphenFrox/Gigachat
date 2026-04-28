@@ -369,9 +369,20 @@ def init() -> None:
             -- Compute pool: other PCs the user has registered as workers.
             -- The host can route embedding calls, subagent runs, and chat
             -- turns to these workers to parallelise across machines. Each
-            -- worker exposes an Ollama endpoint on a Tailscale or LAN IP.
+            -- worker exposes an Ollama endpoint on a LAN address — all
+            -- ongoing traffic stays on the local Wi-Fi/Ethernet so it
+            -- never burns metered internet bandwidth.
             -- `auth_token` is a shared secret the worker validates; without
-            -- it any tailnet peer could drain the GPU.
+            -- it any LAN peer could drain the GPU.
+            -- `ssh_host` is an optional SSH alias used for LAN-side model
+            -- copy (scp). Same network as `address`.
+            -- `tailscale_host` is an optional, stable Tailscale identifier
+            -- (MagicDNS name or CGNAT IPv4) used ONLY by the auto-repair
+            -- routine: when DHCP hands the worker a new LAN IP and the
+            -- stored `address` goes stale, the host reaches the worker
+            -- over Tailscale just long enough to ask for the new LAN IP,
+            -- updates `address`, and resumes ordinary LAN traffic. Never
+            -- used for chat / embeddings / model copy.
             -- `capabilities_json` is a cached snapshot of what the worker
             -- reports (installed Ollama models, RAM/VRAM/GPU info from
             -- sysdetect). Refreshed by the periodic probe.
@@ -385,16 +396,9 @@ def init() -> None:
                 label TEXT NOT NULL,
                 address TEXT NOT NULL,
                 ollama_port INTEGER NOT NULL DEFAULT 11434,
-                transport TEXT NOT NULL DEFAULT 'lan',
                 auth_token TEXT,
-                -- SSH alias / hostname the host can use to scp blobs to
-                -- this worker (LAN-first model copy, Phase 2 commit 10).
-                -- NULL means "no SSH configured" — model copy falls
-                -- back to manual `ollama pull` on the worker. Typically
-                -- the user puts an entry in ~/.ssh/config (e.g.
-                -- `Host laptop`) and stores that alias here so the
-                -- backend can `scp file laptop:dest` cleanly.
                 ssh_host TEXT,
+                tailscale_host TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 use_for_chat INTEGER NOT NULL DEFAULT 1,
                 use_for_embeddings INTEGER NOT NULL DEFAULT 1,
@@ -575,6 +579,16 @@ def init() -> None:
             # worker side. Typical value is the alias the user has
             # in ~/.ssh/config (e.g. "laptop").
             "ALTER TABLE compute_workers ADD COLUMN ssh_host TEXT",
+            # Optional Tailscale identifier (MagicDNS name or CGNAT
+            # IPv4) used ONLY for the auto-repair routine in
+            # compute_pool.py. When the LAN address goes stale (the
+            # worker rejoined the network and DHCP gave it a new
+            # lease) the host reaches the worker over Tailscale just
+            # long enough to rediscover the new LAN IP, then resumes
+            # ordinary LAN traffic. NULL means auto-repair is off
+            # for this worker — a stale address triggers an
+            # "unreachable" status until the user updates it manually.
+            "ALTER TABLE compute_workers ADD COLUMN tailscale_host TEXT",
             # Phase 2 commit 24: optional path to a multimodal projector
             # GGUF (mmproj). When set, llama-server is launched with
             # `--mmproj <path>` so vision/image inputs work via Phase 2
@@ -3381,11 +3395,25 @@ def _row_to_worktree(row: sqlite3.Row) -> dict:
 # the routing logic and capability-probe loop; this layer is just CRUD.
 # ---------------------------------------------------------------------------
 
-# Two transports: `lan` (mDNS / direct LAN IP — preferred) and
-# `tailscale` (works anywhere but uses internet bandwidth and adds
-# latency). The transport is informational — actual routing decision
-# is per-call and chooses the cheapest path that's reachable.
-COMPUTE_WORKER_TRANSPORTS = {"lan", "tailscale"}
+# Hard cap on stored hostnames/IPs — comfortably above any real DNS name
+# but tight enough to refuse a megabyte-of-junk DOS attempt.
+_HOSTNAME_MAX_LEN = 256
+
+
+def _normalise_optional_host(value: str | None) -> str | None:
+    """Trim a user-entered hostname; return None for empty input.
+
+    Used for `ssh_host` and `tailscale_host` columns where NULL means
+    "feature off" and any non-empty string is the resolved identifier.
+    """
+    if value is None:
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    if len(v) > _HOSTNAME_MAX_LEN:
+        raise ValueError(f"host must be ≤ {_HOSTNAME_MAX_LEN} chars")
+    return v
 
 
 def create_compute_worker(
@@ -3393,9 +3421,9 @@ def create_compute_worker(
     label: str,
     address: str,
     ollama_port: int = 11434,
-    transport: str = "lan",
     auth_token: str | None = None,
     ssh_host: str | None = None,
+    tailscale_host: str | None = None,
     enabled: bool = True,
     use_for_chat: bool = True,
     use_for_embeddings: bool = True,
@@ -3403,9 +3431,14 @@ def create_compute_worker(
 ) -> str:
     """Insert a new compute worker and return its id.
 
-    `address` is a hostname or IP — e.g. `worker.local` for LAN mDNS,
-    a `192.168.x.x` for hardcoded LAN, a `100.x.x.x` for Tailscale.
-    The host probes `http://{address}:{ollama_port}` for capabilities.
+    `address` is a LAN hostname or IPv4 — e.g. `worker.local` for mDNS
+    or a `192.168.x.x` for a hardcoded LAN address. All ongoing traffic
+    (chat / embeddings / subagents) flows over this address; the host
+    probes `http://{address}:{ollama_port}` for capabilities.
+
+    `tailscale_host` is optional and used ONLY for the auto-repair
+    routine in `compute_pool.py`. It exists so a stale `address` after
+    a DHCP rebind can be rediscovered without user intervention.
     """
     lbl = (label or "").strip()
     if not lbl:
@@ -3415,30 +3448,27 @@ def create_compute_worker(
     addr = (address or "").strip()
     if not addr:
         raise ValueError("address is required")
-    if len(addr) > 256:
-        raise ValueError("address must be ≤ 256 chars")
-    if transport not in COMPUTE_WORKER_TRANSPORTS:
-        raise ValueError(
-            f"transport must be one of {sorted(COMPUTE_WORKER_TRANSPORTS)}, "
-            f"got {transport!r}"
-        )
+    if len(addr) > _HOSTNAME_MAX_LEN:
+        raise ValueError(f"address must be ≤ {_HOSTNAME_MAX_LEN} chars")
     # Be careful with the falsy coalesce — `int(0 or 11434)` returns
     # 11434, but a caller passing 0 explicitly meant "clamp to 1", not
     # "use default". Treat None as "use default" and any int as a value
     # to clamp.
     port = 11434 if ollama_port is None else max(1, min(int(ollama_port), 65535))
+    ssh_host_clean = _normalise_optional_host(ssh_host)
+    tailscale_clean = _normalise_optional_host(tailscale_host)
     wid = str(uuid.uuid4())
     now = time.time()
     with _conn() as c:
         c.execute(
             "INSERT INTO compute_workers ("
-            "id, label, address, ollama_port, transport, auth_token, ssh_host, "
-            "enabled, use_for_chat, use_for_embeddings, use_for_subagents, "
-            "created_at, updated_at"
+            "id, label, address, ollama_port, auth_token, ssh_host, "
+            "tailscale_host, enabled, use_for_chat, use_for_embeddings, "
+            "use_for_subagents, created_at, updated_at"
             ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                wid, lbl, addr, port, transport, auth_token,
-                (ssh_host or "").strip() or None,
+                wid, lbl, addr, port, auth_token,
+                ssh_host_clean, tailscale_clean,
                 1 if enabled else 0,
                 1 if use_for_chat else 0,
                 1 if use_for_embeddings else 0,
@@ -3470,10 +3500,16 @@ def get_compute_worker(wid: str) -> dict | None:
 
 
 def update_compute_worker(wid: str, **fields: Any) -> dict | None:
-    """Patch allowed fields on a worker. Returns the refreshed row."""
+    """Patch allowed fields on a worker. Returns the refreshed row.
+
+    For optional-host fields (`ssh_host`, `tailscale_host`) the
+    convention is: pass an empty string to clear the column, ``None`` /
+    omit the key to leave it unchanged. Non-empty strings are trimmed
+    and length-checked the same way as in `create_compute_worker`.
+    """
     allowed = {
-        "label", "address", "ollama_port", "transport", "auth_token",
-        "ssh_host",
+        "label", "address", "ollama_port", "auth_token",
+        "ssh_host", "tailscale_host",
         "enabled", "use_for_chat", "use_for_embeddings", "use_for_subagents",
     }
     sets: list[str] = []
@@ -3481,19 +3517,29 @@ def update_compute_worker(wid: str, **fields: Any) -> dict | None:
     for k, v in fields.items():
         if k not in allowed:
             continue
-        if k == "transport" and v not in COMPUTE_WORKER_TRANSPORTS:
-            raise ValueError(
-                f"transport must be one of {sorted(COMPUTE_WORKER_TRANSPORTS)}"
-            )
         if k in ("enabled", "use_for_chat", "use_for_embeddings",
                  "use_for_subagents"):
             v = 1 if v else 0
-        if k == "ollama_port":
+        elif k == "ollama_port":
             v = 11434 if v is None else max(1, min(int(v), 65535))
-        if k == "ssh_host":
+        elif k in ("ssh_host", "tailscale_host"):
             # Empty string clears; None leaves alone (handled by skipping
             # the key in the patch dict at the API layer).
-            v = (v or "").strip() or None
+            v = _normalise_optional_host(v)
+        elif k == "address":
+            addr = (v or "").strip()
+            if not addr:
+                raise ValueError("address must not be empty")
+            if len(addr) > _HOSTNAME_MAX_LEN:
+                raise ValueError(f"address must be ≤ {_HOSTNAME_MAX_LEN} chars")
+            v = addr
+        elif k == "label":
+            lbl = (v or "").strip()
+            if not lbl:
+                raise ValueError("label must not be empty")
+            if len(lbl) > 80:
+                raise ValueError("label must be ≤ 80 chars")
+            v = lbl
         sets.append(f"{k} = ?")
         values.append(v)
     if not sets:
@@ -3582,24 +3628,29 @@ def _row_to_compute_worker(row: sqlite3.Row) -> dict:
         caps = json.loads(caps_raw) if caps_raw else None
     except Exception:
         caps = None
-    # ssh_host may not exist on older DBs that haven't been migrated;
-    # sqlite3.Row raises IndexError on unknown columns. Use a safe access.
+    # ssh_host / tailscale_host may not exist on older DBs that haven't
+    # been migrated yet — sqlite3.Row raises IndexError on unknown
+    # columns. Defensive accessors keep first-run reads safe.
     try:
         ssh_host = row["ssh_host"]
     except IndexError:
         ssh_host = None
+    try:
+        tailscale_host = row["tailscale_host"]
+    except IndexError:
+        tailscale_host = None
     return {
         "id": row["id"],
         "label": row["label"],
         "address": row["address"],
         "ollama_port": row["ollama_port"],
-        "transport": row["transport"],
         # auth_token is NEVER returned to the API/UI — the column exists
         # for outbound requests only. Surfacing it would be a credential
         # exfiltration vector. Use `get_compute_worker_auth_token(wid)`
         # for the rare internal caller that needs it.
         "auth_token_set": bool(row["auth_token"]),
         "ssh_host": ssh_host,
+        "tailscale_host": tailscale_host,
         "enabled": bool(row["enabled"]),
         "use_for_chat": bool(row["use_for_chat"]),
         "use_for_embeddings": bool(row["use_for_embeddings"]),

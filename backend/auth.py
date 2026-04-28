@@ -1,10 +1,10 @@
 """Password authentication for non-loopback requests.
 
 Gigachat binds to 127.0.0.1 by default so only processes on the same machine
-can reach it. When the user wants to expose the app over LAN, Tailscale, or
-the public internet, they change the bind host — and this module guarantees
-the change is paired with a real password check rather than silently throwing
-the door open.
+can reach it. The user can opt into wider exposure by setting the bind host
+to ``lan`` — the server then accepts connections from other devices on the
+same physical network (Wi-Fi / Ethernet) but never from the public internet
+or from a Tailscale overlay.
 
 Config sources (later overrides earlier):
   1. ``data/auth.json``       — JSON file, shipped untracked, chmod 0600.
@@ -14,23 +14,27 @@ Config sources (later overrides earlier):
   2. ``GIGACHAT_HOST``         env var — wins over the file.
   3. ``GIGACHAT_PASSWORD``     env var — wins over the file.
 
-"host" accepts two special literals:
+"host" accepts two values:
 
-  - ``tailscale`` — auto-detects the first Tailscale IPv4 via ``tailscale ip
-    -4`` and binds to ``0.0.0.0`` with an IP allowlist restricting clients
-    to the tailnet + loopback.
-  - ``public`` — binds to ``127.0.0.1`` only, but expects a reverse proxy
-    (Cloudflare Tunnel, Caddy, nginx) running on the same host to forward
-    public traffic. Password auth is mandatory, loopback is NOT auto-trusted
-    (the reverse proxy delivers public traffic as 127.0.0.1), and session
-    cookies are set with the ``Secure`` flag so they only travel over HTTPS.
+  - loopback (the default — also written as ``127.0.0.1``, ``localhost``,
+    ``::1``, or empty): binds to ``127.0.0.1``, no password required.
+    Only processes on the same machine can connect.
+  - ``lan``: binds to ``0.0.0.0`` so the OS will accept TCP connections on
+    every interface. The middleware then rejects any client whose source
+    IP isn't loopback or a private RFC1918 LAN address. Public IPs and
+    Tailscale CGNAT clients are always refused — by design, this app is
+    not exposed to the internet, and Tailscale traffic is kept off the
+    pipe to save metered bandwidth. Password auth is mandatory for any
+    non-loopback client.
 
-Raw LAN IPs and ``0.0.0.0`` are not supported — use one of the above modes.
+Anything else (raw LAN IPs, ``0.0.0.0``, ``tailscale``, ``public``, etc.)
+is rejected at startup with a clear error rather than silently binding to
+an unexpected interface.
 
 Session tokens are HMAC-SHA256 signed against ``data/auth_secret.key`` (created
 on first access with 0600 permissions). They're plain ``<issued_at>.<hmac>``
 strings — no external JWT dependency, no replay protection beyond the 30-day
-TTL (the attack surface of a single-user localhost app doesn't justify more).
+TTL (the attack surface of a single-user LAN app doesn't justify more).
 """
 
 from __future__ import annotations
@@ -41,7 +45,6 @@ import ipaddress
 import json
 import os
 import secrets
-import subprocess
 import time
 from pathlib import Path
 
@@ -50,8 +53,8 @@ _AUTH_JSON = _DATA_DIR / "auth.json"
 _SECRET_KEY_FILE = _DATA_DIR / "auth_secret.key"
 
 # Cookie name and TTL. 30 days is long enough that a user on their own
-# Tailscale net doesn't have to re-enter the password every week; it's also
-# short enough that a stolen cookie eventually rots.
+# LAN doesn't have to re-enter the password every week; it's also short
+# enough that a stolen cookie eventually rots.
 SESSION_COOKIE = "gigachat_session"
 SESSION_TTL_SECONDS = 30 * 24 * 3600
 
@@ -61,14 +64,24 @@ SESSION_TTL_SECONDS = 30 * 24 * 3600
 _LOOPBACK_PREFIXES = ("127.", "::ffff:127.")
 _LOOPBACK_LITERALS = {"::1", "localhost"}
 
-# Tailscale assigns addresses from the CGNAT block 100.64.0.0/10 (IPv4) and
-# the fd7a:115c:a1e0::/48 ULA prefix (IPv6). We treat any source IP inside
-# these ranges as "on the tailnet" for the purposes of the access-control
-# middleware — auth cookies are still required, this just means the packet
-# wasn't delivered by some other interface (e.g. the LAN NIC).
-_TAILSCALE_CIDRS = (
-    ipaddress.ip_network("100.64.0.0/10"),
-    ipaddress.ip_network("fd7a:115c:a1e0::/48"),
+# Private (RFC1918) IPv4 ranges plus the IPv6 unique-local block. A client
+# whose source IP falls inside one of these is "on the LAN" — typical home
+# / small-office networks live in 192.168.0.0/16 or 10.0.0.0/8, and a few
+# routers default to 172.16.0.0/12. fc00::/7 is the IPv6 unique-local space
+# (the moral equivalent of RFC1918 for IPv6).
+#
+# Note: 100.64.0.0/10 is the CGNAT block Tailscale uses, and it's also used
+# by some real ISPs. We DO NOT include it here. LAN mode is for traffic on
+# the user's own home/office network only — Tailscale traffic is encrypted
+# but transits relay servers and burns metered internet bandwidth, which
+# the user has explicitly opted out of for ongoing app access.
+_LAN_CIDRS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),  # link-local (e.g. mDNS)
+    ipaddress.ip_network("fc00::/7"),         # IPv6 unique local
+    ipaddress.ip_network("fe80::/10"),        # IPv6 link-local
 )
 
 
@@ -102,35 +115,27 @@ def get_config() -> dict:
 
 
 def requires_password(cfg: dict | None = None) -> bool:
-    """Auth is required iff the configured host is ``tailscale`` or ``public``.
+    """Auth is required iff the configured host is ``lan``.
 
-    Three bind modes are supported: loopback (default, no auth), ``tailscale``
-    (tailnet-only, password required), and ``public`` (reverse-proxy mode,
-    password required on every request including loopback). See
-    ``resolve_bind_host`` for the full list of accepted values — anything
-    else is rejected at startup.
+    Two bind modes are supported: loopback (default, no auth) and ``lan``
+    (other devices on the same LAN can connect, password required for
+    every non-loopback request). See ``resolve_bind_host`` for the full
+    list of accepted values — anything else is rejected at startup.
     """
     cfg = cfg or get_config()
     host = (cfg.get("host") or "127.0.0.1").strip()
-    return host in {"tailscale", "public"}
+    return host == "lan"
 
 
-def is_public_mode(cfg: dict | None = None) -> bool:
-    """True when the bind host is ``public`` — reverse-proxy deployments.
+def is_lan_mode(cfg: dict | None = None) -> bool:
+    """True when the bind host is ``lan``.
 
-    In public mode the operator runs a TLS-terminating proxy (Cloudflare
-    Tunnel, Caddy, nginx) on the same host that forwards traffic to the
-    backend over loopback. Two behaviours differ from tailscale mode:
-
-      1. Loopback is NOT auto-trusted. The proxy delivers public requests as
-         ``127.0.0.1``, so skipping auth there would hand anonymous sessions
-         to anyone on the internet.
-      2. The Tailscale CGNAT IP allowlist is skipped — the client IP the
-         backend sees is always loopback anyway (the proxy is on the same
-         host), so there's nothing to filter on.
+    Convenience alias kept separate from ``requires_password`` so that
+    if a future mode is added that also requires auth (without being
+    LAN), the call sites stay legible.
     """
     cfg = cfg or get_config()
-    return (cfg.get("host") or "").strip() == "public"
+    return (cfg.get("host") or "").strip() == "lan"
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +220,7 @@ def make_token() -> str:
 
     Encodes only the issuance timestamp so the server is stateless. TTL is
     enforced at verify time; there's no mid-session rotation because the
-    app has exactly one user role (the owner) and no priveledge separation
+    app has exactly one user role (the owner) and no privilege separation
     that would justify one.
     """
     issued = str(int(time.time()))
@@ -256,50 +261,29 @@ def is_loopback(host: str | None) -> bool:
     return any(host.startswith(p) for p in _LOOPBACK_PREFIXES)
 
 
-def is_tailscale_client(host: str | None) -> bool:
-    """Is ``host`` a Tailscale tailnet address?
+def is_lan_client(host: str | None) -> bool:
+    """Is ``host`` a private LAN address (RFC1918 / IPv6 ULA / link-local)?
 
-    Tailscale IPv4 addresses live in the CGNAT block ``100.64.0.0/10`` and
-    its IPv6 addresses live in ``fd7a:115c:a1e0::/48``. Packets from any
-    other source — LAN IPs like ``192.168.1.50``, the Wi-Fi NIC's own
-    address, or public internet — return False and should be rejected by
-    the access-control middleware when the server is bound to all
-    interfaces for Tailscale access.
+    Used by the access-control middleware in ``lan`` mode to admit the
+    user's own LAN devices and reject everything else — Tailscale CGNAT
+    clients (100.64.0.0/10) and public IPs both fail this check.
+
+    Loopback is handled separately by ``is_loopback``; this function
+    returns False for loopback addresses so the middleware can keep the
+    two checks distinct (loopback bypasses auth, LAN clients still need
+    a session cookie).
     """
     if not host:
         return False
-    # Strip an IPv4-mapped IPv6 prefix like ``::ffff:100.64.0.1`` so the
-    # CGNAT check sees the plain dotted form.
+    # Strip an IPv4-mapped IPv6 prefix like ``::ffff:192.168.1.10`` so the
+    # CIDR check sees the plain dotted form.
     if host.startswith("::ffff:"):
         host = host[len("::ffff:"):]
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return any(addr in net for net in _TAILSCALE_CIDRS)
-
-
-def get_tailscale_ip() -> str | None:
-    """Return the first IPv4 reported by ``tailscale ip -4``, or None.
-
-    Used purely for the startup banner — ``resolve_bind_host`` binds to
-    ``0.0.0.0`` in tailscale mode and the middleware does the real
-    access-control, so this helper doesn't affect security.
-    """
-    try:
-        out = subprocess.check_output(
-            ["tailscale", "ip", "-4"],
-            timeout=5,
-            text=True,
-            stderr=subprocess.DEVNULL,
-        )
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        return None
-    for line in out.splitlines():
-        ip = line.strip()
-        if ip:
-            return ip
-    return None
+    return any(addr in net for net in _LAN_CIDRS)
 
 
 _ALLOWED_LOOPBACK_HOSTS = {"", "127.0.0.1", "localhost", "::1"}
@@ -308,51 +292,35 @@ _ALLOWED_LOOPBACK_HOSTS = {"", "127.0.0.1", "localhost", "::1"}
 def resolve_bind_host(host: str | None) -> str:
     """Translate a config value into something uvicorn can bind to.
 
-    Three modes are supported:
+    Two modes are supported:
       - loopback (``127.0.0.1`` / ``localhost`` / ``::1`` / empty)
-        → binds to ``127.0.0.1``. No auth required.
-      - ``tailscale`` → binds to ``0.0.0.0`` so that both the loopback
-        interface *and* the Tailscale interface accept traffic on the
-        host machine. The real access-control is done by the middleware
+        → binds to ``127.0.0.1``. No auth required. Only same-machine
+        processes can connect.
+      - ``lan`` → binds to ``0.0.0.0`` so the host accepts traffic on
+        every NIC. The real access-control happens in the middleware
         in ``app.py``, which rejects any client that isn't loopback or
-        inside the Tailscale CGNAT range (100.64.0.0/10 or
-        fd7a:115c:a1e0::/48). If the Tailscale daemon isn't running we
-        degrade to pure loopback so the app still starts locally and
-        ``server.py`` prints a warning.
-      - ``public`` → binds to ``127.0.0.1`` ONLY. Intended for deployments
-        where a TLS-terminating reverse proxy (Cloudflare Tunnel, Caddy,
-        nginx, …) runs on the same host and forwards traffic to the
-        backend. Listening on loopback only means the raw HTTP port cannot
-        be reached from the LAN or public internet even if the firewall is
-        misconfigured — the proxy is the only gateway. Password auth is
-        mandatory; see ``is_public_mode`` and the AuthMiddleware.
+        on a private LAN range (RFC1918 IPv4 + IPv6 ULA + link-local).
+        Public IPs and Tailscale CGNAT addresses are refused — this app
+        is not designed for internet exposure or overlay-network access.
 
-    Anything else (raw LAN IPs, ``192.168.x.x``, bare ``0.0.0.0``, etc.)
-    is rejected outright — exposing Gigachat on a LAN NIC or unrestricted
-    all-interfaces is intentionally not supported.
+    Anything else (raw LAN IPs, ``0.0.0.0``, ``tailscale``, ``public``,
+    etc.) is rejected outright. Forcing the user through the named
+    ``lan`` literal keeps the audit trail honest: there's exactly one
+    way to opt into wider listening, and it's spelled out.
     """
     host = (host or "").strip()
     if host in _ALLOWED_LOOPBACK_HOSTS:
         return "127.0.0.1"
-    if host == "tailscale":
-        # Only bind to all interfaces when Tailscale is actually up. If
-        # the daemon isn't running there's nothing to listen for, so stay
-        # on pure loopback — the banner in server.py tells the user what
-        # happened and they can restart after starting Tailscale.
-        if get_tailscale_ip() is not None:
-            return "0.0.0.0"
-        return "127.0.0.1"
-    if host == "public":
-        # Reverse-proxy mode — the operator runs cloudflared / caddy /
-        # nginx in front and we only accept traffic from that local proxy.
-        # Refusing to listen on 0.0.0.0 is defence in depth: a typo in the
-        # proxy config or an off-by-one firewall rule can't accidentally
-        # expose the raw HTTP port to the world.
-        return "127.0.0.1"
+    if host == "lan":
+        # Bind on every interface; the middleware filters by source IP.
+        # We can't pre-pick a single LAN NIC because home networks often
+        # have several (Wi-Fi + Ethernet + a Hyper-V virtual switch) and
+        # the user shouldn't have to enumerate them.
+        return "0.0.0.0"
     raise ValueError(
-        f"unsupported host {host!r}. Set host to 'tailscale' for tailnet-only "
-        "remote access, 'public' to run behind a reverse proxy (Cloudflare "
-        "Tunnel / Caddy / nginx on the same host), or leave it empty / "
-        "'127.0.0.1' for local-only. Raw LAN IPs and '0.0.0.0' are not "
-        "supported — pick one of the named modes."
+        f"unsupported host {host!r}. Set host to 'lan' to allow other "
+        "devices on the same physical network to connect, or leave it "
+        "empty / '127.0.0.1' for local-only. Raw IPs, '0.0.0.0', "
+        "'tailscale' and 'public' are not supported — pick one of the "
+        "named modes."
     )

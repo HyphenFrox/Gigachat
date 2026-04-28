@@ -135,17 +135,19 @@ except Exception:  # never block startup on a sync issue
 # ---------------------------------------------------------------------------
 # Access-control middleware
 #
-# In tailscale mode the server binds to 0.0.0.0 so the host machine can hit
-# itself via ``localhost`` *and* other tailnet peers can hit it via the
-# tailscale IP. That's a wider listener than we actually trust — someone on
-# the same LAN could also reach the port. This middleware closes that gap:
-# it inspects ``request.client.host`` and only admits requests from loopback
-# (the host machine) or the Tailscale CGNAT ranges. Everything else — LAN
-# IPs, random public sources — gets a flat 403.
+# In LAN mode the server binds to 0.0.0.0 so the host machine can hit itself
+# via ``localhost`` *and* other devices on the same Wi-Fi/Ethernet can hit it
+# via the LAN IP. That's a wider listener than we want to trust unconditionally
+# — a public IP could reach the port if the user is on a network with a
+# misconfigured firewall, and we never want Tailscale CGNAT clients to drain
+# the LLM either. This middleware closes both gaps: it inspects
+# ``request.client.host`` and admits only loopback (this machine) or RFC1918
+# LAN sources. Everything else — public IPs, Tailscale CGNAT, anything weird —
+# gets a flat 403.
 #
-# On top of that, every non-loopback request must also carry a valid session
-# cookie (or Bearer token). Loopback is implicitly trusted because if someone
-# can already execute code on the box, there's no boundary left to enforce.
+# On top of that, every non-loopback request must carry a valid session cookie
+# (or Bearer token). Loopback is implicitly trusted because if someone can
+# already execute code on the box, there's no boundary left to enforce.
 #
 # The login endpoint and static assets are public so the frontend can render
 # its password form before authenticating.
@@ -171,26 +173,20 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         client_host = request.client.host if request.client else None
         is_loopback = auth.is_loopback(client_host)
-        public_mode = auth.is_public_mode(cfg)
+        is_lan = auth.is_lan_client(client_host)
 
-        # In public mode a TLS-terminating reverse proxy (cloudflared, Caddy,
-        # nginx) runs on the same host and forwards traffic from loopback.
-        # Every request therefore looks loopback to us — IP filtering is
-        # meaningless and auto-trusting loopback would hand anonymous
-        # sessions to the entire internet. So: skip the Tailscale allowlist,
-        # require the session token for every protected path.
-        if not public_mode:
-            is_tailnet = auth.is_tailscale_client(client_host)
-            # Tailscale mode: reject anything that didn't come in over the
-            # loopback interface or the tailnet. This is defence-in-depth on
-            # top of the Tailscale ACL model — the port is physically
-            # listening on 0.0.0.0 so a LAN peer *could* TCP-connect, but
-            # they'll get a 403 before any real handler runs.
-            if not (is_loopback or is_tailnet):
-                return JSONResponse(
-                    {"error": "forbidden"},
-                    status_code=403,
-                )
+        # LAN mode: reject anything that didn't come in over the loopback
+        # interface or a private RFC1918 / IPv6 ULA range. This is defence
+        # in depth — the port is physically listening on 0.0.0.0 so a
+        # public client *could* TCP-connect if the firewall is wide open,
+        # but they'll get a 403 before any handler runs. Tailscale CGNAT
+        # (100.64.0.0/10) is intentionally NOT in the allowlist: this app
+        # stays on the user's own LAN.
+        if not (is_loopback or is_lan):
+            return JSONResponse(
+                {"error": "forbidden"},
+                status_code=403,
+            )
 
         path = request.url.path
         # The login page itself plus the static assets needed to render it
@@ -200,17 +196,15 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # case, so we let it through — the frontend does the redirect).
         if path == "/" or any(path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES):
             return await call_next(request)
-        # Tailscale mode only: loopback on-host is trusted (the operator
-        # themselves or a local script). Public mode must NOT do this — all
-        # proxy traffic arrives over loopback so it would be a complete
-        # bypass of the password.
-        if is_loopback and not public_mode:
+        # Loopback on-host is trusted (the operator themselves or a local
+        # script). Other LAN clients still need to authenticate.
+        if is_loopback:
             return await call_next(request)
         token = request.cookies.get(auth.SESSION_COOKIE)
         if not token:
             # Also accept Bearer header for programmatic clients (curl,
-            # mobile app, Tailscale Funnel). Keeps the cookie path as the
-            # primary flow but doesn't force it.
+            # mobile app, scripted automation). Keeps the cookie path as
+            # the primary flow but doesn't force it.
             header = request.headers.get("authorization", "")
             if header.lower().startswith("bearer "):
                 token = header[7:].strip()
@@ -926,10 +920,8 @@ class CreateConversation(BaseModel):
     restarting any client that cached the old default.
 
     `cwd` defaults to ``None`` so the handler can tell "client didn't
-    specify" from "client explicitly passed the project root". In public
-    mode an unspecified cwd is auto-assigned an isolated workspace folder
-    under ``data/workspaces/<conv_id>/`` so remote sessions don't stomp
-    on each other or the operator's main tree.
+    specify" from "client explicitly passed the project root". An
+    unspecified cwd inherits the Gigachat project root.
     """
 
     title: str = "New chat"
@@ -1034,9 +1026,9 @@ def api_auth_status(request: Request) -> dict:
     """Tell the frontend whether it needs to show the login page.
 
     Returns ``{requires_password, authenticated, host}``. ``host`` is the
-    *configured* bind address (not the resolved one) so an admin UI can
-    surface "you're exposed on Tailscale" without scraping ``tailscale ip``
-    on the client.
+    *configured* bind mode (``127.0.0.1`` or ``lan``) so the UI can
+    surface a "you're reachable from other LAN devices" indicator
+    without probing the network from the client.
 
     Loopback clients are implicitly authenticated — the middleware waives
     the gate for them, and reporting ``authenticated: false`` here would
@@ -1049,11 +1041,10 @@ def api_auth_status(request: Request) -> dict:
     if not requires:
         return {"requires_password": False, "authenticated": True, "host": host_str}
     client_host = request.client.host if request.client else None
-    public_mode = auth.is_public_mode(cfg)
-    # Only trust loopback in tailscale mode. In public mode the reverse
-    # proxy delivers every request as loopback, so the same shortcut would
-    # hand anonymous sessions to the internet (mirrors the middleware).
-    if auth.is_loopback(client_host) and not public_mode:
+    # Loopback callers (curl on the host, the desktop browser) are always
+    # trusted — they're already on the box. LAN clients still have to
+    # present a valid session cookie or Bearer token.
+    if auth.is_loopback(client_host):
         return {"requires_password": True, "authenticated": True, "host": host_str}
     token = request.cookies.get(auth.SESSION_COOKIE)
     header = request.headers.get("authorization", "")
@@ -1067,12 +1058,13 @@ def api_auth_status(request: Request) -> dict:
     }
 
 
-# Simple in-memory login rate limiter — one counter, no per-IP keying because
-# in public mode the proxy delivers every request as 127.0.0.1 anyway. Resets
-# the count on a successful login so the common "wrong password, retype" case
-# doesn't lock the real user out. The lockout window only kicks in for public
-# mode where the endpoint is reachable from the internet; tailscale mode is
-# already gated at the network layer.
+# Simple in-memory login rate limiter — one global counter (we don't bother
+# keying per-IP because LAN mode admits at most a handful of devices and a
+# brute-force attempt from any of them is equally interesting). At PBKDF2-
+# 200k's ~100 ms per attempt the password check itself already caps
+# throughput; this is belt-and-braces against a misbehaving script. The
+# count resets on a successful login so the common "wrong password, retype"
+# case doesn't lock the real user out.
 _LOGIN_FAIL_COUNT = 0
 _LOGIN_LOCKED_UNTIL = 0.0
 _LOGIN_MAX_FAILS = 10
@@ -1083,12 +1075,10 @@ _LOGIN_LOCKOUT_SEC = 60
 def api_auth_login(body: LoginBody, response: Response) -> dict:
     """Exchange a password for a signed session cookie.
 
-    Public mode adds a minimal rate limit: after 10 consecutive failed
-    attempts, further logins are refused for 60 seconds. At PBKDF2-200k's
-    ~100 ms per attempt this already caps throughput, but an internet-
-    exposed login form is worth the extra belt-and-braces against slow
-    credential stuffing. Tailscale mode skips the limiter because the
-    endpoint isn't reachable from outside the tailnet.
+    A tiny rate limit guards the endpoint: after 10 consecutive failed
+    attempts further logins are refused for 60 seconds. The window is
+    deliberately short — the threat model is a typo or a curious LAN
+    neighbour, not a sustained credential-stuffing campaign.
     """
     global _LOGIN_FAIL_COUNT, _LOGIN_LOCKED_UNTIL
     cfg = auth.get_config()
@@ -1096,20 +1086,18 @@ def api_auth_login(body: LoginBody, response: Response) -> dict:
         # Server isn't running in auth mode — login is a no-op success so
         # the frontend flow stays uniform.
         return {"ok": True, "authenticated": True}
-    if auth.is_public_mode(cfg):
-        now = time.time()
-        if now < _LOGIN_LOCKED_UNTIL:
-            retry_in = int(_LOGIN_LOCKED_UNTIL - now) + 1
-            raise HTTPException(
-                429,
-                f"too many failed logins; retry in {retry_in}s",
-            )
+    now = time.time()
+    if now < _LOGIN_LOCKED_UNTIL:
+        retry_in = int(_LOGIN_LOCKED_UNTIL - now) + 1
+        raise HTTPException(
+            429,
+            f"too many failed logins; retry in {retry_in}s",
+        )
     if not auth.check_password(body.password or ""):
-        if auth.is_public_mode(cfg):
-            _LOGIN_FAIL_COUNT += 1
-            if _LOGIN_FAIL_COUNT >= _LOGIN_MAX_FAILS:
-                _LOGIN_LOCKED_UNTIL = time.time() + _LOGIN_LOCKOUT_SEC
-                _LOGIN_FAIL_COUNT = 0
+        _LOGIN_FAIL_COUNT += 1
+        if _LOGIN_FAIL_COUNT >= _LOGIN_MAX_FAILS:
+            _LOGIN_LOCKED_UNTIL = time.time() + _LOGIN_LOCKOUT_SEC
+            _LOGIN_FAIL_COUNT = 0
         raise HTTPException(401, "invalid password")
     # Success: reset the counter so a user who typo'd doesn't stay locked.
     _LOGIN_FAIL_COUNT = 0
@@ -1117,17 +1105,16 @@ def api_auth_login(body: LoginBody, response: Response) -> dict:
     token = auth.make_token()
     # HttpOnly + SameSite=Lax: the cookie is not JS-readable (no XSS to
     # cookie-exfiltration path) and isn't sent on cross-site POSTs (no
-    # trivial CSRF). In LAN/Tailscale mode we deliberately skip ``Secure``
-    # because HTTP on the tailnet is the common case. In public mode the
-    # frontend is reached over the internet via a TLS-terminating proxy —
-    # flip Secure on so the cookie never leaks over a stray plaintext hop.
+    # trivial CSRF). The Secure flag is omitted because LAN mode serves
+    # plain HTTP on the local network — the cookie never traverses a
+    # public network where it could be sniffed in transit.
     response.set_cookie(
         auth.SESSION_COOKIE,
         token,
         max_age=auth.SESSION_TTL_SECONDS,
         httponly=True,
         samesite="lax",
-        secure=auth.is_public_mode(cfg),
+        secure=False,
         path="/",
     )
     return {"ok": True, "authenticated": True, "token": token}
@@ -1527,20 +1514,6 @@ def api_create(body: CreateConversation) -> dict:
     # the time the first turn runs. No-op if already indexed / in flight.
     _kick_codebase_index(conv.get("cwd"))
     return {"conversation": conv}
-
-
-def _ensure_conversation_workspace(cid: str) -> str:
-    """Create (if missing) and return the isolated workspace for a chat.
-
-    Used in public mode so each conversation starts pointed at its own
-    ``data/workspaces/<cid>/`` directory instead of the Gigachat project
-    root. The folder is only created once — repeated calls are safe. We
-    never rm-rf this directory on conversation delete; remote users may
-    have put work in there that they still want to retrieve via the UI.
-    """
-    root = ROOT / "data" / "workspaces" / cid
-    root.mkdir(parents=True, exist_ok=True)
-    return str(root.resolve())
 
 
 @app.get("/api/conversations/{cid}")
@@ -3295,18 +3268,36 @@ async def api_settings_patch(body: SettingsPatch) -> dict:
 # ---------------------------------------------------------------------------
 # Compute pool: register other PCs as workers the host can route work to.
 #
-# Each row represents another machine reachable over the LAN (preferred —
-# saves internet bandwidth) or via Tailscale (anywhere). Capability probe
-# + routing live in `compute_pool.py`; this layer is just CRUD.
+# Each row represents another machine reachable over the LAN — same Wi-Fi
+# or Ethernet, no internet bandwidth used. An optional Tailscale identifier
+# is stored alongside the LAN address purely as a self-repair handle: when
+# DHCP rebinds the worker to a new LAN IP, the host reaches it over
+# Tailscale just long enough to rediscover the new address. Capability
+# probe + routing live in `compute_pool.py`; this layer is just CRUD.
 # ---------------------------------------------------------------------------
 class ComputeWorkerCreate(BaseModel):
-    """Body for POST /api/compute-workers."""
+    """Body for POST /api/compute-workers.
+
+    All ongoing traffic — chat / embeddings / subagent calls — flows over
+    ``address`` (a LAN hostname or RFC1918 IPv4). ``tailscale_host`` is an
+    optional fallback used ONLY by the auto-repair routine: when the LAN
+    address goes stale (e.g. because the worker rejoined the network and
+    DHCP gave it a new lease), the backend reaches the worker over its
+    Tailscale identifier just long enough to ask for the new LAN IP, then
+    resumes regular traffic over LAN.
+    """
     label: str
-    address: str
+    address: str  # LAN hostname or IPv4 — used for ongoing Ollama traffic
     ollama_port: int = 11434
-    transport: str = "lan"  # "lan" or "tailscale"
     auth_token: str | None = None
-    ssh_host: str | None = None  # optional SSH alias for LAN model copy
+    # Optional SSH alias from ~/.ssh/config — used for LAN-side scp of
+    # Ollama model blobs. Connects over LAN, not Tailscale.
+    ssh_host: str | None = None
+    # Optional Tailscale identifier (MagicDNS name like
+    # ``worker.your-tailnet.ts.net``, or a CGNAT IPv4 in 100.64.0.0/10).
+    # Used only by the auto-repair routine to rediscover the worker's LAN
+    # IP after it changes; never used for ongoing traffic.
+    tailscale_host: str | None = None
     enabled: bool = True
     use_for_chat: bool = True
     use_for_embeddings: bool = True
@@ -3318,9 +3309,9 @@ class ComputeWorkerPatch(BaseModel):
     label: str | None = None
     address: str | None = None
     ollama_port: int | None = None
-    transport: str | None = None
-    auth_token: str | None = None  # send "" to clear, null to leave alone
-    ssh_host: str | None = None    # send "" to clear, null to leave alone
+    auth_token: str | None = None       # send "" to clear, null to leave alone
+    ssh_host: str | None = None         # send "" to clear, null to leave alone
+    tailscale_host: str | None = None   # send "" to clear, null to leave alone
     enabled: bool | None = None
     use_for_chat: bool | None = None
     use_for_embeddings: bool | None = None
@@ -3329,16 +3320,13 @@ class ComputeWorkerPatch(BaseModel):
 
 @app.get("/api/compute-workers")
 def api_list_compute_workers() -> dict:
-    """Return every registered worker + the allowed transport values.
+    """Return every registered worker.
 
     Auth tokens are NEVER included in the response — the row dict only
     carries an `auth_token_set` boolean so the UI can show "(set)" or
     "(none)" without ever exposing the secret.
     """
-    return {
-        "workers": db.list_compute_workers(),
-        "transports": sorted(db.COMPUTE_WORKER_TRANSPORTS),
-    }
+    return {"workers": db.list_compute_workers()}
 
 
 @app.post("/api/compute-workers")
@@ -3348,9 +3336,9 @@ def api_create_compute_worker(body: ComputeWorkerCreate) -> dict:
             label=body.label,
             address=body.address,
             ollama_port=body.ollama_port,
-            transport=body.transport,
             auth_token=(body.auth_token or None),
             ssh_host=(body.ssh_host or None),
+            tailscale_host=(body.tailscale_host or None),
             enabled=body.enabled,
             use_for_chat=body.use_for_chat,
             use_for_embeddings=body.use_for_embeddings,

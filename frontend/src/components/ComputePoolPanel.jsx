@@ -7,7 +7,6 @@ import {
   RefreshCw,
   Server,
   Wifi,
-  Globe,
   CircleCheck,
   CircleX,
   CircleHelp,
@@ -36,13 +35,12 @@ import AutoSplitInstallSection from './SplitModelsPanel'
  * machines so big models / parallel subagents finish faster, and cross-LAN
  * fanout doesn't fight a single GPU.
  *
- * Two transports:
- *   - **lan** (preferred when both machines are on the same LAN/Wi-Fi) —
- *     traffic stays on local Ethernet/Wi-Fi, no internet bandwidth, lowest
- *     latency. Address is typically a `.local` mDNS hostname or RFC1918 IP.
- *   - **tailscale** (fallback when the worker is travelling) — Tailscale
- *     CGNAT (`100.x.x.x`); a few ms slower and uses internet bandwidth, but
- *     it works anywhere.
+ * All ongoing traffic — chat, embeddings, subagent calls — flows over the
+ * LAN address. An optional Tailscale identifier is stored alongside it
+ * purely as a self-repair handle: when the worker rejoins the LAN and DHCP
+ * gives it a different IP, the backend reaches it over Tailscale just long
+ * enough to rediscover the new LAN address. Tailscale is never used for
+ * regular traffic, so the user's metered internet bandwidth is preserved.
  *
  * Each row shows the live probe status (online / unreachable / never seen),
  * the worker's Ollama version, and how many models it has installed. The
@@ -51,9 +49,9 @@ import AutoSplitInstallSection from './SplitModelsPanel'
  */
 export default function ComputePoolSection() {
   const [workers, setWorkers] = useState([])
-  const [transports, setTransports] = useState(['lan', 'tailscale'])
   const [loading, setLoading] = useState(false)
-  const [editing, setEditing] = useState(null) // form state
+  // Form state for the add/edit dialog. `null` = dialog closed.
+  const [editing, setEditing] = useState(null)
   const [pendingDelete, setPendingDelete] = useState(null)
   // Worker IDs currently being probed — used to spin the per-row icon.
   const [probing, setProbing] = useState(() => new Set())
@@ -64,9 +62,6 @@ export default function ComputePoolSection() {
     try {
       const res = await api.listComputeWorkers()
       setWorkers(res.workers || [])
-      if (Array.isArray(res.transports) && res.transports.length) {
-        setTransports(res.transports)
-      }
     } catch (e) {
       toast.error('Failed to load compute workers', { description: e.message })
     } finally {
@@ -78,14 +73,15 @@ export default function ComputePoolSection() {
     refresh()
   }, [refresh])
 
+  /** Default form state for "Add device". */
   function blankForm() {
     return {
       label: '',
       address: '',
       ollama_port: 11434,
-      transport: transports[0] || 'lan',
       auth_token: '',
       ssh_host: '',
+      tailscale_host: '',
       enabled: true,
       use_for_chat: true,
       use_for_embeddings: true,
@@ -104,12 +100,12 @@ export default function ComputePoolSection() {
       label: w.label || '',
       address: w.address || '',
       ollama_port: w.ollama_port ?? 11434,
-      transport: w.transport || 'lan',
       // Empty string means "leave token alone" on save (the placeholder
       // "••••••" is rendered when the row already has one).
       auth_token: '',
       auth_token_was_set: !!w.auth_token_set,
       ssh_host: w.ssh_host || '',
+      tailscale_host: w.tailscale_host || '',
       enabled: !!w.enabled,
       use_for_chat: !!w.use_for_chat,
       use_for_embeddings: !!w.use_for_embeddings,
@@ -135,8 +131,8 @@ export default function ComputePoolSection() {
           label,
           address,
           ollama_port: port,
-          transport: editing.transport,
           ssh_host: editing.ssh_host || '',
+          tailscale_host: editing.tailscale_host || '',
           enabled: editing.enabled,
           use_for_chat: editing.use_for_chat,
           use_for_embeddings: editing.use_for_embeddings,
@@ -154,9 +150,9 @@ export default function ComputePoolSection() {
           label,
           address,
           ollama_port: port,
-          transport: editing.transport,
           auth_token: editing.auth_token || null,
           ssh_host: editing.ssh_host || null,
+          tailscale_host: editing.tailscale_host || null,
           enabled: editing.enabled,
           use_for_chat: editing.use_for_chat,
           use_for_embeddings: editing.use_for_embeddings,
@@ -285,10 +281,9 @@ export default function ComputePoolSection() {
           send a slice of chat / embedding / subagent traffic to them so
           parallel work finishes faster.
           <br />
-          <strong className="text-foreground">LAN</strong> is preferred when
-          the worker is on the same Wi-Fi/Ethernet (no internet bandwidth,
-          lowest latency). Use <strong>Tailscale</strong> as a fallback when
-          the device is travelling.
+          All ongoing traffic stays on the <strong className="text-foreground">LAN</strong>.
+          A Tailscale identifier is optional — used only to rediscover the
+          worker's LAN IP after it changes (e.g. a fresh DHCP lease).
         </p>
 
         <div className="flex-1 space-y-2 overflow-y-auto pr-1">
@@ -337,7 +332,7 @@ export default function ComputePoolSection() {
             <DialogDescription>
               {editing?._mode === 'edit'
                 ? 'Update the connection details. Capabilities re-probe automatically; click Save and then "Test connection" on the row.'
-                : 'Point to another PC running Ollama. LAN-direct keeps traffic off the internet; pick Tailscale only if the device might be off-network.'}
+                : 'Point to another PC running Ollama on the same LAN. Add a Tailscale identifier if you want the LAN IP to self-heal after a DHCP rebind.'}
             </DialogDescription>
           </DialogHeader>
           {editing && (
@@ -359,19 +354,20 @@ export default function ComputePoolSection() {
               <div className="grid grid-cols-3 gap-2">
                 <div className="col-span-2">
                   <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                    Address
+                    LAN address
                   </label>
                   <Input
                     value={editing.address}
                     onChange={(e) =>
                       setEditing({ ...editing, address: e.target.value })
                     }
-                    placeholder={
-                      editing.transport === 'tailscale'
-                        ? '100.x.x.x'
-                        : 'worker.local'
-                    }
+                    placeholder="worker.local or 192.168.x.x"
                   />
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Hostname or private IPv4 on the same Wi-Fi/Ethernet.
+                    Public IPs and Tailscale CGNAT addresses are not
+                    accepted here — all ongoing traffic stays on the LAN.
+                  </p>
                 </div>
                 <div>
                   <label className="mb-1 block text-xs font-medium text-muted-foreground">
@@ -391,39 +387,6 @@ export default function ComputePoolSection() {
                     }
                   />
                 </div>
-              </div>
-
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  Transport
-                </label>
-                <div className="flex gap-2">
-                  {transports.map((t) => (
-                    <button
-                      key={t}
-                      type="button"
-                      onClick={() => setEditing({ ...editing, transport: t })}
-                      className={cn(
-                        'flex flex-1 items-center justify-center gap-2 rounded-md border px-3 py-2 text-xs font-medium transition-colors',
-                        editing.transport === t
-                          ? 'border-primary bg-primary/10 text-foreground'
-                          : 'border-input bg-background text-muted-foreground hover:bg-accent',
-                      )}
-                    >
-                      {t === 'lan' ? (
-                        <Wifi className="h-3.5 w-3.5" />
-                      ) : (
-                        <Globe className="h-3.5 w-3.5" />
-                      )}
-                      {t === 'lan' ? 'LAN (preferred)' : 'Tailscale'}
-                    </button>
-                  ))}
-                </div>
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  {editing.transport === 'lan'
-                    ? 'Same Wi-Fi/Ethernet. mDNS hostnames like x.local resolve automatically; or use the LAN IPv4.'
-                    : 'Worker is reachable over Tailscale (CGNAT 100.x.x.x). Slower than LAN, works anywhere.'}
-                </p>
               </div>
 
               <div>
@@ -477,6 +440,27 @@ export default function ComputePoolSection() {
                   the internet. Saves bandwidth on multi-GB models. Add
                   the alias to <code className="rounded bg-muted px-1">~/.ssh/config</code>{' '}
                   on this host first; the backend just reuses your existing SSH setup.
+                </p>
+              </div>
+
+              <div>
+                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                  Tailscale host (optional, for auto-repair only)
+                </label>
+                <Input
+                  value={editing.tailscale_host}
+                  onChange={(e) =>
+                    setEditing({ ...editing, tailscale_host: e.target.value })
+                  }
+                  placeholder="e.g. worker.your-tailnet.ts.net or 100.x.x.x"
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  Stable Tailscale identifier (MagicDNS name or CGNAT IPv4).
+                  When the LAN address goes stale — typically because the
+                  worker rejoined the network and DHCP gave it a new lease —
+                  the host SSHes over Tailscale just long enough to rediscover
+                  the new LAN IP. Never used for ongoing chat / embedding
+                  traffic, so your metered internet bandwidth is preserved.
                 </p>
               </div>
 
@@ -617,13 +601,6 @@ function WorkerRow({ worker, probing, onProbe, onEdit, onDelete }) {
     statusClass = 'text-muted-foreground'
   }
 
-  const transportIcon =
-    worker.transport === 'tailscale' ? (
-      <Globe className="h-3 w-3" />
-    ) : (
-      <Wifi className="h-3 w-3" />
-    )
-
   // Build a compact "uses" pill string — chat / embed / subagents — so the
   // user can see at a glance which workloads route here without opening the
   // edit dialog. Order matches the form.
@@ -648,7 +625,7 @@ function WorkerRow({ worker, probing, onProbe, onEdit, onDelete }) {
             <StatusIcon className="h-3 w-3" /> {statusLabel}
           </span>
           <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
-            {transportIcon} {worker.transport}
+            <Wifi className="h-3 w-3" /> LAN
           </span>
         </div>
 
@@ -671,6 +648,7 @@ function WorkerRow({ worker, probing, onProbe, onEdit, onDelete }) {
             <span>uses: {uses.join(', ')}</span>
           )}
           {worker.auth_token_set && <span>auth: set</span>}
+          {worker.tailscale_host && <span title={`auto-repair via ${worker.tailscale_host}`}>auto-repair: on</span>}
         </div>
 
         {worker.last_error && (

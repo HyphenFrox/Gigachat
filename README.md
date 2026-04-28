@@ -4,7 +4,7 @@
 
 # Gigachat
 
-A self-hosted web app that turns **any locally-running Ollama model** (Gemma, Llama, Qwen, DeepSeek, Mistral — anything with function-calling) into a Claude-Code-style coding assistant: chat with conversation history, plus tools to run shell commands, read and write files, drive your desktop, search the web, and more — with a per-conversation permission gate on every tool call. Optional password auth + Tailscale-aware bind host for remote access.
+A self-hosted web app that turns **any locally-running Ollama model** (Gemma, Llama, Qwen, DeepSeek, Mistral — anything with function-calling) into a Claude-Code-style coding assistant: chat with conversation history, plus tools to run shell commands, read and write files, drive your desktop, search the web, and more — with a per-conversation permission gate on every tool call. Optional password auth + opt-in LAN bind so other devices on the same Wi-Fi/Ethernet can join.
 
 ```
 ┌────────────────┐          ┌─────────────────┐          ┌──────────────┐
@@ -34,7 +34,7 @@ cd frontend && npm install && cd ..
 .\dev.bat
 ```
 
-That's it for solo loopback use. Production build (`build.bat` then `start.bat`) and remote access (Tailscale or reverse proxy) are covered further down.
+That's it for solo loopback use. Production build (`build.bat` then `start.bat`) and LAN access for other devices on the same Wi-Fi/Ethernet are covered further down.
 
 ---
 
@@ -242,8 +242,8 @@ When the model is too big for any single node — e.g. a 27 B Q4 model that does
        ▲                          ▲
        └── llama-server reads GGUF locally on host,
            streams layer weights to each rpc-server
-           over LAN/Tailscale. Layers cascade
-           VRAM → RAM → next node, native to llama.cpp.
+           over LAN. Layers cascade VRAM → RAM → next
+           node, native to llama.cpp.
 ```
 
 Workers do **not** need the model installed for the split path — bytes stream over RPC from the host's local GGUF blob.
@@ -329,7 +329,7 @@ The pool's value is the top three rows — large models that the host can't load
 ### Setup, per machine
 
 - **Worker side** — Ollama installed and listening on `0.0.0.0:11434` (set `OLLAMA_HOST` env var, allow port 11434 on the Private firewall profile). Optional but enables Phase 2: install [llama.cpp's prebuilt Vulkan build](https://github.com/ggml-org/llama.cpp/releases) at `~/.gigachat/llama-cpp/`, run `rpc-server.exe --host 0.0.0.0 --port 50052`. Allow port 50052 on the Private firewall profile.
-- **Host side** — register each worker via Settings → Compute → Add device. Fill in the LAN address (mDNS `.local` works) or Tailscale IP. Set `ssh_host` to your `~/.ssh/config` alias for that machine if you want LAN-first model copy. One-click "Install llama.cpp" in the Compute panel fetches the host's CUDA build (~150 MB).
+- **Host side** — register each worker via Settings → Compute → Add device. Fill in the LAN address (mDNS `.local` or a private IPv4 like `192.168.x.x`). Set `ssh_host` to your `~/.ssh/config` alias for that machine if you want LAN-first model copy. Optionally set `tailscale_host` to a stable Tailscale identifier (MagicDNS name or CGNAT IPv4) so the LAN address self-heals via Tailscale rediscovery whenever DHCP gives the worker a new lease — Tailscale is used **only** for that one query, never for ongoing chat / embeddings / model-copy traffic. One-click "Install llama.cpp" in the Compute panel fetches the host's CUDA build (~150 MB).
 
 The Settings panel shows live status pills per worker (Ollama version, model count, RPC reachability, GPU detection). The panel polls capabilities every 5 minutes; click the 🔄 on any row to probe immediately.
 
@@ -479,21 +479,18 @@ Two console windows. Visit **http://localhost:5173** — Vite dev server proxies
 
 ---
 
-## Remote access
+## LAN access
 
-Three bind modes — pick by who needs to reach it:
+Two bind modes — pick by who needs to reach it:
 
-| Mode | Reachable from | Client install? | Use case |
-| --- | --- | --- | --- |
-| **loopback** *(default)* | Host machine only | — | Day-to-day solo. Zero config. |
-| **`tailscale`** | Any device in your tailnet | [Tailscale](https://tailscale.com/download) on each client | Your own phone/laptop only. End-to-end encrypted. |
-| **`public`** | Anyone with the URL | None — a normal browser | Sharing with others / untrusted networks via reverse proxy. |
+| Mode | Reachable from | Use case |
+| --- | --- | --- |
+| **loopback** *(default)* | Host machine only | Day-to-day solo. Zero config. |
+| **`lan`** | Loopback + any device on the same Wi-Fi/Ethernet (RFC1918 ranges) | Phone / tablet / second laptop on your home network. |
 
-Raw LAN IPs and `0.0.0.0` binds are intentionally unsupported — the three modes above cover every real-world access pattern without dynamic-IP / port-forwarding footguns.
+Public-internet exposure and Tailscale-overlay access for the web UI are intentionally unsupported. The app is designed to live on a single physical network — it is not a hosted service.
 
-### Tailscale mode
-
-Install Tailscale on the host **and** every device you want to reach it from, sign them into the same account, run `tailscale up`.
+### LAN mode
 
 Hash a password (PBKDF2-SHA256, 200 000 iterations, 16-byte salt):
 
@@ -507,40 +504,20 @@ Write `data/auth.json`:
 
 ```json
 {
-  "host": "tailscale",
+  "host": "lan",
   "password": "a1b2c3…:d4e5f6…"
 }
 ```
 
-Or use env vars (they win over the file): `GIGACHAT_HOST=tailscale` and `GIGACHAT_PASSWORD=…`. Then `.\start.bat`.
+Or use env vars (they win over the file): `GIGACHAT_HOST=lan` and `GIGACHAT_PASSWORD=…`. Then `.\start.bat`.
 
-The launcher binds to `0.0.0.0` but the access-control middleware admits only loopback and Tailscale CGNAT ranges (`100.64.0.0/10` IPv4, `fd7a:115c:a1e0::/48` IPv6) — anything else gets a flat 403. The banner prints two URLs: `http://localhost:8000` for the host machine, `http://<your-tailscale-ip>:8000` for tailnet peers. MagicDNS handles hostname lookup. Login stores an HMAC-signed session cookie (httponly, SameSite=Lax, 30-day TTL). Loopback requests from the host are still implicitly authenticated. If Tailscale isn't running, startup falls back to pure loopback with a warning.
+The launcher binds to `0.0.0.0` but the access-control middleware admits only loopback and **private (RFC1918) LAN sources** — `192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`, IPv4 link-local, IPv6 ULA, IPv6 link-local. Public IPs and Tailscale CGNAT (`100.64.0.0/10`) get a flat 403. The banner prints two URLs: `http://localhost:8000` for the host machine, `http://<your-lan-ipv4>:8000` for other devices on the same network. Login stores an HMAC-signed session cookie (httponly, SameSite=Lax, 30-day TTL). Loopback requests from the host are still implicitly authenticated.
 
-### Public mode (reverse proxy)
+### Auto-repair for compute pool workers
 
-For when clients won't install Tailscale (a friend logging in, library PC, demo). Backend still binds to `127.0.0.1`; you run a TLS-terminating reverse proxy on the same host that forwards public HTTPS traffic onto loopback. **Auth is mandatory for every request, including loopback** — the proxy delivers all public traffic as `127.0.0.1`, so auto-trusting it would be a complete bypass.
+Worker LAN addresses can go stale when the worker rejoins the network and DHCP hands it a different IP. The Compute Pool panel exposes an optional **Tailscale host** field per worker: a stable Tailscale identifier (MagicDNS name like `worker.your-tailnet.ts.net`, or a CGNAT IPv4 in `100.64.0.0/10`). When the LAN probe to the worker fails, the backend reaches the worker over Tailscale via SSH **just long enough to ask for its current LAN IPv4**, then updates the stored address and resumes ordinary LAN traffic. The discovered address is validated to be RFC1918 before the row is updated.
 
-Same auth setup but `"host": "public"`:
-
-```json
-{
-  "host": "public",
-  "password": "a1b2c3…:d4e5f6…"
-}
-```
-
-**Cloudflare Tunnel** is the easiest. One-time setup:
-
-```powershell
-winget install --id Cloudflare.cloudflared
-cloudflared tunnel login
-cloudflared tunnel create gigachat
-cloudflared tunnel route dns gigachat gigachat.yourdomain.com
-```
-
-`start.bat` detects public mode, launches the backend, and runs the `gigachat` tunnel for you. Any HTTPS-terminating proxy works (Caddy `reverse_proxy 127.0.0.1:8000`, nginx, Traefik, …) as long as it terminates TLS and forwards to `http://127.0.0.1:8000`. The backend doesn't trust proxy headers (`X-Forwarded-For`, `X-Real-IP`) for auth decisions, and the session cookie is marked `Secure` so it only ever travels over the HTTPS hop.
-
-**Per-conversation workspaces.** New chats in public mode default `cwd` to an auto-created `data/workspaces/<conv-id>/` instead of the Gigachat project root, so a remote session won't land inside the source tree. You can still retarget `cwd` from the chat header to any path on the host. Folders are never auto-deleted on chat delete.
+Tailscale is **never** used for ongoing chat / embedding / model-copy traffic — only that one rediscovery query, rate-limited to one attempt per minute per worker. If Tailscale isn't installed or `tailscale_host` isn't set, a stale address surfaces as "Unreachable" in the panel and the user can fix it manually.
 
 ### Signing in and out
 
@@ -570,11 +547,12 @@ The `isolated_db` fixture rewires `db.DB_PATH` to a tmp file per test, so the su
 
 ## Safety & security
 
-- **Default bind is 127.0.0.1.** Nothing on your LAN reaches it until you opt in via `GIGACHAT_HOST` / `data/auth.json`.
-- **Password gate on every remote request.** Tailscale mode: non-loopback requests need a session cookie or `Bearer` token. Public mode: every request — **including loopback** — needs auth, because the reverse proxy delivers public traffic as 127.0.0.1.
+- **Default bind is 127.0.0.1.** Nothing on your LAN reaches it until you opt in via `GIGACHAT_HOST=lan` / `data/auth.json`.
+- **No public-internet exposure.** The bind layer refuses anything other than loopback or LAN. Tailscale CGNAT (`100.64.0.0/10`) is explicitly rejected by the middleware so the app can't be reached over the overlay either.
+- **Password gate on every LAN request.** In LAN mode non-loopback requests need a session cookie or `Bearer` token. Loopback callers (curl on the host, the desktop browser) skip the gate by design — anyone who can already execute code on the box has full access.
 - **PBKDF2-SHA256 password hashes** (200 000 iterations, 16-byte salt). Plaintext is accepted for dev convenience; `hash_password()` is canonical. Session tokens are HMAC-SHA256 signed against `data/auth_secret.key` (0600, auto-generated). 30-day TTL. Rotating the secret file invalidates every existing session — a one-step "log everyone out" lever.
-- **Public-mode hardening.** Session cookie is `Secure` so it only ever travels HTTPS. The login endpoint rate-limits to **10 failed attempts per 60 seconds** to blunt credential-stuffing.
-- **Use a strong random password** (`python -c "import secrets; print(secrets.token_urlsafe(24))"`) and consider layering Cloudflare Access / Zero Trust if the machine is a target.
+- **Login rate limit.** 10 failed attempts in 60 seconds locks out further logins for the next 60 seconds, regardless of source. Belt-and-braces against a misbehaving script on the LAN.
+- **Use a strong random password** (`python -c "import secrets; print(secrets.token_urlsafe(24))"`).
 - **Parameterized SQL end-to-end.** No string concat into SQL.
 - **Per-tool runtime caps.** 120-second default timeout, 20 000-character output cap.
 - **Approve edits is the safe default** for new conversations. Read-only is great for "let the model poke around but don't let it touch anything." Allow everything is for watched sessions or scheduled jobs only.
@@ -637,11 +615,11 @@ The `isolated_db` fixture rewires `db.DB_PATH` to a tmp file per test, so the su
 Gigachat/
 ├── backend/
 │   ├── server.py         thin uvicorn launcher — reads auth config, resolves
-│   │                     `tailscale` → `tailscale ip -4` / `public` → `127.0.0.1`,
-│   │                     prints a banner, warns if remote without a password
+│   │                     `lan` → `0.0.0.0`, prints a banner, warns if LAN
+│   │                     mode is configured without a password
 │   ├── auth.py           PBKDF2-SHA256 password hashing + HMAC session tokens +
-│   │                     loopback / Tailscale / public host resolution
-│   ├── app.py            FastAPI routes + SSE + AuthMiddleware (loopback-or-tailnet
+│   │                     loopback / LAN host resolution + RFC1918 client check
+│   ├── app.py            FastAPI routes + SSE + AuthMiddleware (loopback-or-LAN
 │   │                     IP allowlist + session cookie) + startup resumer for
 │   │                     interrupted turns
 │   ├── agent.py          run_turn() — Ollama ↔ tool loop, approvals,
@@ -714,4 +692,4 @@ Gigachat/
 | "[crash-resilience] The previous run was interrupted…" note | Backend exited mid-turn last time. Resumer detected a `state='running'` conversation and dropped the breadcrumb. Either auto-resumed (last message was user-role) or flipped state back to idle. Safe to ignore. |
 | User-tool create fails with "dep install failed" | Read the install_log from the toast — it's pip's raw output. Usual causes: dep misspelled, version spec stricter than anything available, network can't reach PyPI. The dep-spec regex refuses URLs / VCS URIs / file paths by design — rewrite as a plain `name>=ver` spec. Kill switch: `GIGACHAT_DISABLE_USER_TOOLS=1`. |
 | User tool: "user tools are disabled" | `GIGACHAT_DISABLE_USER_TOOLS=1` is set in the backend env. Unset and restart, or remove from `data/auth.json`'s env block. Rows stay in SQLite; nothing was lost. |
-| Public mode: every request 401s even on localhost | Expected. Loopback is not auto-trusted because the reverse proxy delivers public traffic as 127.0.0.1. Log in at the public URL (or `http://127.0.0.1:8000` locally) to get a session cookie. |
+| LAN mode: another device on the LAN gets a 403 | Its source IP isn't in an RFC1918 range. The middleware admits only `192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`, IPv4 link-local, IPv6 ULA, IPv6 link-local — anything else is rejected. Confirm both devices are on the same physical network. Tailscale CGNAT (`100.64.0.0/10`) is intentionally refused. |

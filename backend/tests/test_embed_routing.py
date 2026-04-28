@@ -46,8 +46,7 @@ def _run(coro):
 def _seed_eligible_worker(isolated_db, *, address: str, auth_token=None) -> str:
     import time as _t
     wid = isolated_db.create_compute_worker(
-        label="W", address=address, transport="lan",
-        auth_token=auth_token, use_for_embeddings=True,
+        label="W", address=address, auth_token=auth_token, use_for_embeddings=True,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,

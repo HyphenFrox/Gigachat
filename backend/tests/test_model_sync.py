@@ -108,8 +108,7 @@ def _stub_subprocess(monkeypatch, *, blobs_already_present: list[str] | None = N
 
 def _seed_worker(isolated_db, *, ssh_host: str | None = "laptop"):
     return isolated_db.create_compute_worker(
-        label="L", address="x.local", transport="lan",
-        ssh_host=ssh_host,
+        label="L", address="x.local", ssh_host=ssh_host,
     )
 
 
@@ -162,7 +161,7 @@ def test_find_lan_source_returns_worker_when_host_lacks(isolated_db, monkeypatch
     monkeypatch.setattr(model_sync, "db", isolated_db)
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     _redirect_ollama_dir(monkeypatch, tmp_path)
-    wid = isolated_db.create_compute_worker(label="A", address="a.local", transport="lan")
+    wid = isolated_db.create_compute_worker(label="A", address="a.local")
     isolated_db.update_compute_worker_capabilities(
         wid,
         capabilities={

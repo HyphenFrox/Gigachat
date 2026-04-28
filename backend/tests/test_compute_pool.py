@@ -117,7 +117,7 @@ def test_probe_worker_disabled_short_circuits(isolated_db, monkeypatch):
     off for a reason (offline, being maintained, etc.)."""
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     wid = isolated_db.create_compute_worker(
-        label="A", address="a", transport="lan", enabled=False,
+        label="A", address="a", enabled=False,
     )
     result = _run(compute_pool.probe_worker(wid))
     assert result["ok"] is False
@@ -130,8 +130,7 @@ def test_probe_worker_disabled_short_circuits(isolated_db, monkeypatch):
 def test_probe_worker_persists_capabilities_on_success(isolated_db, monkeypatch):
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     wid = isolated_db.create_compute_worker(
-        label="A", address="x.local", transport="lan",
-    )
+        label="A", address="x.local", )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/version":
@@ -177,8 +176,7 @@ def test_probe_worker_persists_capabilities_on_success(isolated_db, monkeypatch)
 def test_probe_worker_records_network_failure(isolated_db, monkeypatch):
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     wid = isolated_db.create_compute_worker(
-        label="A", address="dead.local", transport="lan",
-    )
+        label="A", address="dead.local", )
 
     def handler(request: httpx.Request) -> httpx.Response:
         # Simulate connection refused at the transport layer.
@@ -204,8 +202,7 @@ def test_probe_worker_partial_failure_keeps_working_half(isolated_db, monkeypatc
     worker as dead — the routing layer can then send chat traffic to it."""
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     wid = isolated_db.create_compute_worker(
-        label="A", address="x.local", transport="lan",
-    )
+        label="A", address="x.local", )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/version":
@@ -236,8 +233,7 @@ def test_probe_worker_partial_failure_keeps_working_half(isolated_db, monkeypatc
 def test_probe_worker_sends_bearer_token_when_set(isolated_db, monkeypatch):
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     wid = isolated_db.create_compute_worker(
-        label="A", address="x.local", transport="tailscale",
-        auth_token="hunter2",
+        label="A", address="x.local", auth_token="hunter2",
     )
 
     seen_auth_headers: list[str | None] = []
@@ -259,8 +255,7 @@ def test_probe_worker_sends_bearer_token_when_set(isolated_db, monkeypatch):
 def test_probe_worker_omits_auth_when_token_unset(isolated_db, monkeypatch):
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     wid = isolated_db.create_compute_worker(
-        label="A", address="x.local", transport="lan",
-    )
+        label="A", address="x.local", )
 
     seen_auth_headers: list[str | None] = []
 
@@ -287,8 +282,8 @@ def test_probe_all_enabled_empty_when_no_workers(isolated_db, monkeypatch):
 
 def test_probe_all_enabled_aggregates_summaries(isolated_db, monkeypatch):
     monkeypatch.setattr(compute_pool, "db", isolated_db)
-    isolated_db.create_compute_worker(label="A", address="a.local", transport="lan")
-    isolated_db.create_compute_worker(label="B", address="b.local", transport="lan")
+    isolated_db.create_compute_worker(label="A", address="a.local")
+    isolated_db.create_compute_worker(label="B", address="b.local")
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "a.local":
@@ -312,8 +307,8 @@ def test_probe_all_enabled_skips_disabled(isolated_db, monkeypatch):
     for a reason (e.g. user knows the laptop is travelling) and probing
     them just spams `last_error`."""
     monkeypatch.setattr(compute_pool, "db", isolated_db)
-    isolated_db.create_compute_worker(label="A", address="a.local", transport="lan", enabled=True)
-    isolated_db.create_compute_worker(label="B", address="b.local", transport="lan", enabled=False)
+    isolated_db.create_compute_worker(label="A", address="a.local", enabled=True)
+    isolated_db.create_compute_worker(label="B", address="b.local", enabled=False)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/version":
@@ -372,7 +367,6 @@ def _seed_eligible_worker(
     wid = isolated_db.create_compute_worker(
         label=label,
         address=address,
-        transport="lan",
         enabled=enabled,
         use_for_embeddings=use_for_embeddings,
         auth_token=auth_token,
@@ -450,8 +444,7 @@ def test_pick_embed_target_skips_never_probed(isolated_db, monkeypatch):
     yet (last_seen=None). Don't route until we've confirmed it works."""
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     isolated_db.create_compute_worker(
-        label="A", address="a.local", transport="lan",
-    )
+        label="A", address="a.local", )
     assert compute_pool.pick_embed_target("nomic-embed-text") is None
 
 
@@ -498,7 +491,6 @@ def _seed_eligible_subagent_worker(isolated_db, **kwargs):
     wid = isolated_db.create_compute_worker(
         label=label,
         address=address,
-        transport="lan",
         enabled=enabled,
         use_for_subagents=use_for_subagents,
         auth_token=auth_token,
@@ -575,7 +567,7 @@ def test_list_subagent_workers_skips_too_slow_relative_to_host(isolated_db, monk
     )
 
     wid = isolated_db.create_compute_worker(
-        label="slow", address="slow.local", transport="lan", use_for_subagents=True,
+        label="slow", address="slow.local", use_for_subagents=True,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,
@@ -605,7 +597,7 @@ def test_list_subagent_workers_includes_fast_enough_workers(isolated_db, monkeyp
     )
 
     wid = isolated_db.create_compute_worker(
-        label="fast-enough", address="ok.local", transport="lan", use_for_subagents=True,
+        label="fast-enough", address="ok.local", use_for_subagents=True,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,
@@ -639,7 +631,7 @@ def test_list_subagent_workers_includes_unmeasured_worker(isolated_db, monkeypat
     )
 
     wid = isolated_db.create_compute_worker(
-        label="unbenched", address="unb.local", transport="lan", use_for_subagents=True,
+        label="unbenched", address="unb.local", use_for_subagents=True,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,
@@ -671,7 +663,7 @@ def test_eligible_workers_enqueues_sync_instead_of_firing(isolated_db, monkeypat
     compute_pool._AUTO_SYNC_TASKS.clear()
 
     wid = isolated_db.create_compute_worker(
-        label="A", address="a.local", transport="lan", ssh_host="a-alias",
+        label="A", address="a.local", ssh_host="a-alias",
         use_for_chat=True,
     )
     isolated_db.update_compute_worker_capabilities(
@@ -710,8 +702,7 @@ def _seed_chat_worker(isolated_db, **kwargs):
     last_error = kwargs.pop("last_error", "")
     auth_token = kwargs.pop("auth_token", None)
     wid = isolated_db.create_compute_worker(
-        label=label, address=address, transport="lan",
-        enabled=enabled, use_for_chat=use_for_chat, auth_token=auth_token,
+        label=label, address=address, enabled=enabled, use_for_chat=use_for_chat, auth_token=auth_token,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,
@@ -784,8 +775,7 @@ def test_probe_records_rpc_reachable_in_capabilities(isolated_db, monkeypatch):
     badge separately from the Ollama status."""
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     wid = isolated_db.create_compute_worker(
-        label="A", address="x.local", transport="lan",
-    )
+        label="A", address="x.local", )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/version":
@@ -818,8 +808,7 @@ def test_probe_records_rpc_unreachable_separately_from_last_error(
     reflects the missing rpc daemon for the Settings UI."""
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     wid = isolated_db.create_compute_worker(
-        label="A", address="x.local", transport="lan",
-    )
+        label="A", address="x.local", )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/version":
@@ -864,8 +853,7 @@ def test_probe_records_gpu_present_when_loaded_model_in_vram(isolated_db, monkey
     to prefer GPU-equipped workers over CPU-only ones."""
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     wid = isolated_db.create_compute_worker(
-        label="gpu-worker", address="g.local", transport="lan",
-    )
+        label="gpu-worker", address="g.local", )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/version":
@@ -898,8 +886,7 @@ def test_probe_records_no_gpu_when_ps_empty(isolated_db, monkeypatch):
     artificially preferred)."""
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     wid = isolated_db.create_compute_worker(
-        label="idle", address="i.local", transport="lan",
-    )
+        label="idle", address="i.local", )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/version":
@@ -969,7 +956,7 @@ def test_pick_chat_target_keeps_host_when_worker_weaker(isolated_db, monkeypatch
     )
 
     wid = isolated_db.create_compute_worker(
-        label="weak", address="w.local", transport="lan", use_for_chat=True,
+        label="weak", address="w.local", use_for_chat=True,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,
@@ -998,7 +985,7 @@ def test_pick_chat_target_routes_to_worker_when_strictly_more_capable(
     )
 
     wid = isolated_db.create_compute_worker(
-        label="beefy", address="big.local", transport="lan", use_for_chat=True,
+        label="beefy", address="big.local", use_for_chat=True,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,
@@ -1032,7 +1019,7 @@ def test_pick_chat_target_routes_to_worker_with_higher_measured_tps(
     )
 
     wid = isolated_db.create_compute_worker(
-        label="beefy-gpu", address="big.local", transport="lan", use_for_chat=True,
+        label="beefy-gpu", address="big.local", use_for_chat=True,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,
@@ -1070,7 +1057,7 @@ def test_pick_chat_target_keeps_host_when_worker_tps_lower(
     )
 
     wid = isolated_db.create_compute_worker(
-        label="weak-gpu", address="weak.local", transport="lan", use_for_chat=True,
+        label="weak-gpu", address="weak.local", use_for_chat=True,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,
@@ -1108,7 +1095,7 @@ def test_route_chat_uses_ollama_when_worker_can_hold_model(isolated_db, monkeypa
     )
 
     wid = isolated_db.create_compute_worker(
-        label="big", address="big.local", transport="lan", use_for_chat=True,
+        label="big", address="big.local", use_for_chat=True,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,
@@ -1139,7 +1126,7 @@ def test_pick_chat_target_picks_gpu_worker_over_cpu_only(isolated_db, monkeypatc
 
     # CPU-only worker, fresher probe.
     cpu_id = isolated_db.create_compute_worker(
-        label="cpu", address="cpu.local", transport="lan", use_for_chat=True,
+        label="cpu", address="cpu.local", use_for_chat=True,
     )
     isolated_db.update_compute_worker_capabilities(
         cpu_id,
@@ -1153,7 +1140,7 @@ def test_pick_chat_target_picks_gpu_worker_over_cpu_only(isolated_db, monkeypatc
     )
     # GPU worker, slightly older probe.
     gpu_id = isolated_db.create_compute_worker(
-        label="gpu", address="gpu.local", transport="lan", use_for_chat=True,
+        label="gpu", address="gpu.local", use_for_chat=True,
     )
     isolated_db.update_compute_worker_capabilities(
         gpu_id,

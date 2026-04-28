@@ -9,10 +9,10 @@ import { api } from '@/lib/api'
  * LoginView — full-viewport password gate shown when the backend is bound
  * to a non-loopback address and the user has no valid session cookie.
  *
- * This is the ONE screen that renders before the main app on a remote
- * (LAN / Tailscale / public) install. On a localhost install the gate is
- * skipped entirely by App.jsx, so the UX cost of having this page is zero
- * for the default setup.
+ * This is the ONE screen that renders before the main app on a LAN
+ * install (the only non-loopback bind mode supported). On a localhost
+ * install the gate is skipped entirely by App.jsx, so the UX cost of
+ * having this page is zero for the default setup.
  *
  * The page deliberately says "Gigachat" in plain text and shows the host
  * the server believes it's bound to — no sneaky re-branding, no hidden

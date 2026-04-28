@@ -404,18 +404,30 @@ export const api = {
 
   /* -------------------- Compute pool (multi-PC workers) ----------------- */
   /**
-   * List every registered compute worker plus the allowed `transport` values.
+   * List every registered compute worker.
    * Auth tokens are NEVER returned — each row carries `auth_token_set: bool`.
-   * Response: `{workers: [...], transports: ["lan","tailscale"]}`.
+   * Response: `{workers: [...]}`.
    */
   listComputeWorkers: () => request('/api/compute-workers'),
 
   /**
-   * Register a new worker. `address` may be a hostname (`x.local`), an IPv4
-   * (`192.168.1.10`), or a Tailscale CGNAT IP (`100.x.x.x`) — the probe
-   * layer strips any `http(s)://` prefix the user pastes.
-   * @param {{label:string,address:string,ollama_port?:number,transport:string,
-   *          auth_token?:string|null,enabled?:boolean,
+   * Register a new worker.
+   *
+   * `address` is a LAN hostname (`worker.local`) or a private IPv4
+   * (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`); the probe layer strips
+   * any `http(s)://` prefix the user pastes. All ongoing traffic flows
+   * over this address.
+   *
+   * `tailscale_host` is optional — a stable Tailscale identifier (MagicDNS
+   * name like `worker.your-tailnet.ts.net`, or a CGNAT IPv4 in
+   * 100.64.0.0/10). It's used ONLY by the auto-repair routine: when the
+   * worker reconnects to the LAN with a different DHCP lease the backend
+   * reaches it over Tailscale to rediscover the new LAN IP, then resumes
+   * regular traffic over LAN.
+   *
+   * @param {{label:string,address:string,ollama_port?:number,
+   *          auth_token?:string|null,ssh_host?:string|null,
+   *          tailscale_host?:string|null,enabled?:boolean,
    *          use_for_chat?:boolean,use_for_embeddings?:boolean,
    *          use_for_subagents?:boolean}} body
    */

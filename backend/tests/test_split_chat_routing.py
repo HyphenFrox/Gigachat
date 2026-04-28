@@ -258,8 +258,7 @@ def _seed_eligible_split_worker(isolated_db, *, label, address, model_present="g
     """Worker with rpc-server reachable + use_for_chat enabled."""
     import time
     wid = isolated_db.create_compute_worker(
-        label=label, address=address, transport="lan",
-        use_for_chat=True,
+        label=label, address=address, use_for_chat=True,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,

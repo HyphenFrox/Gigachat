@@ -2,36 +2,61 @@
 
 Run this instead of calling ``uvicorn backend.app:app`` directly — it reads
 ``backend.auth.get_config()`` so the host configured via env var or
-``data/auth.json`` takes effect, including the magic ``tailscale`` value
-which auto-detects the Tailscale IPv4 via ``tailscale ip -4``.
+``data/auth.json`` takes effect.
 
-Three hosts are supported:
+Two hosts are supported:
 
-  - loopback (default): no auth, binds to 127.0.0.1.
-  - ``tailscale``: binds to 0.0.0.0 with IP allowlist for loopback + tailnet
-    CGNAT. Auth required for non-loopback clients.
-  - ``public``: binds to 127.0.0.1 and expects a TLS-terminating reverse
-    proxy (cloudflared / Caddy / nginx) on the same host to forward public
-    traffic in. Auth required for every request — loopback is NOT trusted
-    because the proxy delivers everything as loopback.
+  - loopback (default): no auth, binds to 127.0.0.1. Only same-machine
+    processes can connect.
+  - ``lan``: binds to 0.0.0.0 with a source-IP allowlist (loopback + RFC1918
+    LAN ranges). Other devices on the same physical network can reach the
+    app once they enter the password. Public IPs and Tailscale CGNAT
+    clients are refused — the app is intentionally not exposed over the
+    internet or over the Tailscale overlay.
 
 A misconfigured host aborts startup with a clear error rather than
 silently binding to an unexpected interface.
-
-If ``tailscale`` is configured but the Tailscale daemon isn't running,
-``resolve_bind_host`` falls back to loopback so the app still runs
-locally — we print a warning and the user can restart once Tailscale
-is up.
 """
 
 from __future__ import annotations
 
 import os
+import socket
 import sys
 
 import uvicorn
 
 from . import auth
+
+
+def _detect_lan_ipv4() -> str | None:
+    """Best-effort discovery of the host's primary LAN IPv4.
+
+    Used purely for the startup banner so the user knows which URL to
+    paste into another device on the same network. The middleware does
+    the real access-control, so this helper isn't security-relevant —
+    if it returns the wrong NIC the app still works.
+
+    Strategy: open a UDP socket "to" a public address (no packet is
+    actually sent) and read the kernel's chosen source IP. This picks
+    whichever interface the OS would route an outbound packet through,
+    which on a typical home setup is the active Wi-Fi or Ethernet NIC.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # 203.0.113.1 is a TEST-NET-3 address that no network actually
+        # routes to — picking it avoids ever leaking a real packet to a
+        # third-party host while still letting the kernel resolve the
+        # routing table to a source address.
+        s.connect(("203.0.113.1", 1))
+        ip = s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+    if not ip or ip.startswith("127."):
+        return None
+    return ip
 
 
 def main() -> None:
@@ -49,48 +74,33 @@ def main() -> None:
         port = 8000
 
     auth_required = auth.requires_password(cfg)
-    public_mode = configured_host == "public"
     print()
 
     if host == "0.0.0.0":
-        # Tailscale mode: we're listening on every interface but the
-        # middleware only admits loopback + Tailscale CGNAT clients.
-        # Show both URLs so the user knows how to reach the app from the
-        # host machine and from remote tailnet peers.
+        # LAN mode: listening on every interface but the middleware only
+        # admits loopback + RFC1918 LAN clients. Show both URLs so the
+        # user knows how to reach the app from this machine and from
+        # another device on the same Wi-Fi/Ethernet.
         print(f"  Gigachat listening on http://localhost:{port}  (this machine)")
-        ts_ip = auth.get_tailscale_ip()
-        if ts_ip:
-            print(f"  Gigachat listening on http://{ts_ip}:{port}  (tailnet)")
-    elif public_mode:
-        # Public mode binds to loopback — the reverse proxy (cloudflared,
-        # Caddy, nginx) forwards internet traffic onto it. Tell the user so
-        # there's no surprise when :8000 isn't directly reachable.
-        print(f"  Gigachat listening on http://{host}:{port}  (behind reverse proxy)")
+        lan_ip = _detect_lan_ipv4()
+        if lan_ip:
+            print(f"  Gigachat listening on http://{lan_ip}:{port}  (LAN)")
+        else:
+            # Couldn't auto-detect — give the user a hint without printing
+            # anything that might be wrong.
+            print("  (use this machine's LAN IPv4 from another device on the same network)")
     else:
         print(f"  Gigachat listening on http://{host}:{port}")
 
-    if configured_host == "tailscale" and host == "127.0.0.1":
-        # Tailscale was requested but unreachable — we silently downgraded
-        # to loopback. Tell the user so they can start Tailscale and retry.
+    if auth_required and not (cfg.get("password") or "").strip():
         print(
-            "  [!] host 'tailscale' requested but tailscale is not running.\n"
-            "      Falling back to loopback — remote access is disabled until\n"
-            "      you start Tailscale and restart this server.",
-            file=sys.stderr,
-        )
-    elif auth_required and not (cfg.get("password") or "").strip():
-        mode_name = "public" if public_mode else "tailscale"
-        print(
-            f"  [!] host is '{mode_name}' but no password is configured.\n"
-            "      All requests will be rejected with 401 until you set\n"
+            "  [!] host is 'lan' but no password is configured.\n"
+            "      All non-loopback requests will be rejected with 401 until you set\n"
             "      GIGACHAT_PASSWORD=... or write a password into data/auth.json.",
             file=sys.stderr,
         )
-    elif public_mode:
-        print("  public mode — password required for every request (loopback is NOT trusted)")
-        print("  point your reverse proxy at http://127.0.0.1:" + str(port) + " to expose this over HTTPS")
     elif auth_required:
-        print("  password required for remote (tailnet) requests — localhost is free")
+        print("  password required for LAN clients — localhost is free")
     else:
         print("  loopback-only (no password required)")
     print()

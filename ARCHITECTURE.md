@@ -263,6 +263,16 @@ because they're missing the model auto-trigger an SCP from host
 (`_maybe_kickoff_lan_sync`) when `ssh_host` is configured — fully
 non-blocking, future turns route to the now-loaded worker.
 
+All worker traffic — Ollama HTTP, scp model copy, rpc-server probes —
+flows over the LAN address stored on the row. An optional
+`tailscale_host` is used purely as a self-repair handle: when a probe
+fails because DHCP rebound the worker to a new IP, the periodic sweep
+SSHes over Tailscale just long enough to call
+`_rediscover_lan_ip_via_tailscale`, validates the returned IP is
+RFC1918, updates `address`, and retries the probe. Rate-limited to one
+attempt per minute per worker (`_LAN_REPAIR_LAST_ATTEMPT`) so a dead
+worker doesn't burn metered Tailscale bandwidth on every sweep.
+
 **Layer-split routing (Phase 2).** When a model exceeds the strongest
 single node's capacity, `route_chat_for` spawns
 `llama-server --rpc <worker>:50052,...` on host port 11500 via
@@ -406,9 +416,13 @@ today, only service-worker registration in `lib/pwa.js`. Adding a new
 
 - **Single machine, single user, single worker.** The app is a localhost
   desktop tool; it is not designed to be exposed on the public internet or
-  served to multiple users. Computer-use tools drive the real mouse. In-
-  memory caches (element IDs, SSE stop flags, screenshot signatures,
-  click-marker globals) are process-local and don't survive a restart.
+  served to multiple users. The bind layer offers two modes — loopback
+  (default) and ``lan`` (admits other devices on the same physical
+  network) — and explicitly rejects raw IP binds, Tailscale CGNAT
+  clients, and reverse-proxy / public-tunnel deployments. Computer-use
+  tools drive the real mouse. In-memory caches (element IDs, SSE stop
+  flags, screenshot signatures, click-marker globals) are process-local
+  and don't survive a restart.
 - **Hot reload is on by default.** `uvicorn --reload` watches `backend/`.
   Long-running tests that hit live HTTP must either disable the reloader
   or tolerate the mid-run restart. In-process tests (`backend/tests/`)

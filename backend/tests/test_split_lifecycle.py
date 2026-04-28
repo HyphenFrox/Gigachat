@@ -91,7 +91,7 @@ def _seed_worker_with_rpc(isolated_db, *, label, address, rpc_reachable: bool, e
     """Helper: create a worker AND record a probe outcome with rpc state."""
     import time
     wid = isolated_db.create_compute_worker(
-        label=label, address=address, transport="lan", enabled=enabled,
+        label=label, address=address, enabled=enabled,
     )
     isolated_db.update_compute_worker_capabilities(
         wid,

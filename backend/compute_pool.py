@@ -694,6 +694,150 @@ async def _probe_one(client: httpx.AsyncClient, base: str, token: str | None) ->
     return out
 
 
+# ---------------------------------------------------------------------------
+# Auto-repair: rediscover a worker's LAN IP after DHCP rebind.
+#
+# When a worker rejoins the user's Wi-Fi/Ethernet, the home router can
+# hand it a different IPv4 lease — the stored `address` becomes stale and
+# the LAN probe starts failing with "no route to host" / "connection
+# refused". The user expects the pool to heal itself without manual
+# editing of the worker row.
+#
+# The fix uses the worker's optional `tailscale_host` as a stable handle:
+# Tailscale assigns each device a permanent overlay address that survives
+# the DHCP rebind, so the host can reach the worker over Tailscale just
+# long enough to ask "what's your current LAN IPv4?", then resume all
+# regular traffic over LAN. Tailscale is only used for that one rediscovery
+# query, never for ongoing chat / embedding / model-copy traffic.
+#
+# Rate-limited per worker (one attempt per cooldown window) so a worker
+# that's genuinely powered off doesn't generate a Tailscale SSH per probe
+# sweep — that would burn metered Tailscale bandwidth for no benefit.
+# ---------------------------------------------------------------------------
+_LAN_REPAIR_LAST_ATTEMPT: dict[str, float] = {}
+_LAN_REPAIR_COOLDOWN_SEC = 60.0
+
+
+async def _rediscover_lan_ip_via_tailscale(worker: dict) -> str | None:
+    """SSH to the worker over Tailscale and return its current LAN IPv4.
+
+    Returns ``None`` when ``tailscale_host`` is unset, the SSH call
+    fails, or the worker reports no usable LAN address. The returned
+    string is always a private (RFC1918) IPv4 — anything else is
+    discarded as an extra defence-in-depth check before we point
+    ongoing traffic at it.
+    """
+    tailscale_host = (worker.get("tailscale_host") or "").strip()
+    if not tailscale_host:
+        return None
+
+    # PowerShell one-liner that picks the active Wi-Fi / Ethernet IPv4
+    # by walking ``Get-NetIPAddress`` filtered to RFC1918 ranges. We
+    # sort by InterfaceMetric so the same NIC the OS routes outbound
+    # traffic through is the one we report — picks the right adapter
+    # on a host with both an Ethernet cable and a Wi-Fi connection.
+    ps = (
+        "$ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue"
+        " | Where-Object { $_.IPAddress -match"
+        " '^(192\\.168\\.|10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.)' };"
+        "if ($ips) {"
+        "  ($ips | Sort-Object -Property InterfaceMetric)[0].IPAddress"
+        "} else { '' }"
+    )
+    import base64
+    encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+    # BatchMode=yes prevents ssh from prompting for a password — if key
+    # auth isn't configured we fail fast instead of hanging the probe.
+    # ConnectTimeout caps the dial wait so a dead Tailscale link doesn't
+    # block the periodic sweep.
+    cmd = [
+        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+        tailscale_host,
+        "powershell", "-NoProfile", "-EncodedCommand", encoded,
+    ]
+    import subprocess as _sp
+
+    def _run() -> tuple[int, bytes]:
+        try:
+            r = _sp.run(cmd, capture_output=True, timeout=20.0)
+            return r.returncode, r.stdout
+        except _sp.TimeoutExpired:
+            return -1, b""
+        except Exception:
+            return -2, b""
+
+    try:
+        rc, stdout = await asyncio.to_thread(_run)
+    except Exception as e:
+        log.info("LAN rediscovery ssh failed for %s: %s", tailscale_host, e)
+        return None
+    if rc != 0:
+        return None
+    candidate = stdout.decode("utf-8", errors="replace").strip()
+    if not candidate:
+        return None
+
+    # Defence in depth: a misbehaving (or compromised) worker shouldn't
+    # be able to redirect ongoing traffic to a public IP just by lying
+    # about its LAN address. Re-validate the returned string is a
+    # private, non-loopback, non-link-local IPv4 before committing it.
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    if not addr.is_private:
+        return None
+    if addr.is_loopback or addr.is_link_local:
+        return None
+    return str(addr)
+
+
+async def _attempt_lan_address_repair(worker: dict) -> dict | None:
+    """Try to refresh a worker's LAN address via Tailscale rediscovery.
+
+    Returns the refreshed worker dict (with the new ``address``) on
+    success so callers can immediately retry their probe. Returns
+    ``None`` when no repair was attempted or the attempt didn't help.
+
+    Rate-limited per worker via a module-level cache: at most one
+    attempt per ``_LAN_REPAIR_COOLDOWN_SEC`` seconds, regardless of how
+    many probe sweeps fail in the interim.
+    """
+    wid = worker.get("id")
+    if not wid:
+        return None
+    if not (worker.get("tailscale_host") or "").strip():
+        return None
+    now_m = time.monotonic()
+    last = _LAN_REPAIR_LAST_ATTEMPT.get(wid, 0.0)
+    if now_m - last < _LAN_REPAIR_COOLDOWN_SEC:
+        return None
+    _LAN_REPAIR_LAST_ATTEMPT[wid] = now_m
+
+    log.info(
+        "compute_pool: LAN address %r unreachable for worker %r; "
+        "attempting auto-repair via tailscale_host",
+        worker.get("address"), worker.get("label"),
+    )
+    discovered = await _rediscover_lan_ip_via_tailscale(worker)
+    if not discovered:
+        return None
+    if discovered == (worker.get("address") or "").strip():
+        # Address already correct — the failure must be downstream
+        # (firewall, Ollama crashed, etc.). Rediscovery wouldn't help.
+        return None
+    try:
+        updated = db.update_compute_worker(wid, address=discovered)
+    except ValueError:
+        return None
+    log.info(
+        "compute_pool: auto-repair updated worker %r LAN address: %r -> %r",
+        worker.get("label"), worker.get("address"), discovered,
+    )
+    return updated
+
+
 async def probe_worker(wid: str) -> dict:
     """Probe one worker now and persist the result.
 
@@ -701,6 +845,12 @@ async def probe_worker(wid: str) -> dict:
     `models`, or error markers), and the `last_seen` timestamp. Safe
     to call from any context — failures are caught and recorded on
     the row, never propagated.
+
+    On a network-level failure the auto-repair routine attempts to
+    rediscover the worker's LAN IP via Tailscale (when ``tailscale_host``
+    is set on the row); a successful rediscovery transparently retries
+    the probe with the new address so the user just sees the worker
+    stay green across DHCP rebinds.
     """
     worker = db.get_compute_worker(wid)
     if not worker:
@@ -712,13 +862,32 @@ async def probe_worker(wid: str) -> dict:
     token = db.get_compute_worker_auth_token(wid)
     now = time.time()
 
+    payload: dict | None = None
+    last_exc: Exception | None = None
     try:
         async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_SEC) as client:
             payload = await _probe_one(client, base, token)
     except Exception as e:
+        last_exc = e
+
+    if payload is None:
         # Network-level failure — connection refused, DNS miss, etc.
-        # Record on the row so the UI can show "unreachable since X".
-        err = f"{type(e).__name__}: {e}"
+        # Try to recover by rediscovering the LAN IP via Tailscale; on
+        # success, retry the probe once with the refreshed address.
+        repaired = await _attempt_lan_address_repair(worker)
+        if repaired is not None:
+            worker = repaired
+            base = _worker_base_url(worker)
+            try:
+                async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_SEC) as client:
+                    payload = await _probe_one(client, base, token)
+            except Exception as e:
+                last_exc = e
+
+    if payload is None:
+        # Still down after the (possible) repair retry — record the
+        # error on the row so the UI can show "unreachable since X".
+        err = f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unreachable"
         try:
             db.update_compute_worker_capabilities(
                 wid, last_seen=now, last_error=err,

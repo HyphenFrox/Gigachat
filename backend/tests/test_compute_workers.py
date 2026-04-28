@@ -1,15 +1,16 @@
 """Regression: compute-pool worker registry — DB CRUD + invariants.
 
-These tests cover commit #1 of the multi-PC feature:
-  * Workers can be added with label / address / transport (lan / tailscale).
+These tests cover the worker-registry data layer:
+  * Workers can be added with label / address (LAN-only) and an optional
+    Tailscale identifier used purely for auto-repair of a stale LAN IP.
   * Capability snapshots and last-seen timestamps round-trip independently
     of user-facing edits (separated so the background probe loop and the
     Settings UI don't fight over `updated_at`).
   * Auth tokens stay server-side: the standard list / get rows include
     only an `auth_token_set` boolean — the secret itself is reachable
     only via `get_compute_worker_auth_token`.
-  * Field validation rejects bad inputs (unknown transport, blank label /
-    address, out-of-range port).
+  * Field validation rejects bad inputs (blank label / address,
+    out-of-range port, oversize hostname).
 
 Routing tests (which worker handles a given request) come with the
 capability-probe + routing commits — this file only pins the data
@@ -26,17 +27,16 @@ pytestmark = pytest.mark.smoke
 
 
 def test_create_basic_lan_worker(isolated_db):
+    """Default insert: LAN-only, all routing flags on, no auto-repair host."""
     wid = isolated_db.create_compute_worker(
         label="laptop",
         address="worker.local",
-        transport="lan",
     )
     row = isolated_db.get_compute_worker(wid)
     assert row is not None
     assert row["label"] == "laptop"
     assert row["address"] == "worker.local"
     assert row["ollama_port"] == 11434
-    assert row["transport"] == "lan"
     assert row["enabled"] is True
     # All three workload flags default to enabled.
     assert row["use_for_chat"] is True
@@ -47,13 +47,16 @@ def test_create_basic_lan_worker(isolated_db):
     assert row["capabilities"] is None
     # No token set on this row.
     assert row["auth_token_set"] is False
+    # Auto-repair fields default to None.
+    assert row["ssh_host"] is None
+    assert row["tailscale_host"] is None
 
 
 def test_create_with_auth_token_keeps_it_internal(isolated_db):
+    """The Bearer token is never echoed back through the public row dict."""
     wid = isolated_db.create_compute_worker(
         label="t",
-        address="100.91.9.91",
-        transport="tailscale",
+        address="192.168.1.50",
         auth_token="hunter2",
     )
     row = isolated_db.get_compute_worker(wid)
@@ -66,17 +69,34 @@ def test_create_with_auth_token_keeps_it_internal(isolated_db):
     assert isolated_db.get_compute_worker_auth_token(wid) == "hunter2"
 
 
+def test_create_with_tailscale_host_for_auto_repair(isolated_db):
+    """The optional Tailscale identifier is round-tripped on the row."""
+    wid = isolated_db.create_compute_worker(
+        label="t",
+        address="192.168.1.50",
+        tailscale_host="worker.tailnet-example.ts.net",
+    )
+    row = isolated_db.get_compute_worker(wid)
+    assert row["tailscale_host"] == "worker.tailnet-example.ts.net"
+    # Whitespace is trimmed.
+    wid2 = isolated_db.create_compute_worker(
+        label="t2", address="192.168.1.51",
+        tailscale_host="  100.64.0.1  ",
+    )
+    assert isolated_db.get_compute_worker(wid2)["tailscale_host"] == "100.64.0.1"
+
+
 def test_list_returns_newest_first(isolated_db):
-    a = isolated_db.create_compute_worker(label="A", address="a", transport="lan")
+    isolated_db.create_compute_worker(label="A", address="a.local")
     import time; time.sleep(0.01)
-    b = isolated_db.create_compute_worker(label="B", address="b", transport="lan")
+    isolated_db.create_compute_worker(label="B", address="b.local")
     rows = isolated_db.list_compute_workers()
     assert [r["label"] for r in rows[:2]] == ["B", "A"]
 
 
 def test_list_enabled_only(isolated_db):
-    a = isolated_db.create_compute_worker(label="A", address="a", transport="lan", enabled=True)
-    b = isolated_db.create_compute_worker(label="B", address="b", transport="lan", enabled=False)
+    isolated_db.create_compute_worker(label="A", address="a.local", enabled=True)
+    isolated_db.create_compute_worker(label="B", address="b.local", enabled=False)
     enabled = isolated_db.list_compute_workers(enabled_only=True)
     labels = {r["label"] for r in enabled}
     assert labels == {"A"}
@@ -87,30 +107,35 @@ def test_list_enabled_only(isolated_db):
 
 def test_blank_label_rejected(isolated_db):
     with pytest.raises(ValueError):
-        isolated_db.create_compute_worker(label="", address="x", transport="lan")
+        isolated_db.create_compute_worker(label="", address="x")
     with pytest.raises(ValueError):
-        isolated_db.create_compute_worker(label="  ", address="x", transport="lan")
+        isolated_db.create_compute_worker(label="  ", address="x")
 
 
 def test_blank_address_rejected(isolated_db):
     with pytest.raises(ValueError):
-        isolated_db.create_compute_worker(label="L", address="", transport="lan")
+        isolated_db.create_compute_worker(label="L", address="")
 
 
-def test_unknown_transport_rejected(isolated_db):
+def test_oversize_hostname_rejected(isolated_db):
+    """Defensive cap on hostname length to refuse junk input at the
+    DB layer (the API layer also validates, but belt-and-braces)."""
+    too_long = "a" * 300
+    with pytest.raises(ValueError):
+        isolated_db.create_compute_worker(label="L", address=too_long)
     with pytest.raises(ValueError):
         isolated_db.create_compute_worker(
-            label="L", address="x", transport="bogus",
+            label="L", address="x", tailscale_host=too_long,
         )
 
 
 def test_port_clamped_to_valid_range(isolated_db):
     wid = isolated_db.create_compute_worker(
-        label="L", address="x", transport="lan", ollama_port=99999,
+        label="L", address="x", ollama_port=99999,
     )
     assert isolated_db.get_compute_worker(wid)["ollama_port"] == 65535
     wid2 = isolated_db.create_compute_worker(
-        label="L2", address="x", transport="lan", ollama_port=0,
+        label="L2", address="x", ollama_port=0,
     )
     assert isolated_db.get_compute_worker(wid2)["ollama_port"] == 1
 
@@ -120,7 +145,7 @@ def test_port_clamped_to_valid_range(isolated_db):
 
 def test_update_partial_fields(isolated_db):
     wid = isolated_db.create_compute_worker(
-        label="A", address="a.local", transport="lan",
+        label="A", address="a.local",
     )
     updated = isolated_db.update_compute_worker(
         wid, label="A renamed", use_for_embeddings=False,
@@ -132,19 +157,32 @@ def test_update_partial_fields(isolated_db):
     assert updated["use_for_chat"] is True
 
 
-def test_update_rejects_invalid_transport(isolated_db):
-    wid = isolated_db.create_compute_worker(label="A", address="a", transport="lan")
-    with pytest.raises(ValueError):
-        isolated_db.update_compute_worker(wid, transport="bogus")
+def test_update_tailscale_host_round_trip(isolated_db):
+    """Set, swap, and clear tailscale_host via update_compute_worker."""
+    wid = isolated_db.create_compute_worker(label="A", address="a.local")
+    # Set it.
+    upd = isolated_db.update_compute_worker(
+        wid, tailscale_host="worker.example.ts.net",
+    )
+    assert upd["tailscale_host"] == "worker.example.ts.net"
+    # Swap it.
+    upd = isolated_db.update_compute_worker(
+        wid, tailscale_host="100.64.0.1",
+    )
+    assert upd["tailscale_host"] == "100.64.0.1"
+    # Clear via empty-string convention.
+    upd = isolated_db.update_compute_worker(wid, tailscale_host="")
+    assert upd["tailscale_host"] is None
 
 
 def test_update_unknown_field_silently_ignored(isolated_db):
     """Patches with unknown keys (e.g. an old client sending a removed
-    field) MUST NOT raise — they should ignore the unknown key and patch
-    the rest. Otherwise rolling forward the schema breaks old clients."""
-    wid = isolated_db.create_compute_worker(label="A", address="a", transport="lan")
+    field — ``transport`` was removed in the LAN-only refactor) MUST NOT
+    raise. They should ignore the unknown key and patch the rest so
+    rolling forward the schema doesn't break old clients."""
+    wid = isolated_db.create_compute_worker(label="A", address="a")
     updated = isolated_db.update_compute_worker(
-        wid, label="A2", legacy_field="goodbye",
+        wid, label="A2", transport="goodbye", legacy_field="ignored",
     )
     assert updated["label"] == "A2"
 
@@ -153,7 +191,7 @@ def test_update_unknown_field_silently_ignored(isolated_db):
 
 
 def test_update_capabilities_persists(isolated_db):
-    wid = isolated_db.create_compute_worker(label="A", address="a", transport="lan")
+    wid = isolated_db.create_compute_worker(label="A", address="a")
     snapshot = {
         "models": ["gemma4:e4b", "llama3.1:8b"],
         "ram_gb": 16,
@@ -170,7 +208,7 @@ def test_update_capabilities_persists(isolated_db):
 
 
 def test_update_capabilities_with_error(isolated_db):
-    wid = isolated_db.create_compute_worker(label="A", address="a", transport="lan")
+    wid = isolated_db.create_compute_worker(label="A", address="a")
     isolated_db.update_compute_worker_capabilities(
         wid, last_error="connection refused", last_seen=99.0,
     )
@@ -184,7 +222,7 @@ def test_update_capabilities_with_error(isolated_db):
 def test_update_capabilities_clear_error(isolated_db):
     """Passing empty-string `last_error` clears it (success after a
     previous failure)."""
-    wid = isolated_db.create_compute_worker(label="A", address="a", transport="lan")
+    wid = isolated_db.create_compute_worker(label="A", address="a")
     isolated_db.update_compute_worker_capabilities(wid, last_error="oops")
     isolated_db.update_compute_worker_capabilities(wid, last_error="")
     assert isolated_db.get_compute_worker(wid)["last_error"] is None
@@ -194,7 +232,7 @@ def test_update_capabilities_clear_error(isolated_db):
 
 
 def test_delete_removes_row(isolated_db):
-    wid = isolated_db.create_compute_worker(label="A", address="a", transport="lan")
+    wid = isolated_db.create_compute_worker(label="A", address="a")
     n = isolated_db.delete_compute_worker(wid)
     assert n == 1
     assert isolated_db.get_compute_worker(wid) is None
