@@ -310,31 +310,61 @@ Honest performance note: even with the full workaround stack, E4B via pool runs 
 
 ### Speculative decoding (recruit the rest of the pool)
 
-Layer-split is for models the strongest single node can't fit. But what about the common case — model fits one node, and the rest of the pool sits idle while that node runs the chat alone? Tell Gigachat to use speculative decoding and the picker auto-selects a smaller chat model from anywhere in the pool's combined inventory, then loads it as a draft alongside the target. The draft proposes a few cheap tokens per round, the target verifies them in a single batched pass, and net throughput on a single chat stream typically goes up 1.3–2× depending on accept rate.
+Layer-split is for models the strongest single node can't fit. But the common case is the opposite: model fits one node, and the rest of the pool sits idle while that node runs the chat alone. Speculative decoding fixes that — the picker auto-selects a smaller vocab-compatible chat model from anywhere in the pool's combined inventory, then loads it as a draft alongside the target. The draft proposes a few cheap tokens per round, the target verifies them in a single batched pass, and net throughput on a single chat stream typically goes up 1.3–2× depending on accept rate.
 
-The picker is generic — nothing is hard-coded to a particular model or device. It walks every enabled worker's `/api/tags` snapshot plus the host's Ollama manifest store and chooses the smallest candidate that:
+**Default: ON.** The picker has its own gates so leaving it on is a no-op for setups that can't benefit. To force the legacy Ollama-only path:
 
-* shares a tokenizer family with the target (`details.family` from Ollama — same family is the safe approximation; cross-family pairs accept at near 0%),
-* is dramatically smaller than the target (≤ 30% of target size — beyond that, draft cost eats the speedup),
+```
+POST /api/settings  {"compute_pool_speculative_decoding": "false"}
+```
+
+#### How a candidate is matched
+
+The picker is generic — nothing is hard-coded to a particular model or device. It walks every enabled worker's `/api/tags` snapshot plus the host's Ollama manifest store and accepts a candidate via three tiers, cheapest first:
+
+1. **Manual override** — when the user pinned a specific draft for this target via `compute_pool_speculative_overrides` (a JSON-encoded `{"<target>": "<draft>"}` map). Trusted unconditionally; size, family, and fingerprint checks are bypassed. Misuse just produces low accept rates, no crashes.
+2. **Family match** — same Ollama-reported `details.family` (`llama` ↔ `llama`, `qwen2` ↔ `qwen2`, `gemma` ↔ `gemma`, …). Fast — no GGUF parse, just the inventory snapshot. Catches the common case where users pull multiple sizes of the same family.
+3. **Tokenizer fingerprint match** — different families but identical GGUF tokenizers, parsed via the official [`gguf`](https://pypi.org/project/gguf/) library. Catches cross-family pairs that ship the same vocabulary (e.g. some Mistral derivatives that adopt the Llama tokenizer). Slightly slower (one GGUF parse per cross-family candidate, cached by mtime), but correct.
+
+A candidate that passes any tier still has to satisfy:
+
+* dramatically smaller than the target (≤ 30 % of target size — beyond that, draft cost eats the speedup),
 * lives on the host's local disk (v1 limitation; worker-only drafts would need an upfront LAN copy via `push-model`).
 
-The router only engages speculative when the host has VRAM headroom for both models — the budget check uses `target_size + draft_size` × 1.30 ≤ host VRAM budget. Below that, it falls back to plain Ollama silently.
+#### When the router actually engages speculative
 
-Switching to llama-server (the engine that supports `--model-draft`) means leaving Ollama's pre-tuned defaults, so this is **opt-in**. Toggle once via Settings → Compute, or set `compute_pool_speculative_decoding=true` via the settings API. Default: off.
+Tier 1 of `route_chat_for` (the model fits one node) checks the picker before falling through to plain Ollama. Engagement requires:
+
+* `compute_pool_speculative_decoding` is on (default).
+* Picker returned a draft.
+* Host has VRAM headroom for both models: `(target_size + draft_size) × 1.30 ≤ host VRAM budget`.
+* `llama-server` is installed locally (one-click install in Settings → Compute).
+
+Below any of those thresholds, the router stays on plain Ollama with no fanfare — the feature degrades silently.
 
 | Setup | Without speculative | With speculative | Notes |
 |---|---|---|---|
-| 7B target + 1B same-family draft on 8 GB GPU | 30 tok/s (Ollama host) | ~50 tok/s (llama-server host with `-md`) | typical 1.5–2× on chat-heavy prompts |
+| 7B target + 1B same-family draft on 8 GB GPU | 30 tok/s (Ollama) | tight — see headroom check | engagement gated by VRAM budget |
+| 8B target + 1B same-family draft on 16 GB GPU | 30 tok/s | ~50 tok/s (llama-server with `-md`) | typical 1.5–2× on chat-heavy prompts |
 | 13B target + 1B draft on 16 GB GPU | 18 tok/s | ~32 tok/s | scales with target/draft ratio |
 | 70B target on host that can't even fit it | already Tier 2 split | layer-split + draft layered on top | speculative + RPC stack cleanly |
 
-The pick is logged at startup so you can see which draft ran:
+The pick is logged at startup so you can see which draft ran and via which match tier:
 
 ```
-compute_pool: speculative decoding engaged — target=llama3.1:8b draft=llama3.2:1b (draft is 12% of target size)
+compute_pool: speculative decoding engaged — target=llama3.1:8b draft=llama3.2:1b match=family (draft is 12% of target size)
 ```
 
-If the target is too small to bother (under ~1.5 GB) or no same-family draft is around, the router stays on Ollama with no fanfare — the feature degrades silently.
+#### Manual override
+
+If you have a specific pair you know works (e.g. an exotic cross-vocab draft that the safety checks reject), pin it via the settings API:
+
+```
+POST /api/settings
+{"compute_pool_speculative_overrides": "{\"llama3.1:8b\": \"my-tiny-draft:1b\"}"}
+```
+
+The override is consulted before the auto picker, and it skips every safety check — bad pairs just won't accept many tokens. Use sparingly. Stale entries (override targets a model you've since deleted) fall through to the auto picker rather than crashing the chat.
 
 ### Build version
 

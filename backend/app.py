@@ -3243,14 +3243,20 @@ async def api_mcp_refresh() -> dict:
 # rogue request can't pollute the store with arbitrary entries.
 _ALLOWED_SETTING_KEYS = {
     "default_chat_model",
-    # Compute-pool: opt-in flag for engaging llama-server with
-    # `--model-draft` (speculative decoding) when a fits-on-host model
-    # has a viable smaller same-family chat model anywhere in the
-    # pool's combined inventory. Default OFF — switching engines from
-    # Ollama to llama-server has different defaults around context
-    # size + KV cache reuse, so users opt in once after reading the
-    # docs. Read by `compute_pool.speculative_decoding_enabled`.
+    # Compute-pool: flag for engaging llama-server with `--model-draft`
+    # (speculative decoding) when a fits-on-host model has a viable
+    # vocab-compatible smaller chat model anywhere in the pool's
+    # combined inventory. Default ON — the picker's gates handle
+    # viability, so leaving it on is a no-op for setups that can't
+    # benefit and a free 1.3-2× speedup for everyone else. Set to
+    # "false" to force the legacy Ollama-only path.
     "compute_pool_speculative_decoding",
+    # Compute-pool: per-target manual draft override, JSON-encoded
+    # mapping `{"<target_model_name>": "<draft_model_name>"}`. Power-
+    # user escape hatch for cross-vocab pairs the safety checks
+    # reject. Misuse just produces low accept rates, so it's
+    # documented in the README rather than gated.
+    "compute_pool_speculative_overrides",
 }
 
 

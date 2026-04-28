@@ -24,6 +24,7 @@ flakiness appears.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -2706,6 +2707,141 @@ _SPECULATIVE_MIN_TARGET_BYTES = 1_500_000_000
 _SPECULATIVE_VRAM_HEADROOM = 1.30
 
 
+# Process-level cache of GGUF tokenizer fingerprints, keyed by absolute
+# path. The cache invalidates on mtime change so re-pulling a model
+# refreshes the fingerprint on the next probe. Bounded implicitly — at
+# most one entry per Ollama-managed GGUF on disk, which tops out in the
+# tens. No LRU needed.
+_TOKENIZER_FINGERPRINT_CACHE: dict[str, tuple[float, str | None]] = {}
+
+
+def _gguf_tokenizer_fingerprint(gguf_path: str) -> str | None:
+    """Return a short SHA-256 fingerprint of the GGUF's tokenizer.
+
+    Two GGUFs whose fingerprints match share token IDs — i.e. the
+    speculative-decoding draft model can verify against the target
+    without false rejections, regardless of what `details.family` each
+    one reports. Lets the picker accept cross-family-but-same-vocab
+    pairs (e.g. some Mistral derivatives shipping the Llama tokenizer)
+    that the family heuristic alone would miss.
+
+    Returns ``None`` when the file isn't a GGUF, the optional ``gguf``
+    package isn't installed (older deployments), or the metadata is
+    incomplete. Callers MUST treat ``None`` as "can't verify" and fall
+    back to the family check, never as an implicit match — silently
+    treating an unknown fingerprint as compatible would mean engaging
+    speculative on truly incompatible pairs.
+
+    Cheap fingerprint over the tokenizer model name, vocabulary size,
+    and a deterministic 15-token sample (start / middle / end). Two
+    different tokenizers practically never share that combination,
+    while two GGUFs of the same tokenizer always do — fast and
+    correct in practice. Hashing the entire vocab would also work
+    but parses 100k+ string entries per probe and gains nothing.
+    """
+    if not gguf_path:
+        return None
+    try:
+        path = Path(gguf_path)
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+
+    cached = _TOKENIZER_FINGERPRINT_CACHE.get(gguf_path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    fingerprint: str | None = None
+    try:
+        # Imported lazily so the import error surfaces only when the
+        # picker actually walks GGUFs — useful for old deployments
+        # whose `gguf` package install lags requirements.txt.
+        from gguf import GGUFReader
+
+        reader = GGUFReader(gguf_path)
+        model_name: str | None = None
+        token_count: int | None = None
+        sample: list[str] = []
+        for field in reader.fields.values():
+            if field.name == "tokenizer.ggml.model":
+                # `field.parts[-1]` is a numpy uint8 array of UTF-8
+                # bytes for string-typed metadata.
+                try:
+                    model_name = bytes(field.parts[-1]).decode("utf-8", errors="replace")
+                except Exception:
+                    model_name = None
+            elif field.name == "tokenizer.ggml.tokens":
+                # Array of strings — `field.contents()` gives a
+                # list-like of decoded tokens. We only sample 15 to
+                # keep this cheap; collisions with this much detail
+                # require a deliberately constructed adversary.
+                try:
+                    tokens = field.contents()
+                    token_count = len(tokens)
+                    if token_count > 0:
+                        positions = set(range(min(5, token_count)))
+                        if token_count > 10:
+                            mid = token_count // 2
+                            positions.update(range(mid, mid + 5))
+                        if token_count > 5:
+                            positions.update(
+                                range(max(0, token_count - 5), token_count)
+                            )
+                        for i in sorted(positions):
+                            try:
+                                sample.append(str(tokens[i]))
+                            except Exception:
+                                pass
+                except Exception:
+                    token_count = None
+        if model_name and token_count is not None:
+            payload = f"{model_name}|{token_count}|" + "|".join(sample)
+            fingerprint = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    except ImportError:
+        # `gguf` package missing — not an error, just no fingerprinting
+        # for this deploy. Family fallback still works.
+        log.debug("gguf package unavailable; skipping tokenizer fingerprint")
+    except Exception as e:
+        log.debug("tokenizer fingerprint read failed for %s: %s", gguf_path, e)
+
+    _TOKENIZER_FINGERPRINT_CACHE[gguf_path] = (mtime, fingerprint)
+    return fingerprint
+
+
+def _draft_override_for(target_model_name: str) -> str | None:
+    """User-pinned draft override for a specific target.
+
+    Read from the ``compute_pool_speculative_overrides`` setting, which
+    stores a JSON object mapping ``"<target_model_name>": "<draft_name>"``.
+    When set, the picker uses that exact draft regardless of family or
+    tokenizer-fingerprint matches — an escape hatch for power users who
+    want to experiment with cross-vocab speculative pairs (the few cases
+    where the safety checks reject a pair the user knows works).
+
+    Misuse is the user's responsibility: a draft with a different
+    tokenizer than the target produces near-0 % accept rate and slows
+    chat down. The setting is undocumented in the chat UI — only the
+    settings API exposes it — so it stays out of the way of users who
+    haven't read the README.
+    """
+    try:
+        raw = db.get_setting("compute_pool_speculative_overrides")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        mapping = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(mapping, dict):
+        return None
+    val = mapping.get(target_model_name)
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return None
+
+
 def _pool_model_inventory() -> list[dict]:
     """Collated list of every chat-capable model installed anywhere in
     the pool. Each entry carries the source (host vs worker) so the
@@ -2815,30 +2951,80 @@ def pick_draft_for(target_model_name: str) -> dict | None:
     """Find a viable speculative-decoding draft for ``target_model_name``.
 
     Returns a dict shaped ``{"name", "gguf_path", "size_bytes",
-    "source"}`` when a same-family chat model dramatically smaller than
-    the target is available on the host's disk, else ``None``.
+    "source", "match"}`` when a vocab-compatible chat model dramatically
+    smaller than the target is available on the host's disk, else
+    ``None``. The ``match`` field reports how the candidate was
+    verified — ``"family"``, ``"tokenizer"``, or ``"override"`` — so
+    operators can audit which path engaged.
 
-    Generic across the pool — the inventory walker (`_pool_model_inventory`)
-    finds candidates anywhere in the pool, but the v1 picker only
-    promotes host-resident drafts because llama-server needs the draft
-    GGUF on local disk. Worker-only drafts are noted in the result via
-    the ``source`` field of the parent inventory pass; if the user
+    Three-tier matching, cheapest first:
+
+      1. **Manual override.** If the user pinned a specific draft for
+         this target via ``compute_pool_speculative_overrides``, that
+         draft wins outright (size + family checks bypassed). Trust
+         the operator — they've decided the pair works.
+
+      2. **Family match.** Same Ollama-reported family
+         (`details.family`), e.g. both ``llama`` or both ``qwen2``.
+         Fast — only needs the inventory snapshot.
+
+      3. **Tokenizer fingerprint match.** Different families but
+         identical GGUF tokenizers (parsed via the ``gguf`` package).
+         Catches cross-family-but-same-vocab pairs that the family
+         heuristic would otherwise reject — e.g. a Mistral derivative
+         that ships the Llama tokenizer. Slower (parses each
+         candidate's GGUF once, cached by mtime), but correct.
+
+    Generic across the pool — the inventory walker
+    (`_pool_model_inventory`) finds candidates anywhere in the pool,
+    but the picker only promotes host-resident drafts because
+    llama-server needs the draft GGUF on local disk. Worker-only
+    drafts are noted in the inventory's ``source`` field; if the user
     wants them as drafts they'd need to ship the model to host first
-    (manual `ollama pull` or `push-model` from another node). Future
-    work: auto-LAN-pull when a worker-only draft outranks every host
-    candidate.
+    (manual ``ollama pull`` or ``push-model`` from another node).
+    Future work: auto-LAN-pull when a worker-only draft outranks
+    every host candidate.
     """
     target = resolve_ollama_model(target_model_name)
     if not target:
         return None
     target_family = (target.get("family") or "").lower()
     target_size = int(target.get("size_bytes") or 0)
-    if not target_family or target_size <= 0:
+    target_path = target.get("gguf_path") or ""
+    if target_size <= 0:
         return None
     if target_size < _SPECULATIVE_MIN_TARGET_BYTES:
         # Target is already small — speculative decoding overhead would
         # likely outweigh any speedup. Skip silently.
         return None
+
+    # Tier 1: manual override — short-circuits all the safety checks
+    # because the user explicitly told us this pair works.
+    override = _draft_override_for(target_model_name)
+    if override:
+        info = resolve_ollama_model(override)
+        if info and info.get("gguf_path"):
+            return {
+                "name": override,
+                "gguf_path": info["gguf_path"],
+                "size_bytes": int(info.get("size_bytes") or 0),
+                "source": "host",
+                "match": "override",
+            }
+        # Override pointed at a model we can't resolve — log + fall
+        # through to the auto picker so the chat doesn't die just
+        # because the override is stale.
+        log.info(
+            "speculative override for %r names %r but it isn't resolvable; "
+            "falling through to auto picker",
+            target_model_name, override,
+        )
+
+    # Target's tokenizer fingerprint is computed at most once across
+    # the loop — Tier 3's cross-family path only needs it when no
+    # family match is available, and the GGUF parse isn't free.
+    target_fingerprint: str | None = None
+    target_fingerprint_loaded = False
 
     max_draft_bytes = int(target_size * _DRAFT_MAX_SIZE_FRACTION)
     candidates: list[dict] = []
@@ -2849,14 +3035,34 @@ def pick_draft_for(target_model_name: str) -> dict | None:
         if m["name"] == target_model_name:
             # Don't pick the target as its own draft.
             continue
-        if not m["family"] or m["family"] != target_family:
-            # Tokenizer compatibility is approximated by same family.
-            # Cross-family pairs produce 0 % accept rate — verified
-            # empirically + by llama.cpp upstream advice.
-            continue
         if m["size_bytes"] <= 0 or m["size_bytes"] >= max_draft_bytes:
             continue
-        candidates.append(m)
+
+        # Tier 2: same-family — cheap, no GGUF parse.
+        if (
+            m["family"]
+            and target_family
+            and m["family"] == target_family
+        ):
+            candidates.append({**m, "match": "family"})
+            continue
+
+        # Tier 3: same tokenizer fingerprint. Resolve the candidate's
+        # path so we can fingerprint it; lazily compute the target's
+        # fingerprint on the first cross-family candidate we hit.
+        cand_info = resolve_ollama_model(m["name"])
+        if not cand_info or not cand_info.get("gguf_path"):
+            continue
+        cand_fingerprint = _gguf_tokenizer_fingerprint(cand_info["gguf_path"])
+        if not cand_fingerprint:
+            continue  # Can't verify — refuse rather than guess.
+        if not target_fingerprint_loaded:
+            target_fingerprint = _gguf_tokenizer_fingerprint(target_path)
+            target_fingerprint_loaded = True
+        if not target_fingerprint:
+            continue  # Target unreadable — no Tier 3 matches possible.
+        if cand_fingerprint == target_fingerprint:
+            candidates.append({**m, "match": "tokenizer"})
 
     if not candidates:
         return None
@@ -2873,21 +3079,29 @@ def pick_draft_for(target_model_name: str) -> dict | None:
         "gguf_path": info["gguf_path"],
         "size_bytes": pick["size_bytes"],
         "source": pick["source"],
+        "match": pick.get("match", "family"),
     }
 
 
 def speculative_decoding_enabled() -> bool:
     """Read the user's preference for auto-engaging speculative decoding.
 
-    Defaults to OFF because engaging speculative for a fits-on-host
-    model means switching the chat engine from Ollama (the tuned default)
-    to llama-server, which has different defaults around context size,
-    KV cache reuse, and chat-template handling. Users opt in once via
-    Settings → Compute, and the picker takes over from there.
+    Defaults to ON. The picker is conservative — `pick_draft_for` only
+    engages when a same-family draft sits on the host's disk AND
+    `_host_has_vram_for_speculative` confirms there's room for both
+    models with 30 % headroom. Setups that can't benefit (no viable
+    draft, tight VRAM, target too small) silently fall back to plain
+    Ollama, so leaving the feature on by default is a no-op for them
+    and a free 1.3-2× speedup for everyone else.
+
+    Anyone who specifically wants the legacy Ollama-only behaviour
+    can disable via the settings API:
+        POST /api/settings  {"compute_pool_speculative_decoding": "false"}
     """
     val = db.get_setting("compute_pool_speculative_decoding")
-    if val is None:
-        return False
+    if val is None or str(val).strip() == "":
+        # Default ON — the picker's gates handle viability.
+        return True
     return str(val).lower() in ("1", "true", "yes", "on")
 
 
@@ -3186,8 +3400,9 @@ async def route_chat_for(model_name: str) -> dict:
                     )
                     log.info(
                         "compute_pool: speculative decoding engaged — "
-                        "target=%s draft=%s (draft is %.0f%% of target size)",
-                        model_name, draft["name"],
+                        "target=%s draft=%s match=%s "
+                        "(draft is %.0f%% of target size)",
+                        model_name, draft["name"], draft.get("match", "?"),
                         100 * draft["size_bytes"] / max(size_bytes, 1),
                     )
                     return {
@@ -3195,6 +3410,7 @@ async def route_chat_for(model_name: str) -> dict:
                         "base_url": base_url,
                         "label": model_name,
                         "speculative_draft": draft["name"],
+                        "speculative_match": draft.get("match", "family"),
                     }
         await stop_all_running_splits()
         return {"engine": "ollama"}

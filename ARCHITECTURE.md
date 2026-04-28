@@ -264,20 +264,30 @@ because they're missing the model auto-trigger an SCP from host
 (`_maybe_kickoff_lan_sync`) when `ssh_host` is configured — fully
 non-blocking, future turns route to the now-loaded worker.
 
-**Speculative-decoding overlay (Phase 1+).** When a fits-on-host model
-would normally route to plain Ollama on host AND the user has opted
-into `compute_pool_speculative_decoding`, `route_chat_for` calls
-`pick_draft_for(target)` to walk the pool's combined model inventory
-for a same-family chat model dramatically smaller than the target
-(≤ 30 % size). On a hit, the router engages llama-server with
-`-md <draft.gguf>` and a single-node spawn (no `--rpc` workers) so
-the draft+target pair runs on host, accelerating the chat stream
-1.3-2× without changing what the model produces. The draft itself
-can come from anywhere in the pool's combined inventory; v1 only
-promotes host-resident drafts (worker-only drafts would need a
-prior LAN copy via `model_sync.sync_model`). VRAM headroom is gated
-by `_host_has_vram_for_speculative` so engagement is silently
-skipped when both models can't co-reside.
+**Speculative-decoding overlay (Phase 1+).** Default-ON. When a fits-
+on-host model would normally route to plain Ollama on host,
+`route_chat_for` calls `pick_draft_for(target)` to walk the pool's
+combined model inventory and accept a candidate via three tiers,
+cheapest first: (1) `compute_pool_speculative_overrides` user-pinned
+mapping — trusted unconditionally; (2) same Ollama-reported family
+(`details.family`); (3) GGUF tokenizer fingerprint match via the
+`gguf` package — catches cross-family-but-same-vocab pairs (e.g. a
+Mistral derivative shipping the Llama tokenizer) that the family
+heuristic alone would miss. Fingerprints are cached by GGUF mtime
+in `_TOKENIZER_FINGERPRINT_CACHE` so the lookup amortises across
+the chat session.
+
+On a hit, the router engages llama-server with `-md <draft.gguf>`
+and a single-node spawn (no `--rpc` workers) so the draft+target
+pair runs on host, accelerating the chat stream 1.3-2× without
+changing what the model produces. The draft itself can come from
+anywhere in the pool's combined inventory; v1 only promotes
+host-resident drafts (worker-only drafts would need a prior LAN
+copy via `model_sync.sync_model`). VRAM headroom is gated by
+`_host_has_vram_for_speculative` (`(target + draft) × 1.30 ≤
+host_vram_budget`) so engagement is silently skipped when both
+models can't co-reside — the chat stays on Ollama with no
+behavioural change.
 
 All worker traffic — Ollama HTTP, scp model copy, rpc-server probes —
 flows over the LAN address stored on the row. An optional

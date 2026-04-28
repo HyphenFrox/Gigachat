@@ -39,6 +39,12 @@ websockets==16.0
 pymupdf==1.27.2.3
 python-docx==1.2.0
 openpyxl==3.1.5
+# GGUF metadata reader — used by the compute-pool speculative-decoding
+# picker to read each candidate model's tokenizer fingerprint. Lets the
+# picker accept cross-family pairs that share a vocabulary (e.g. some
+# Mistral derivatives shipping the Llama tokenizer), instead of relying
+# on the family-label heuristic alone. Official ggml-org library.
+gguf==0.18.0
 # Web Push (VAPID-signed PWA notifications). pywebpush pulls in `cryptography`
 # + `http-ece` for the actual payload encryption; we expose it through
 # `backend/push.py` to fire notifications when scheduled tasks complete or a

@@ -148,6 +148,149 @@ def test_pick_draft_returns_smallest_same_family_host_resident(monkeypatch):
     assert pick is not None
     assert pick["name"] == "llama3.2:1b"
     assert pick["gguf_path"] == "/m/draft1.gguf"
+    assert pick["match"] == "family"
+
+
+def test_pick_draft_promotes_cross_family_when_tokenizer_matches(monkeypatch):
+    """A different-family candidate whose tokenizer fingerprint matches
+    the target IS accepted — the family heuristic alone would reject
+    it, but identical token IDs mean speculative decoding works fine."""
+    _stub_resolve(monkeypatch, {
+        "llama3.1:8b": {
+            "family": "llama", "size_bytes": 5_000_000_000,
+            "gguf_path": "/m/target.gguf",
+        },
+        "mistral-tiny:1b": {
+            # Different family label, but ships the Llama tokenizer.
+            "family": "mistral", "size_bytes": 1_000_000_000,
+            "gguf_path": "/m/mistral.gguf",
+        },
+    })
+    _stub_inventory(monkeypatch, [
+        {"name": "mistral-tiny:1b", "family": "mistral", "size_bytes": 1_000_000_000, "source": "host"},
+    ])
+    # Stub fingerprint to return the SAME hash for both paths.
+    monkeypatch.setattr(
+        compute_pool, "_gguf_tokenizer_fingerprint",
+        lambda p: "shared-llama-tokenizer-hash",
+    )
+    pick = compute_pool.pick_draft_for("llama3.1:8b")
+    assert pick is not None
+    assert pick["name"] == "mistral-tiny:1b"
+    assert pick["match"] == "tokenizer"
+
+
+def test_pick_draft_rejects_cross_family_when_fingerprint_differs(monkeypatch):
+    """Different family + different fingerprint → the picker correctly
+    refuses. Two different tokenizers can't share token IDs, so
+    speculative decoding wouldn't work."""
+    _stub_resolve(monkeypatch, {
+        "llama3.1:8b": {
+            "family": "llama", "size_bytes": 5_000_000_000,
+            "gguf_path": "/m/target.gguf",
+        },
+        "qwen2.5:0.5b": {
+            "family": "qwen2", "size_bytes": 400_000_000,
+            "gguf_path": "/m/qwen.gguf",
+        },
+    })
+    _stub_inventory(monkeypatch, [
+        {"name": "qwen2.5:0.5b", "family": "qwen2", "size_bytes": 400_000_000, "source": "host"},
+    ])
+    # Different fingerprint per path — Llama vs Qwen tokenizer.
+    fingerprints = {
+        "/m/target.gguf": "llama-tokenizer-hash",
+        "/m/qwen.gguf": "qwen-tokenizer-hash",
+    }
+    monkeypatch.setattr(
+        compute_pool, "_gguf_tokenizer_fingerprint",
+        lambda p: fingerprints.get(p),
+    )
+    assert compute_pool.pick_draft_for("llama3.1:8b") is None
+
+
+def test_pick_draft_skips_cross_family_when_fingerprint_unavailable(monkeypatch):
+    """If the GGUF parser can't read either model's tokenizer (no
+    `gguf` package installed, or malformed file), cross-family
+    candidates are silently rejected — `None` from the fingerprint
+    means "can't verify", not "implicit match"."""
+    _stub_resolve(monkeypatch, {
+        "llama3.1:8b": {
+            "family": "llama", "size_bytes": 5_000_000_000,
+            "gguf_path": "/m/target.gguf",
+        },
+        "mistral-tiny:1b": {
+            "family": "mistral", "size_bytes": 1_000_000_000,
+            "gguf_path": "/m/mistral.gguf",
+        },
+    })
+    _stub_inventory(monkeypatch, [
+        {"name": "mistral-tiny:1b", "family": "mistral", "size_bytes": 1_000_000_000, "source": "host"},
+    ])
+    # Both fingerprint reads fail.
+    monkeypatch.setattr(compute_pool, "_gguf_tokenizer_fingerprint", lambda p: None)
+    assert compute_pool.pick_draft_for("llama3.1:8b") is None
+
+
+def test_pick_draft_manual_override_bypasses_safety_checks(monkeypatch, isolated_db):
+    """A user-pinned override is trusted unconditionally — size check,
+    family check, and fingerprint check are all skipped. Misuse
+    produces low accept rates but never crashes."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _stub_resolve(monkeypatch, {
+        "llama3.1:8b": {
+            "family": "llama", "size_bytes": 5_000_000_000,
+            "gguf_path": "/m/target.gguf",
+        },
+        # The user wants this exotic Qwen as the draft for a Llama
+        # target, even though normal checks would reject the pair.
+        "qwen2.5:0.5b": {
+            "family": "qwen2", "size_bytes": 400_000_000,
+            "gguf_path": "/m/qwen.gguf",
+        },
+    })
+    _stub_inventory(monkeypatch, [])  # Nothing in normal inventory.
+
+    import json as _json
+    isolated_db.set_setting(
+        "compute_pool_speculative_overrides",
+        _json.dumps({"llama3.1:8b": "qwen2.5:0.5b"}),
+    )
+    pick = compute_pool.pick_draft_for("llama3.1:8b")
+    assert pick is not None
+    assert pick["name"] == "qwen2.5:0.5b"
+    assert pick["match"] == "override"
+
+
+def test_pick_draft_falls_through_when_override_target_unresolvable(monkeypatch, isolated_db):
+    """Stale override (user removed the pinned model) doesn't kill the
+    picker — log + fall through to the auto picker so the chat layer
+    still gets a viable draft."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    _stub_resolve(monkeypatch, {
+        "llama3.1:8b": {
+            "family": "llama", "size_bytes": 5_000_000_000,
+            "gguf_path": "/m/target.gguf",
+        },
+        "llama3.2:1b": {
+            "family": "llama", "size_bytes": 1_000_000_000,
+            "gguf_path": "/m/draft.gguf",
+        },
+        # Note: deleted-model:1b is intentionally NOT in this map.
+    })
+    _stub_inventory(monkeypatch, [
+        {"name": "llama3.2:1b", "family": "llama", "size_bytes": 1_000_000_000, "source": "host"},
+    ])
+    import json as _json
+    isolated_db.set_setting(
+        "compute_pool_speculative_overrides",
+        _json.dumps({"llama3.1:8b": "deleted-model:1b"}),
+    )
+    pick = compute_pool.pick_draft_for("llama3.1:8b")
+    assert pick is not None
+    # Auto picker took over with the family-matched draft.
+    assert pick["name"] == "llama3.2:1b"
+    assert pick["match"] == "family"
 
 
 # --- pick_draft_for: negative matches ------------------------------------
@@ -243,15 +386,21 @@ def test_pick_draft_filters_out_embed_models_via_inventory(monkeypatch):
 # --- speculative_decoding_enabled flag -----------------------------------
 
 
-def test_speculative_default_off(isolated_db):
-    """No setting written → speculative is OFF. User must opt in once
-    via Settings → Compute."""
-    assert compute_pool.speculative_decoding_enabled() is False
+def test_speculative_default_on(isolated_db, monkeypatch):
+    """No setting written → speculative defaults to ON. The picker's
+    own gates handle viability so leaving it on is a no-op for setups
+    that can't benefit and a free speedup for everyone else."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    assert compute_pool.speculative_decoding_enabled() is True
 
 
 def test_speculative_flag_round_trip(isolated_db, monkeypatch):
-    """Persisting the setting flips the helper's verdict."""
+    """Persisting the setting flips the helper's verdict — both
+    directions, including the explicit-disable path the user takes
+    when they want to force the legacy Ollama-only behaviour."""
     monkeypatch.setattr(compute_pool, "db", isolated_db)
+    isolated_db.set_setting("compute_pool_speculative_decoding", "false")
+    assert compute_pool.speculative_decoding_enabled() is False
     isolated_db.set_setting("compute_pool_speculative_decoding", "true")
     assert compute_pool.speculative_decoding_enabled() is True
     isolated_db.set_setting("compute_pool_speculative_decoding", "0")
