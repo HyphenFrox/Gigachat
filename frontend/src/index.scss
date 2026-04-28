@@ -1,64 +1,21 @@
 // =============================================================================
-// index.scss — global styles, Tailwind entry point, and shadcn theme tokens.
+// index.scss — custom rules that benefit from Sass features (nesting, @apply
+// references). Tailwind v4 + the shadcn theme tokens live in `index.css` and
+// are imported BEFORE this file so utility classes referenced via `@apply`
+// here are already in scope.
 //
-// Using SCSS (not plain CSS) gives us nesting and variables for the small
-// bits of custom styling around Tailwind. The @tailwind directives still
-// work inside .scss — PostCSS runs first.
+// Anything that uses Tailwind's at-rules like `@theme` / `@utility` /
+// `@custom-variant` belongs in `index.css`, not here — Sass cannot parse
+// those and will hard-fail the build.
+//
+// `@reference` tells Tailwind v4 where to look up utility definitions for
+// the `@apply` directives in this file. Without it Tailwind treats every
+// utility as unknown because the file is processed as a standalone PostCSS
+// input — Tailwind only auto-discovers theme tokens declared in the same
+// file as the `@import "tailwindcss"` statement.
 // =============================================================================
+@reference "./index.css";
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
-// ----- shadcn/ui theme tokens ------------------------------------------------
-// HSL triplets (no `hsl()` wrapper) because tailwind.config.js wraps them.
-// To retheme the app, edit a variable here and the whole color system follows.
-@layer base {
-  :root {
-    --background: 0 0% 100%;
-    --foreground: 240 10% 3.9%;
-    --card: 0 0% 100%;
-    --card-foreground: 240 10% 3.9%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 240 10% 3.9%;
-    --primary: 240 5.9% 10%;
-    --primary-foreground: 0 0% 98%;
-    --secondary: 240 4.8% 95.9%;
-    --secondary-foreground: 240 5.9% 10%;
-    --muted: 240 4.8% 95.9%;
-    --muted-foreground: 240 3.8% 46.1%;
-    --accent: 240 4.8% 95.9%;
-    --accent-foreground: 240 5.9% 10%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 0 0% 98%;
-    --border: 240 5.9% 90%;
-    --input: 240 5.9% 90%;
-    --ring: 240 5.9% 10%;
-    --radius: 0.75rem;
-  }
-
-  .dark {
-    --background: 240 10% 3.9%;
-    --foreground: 0 0% 98%;
-    --card: 240 10% 5.5%;
-    --card-foreground: 0 0% 98%;
-    --popover: 240 10% 5.5%;
-    --popover-foreground: 0 0% 98%;
-    --primary: 0 0% 98%;
-    --primary-foreground: 240 5.9% 10%;
-    --secondary: 240 3.7% 15.9%;
-    --secondary-foreground: 0 0% 98%;
-    --muted: 240 3.7% 15.9%;
-    --muted-foreground: 240 5% 64.9%;
-    --accent: 240 3.7% 15.9%;
-    --accent-foreground: 0 0% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 0 0% 98%;
-    --border: 240 3.7% 15.9%;
-    --input: 240 3.7% 15.9%;
-    --ring: 240 4.9% 83.9%;
-  }
-}
 
 // ----- base element styles ---------------------------------------------------
 @layer base {

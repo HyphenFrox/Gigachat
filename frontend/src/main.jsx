@@ -1,6 +1,13 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App.jsx'
+// Stylesheets are split in two: `index.css` activates Tailwind v4 + the
+// shadcn theme tokens (PostCSS pipeline only — Sass cannot parse the
+// `@theme` / `@utility` directives Tailwind v4 emits). `index.scss` then
+// holds the project's custom rules that benefit from Sass features
+// (nesting, `@apply` references). Order matters for the cascade — Tailwind
+// utilities defined first so component overrides below win.
+import './index.css'
 import './index.scss'
 import { registerServiceWorker } from './lib/pwa'
 

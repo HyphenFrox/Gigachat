@@ -1,20 +1,20 @@
-fastapi==0.115.0
+fastapi==0.136.1
 # python-multipart is required by FastAPI to parse `multipart/form-data`
 # (our /api/conversations/{id}/uploads endpoint uses UploadFile).
-python-multipart==0.0.26
-uvicorn[standard]==0.32.0
-httpx==0.27.2
-pydantic==2.9.2
+python-multipart==0.0.27
+uvicorn[standard]==0.46.0
+httpx==0.28.1
+pydantic==2.13.3
 # Computer-use tools: screenshots, mouse, keyboard.
 # pyautogui pulls in Pillow (for screenshots + image processing) and pygetwindow / mouseinfo.
 pyautogui==0.9.54
-Pillow==10.4.0
+Pillow==12.2.0
 # Web-search tools: DuckDuckGo (keyless) + readable-text extraction.
 # ddgs is the maintained successor to `duckduckgo-search`.
-ddgs==9.11.3
+ddgs==9.14.1
 trafilatura==2.0.0
 # Clipboard read/write tool (cross-platform).
-pyperclip==1.9.0
+pyperclip==1.11.0
 # System-resource detection for context-window auto-tuning (see sysdetect.py).
 # RAM probing uses this; GPU detection shells out to nvidia-smi separately.
 psutil==7.2.2
@@ -22,38 +22,41 @@ psutil==7.2.2
 # UI control by its accessible name instead of guessing pixels. Windows-only
 # (wraps Microsoft UI Automation). The tool gracefully no-ops on non-Windows
 # so the import is conditional at call time, not at module import.
-uiautomation==2.0.18 ; platform_system == "Windows"
+uiautomation==2.0.29 ; platform_system == "Windows"
 # Multi-monitor screenshot capture. pyautogui only sees the primary display;
 # mss exposes every monitor plus the virtual "all-monitors" rectangle, which
 # is necessary for `screenshot({monitor: N})` and `list_monitors`.
-mss==10.1.0
+mss==10.2.0
 # Browser automation via Chrome DevTools Protocol. `websockets` is the lowest-
 # dependency async WebSocket client that talks JSON-RPC to a Chromium browser
 # launched with `--remote-debugging-port`. Lets us drive pages by DOM selector
 # instead of pixel clicks.
-websockets==15.0.1
+websockets==16.0
 # Document readers used by the `read_doc` tool.
 #   - pymupdf: robust PDF text + page layout; pure-Python wheels on PyPI.
 #   - python-docx: .docx paragraphs + tables.
 #   - openpyxl: .xlsx cells with formula evaluation for the common cases.
-pymupdf==1.25.1
-python-docx==1.1.2
+pymupdf==1.27.2.3
+python-docx==1.2.0
 openpyxl==3.1.5
 # Web Push (VAPID-signed PWA notifications). pywebpush pulls in `cryptography`
 # + `http-ece` for the actual payload encryption; we expose it through
 # `backend/push.py` to fire notifications when scheduled tasks complete or a
 # long-running agent turn finishes while the browser is in the background.
-pywebpush==2.0.3
+pywebpush==2.3.0
 # OCR is optional. We try two backends at call time and report a clear error
 # if neither is available, so this dep is best-effort:
 #   - winsdk exposes the Windows.Media.Ocr engine built into every Win10+ box,
-#     zero extra binaries. Preferred on Windows.
+#     zero extra binaries. Preferred on Windows. Latest upstream is still a
+#     beta and only ships wheels for Python ≤ 3.13 — gated on the interpreter
+#     version so a Python 3.14+ install doesn't fail at pip time, the OCR
+#     code falls through to pytesseract automatically when the import fails.
 #   - pytesseract wraps the Tesseract OCR binary (user must install Tesseract
-#     separately). Used as fallback / on non-Windows.
-winsdk==1.0.0b10 ; platform_system == "Windows"
+#     separately). Used as fallback / on non-Windows / on Python 3.14+.
+winsdk==1.0.0b10 ; platform_system == "Windows" and python_version < "3.14"
 pytesseract==0.3.13
 # ----- Test-only dependencies (install with `pip install -r requirements.txt`
 # then `pip install pytest pytest-asyncio`, OR see `backend/tests/README` for
 # the standalone test-runner script). Pinned to current stable releases. -----
-pytest==8.3.4
-pytest-asyncio==0.24.0
+pytest==9.0.3
+pytest-asyncio==1.3.0
