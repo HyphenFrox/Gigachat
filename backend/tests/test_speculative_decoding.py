@@ -394,6 +394,187 @@ def test_speculative_default_on(isolated_db, monkeypatch):
     assert compute_pool.speculative_decoding_enabled() is True
 
 
+# --- Auto-LAN-pull for worker-only drafts --------------------------------
+
+
+def test_pick_draft_kicks_off_lan_pull_when_worker_candidate_wins(monkeypatch):
+    """When the smallest viable draft sits only on a worker, we
+    schedule a background pull so a future turn can promote it."""
+    _stub_resolve(monkeypatch, {
+        "llama3.1:8b": {
+            "family": "llama", "size_bytes": 5_000_000_000,
+            "gguf_path": "/m/target.gguf",
+        },
+        "llama3.2:1b": {
+            "family": "llama", "size_bytes": 1_000_000_000,
+            "gguf_path": "/m/draft.gguf",
+        },
+    })
+    # Worker has the only viable draft.
+    _stub_inventory(monkeypatch, [
+        {"name": "llama3.2:1b", "family": "llama", "size_bytes": 1_000_000_000, "source": "worker:wid-A"},
+    ])
+    triggered: list[tuple] = []
+    monkeypatch.setattr(
+        compute_pool, "_maybe_kickoff_draft_lan_sync",
+        lambda target, candidate, wid: triggered.append((target, candidate, wid)),
+    )
+    pick = compute_pool.pick_draft_for("llama3.1:8b")
+    # No host candidate → return None for this turn.
+    assert pick is None
+    # But the background pull was scheduled.
+    assert triggered == [("llama3.1:8b", "llama3.2:1b", "wid-A")]
+
+
+def test_pick_draft_prefers_host_when_worker_candidate_is_larger(monkeypatch):
+    """Host-resident candidates win on ties / when smaller than the
+    worker-only candidate. No background pull is triggered."""
+    _stub_resolve(monkeypatch, {
+        "llama3.1:8b": {
+            "family": "llama", "size_bytes": 5_000_000_000,
+            "gguf_path": "/m/target.gguf",
+        },
+        "llama3.2:1b": {
+            "family": "llama", "size_bytes": 1_000_000_000,
+            "gguf_path": "/m/host.gguf",
+        },
+        "llama3.2:3b": {
+            "family": "llama", "size_bytes": 3_000_000_000,
+            "gguf_path": "/m/worker.gguf",
+        },
+    })
+    _stub_inventory(monkeypatch, [
+        {"name": "llama3.2:1b", "family": "llama", "size_bytes": 1_000_000_000, "source": "host"},
+        {"name": "llama3.2:3b", "family": "llama", "size_bytes": 3_000_000_000, "source": "worker:wid-A"},
+    ])
+    triggered: list = []
+    monkeypatch.setattr(
+        compute_pool, "_maybe_kickoff_draft_lan_sync",
+        lambda *a, **k: triggered.append(a),
+    )
+    pick = compute_pool.pick_draft_for("llama3.1:8b")
+    assert pick is not None
+    assert pick["name"] == "llama3.2:1b"  # host candidate wins
+    assert triggered == []  # no pull needed
+
+
+# --- Adaptive split-vs-host routing --------------------------------------
+
+
+def test_aggressive_split_default_off(isolated_db, monkeypatch):
+    """`compute_pool_aggressive_split` defaults to OFF — we don't want
+    the router silently flipping fits-on-host models onto a slower
+    path without measurement evidence."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    assert compute_pool._aggressive_split_enabled() is False
+
+
+def test_aggressive_split_round_trip(isolated_db, monkeypatch):
+    """Persisting the setting flips the helper's verdict."""
+    monkeypatch.setattr(compute_pool, "db", isolated_db)
+    isolated_db.set_setting("compute_pool_aggressive_split", "true")
+    assert compute_pool._aggressive_split_enabled() is True
+    isolated_db.set_setting("compute_pool_aggressive_split", "0")
+    assert compute_pool._aggressive_split_enabled() is False
+
+
+def test_route_tps_cache_round_trips_recent_measurement():
+    """Recording a TPS measurement makes it readable through the
+    paired getter — within the freshness window."""
+    compute_pool._ROUTE_TPS_CACHE.clear()
+    compute_pool._record_route_tps("llama3:8b", kind="host", tps=42.5)
+    assert compute_pool._route_tps_for("llama3:8b", "host") == 42.5
+    assert compute_pool._route_tps_for("llama3:8b", "split") is None
+
+
+def test_route_tps_cache_ignores_zero_or_negative():
+    """A failed bench (TPS=0) must not clobber a previously-recorded
+    valid measurement."""
+    compute_pool._ROUTE_TPS_CACHE.clear()
+    compute_pool._record_route_tps("llama3:8b", kind="host", tps=42.5)
+    compute_pool._record_route_tps("llama3:8b", kind="host", tps=0)
+    compute_pool._record_route_tps("llama3:8b", kind="host", tps=-1)
+    assert compute_pool._route_tps_for("llama3:8b", "host") == 42.5
+
+
+def test_route_tps_cache_expires_stale_samples(monkeypatch):
+    """A sample older than the TTL is treated as missing — the router
+    re-benches rather than trusting an obsolete number."""
+    compute_pool._ROUTE_TPS_CACHE.clear()
+    compute_pool._record_route_tps("llama3:8b", kind="split", tps=20.0)
+    # Stamp the entry as hour-2-old (TTL is 24h, so still fresh).
+    compute_pool._ROUTE_TPS_CACHE["llama3:8b"]["split_measured_at"] = (
+        compute_pool.time.time() - 7200
+    )
+    assert compute_pool._route_tps_for("llama3:8b", "split") == 20.0
+    # Now stamp it as 25-hour-old → expired.
+    compute_pool._ROUTE_TPS_CACHE["llama3:8b"]["split_measured_at"] = (
+        compute_pool.time.time() - 25 * 3600
+    )
+    assert compute_pool._route_tps_for("llama3:8b", "split") is None
+
+
+# --- Round-robin embeddings ----------------------------------------------
+
+
+def test_pick_embed_target_rotates_across_workers(monkeypatch):
+    """Three eligible workers → three back-to-back calls hit each one
+    in turn instead of pinning to the first."""
+    fake_workers = [
+        {"id": "w1", "address": "w1.local", "ollama_port": 11434, "label": "w1"},
+        {"id": "w2", "address": "w2.local", "ollama_port": 11434, "label": "w2"},
+        {"id": "w3", "address": "w3.local", "ollama_port": 11434, "label": "w3"},
+    ]
+    monkeypatch.setattr(
+        compute_pool, "_eligible_workers",
+        lambda flag, model=None: list(fake_workers),
+    )
+    # All workers comparably "capable" — no exclusion at the threshold step.
+    monkeypatch.setattr(compute_pool, "_capability_score", lambda w: (1.0, True, 100, 100))
+    monkeypatch.setattr(
+        compute_pool.db, "get_compute_worker_auth_token", lambda wid: None,
+    )
+    compute_pool._EMBED_TARGET_INDEX.clear()
+
+    seen: list[str] = []
+    for _ in range(6):
+        result = compute_pool.pick_embed_target("nomic-embed-text")
+        assert result is not None
+        seen.append(result[0])
+    # Round-robin over 3 workers across 6 calls → each worker hit twice.
+    assert sorted(set(seen)) == ["http://w1.local:11434", "http://w2.local:11434", "http://w3.local:11434"]
+    assert len([s for s in seen if s == "http://w1.local:11434"]) == 2
+
+
+def test_pick_embed_target_returns_none_when_no_eligible_workers(monkeypatch):
+    """No eligible workers → caller falls back to host (None return)."""
+    monkeypatch.setattr(compute_pool, "_eligible_workers", lambda *a, **k: [])
+    assert compute_pool.pick_embed_target("nomic-embed-text") is None
+
+
+def test_pick_embed_target_excludes_dramatically_slower_worker(monkeypatch):
+    """A worker measured at <50 % of the leader's TPS is excluded from
+    the rotation — including it would slow the whole pool to its pace."""
+    fast = {"id": "w-fast", "address": "fast.local", "ollama_port": 11434, "label": "fast"}
+    slow = {"id": "w-slow", "address": "slow.local", "ollama_port": 11434, "label": "slow"}
+    monkeypatch.setattr(
+        compute_pool, "_eligible_workers",
+        lambda flag, model=None: [fast, slow],
+    )
+    # Score schema: (tps, gpu_present, vram, last_seen). Slow is 30% of fast.
+    scores = {"w-fast": (100.0, True, 8_000_000_000, 1.0), "w-slow": (30.0, True, 8_000_000_000, 1.0)}
+    monkeypatch.setattr(compute_pool, "_capability_score", lambda w: scores[w["id"]])
+    monkeypatch.setattr(
+        compute_pool.db, "get_compute_worker_auth_token", lambda wid: None,
+    )
+    compute_pool._EMBED_TARGET_INDEX.clear()
+
+    seen = set()
+    for _ in range(4):
+        seen.add(compute_pool.pick_embed_target("nomic-embed-text")[0])
+    assert seen == {"http://fast.local:11434"}  # slow worker excluded
+
+
 def test_speculative_flag_round_trip(isolated_db, monkeypatch):
     """Persisting the setting flips the helper's verdict — both
     directions, including the explicit-disable path the user takes

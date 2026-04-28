@@ -178,18 +178,6 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Gigachat", lifespan=lifespan)
 db.init()
 
-# Mirror compute-pool workers into the standalone llamapool config
-# at startup, so other LLM workloads on this host (Peerful's
-# extraction script, third-party tools using `llamapool-llama-server`)
-# inherit the same pool without separate registration. CRUD updates
-# trigger their own resync; this catches the first-run case where
-# CRUD hasn't happened yet but workers already exist in the DB.
-try:
-    from . import llamapool_sync
-    llamapool_sync.sync_now()
-except Exception:  # never block startup on a sync issue
-    pass
-
 
 # ---------------------------------------------------------------------------
 # Access-control middleware

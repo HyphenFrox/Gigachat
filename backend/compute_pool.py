@@ -465,24 +465,12 @@ async def _set_workers_backend(workers: list[dict], *, in_split: bool) -> int:
     + freshly-restarted).
     """
     aligned = 0
-    # Pull in the standalone llamapool's view of `current_rpc_backend`
-    # so we don't bounce a worker out from under a peer workload (e.g.,
-    # Peerful's extraction script) that already aligned this worker
-    # via `llamapool-llama-server`. Best-effort: missing JSON is fine.
-    peer_backends = _read_llamapool_peer_backends()
     for w in workers:
         if not (w.get("ssh_host") or "").strip():
             continue
         backend = _select_worker_backend(w, in_split=in_split)
         caps = w.get("capabilities") or {}
         current = caps.get("current_rpc_backend", "unknown")
-        # Always prefer the peer's view when present. The standalone
-        # llamapool wrapper writes `current_rpc_backend` to the JSON
-        # atomically when it bounces rpc-server, so its value is the
-        # live ground truth — our SQLite cache may be stale.
-        peer_current = peer_backends.get(w.get("label") or "")
-        if peer_current:
-            current = peer_current
         if current == backend:
             aligned += 1
             continue
@@ -501,31 +489,6 @@ async def _set_workers_backend(workers: list[dict], *, in_split: bool) -> int:
                 "%s -> %s", w.get("label"), current, backend,
             )
     return aligned
-
-
-def _read_llamapool_peer_backends() -> dict[str, str]:
-    """Read `~/.llamapool/config.json` and return a {label:
-    current_rpc_backend} map of any backends a peer workload (using
-    the standalone llamapool wrapper) has set.
-
-    Used by `_set_workers_backend` to avoid bouncing rpc-server out
-    from under a peer that's mid-split. Returns an empty dict if the
-    file doesn't exist or is unreadable — best-effort coordination.
-    """
-    import json
-    from pathlib import Path
-    path = Path.home() / ".llamapool" / "config.json"
-    try:
-        cfg = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
-    out: dict[str, str] = {}
-    for w in (cfg.get("workers") or []):
-        label = w.get("label")
-        backend = w.get("current_rpc_backend")
-        if label and backend:
-            out[label] = backend
-    return out
 
 
 async def _probe_rpc_server(
@@ -1392,8 +1355,25 @@ async def drain_deferred_syncs() -> int:
     return started
 
 
+# Per-process round-robin counter for embedding fan-out, keyed by
+# embedding model name. Embedding requests are stateless and uniform —
+# any worker that has the model loaded can serve any request in the
+# stream. Rotating across the eligible set is dramatically faster than
+# pinning to one worker: a 1000-chunk codebase index parallelises N-fold
+# across N workers instead of bottlenecking on the strongest single
+# worker's queue.
+_EMBED_TARGET_INDEX: dict[str, int] = {}
+
+
 def pick_embed_target(model: str) -> tuple[str, str | None] | None:
     """Choose a worker to run an embed request against, or None for host.
+
+    Round-robins across every eligible worker that has the embedding
+    model installed. Embedding throughput in the pool was previously
+    bottlenecked by the strongest single worker — this rotation lets
+    the whole pool absorb concurrent embed traffic (RAG indexing,
+    codebase search builds, recall lookups) at near-N× the previous
+    rate.
 
     Returns `(base_url, auth_token_or_None)`. `auth_token` is fetched
     from the dedicated `get_compute_worker_auth_token` so the token never
@@ -1403,10 +1383,57 @@ def pick_embed_target(model: str) -> tuple[str, str | None] | None:
     cands = _eligible_workers("use_for_embeddings", model=model)
     if not cands:
         return None
-    w = cands[0]
+
+    # Capability-sorted: `_eligible_workers` already returns the strongest
+    # worker first. We don't blindly round-robin across all of them — a
+    # very weak worker with the model loaded would slow the whole rotation
+    # to its pace. Take the top-K where K is the count of workers within
+    # 50 % of the strongest worker's score; that lets pools with mostly-
+    # uniform laptops use everyone while still excluding a clearly-slower
+    # outlier (e.g. a Pi running Ollama for diagnostic reasons).
+    if len(cands) > 1:
+        top_score = _capability_score(cands[0])
+        # Score tuple's first element is measured TPS (or 0 if no bench).
+        # Fall back to capability tier when no measurement.
+        threshold_score = top_score
+        usable = [
+            c for c in cands
+            if _capability_score(c) >= _scaled_score_threshold(threshold_score)
+        ]
+    else:
+        usable = cands
+
+    # Stateful rotation. Module-level counter avoids re-issuing the same
+    # worker on back-to-back calls within a turn. Atomic-ish — the GIL
+    # gives us enough safety; an embed request lost across a race is a
+    # one-off latency hit, never a correctness problem.
+    idx = _EMBED_TARGET_INDEX.get(model, 0)
+    w = usable[idx % len(usable)]
+    _EMBED_TARGET_INDEX[model] = (idx + 1) % max(len(usable), 1)
     base = _worker_base_url(w)
     token = db.get_compute_worker_auth_token(w["id"])
     return (base, token)
+
+
+def _scaled_score_threshold(top_score: tuple) -> tuple:
+    """Half the leader's measured TPS becomes the floor for inclusion in
+    the round-robin. Tuple comparison works because the score schema
+    starts with TPS — anything with TPS ≥ half-of-top is in.
+
+    For pools whose leader has no measurement yet (TPS=0), we fall
+    through to a permissive threshold (everything qualifies) — the
+    rotation absorbs uneven workers in that case but still parallelises
+    across them, which is strictly better than no rotation at all.
+    """
+    if not top_score or len(top_score) == 0:
+        return top_score
+    head = top_score[0] or 0
+    if head <= 0:
+        # No measurement on the leader — fall through to including all.
+        # Replace the head with 0 so the threshold accepts any worker.
+        return (0,) + tuple(top_score[1:])
+    halved = head / 2.0
+    return (halved,) + tuple(top_score[1:])
 
 
 def pick_chat_target(model: str) -> tuple[str, str | None] | None:
@@ -1518,6 +1545,61 @@ _HOST_VRAM_USE_FRACTION = 0.85
 # Gigachat backend itself, and KV cache. Below this fraction → host
 # (Ollama). Above → engage split path with workers.
 _HOST_TOTAL_USE_FRACTION = 0.70
+
+# Adaptive routing — per-model TPS history so the router can compare
+# host-vs-split throughput on a per-model basis. Schema:
+#     {model_name: {"host_tps": float|None, "split_tps": float|None,
+#                   "host_measured_at": float, "split_measured_at": float}}
+# Both samples carry timestamps so a stale measurement (e.g. host hardware
+# changed, a worker was added) ages out and triggers a re-bench.
+_ROUTE_TPS_CACHE_TTL_SEC = 24 * 3600
+_ROUTE_TPS_CACHE: dict[str, dict] = {}
+
+
+def _aggressive_split_enabled() -> bool:
+    """When True, the router considers Phase 2 (layer-split) for every
+    model that has eligible rpc workers — even when the model fits the
+    host alone — and engages it whenever the cached TPS shows the split
+    path beats host-only. Default OFF: opt-in.
+
+    The setting is the user's "use the entire pool, even when it isn't
+    strictly necessary" lever. Turn on if your pool has fast LAN +
+    workers with proven VRAM (`max_vram_seen_bytes` populated) — that's
+    when split actually wins for fits-on-host models. Turn off if you've
+    measured a regression on your specific topology.
+    """
+    val = db.get_setting("compute_pool_aggressive_split")
+    if val is None or str(val).strip() == "":
+        return False
+    return str(val).lower() in ("1", "true", "yes", "on")
+
+
+def _record_route_tps(model_name: str, *, kind: str, tps: float) -> None:
+    """Stamp a measurement on the per-model TPS cache.
+
+    `kind` is `"host"` or `"split"`. Only TPS > 0 are recorded — a
+    failed bench leaves the previous entry alone so a transient probe
+    error doesn't clobber valid data. Called from the chat layer when
+    a turn finishes (so the cache reflects realised throughput, not a
+    synthetic micro-bench).
+    """
+    if tps <= 0 or kind not in ("host", "split"):
+        return
+    bucket = _ROUTE_TPS_CACHE.setdefault(model_name, {})
+    bucket[f"{kind}_tps"] = tps
+    bucket[f"{kind}_measured_at"] = time.time()
+
+
+def _route_tps_for(model_name: str, kind: str) -> float | None:
+    """Read a measurement back. Returns None if missing or stale."""
+    bucket = _ROUTE_TPS_CACHE.get(model_name) or {}
+    val = bucket.get(f"{kind}_tps")
+    measured_at = bucket.get(f"{kind}_measured_at") or 0
+    if not val or val <= 0:
+        return None
+    if time.time() - measured_at > _ROUTE_TPS_CACHE_TTL_SEC:
+        return None
+    return float(val)
 
 # Path to Ollama's on-disk model store. Default location on every
 # platform Ollama supports; matches what `ollama_runtime` assumes.
@@ -2808,6 +2890,80 @@ def _gguf_tokenizer_fingerprint(gguf_path: str) -> str | None:
     return fingerprint
 
 
+# ---------------------------------------------------------------------------
+# Auto-LAN-pull for worker-only drafts
+#
+# `pick_draft_for` only promotes host-resident drafts because llama-server
+# needs the GGUF on local disk. But the user may have pulled a small
+# same-family chat model on a worker and never copied it to host — leaving
+# speculative decoding off the table even when the pool has exactly the
+# draft we'd want.
+#
+# `_maybe_kickoff_draft_lan_sync` closes that gap. When the picker would
+# have chosen a worker-only draft (smaller than every host candidate, same
+# tokenizer, fits the size budget), we kick off a background SCP from the
+# worker to host. The current chat continues on the slower path; the next
+# turn picks up the now-host-resident draft. Rate-limited per (target,
+# draft) pair so we don't trigger a parallel pull every probe sweep.
+# ---------------------------------------------------------------------------
+_DRAFT_PULL_LAST_ATTEMPT: dict[str, float] = {}
+_DRAFT_PULL_COOLDOWN_SEC = 600.0  # 10 min
+
+
+def _maybe_kickoff_draft_lan_sync(
+    target_model_name: str,
+    candidate_name: str,
+    worker_id: str,
+) -> None:
+    """Schedule a background `model_sync.sync_model` from worker to host.
+
+    Fire-and-forget — the chat layer doesn't wait. On success, the next
+    `pick_draft_for(target)` call sees the model in the host inventory
+    and promotes it through the normal path. Failures are logged and
+    silently retried after the cooldown.
+    """
+    key = f"{target_model_name}|{candidate_name}|{worker_id}"
+    now_m = time.monotonic()
+    last = _DRAFT_PULL_LAST_ATTEMPT.get(key, 0.0)
+    if now_m - last < _DRAFT_PULL_COOLDOWN_SEC:
+        return
+    _DRAFT_PULL_LAST_ATTEMPT[key] = now_m
+
+    log.info(
+        "compute_pool: kicking off LAN sync of draft candidate %r from "
+        "worker %r so future turns can use speculative decoding for %r",
+        candidate_name, worker_id, target_model_name,
+    )
+
+    async def _bg() -> None:
+        try:
+            from . import model_sync
+            # Note: sync_model SCPs FROM host TO worker. We need the
+            # opposite direction. The ModelSync API has `pull_to_host`
+            # for that path; if it's missing, fall back to a manual SCP
+            # via the worker's ssh_host. Best-effort.
+            puller = getattr(model_sync, "pull_model_to_host", None)
+            if puller is None:
+                log.info(
+                    "compute_pool: model_sync.pull_model_to_host unavailable "
+                    "on this build; draft auto-pull deferred to manual `ollama pull`"
+                )
+                return
+            await puller(candidate_name, worker_id)
+        except Exception as e:
+            log.warning(
+                "compute_pool: LAN pull of draft %r from worker %r failed: %s",
+                candidate_name, worker_id, e,
+            )
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_bg())
+    except RuntimeError:
+        pass
+
+
 def _draft_override_for(target_model_name: str) -> str | None:
     """User-pinned draft override for a specific target.
 
@@ -3027,11 +3183,9 @@ def pick_draft_for(target_model_name: str) -> dict | None:
     target_fingerprint_loaded = False
 
     max_draft_bytes = int(target_size * _DRAFT_MAX_SIZE_FRACTION)
-    candidates: list[dict] = []
+    host_candidates: list[dict] = []
+    worker_candidates: list[dict] = []
     for m in _pool_model_inventory():
-        if m["source"] != "host":
-            # Only host-resident drafts are usable in v1 — see docstring.
-            continue
         if m["name"] == target_model_name:
             # Don't pick the target as its own draft.
             continue
@@ -3044,12 +3198,20 @@ def pick_draft_for(target_model_name: str) -> dict | None:
             and target_family
             and m["family"] == target_family
         ):
-            candidates.append({**m, "match": "family"})
+            entry = {**m, "match": "family"}
+            (host_candidates if m["source"] == "host" else worker_candidates).append(entry)
             continue
 
         # Tier 3: same tokenizer fingerprint. Resolve the candidate's
         # path so we can fingerprint it; lazily compute the target's
         # fingerprint on the first cross-family candidate we hit.
+        # Tokenizer fingerprinting requires the GGUF on local disk, so
+        # this tier currently only fires for host-resident candidates.
+        # A worker-only cross-family candidate's fingerprint can't be
+        # read from this side of the LAN — defer to family match for
+        # worker candidates.
+        if m["source"] != "host":
+            continue
         cand_info = resolve_ollama_model(m["name"])
         if not cand_info or not cand_info.get("gguf_path"):
             continue
@@ -3062,24 +3224,51 @@ def pick_draft_for(target_model_name: str) -> dict | None:
         if not target_fingerprint:
             continue  # Target unreadable — no Tier 3 matches possible.
         if cand_fingerprint == target_fingerprint:
-            candidates.append({**m, "match": "tokenizer"})
+            host_candidates.append({**m, "match": "tokenizer"})
 
-    if not candidates:
+    if not host_candidates and not worker_candidates:
         return None
 
     # Smallest draft wins — speculative decoding speedup scales with
     # how much faster the draft generates than the target verifies.
-    candidates.sort(key=lambda m: m["size_bytes"])
-    pick = candidates[0]
-    info = resolve_ollama_model(pick["name"])
+    host_candidates.sort(key=lambda m: m["size_bytes"])
+    worker_candidates.sort(key=lambda m: m["size_bytes"])
+
+    # Prefer host candidates so the chat doesn't pay a LAN round-trip on
+    # every draft load. Worker-only candidates trigger a background SCP
+    # so a future turn can promote them.
+    smallest_worker = worker_candidates[0] if worker_candidates else None
+    smallest_host = host_candidates[0] if host_candidates else None
+    if (
+        smallest_worker is not None
+        and (smallest_host is None or smallest_worker["size_bytes"] < smallest_host["size_bytes"])
+    ):
+        # Worker-only candidate would beat (or replace) every host
+        # candidate. Schedule a background pull so future turns get to
+        # use it; for THIS turn fall back to the best host candidate
+        # (or None if no host candidate exists).
+        try:
+            wid = smallest_worker["source"].split(":", 1)[1]
+        except (KeyError, IndexError):
+            wid = ""
+        if wid:
+            _maybe_kickoff_draft_lan_sync(
+                target_model_name,
+                smallest_worker["name"],
+                wid,
+            )
+
+    if not smallest_host:
+        return None
+    info = resolve_ollama_model(smallest_host["name"])
     if not info or not info.get("gguf_path"):
         return None
     return {
-        "name": pick["name"],
+        "name": smallest_host["name"],
         "gguf_path": info["gguf_path"],
-        "size_bytes": pick["size_bytes"],
-        "source": pick["source"],
-        "match": pick.get("match", "family"),
+        "size_bytes": smallest_host["size_bytes"],
+        "source": smallest_host["source"],
+        "match": smallest_host.get("match", "family"),
     }
 
 
@@ -3358,9 +3547,51 @@ async def route_chat_for(model_name: str) -> dict:
         # was loaded so far, not the worker's true VRAM ceiling).
         pool_vram_total = host_vram + sum(worker_vrams)
 
+    # Adaptive routing override: even when the model would fit one node,
+    # `compute_pool_aggressive_split` may force engaging the pool. The
+    # decision algorithm:
+    #
+    #   * If we've never sampled split for this model → engage split
+    #     once so the cache gets a measurement (the post-turn hook
+    #     records realised TPS).
+    #   * If we have both measurements → engage split only when its
+    #     TPS strictly exceeds host's; that's the "split actually
+    #     wins" condition.
+    #   * If we only have a host measurement → still try split once
+    #     to populate the missing sample. Single sampling cost; the
+    #     comparison kicks in on the next turn.
+    #   * If we only have a split measurement → continue using split;
+    #     comparison is meaningful once host is sampled (which the
+    #     legacy / non-aggressive default path will eventually do).
+    force_split_engagement = False
+    if _aggressive_split_enabled():
+        split_tps = _route_tps_for(model_name, "split")
+        host_tps = _route_tps_for(model_name, "host")
+        wants_split = False
+        if split_tps is None:
+            # No split sample yet — try once.
+            wants_split = True
+        elif host_tps is not None and split_tps > host_tps:
+            # Both measured; split won the bake-off.
+            wants_split = True
+        elif host_tps is None:
+            # Only split is measured — already using it; keep going.
+            wants_split = True
+        if wants_split and _eligible_split_workers():
+            log.info(
+                "compute_pool: aggressive_split engaged for %s "
+                "(host_tps=%s split_tps=%s)",
+                model_name, host_tps, split_tps,
+            )
+            force_split_engagement = True
+
     # Tier 1: fits the strongest single GPU (host or worker)?
     strongest_single_vram = max(host_vram, best_worker_capacity)
-    if strongest_single_vram > 0 and size_bytes <= strongest_single_vram:
+    if (
+        not force_split_engagement
+        and strongest_single_vram > 0
+        and size_bytes <= strongest_single_vram
+    ):
         # Sub-tier: even though one node fits the model alone, the user
         # may have opted in to speculative decoding to recruit the rest
         # of the pool as a draft-model accelerator. The picker walks
@@ -3489,13 +3720,58 @@ async def route_chat_for(model_name: str) -> dict:
             # error and the user can free pool memory / shrink the
             # model / disable workers explicitly. The exception
             # propagates out of `route_chat_for` to the chat layer.
+            #
+            # Speculative-decoding overlay on Phase 2: if the user has
+            # speculative on and the pool offers a viable smaller
+            # vocab-compatible draft, stack `--model-draft` on the
+            # split path. The draft loads on the orchestrator host
+            # alongside the target's first layers; verification still
+            # rides the layer-split for everything past the draft's
+            # local copy. Same picker, same gates, same headroom check
+            # — but using the Phase 2 host VRAM budget reserved for
+            # target layers as the headroom anchor instead of the
+            # full target size.
+            split_draft: dict | None = None
+            split_draft_path: str | None = None
+            if speculative_decoding_enabled():
+                cand = pick_draft_for(model_name)
+                # Phase 2 already plans to stream the bulk of target
+                # weights across `--rpc` workers, so the host only
+                # holds whichever layers `_compute_optimal_ngl`
+                # assigns it. The draft just has to fit alongside
+                # those host-resident target layers — we approximate
+                # that by checking against full host VRAM budget
+                # without the target_size term (the target's split
+                # already accounts for itself in -ngl).
+                if cand and _host_vram_budget_bytes() >= int(
+                    cand["size_bytes"] * _SPECULATIVE_VRAM_HEADROOM
+                ):
+                    split_draft = cand
+                    split_draft_path = cand["gguf_path"]
+
             base_url = await _ensure_split_running_for(
                 model_name,
                 info["gguf_path"],
                 worker_ids,
                 mmproj_path=info.get("mmproj_path"),
+                draft_gguf_path=split_draft_path,
             )
-            return {"engine": "llama_server", "base_url": base_url, "label": model_name}
+            if split_draft:
+                log.info(
+                    "compute_pool: speculative decoding stacked on layer-"
+                    "split — target=%s draft=%s match=%s",
+                    model_name, split_draft["name"],
+                    split_draft.get("match", "?"),
+                )
+            result: dict = {
+                "engine": "llama_server",
+                "base_url": base_url,
+                "label": model_name,
+            }
+            if split_draft:
+                result["speculative_draft"] = split_draft["name"]
+                result["speculative_match"] = split_draft.get("match", "family")
+            return result
 
     # Tier 3: no eligible RPC workers were found, OR Tier 2 decided
     # not to engage split (host can run alone AND latency too high to
