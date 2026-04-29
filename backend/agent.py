@@ -39,7 +39,7 @@ from typing import Any, AsyncGenerator
 
 import httpx
 
-from . import compute_pool, db, mcp, sysdetect, tool_prompt_adapter, tools
+from . import compute_pool, db, jsonutil, mcp, sysdetect, tool_prompt_adapter, tools
 from .prompts import TOOL_SCHEMAS, build_system_prompt
 
 OLLAMA_URL = "http://localhost:11434"
@@ -1481,7 +1481,7 @@ async def _stream_ollama_chat(
                 body = await r.aread()
                 detail = ""
                 try:
-                    detail = json.loads(body.decode("utf-8", errors="replace")).get("error", "")
+                    detail = jsonutil.loads(body.decode("utf-8", errors="replace")).get("error", "")
                 except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
                     detail = body.decode("utf-8", errors="replace")[:400]
                 msg = (detail or f"HTTP {r.status_code}").strip()
@@ -1500,7 +1500,7 @@ async def _stream_ollama_chat(
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    yield jsonutil.loads(line)
                 except json.JSONDecodeError:
                     continue
 
@@ -1582,7 +1582,7 @@ async def _stream_llama_server_chat(
                     yield {"message": {"role": "assistant", "content": ""}, "done": True}
                     break
                 try:
-                    obj = json.loads(payload_str)
+                    obj = jsonutil.loads(payload_str)
                 except json.JSONDecodeError:
                     continue
                 # OpenAI streaming: delta lives at choices[0].delta.
