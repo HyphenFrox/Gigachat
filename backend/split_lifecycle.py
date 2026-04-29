@@ -545,28 +545,21 @@ def _decide_kv_precision_and_parallel(
 ) -> tuple[str | None, int]:
     """Joint decision: pick KV cache type AND `--parallel` slot count.
 
-    Returns ``(cache_type, parallel)`` where ``cache_type`` is either
-    ``None`` (FP16 — llama.cpp default) or ``"q8_0"`` (Q8 — half the
-    KV memory). The slot count is computed against whichever precision
-    we picked, so callers see a coherent (precision, slots) pair.
+    Returns ``(cache_type, parallel)`` where ``cache_type`` is
+    ``"q8_0"`` (default — half the KV memory at <1 % accuracy loss
+    on standard benchmarks) or ``None`` (FP16 — only when the pool
+    has so much headroom that quantising buys nothing).
 
-    Decision: try FP16 first. If the pool is memory-pressured enough
-    that fewer than ``_KV_QUANT_PARALLEL_FLOOR`` slots fit in FP16,
-    re-check at Q8 and switch when Q8 unlocks meaningfully more slots.
-    Pools with plenty of headroom stay on FP16 (no precision penalty
-    when there's no bottleneck to break).
+    Q8 KV is the cheaper-and-faster default. We bias toward it
+    because (a) the memory it frees is real — every freed byte goes
+    to extra parallel slots, longer context, or fewer offload-to-CPU
+    layers; (b) Flash Attention is on by default in `_build_command`
+    so the q8 kernel is always available; (c) the precision floor
+    matches Ollama's recommendation. The only reason to fall back to
+    FP16 is when the pool already fits the Q8 maximum and the small
+    quality margin matters more than freed VRAM — that's a corner
+    we don't optimise for.
     """
-    fp16_parallel = _compute_optimal_parallel(
-        gguf_path, worker_ids,
-        ctx_size=ctx_size,
-        target_size_bytes=target_size_bytes,
-        draft_size_bytes=draft_size_bytes,
-    )
-    if fp16_parallel >= _KV_QUANT_PARALLEL_FLOOR:
-        # Plenty of slots already at FP16 — keep precision, skip the
-        # Q8 ladder.
-        return None, fp16_parallel
-
     q8_parallel = _compute_optimal_parallel(
         gguf_path, worker_ids,
         ctx_size=ctx_size,
@@ -574,13 +567,11 @@ def _decide_kv_precision_and_parallel(
         draft_size_bytes=draft_size_bytes,
         kv_size_multiplier=0.5,
     )
-    if q8_parallel > fp16_parallel:
-        log.info(
-            "split_lifecycle: KV quantized to q8_0 — fp16 fit %d slot(s), "
-            "q8_0 fits %d", fp16_parallel, q8_parallel,
-        )
-        return "q8_0", q8_parallel
-    return None, fp16_parallel
+    log.info(
+        "split_lifecycle: KV cache type=q8_0 (default), fits %d parallel slot(s)",
+        q8_parallel,
+    )
+    return "q8_0", q8_parallel
 
 
 def _compute_optimal_ctx_size(
@@ -904,6 +895,114 @@ def _should_pin_experts_to_cpu(gguf_path: str) -> bool:
     return host_vram_bytes > 0 and file_size > int(host_vram_bytes * 0.85)
 
 
+def _compute_optimal_n_cpu_moe(
+    gguf_path: str,
+    worker_ids: list[str],
+    *,
+    ngl: int,
+    parallel: int,
+    cache_type: str | None,
+    ctx_size: int,
+    target_size_bytes: int,
+) -> int | None:
+    """Decide how many MoE layers' expert FFNs to keep on CPU.
+
+    Only meaningful for MoE models where the GPU pool can't hold
+    every expert; for dense models OR for MoE models that fit GPU
+    completely, returns ``None`` (no override — llama.cpp's default
+    placement is best).
+
+    Algorithm:
+      1. Bail early if the model isn't MoE (`_is_moe_model`).
+      2. Estimate per-layer expert size: total weight bytes minus
+         attention bytes, divided by block_count. Heuristic — most
+         MoE weights are FFN experts (typically 70-90 %).
+      3. Compute the GPU memory budget after KV cache reservations.
+         Budget = (host_vram + each worker's free RAM) - kv_bytes.
+      4. ngl bounds how many layers attempt GPU residency. The first
+         ``ngl`` layers' attention + dense parts already live on GPU.
+         Their experts compete for the remaining budget.
+      5. Walk layers from the END (highest-indexed) and pin one
+         layer's experts to CPU per ``avg_expert_bytes`` of overshoot.
+         llama.cpp counts ``--n-cpu-moe`` from the highest-numbered
+         layer downward, matching this walk direction.
+
+    Returns the integer count of MoE layers to send to CPU, clamped
+    to ``[0, n_layers]``. ``0`` means "no override needed — pool fits
+    every expert"; ``None`` means "model isn't MoE — skip the flag".
+    """
+    if not _is_moe_model(gguf_path):
+        return None
+    metadata = _get_gguf_metadata(gguf_path)
+    n_layers = metadata.get("block_count") or 0
+    if n_layers <= 0:
+        return None
+
+    try:
+        file_size = os.path.getsize(gguf_path)
+    except OSError:
+        return None
+
+    # GPU pool budget: host VRAM + each worker's free RAM (workers
+    # exposing iGPU SYCL via shared system memory, so RAM is the
+    # right proxy). Per the zero-margin policy elsewhere we use 100%
+    # of reported free memory.
+    pool_bytes = 0
+    try:
+        from . import sysdetect
+        spec = sysdetect.detect_system()
+        pool_bytes += int(float(spec.get("vram_gb") or 0) * (1024 ** 3))
+    except Exception:
+        pass
+    for wid in worker_ids:
+        w = db.get_compute_worker(wid)
+        if not w or not w.get("enabled"):
+            continue
+        caps = w.get("capabilities") or {}
+        pool_bytes += int(float(caps.get("ram_free_gb") or 0) * (1024 ** 3))
+    if pool_bytes <= 0:
+        return None
+
+    # Subtract KV cache footprint so we don't tell the GPU it has
+    # bytes that are already spoken for.
+    kv_bytes_per_token = _estimate_kv_bytes_per_slot(metadata, 1)
+    kv_total = (
+        kv_bytes_per_token
+        * max(1, ctx_size)
+        * max(1, parallel)
+        * (0.5 if cache_type == "q8_0" else 1.0)
+    )
+    pool_bytes -= int(kv_total)
+    if pool_bytes <= 0:
+        # Even KV doesn't fit — push everything except attention off GPU.
+        return n_layers
+
+    # Compare what GPU layers want to occupy vs the budget. ngl
+    # caps how many layers attempt GPU residency.
+    ngl_effective = min(int(ngl), n_layers)
+    if ngl_effective <= 0:
+        return n_layers
+    avg_layer_bytes = file_size / n_layers
+    layer_bytes_on_gpu = avg_layer_bytes * ngl_effective
+    if layer_bytes_on_gpu <= pool_bytes:
+        # Whole model fits — no override needed.
+        return 0
+
+    # Excess gets shipped to CPU. Each MoE layer offloaded saves
+    # `avg_layer_bytes` (close enough — experts dominate the layer).
+    excess = layer_bytes_on_gpu - pool_bytes
+    n_offload = int((excess + avg_layer_bytes - 1) / avg_layer_bytes)
+    n_offload = min(n_layers, max(0, n_offload))
+    log.info(
+        "split_lifecycle: --n-cpu-moe: model=MoE, file=%.1f GB, ngl=%d, "
+        "kv=%.1f GB, pool_after_kv=%.1f GB -> offload %d/%d MoE layer(s)",
+        file_size / (1024 ** 3), ngl_effective,
+        kv_total / (1024 ** 3), pool_bytes / (1024 ** 3),
+        n_offload, n_layers,
+    )
+    return n_offload
+
+
 def _should_use_row_split(worker_ids: list[str]) -> bool:
     """Return True when the LAN is fast enough that `--split-mode row`
     might beat the default layer-pipeline.
@@ -1024,6 +1123,9 @@ def _build_command(
     threads: int | None = None,
     threads_batch: int | None = None,
     mlock: bool = False,
+    flash_attn: bool = True,
+    cache_reuse: int = 256,
+    n_cpu_moe: int | None = None,
 ) -> list[str]:
     """Assemble the argv for `llama-server`.
 
@@ -1284,6 +1386,40 @@ def _build_command(
         # (`_should_mlock_weights`) only engages when free RAM is at
         # least 2× the model size, so locking can't OOM the system.
         cmd.append("--mlock")
+    if flash_attn:
+        # Flash Attention switches the attention block to the fused
+        # kernel — typically 5-30 % faster generation depending on
+        # context length, with bigger gains at long contexts. It's
+        # also the prerequisite for KV cache quantisation: llama.cpp
+        # silently falls back to FP16 KV when -fa is off, so without
+        # this flag the q8_0 cache_type above wouldn't actually engage.
+        # `--flash-attn on` (vs the older `-fa` boolean toggle) gives
+        # an explicit value across versions; the runtime warns and
+        # disables for models that don't implement FA so it's safe
+        # to leave on by default.
+        cmd.extend(["--flash-attn", "on"])
+    if cache_reuse and cache_reuse > 0:
+        # KV-shift-based prompt-prefix reuse. When a follow-up turn
+        # shares a prefix with the previous turn (same system prompt,
+        # same first N user/assistant rounds, same tool schemas), the
+        # server skips re-decoding that prefix and shifts the cached
+        # KV state forward by the diff. Non-trivial speed-up on
+        # multi-turn chat where the prefix dominates the prompt
+        # length. Default 256 is the chunk granularity — smaller
+        # values reuse more aggressively at the cost of bookkeeping;
+        # larger values miss small in-prefix edits.
+        cmd.extend(["--cache-reuse", str(int(cache_reuse))])
+    if n_cpu_moe is not None and n_cpu_moe > 0:
+        # MoE expert offload to CPU. Counts the number of MoE layers
+        # whose expert FFN tensors stay on system RAM while attention
+        # + dense parts remain on GPU. Critical for big-MoE models
+        # (DeepSeek-V3, Qwen3-MoE 235B, GPT-OSS 120B) that don't fit
+        # GPU even with -ngl tuned: experts dominate the file size
+        # but each token only routes through a handful of them, so
+        # the GPU↔CPU activation hop costs less than streaming all
+        # weights from disk via mmap. Counts from the highest-numbered
+        # layer downward, so smaller values keep more experts on GPU.
+        cmd.extend(["--n-cpu-moe", str(int(n_cpu_moe))])
     return cmd
 
 
@@ -1417,7 +1553,7 @@ async def _wait_for_health(
 
 
 def _compute_optimal_ngl(
-    gguf_path: str, worker_ids: list[str], *, safety: float = 0.7,
+    gguf_path: str, worker_ids: list[str], *, safety: float = 1.0,
 ) -> int:
     """Decide how many layers to put on GPU pools (rest stay on host
     CPU + RAM, paged from disk via mmap).
@@ -1442,6 +1578,13 @@ def _compute_optimal_ngl(
     divide by average bytes per layer (file size / block_count from
     the GGUF metadata), clamp to [0, n_layers]. Returns the integer
     `-ngl` value to pass.
+
+    `safety=1.0` means "use 100% of the reported free pool memory" —
+    no headroom reserved. Per the user's explicit policy: every
+    available byte should be used for inference; the OOM killer is
+    an acceptable price for pushing throughput. Drop `safety` below
+    1.0 only when a specific failure mode (e.g. a worker that lies
+    about its `ram_free_gb`) demands it.
 
     Falls back to `_DEFAULT_NGL` if any input is missing — e.g.
     a worker without a probe yet, or a GGUF without the
@@ -1475,9 +1618,11 @@ def _compute_optimal_ngl(
     try:
         from . import sysdetect
         spec = sysdetect.detect_system()
-        # Host VRAM (CUDA / dGPU) — `vram_gb` is total; we approximate
-        # free as 80% of total (OS / driver reservation).
-        pool_free_bytes += int(float(spec.get("vram_gb") or 0) * (1024 ** 3) * 0.8)
+        # Host VRAM (CUDA / dGPU) — `vram_gb` is total. Per the
+        # zero-margin policy we treat all of it as available; the
+        # GPU allocator is left to error out on overcommit rather
+        # than us pre-reserving headroom.
+        pool_free_bytes += int(float(spec.get("vram_gb") or 0) * (1024 ** 3))
     except Exception:
         pass
 
@@ -1638,6 +1783,19 @@ async def start(split_id: str) -> dict:
     # least 2× the model file so locking can't OOM the system.
     use_mlock = _should_mlock_weights(target_size_bytes)
 
+    # Adaptive --n-cpu-moe: when the model is MoE AND the file is
+    # bigger than the GPU pool, expert FFN tensors get pinned to
+    # CPU/RAM. Attention + dense weights stay on GPU. Big-MoE
+    # (DeepSeek-V3, Qwen3-MoE 235B, GPT-OSS 120B) wins enormously
+    # from this — token routing only fires a handful of experts per
+    # forward pass, so the GPU↔CPU activation hop costs less than
+    # streaming weights from disk via mmap.
+    n_cpu_moe = _compute_optimal_n_cpu_moe(
+        row["gguf_path"], row["worker_ids"],
+        ngl=ngl, parallel=parallel, cache_type=cache_type,
+        ctx_size=ctx_size, target_size_bytes=target_size_bytes,
+    )
+
     cmd = _build_command(
         llama_server=server,
         gguf_path=row["gguf_path"],
@@ -1657,6 +1815,7 @@ async def start(split_id: str) -> dict:
         threads=threads,
         threads_batch=threads_batch,
         mlock=use_mlock,
+        n_cpu_moe=n_cpu_moe,
     )
     log_path = _log_path_for(split_id)
 

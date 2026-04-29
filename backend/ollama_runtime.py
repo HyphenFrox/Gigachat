@@ -177,6 +177,27 @@ def _spawn_ollama(executable: str) -> subprocess.Popen | None:
     # allocated. User-set value still wins.
     if not env.get("OLLAMA_KEEP_ALIVE"):
         env["OLLAMA_KEEP_ALIVE"] = "60m"
+    # OLLAMA_FLASH_ATTENTION switches Ollama's runner to the Flash-Attention
+    # kernel for the attention block. Two effects:
+    #   * generation throughput climbs noticeably (5-30 % depending on
+    #     model + context length — bigger gains at longer contexts),
+    #   * it's a hard prerequisite for KV cache quantisation below.
+    # Most modern Ollama-supported models implement FA; the runner
+    # silently falls back to the standard kernel for the few that
+    # don't, so leaving this on at all times is safe. User-set value
+    # still wins so anybody chasing reproducibility can disable it.
+    if not env.get("OLLAMA_FLASH_ATTENTION"):
+        env["OLLAMA_FLASH_ATTENTION"] = "1"
+    # OLLAMA_KV_CACHE_TYPE = q8_0 halves the KV cache memory footprint
+    # vs the FP16 default with negligible quality impact on standard
+    # benchmarks. Frees up VRAM for either (a) more parallel slots,
+    # (b) longer context, or (c) more layers offloaded to GPU on big
+    # models. Requires Flash Attention (set just above) to be enabled
+    # — Ollama silently falls back to f16 otherwise.
+    # User-set value wins; explicit "f16" preserves the legacy
+    # behaviour for anyone who needs full-precision KV.
+    if not env.get("OLLAMA_KV_CACHE_TYPE"):
+        env["OLLAMA_KV_CACHE_TYPE"] = "q8_0"
     # OLLAMA_NUM_THREAD overrides the runner's CPU thread count.
     # Default is logical core count which over-subscribes the FPU on
     # hyperthreaded CPUs — physical core count is typically faster
