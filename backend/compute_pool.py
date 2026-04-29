@@ -5332,12 +5332,21 @@ async def ensure_worker_chat_server(
     # CLI as host's, just with target + draft both local. The flags
     # mirror split_lifecycle._build_command's defaults so the chat
     # behaviour matches what the rest of the app expects.
+    #
+    # Inference-perf flags wired here too:
+    #   * `--flash-attn on` over `-fa auto` so behaviour is explicit
+    #     and matches the host path; also unlocks KV quant below.
+    #   * `-ctk q8_0 -ctv q8_0` halves KV memory at <1 % accuracy
+    #     loss — frees room for the draft model on the worker.
+    #   * `--cache-reuse 256` makes follow-up turns reuse the previous
+    #     prompt's prefix via KV-shift; big win on multi-turn chat.
     spawn_cmd = (
         f'"{llama_server_path}" '
         f'--model "{target_on_worker}" '
         '--host 0.0.0.0 '
         f'--port {_WORKER_LLAMA_PORT} '
-        '-fa auto --jinja -ngl 99 -c 4096 --no-warmup '
+        '--flash-attn on -ctk q8_0 -ctv q8_0 --cache-reuse 256 '
+        '--jinja -ngl 99 -c 4096 --no-warmup '
         f'-md "{draft_on_worker}" --draft-max 8 --draft-min 1 -ngld 99'
     )
     # Win32_Process.Create makes the spawned llama-server outlive the
