@@ -506,7 +506,7 @@ def _repair_orphan_tool_calls(conversation_id: str) -> None:
             db.add_message(
                 conversation_id,
                 "tool",
-                json.dumps(
+                jsonutil.dumps(
                     {
                         "ok": False,
                         "output": "",
@@ -2867,14 +2867,13 @@ async def _run_turn_impl(
                     conversation_id,
                     "\n\n".join(workflow_notes),
                 )
-            result_text = json.dumps(
+            result_text = jsonutil.dumps(
                 {
                     "ok": result.get("ok"),
                     "output": result.get("output", ""),
                     "error": result.get("error"),
                     "exit_code": result.get("exit_code"),
                 },
-                ensure_ascii=False,
             )
             # Persist the tool row. Carry `image_path` (screenshot filename)
             # on the tool_calls metadata so future turns can re-attach the
@@ -3295,13 +3294,12 @@ async def run_subagent(
                 {
                     "role": "tool",
                     "tool_name": tc["name"],
-                    "content": json.dumps(
+                    "content": jsonutil.dumps(
                         {
                             "ok": result.get("ok"),
                             "output": result.get("output", ""),
                             "error": result.get("error"),
                         },
-                        ensure_ascii=False,
                     ),
                 }
             )
