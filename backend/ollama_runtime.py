@@ -198,6 +198,21 @@ def _spawn_ollama(executable: str) -> subprocess.Popen | None:
     # behaviour for anyone who needs full-precision KV.
     if not env.get("OLLAMA_KV_CACHE_TYPE"):
         env["OLLAMA_KV_CACHE_TYPE"] = "q8_0"
+    # OLLAMA_SCHED_SPREAD=1 distributes layers across every GPU (vs
+    # the default `pack` mode that fills one GPU before spilling to
+    # the next). On multi-GPU hosts this maximizes parallel matmul
+    # capacity and also memory bandwidth — strictly faster when the
+    # model fits across the spread. Single-GPU systems are unaffected
+    # (one device, nothing to spread). Opt-out preserved via the env.
+    if not env.get("OLLAMA_SCHED_SPREAD"):
+        env["OLLAMA_SCHED_SPREAD"] = "1"
+    # OLLAMA_GPU_OVERHEAD reserves bytes of VRAM as a safety buffer
+    # against allocator overcommit. Per the project's zero-margin
+    # policy ("use every available byte for inference"), we set this
+    # to 0 — Ollama will let the GPU runtime error on overcommit
+    # rather than pre-reserving headroom we don't otherwise need.
+    if not env.get("OLLAMA_GPU_OVERHEAD"):
+        env["OLLAMA_GPU_OVERHEAD"] = "0"
     # OLLAMA_NUM_THREAD overrides the runner's CPU thread count.
     # Default is logical core count which over-subscribes the FPU on
     # hyperthreaded CPUs — physical core count is typically faster
