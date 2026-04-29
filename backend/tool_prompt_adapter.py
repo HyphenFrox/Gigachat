@@ -531,14 +531,14 @@ def _try_parse_tool_body(body: str) -> dict[str, Any] | None:
                     args = inner_args
                 elif isinstance(inner_args, str):
                     try:
-                        candidate = json.loads(inner_args)
+                        candidate = _ju.loads(inner_args)
                         if isinstance(candidate, dict):
                             args = candidate
                     except Exception:
                         pass
         if isinstance(args, str):
             try:
-                args = json.loads(args)
+                args = _ju.loads(args)
             except Exception:
                 args = {}
         if not isinstance(args, dict):
@@ -612,7 +612,8 @@ def _parse_fn_call_args(raw: str) -> dict[str, Any]:
         if v_json.startswith("'") and v_json.endswith("'"):
             v_json = '"' + v_json[1:-1].replace('"', '\\"') + '"'
         try:
-            out[k] = json.loads(v_json)
+            from . import jsonutil as _ju2
+            out[k] = _ju2.loads(v_json)
         except Exception:
             out[k] = v.strip("'\"")
     return out
@@ -650,10 +651,11 @@ def _try_extract_json_codefence_call(
         return text, []
     calls: list[dict[str, Any]] = []
     spans: list[tuple[int, int]] = []
+    from . import jsonutil as _ju
     for m in _JSON_CODEFENCE_RE.finditer(text):
         body = m.group(1).strip()
         try:
-            obj = json.loads(body)
+            obj = _ju.loads(body)
         except Exception:
             continue
         if not isinstance(obj, dict):
@@ -796,20 +798,20 @@ def rewrite_messages_for_adapter(
                 raw_args = fn.get("arguments")
                 if raw_args is None:
                     raw_args = fn.get("args") or {}
+                from . import jsonutil as _ju3
                 if isinstance(raw_args, str):
                     try:
-                        raw_args = json.loads(raw_args)
+                        raw_args = _ju3.loads(raw_args)
                     except Exception:
                         raw_args = {}
                 if not isinstance(raw_args, dict):
                     raw_args = {}
                 try:
-                    payload_json = json.dumps(
+                    payload_json = _ju3.dumps(
                         {"name": tc_name, "args": raw_args},
-                        ensure_ascii=False,
                     )
                 except Exception:
-                    payload_json = json.dumps(
+                    payload_json = _ju3.dumps(
                         {"name": tc_name, "args": {}}
                     )
                 parts.append(f"<tool_call>\n{payload_json}\n</tool_call>")
