@@ -4482,6 +4482,24 @@ def pool_dedup_recommendations() -> list[dict]:
 # ---------------------------------------------------------------------------
 _DRAFT_PULL_LAST_ATTEMPT: dict[str, float] = {}
 _DRAFT_PULL_COOLDOWN_SEC = 600.0  # 10 min
+# Cap on the cooldown tracker: keys are
+# "<target>|<candidate>|<worker_id>" so the combo space is
+# N_targets × N_candidates × N_workers. A backend that's been up for
+# years cycling many models could grow this slowly. FIFO eviction at
+# 1024 entries — losing a cooldown stamp just means the next
+# `_maybe_kickoff_draft_lan_sync` call for that combo can fire
+# immediately, identical to the cold-start behaviour.
+_DRAFT_PULL_LAST_ATTEMPT_MAX = 1024
+
+
+def _evict_draft_pull_tracker_if_full() -> None:
+    """Drop the oldest entry when the combo tracker exceeds its cap."""
+    while len(_DRAFT_PULL_LAST_ATTEMPT) > _DRAFT_PULL_LAST_ATTEMPT_MAX:
+        try:
+            oldest_key = next(iter(_DRAFT_PULL_LAST_ATTEMPT))
+            del _DRAFT_PULL_LAST_ATTEMPT[oldest_key]
+        except (StopIteration, KeyError):
+            break
 
 
 def _maybe_kickoff_draft_lan_sync(
@@ -4502,6 +4520,7 @@ def _maybe_kickoff_draft_lan_sync(
     if now_m - last < _DRAFT_PULL_COOLDOWN_SEC:
         return
     _DRAFT_PULL_LAST_ATTEMPT[key] = now_m
+    _evict_draft_pull_tracker_if_full()
 
     log.info(
         "compute_pool: kicking off LAN sync of draft candidate %r from "
