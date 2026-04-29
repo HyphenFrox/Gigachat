@@ -5290,7 +5290,7 @@ async def ensure_worker_chat_server(
         "        out[name] = None\n"
         "        continue\n"
         "    try:\n"
-        "        m = jsonutil.loads(manifest.read_text())\n"
+        "        m = json.loads(manifest.read_text())\n"
         "    except Exception:\n"
         "        out[name] = None\n"
         "        continue\n"
