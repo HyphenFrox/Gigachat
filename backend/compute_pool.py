@@ -1286,6 +1286,56 @@ async def _drain_idle_reindex() -> int:
     return files_processed
 
 
+# Auto-disable workers that have been unreachable for this long. The
+# periodic probe still tries them every sweep (so a worker coming back
+# online recovers), but we flip `enabled=False` to declutter routing
+# decisions and stop the SSH-restart attempts that were piling up
+# warning logs. User can re-enable manually from Settings; the row
+# itself is preserved with full capabilities + history.
+_STALE_WORKER_DISABLE_SECONDS = 28 * 86400  # 4 weeks
+
+
+async def _auto_disable_stale_workers() -> int:
+    """Flip `enabled=False` on workers unreachable for > 4 weeks.
+
+    Routing already filters by freshness (1-hour `last_seen` window),
+    so stale workers never actually serve traffic — but they stay in
+    the eligible-set scan, tagged `last_error`, and keep being SSH-
+    restart-attempted on every probe sweep. After a month of silence,
+    flipping `enabled=False` is the right "I forgot about this device"
+    semantic. Re-enabling is a one-click action in Settings → Compute.
+
+    Returns the number of workers auto-disabled this sweep so the
+    caller can log it.
+    """
+    rows = db.list_compute_workers(enabled_only=True)
+    now = time.time()
+    disabled_count = 0
+    for w in rows:
+        last_seen = float(w.get("last_seen") or 0)
+        if last_seen <= 0:
+            # Never probed successfully — leave alone, the user just
+            # added it. Manual disable via Settings if they meant to.
+            continue
+        age = now - last_seen
+        if age < _STALE_WORKER_DISABLE_SECONDS:
+            continue
+        try:
+            db.update_compute_worker(w["id"], enabled=False)
+            disabled_count += 1
+            log.info(
+                "compute_pool: auto-disabled stale worker %r — "
+                "unreachable for %.1f days",
+                w.get("label"), age / 86400,
+            )
+        except Exception as e:
+            log.warning(
+                "compute_pool: failed to auto-disable %r: %s",
+                w.get("label"), e,
+            )
+    return disabled_count
+
+
 async def _periodic_loop() -> None:
     """Internal: sweep every `_SWEEP_INTERVAL_SEC`. Started/stopped via
     `start_periodic_probe` / `stop_periodic_probe` on app lifecycle.
@@ -1314,6 +1364,14 @@ async def _periodic_loop() -> None:
                 log.info("compute_pool: started %d deferred LAN-copy task(s)", n)
         except Exception as e:
             log.warning("compute_pool: drain_deferred_syncs failed: %s", e)
+        # Auto-disable workers unreachable for > 4 weeks. Cheap (one
+        # SELECT + at most a few UPDATEs); runs every sweep so the
+        # user sees the state-change in Settings within minutes of
+        # the threshold being crossed.
+        try:
+            await _auto_disable_stale_workers()
+        except Exception as e:
+            log.warning("compute_pool: _auto_disable_stale_workers failed: %s", e)
         # Idle pool re-index — uses spare embed bandwidth to keep RAG
         # vectors fresh without blocking active chats. Skipped when a
         # chat is in flight.
