@@ -8762,30 +8762,59 @@ async def forget(
         return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
 
 
+# Cache the rendered memory section by (path, mtime). Memory files
+# only change when `remember` / `forget` writes to them — same mtime
+# means same content, no disk read needed. Bounded at 256 entries
+# (one per active conv) with FIFO eviction so a long-running backend
+# that's seen many conversations doesn't pin every memory file.
+_MEMORY_FOR_PROMPT_CACHE: dict[str, tuple[float, str]] = {}
+_MEMORY_FOR_PROMPT_CACHE_MAX = 256
+
+
 def load_memory_for_prompt(conv_id: str | None) -> str:
     """Return the memory file wrapped in a system-prompt-friendly section.
 
     Called by prompts.build_system_prompt. Safe to call when the file doesn't
     exist — returns "" in that case.
+
+    Cached by (path, mtime). The `remember` / `forget` tools update the
+    file's mtime when they write, so a fresh memory_put on the same
+    conv invalidates naturally on the next turn.
     """
     path = _memory_path(conv_id)
     if not path or not path.is_file():
         return ""
     try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return ""
+    cached = _MEMORY_FOR_PROMPT_CACHE.get(str(path))
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
         text = path.read_text(encoding="utf-8").strip()
     except Exception:
         return ""
     if not text:
-        return ""
-    return (
-        "\n\n## Your long-term memory for this conversation\n\n"
-        "The notes below were saved earlier via the `remember` tool. Treat "
-        "them as authoritative context about the user, this project, and "
-        "the work in flight. Use `remember(...)` to add new facts and "
-        "`forget(...)` to remove ones that are no longer true.\n\n"
-        + text
-        + "\n"
-    )
+        rendered = ""
+    else:
+        rendered = (
+            "\n\n## Your long-term memory for this conversation\n\n"
+            "The notes below were saved earlier via the `remember` tool. Treat "
+            "them as authoritative context about the user, this project, and "
+            "the work in flight. Use `remember(...)` to add new facts and "
+            "`forget(...)` to remove ones that are no longer true.\n\n"
+            + text
+            + "\n"
+        )
+    _MEMORY_FOR_PROMPT_CACHE[str(path)] = (mtime, rendered)
+    while len(_MEMORY_FOR_PROMPT_CACHE) > _MEMORY_FOR_PROMPT_CACHE_MAX:
+        try:
+            oldest = next(iter(_MEMORY_FOR_PROMPT_CACHE))
+            del _MEMORY_FOR_PROMPT_CACHE[oldest]
+        except (StopIteration, KeyError):
+            break
+    return rendered
 
 
 def load_project_memory_for_prompt(cwd: str | None) -> str:
