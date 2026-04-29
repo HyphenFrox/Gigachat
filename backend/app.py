@@ -912,7 +912,17 @@ async def _start_compute_pool_probe() -> None:
     The first sweep fires immediately so the Settings UI doesn't show stale
     "never seen" state on a fresh boot; the loop then re-runs every 5 min.
     Cheap: two GETs per enabled worker. No-op when no workers registered.
+
+    Also reaps stale SSH ControlMaster sockets from previous runs — a
+    hard-killed previous process leaves orphan sockets in /tmp that
+    accumulate forever otherwise. Each reaped socket forces one fresh
+    handshake on the next dispatch, identical to the no-ControlMaster
+    cost; the alternative is the orphans piling up across reboots.
     """
+    try:
+        compute_pool.reap_stale_ssh_control_sockets()
+    except Exception as e:
+        print(f"[compute_pool] SSH socket reap failed: {e}", file=sys.stderr)
     try:
         compute_pool.start_periodic_probe()
     except Exception as e:

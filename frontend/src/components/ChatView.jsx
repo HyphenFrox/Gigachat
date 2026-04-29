@@ -74,6 +74,17 @@ export default function ChatView({
   const [toolStates, setToolStates] = useState({})
   const [liveContent, setLiveContent] = useState('') // streaming assistant text for current iteration
   const [liveThinking, setLiveThinking] = useState('') // streaming reasoning tokens (if the model emits them)
+  // SSE delta batching: accumulate incoming token text in refs and
+  // flush to state via a single requestAnimationFrame callback per
+  // paint cycle. On fast inference (50+ tok/s) this drops re-renders
+  // from one-per-token to one-per-frame (~60/s max), dramatically
+  // smoother on long messages without changing perceived latency.
+  // Refs survive function-component re-creation; the rAF id lives in
+  // a ref too so we can cancel-on-cleanup if the component unmounts
+  // mid-stream (avoids React "set state on unmounted" warnings).
+  const liveContentBufferRef = useRef('')
+  const liveThinkingBufferRef = useRef('')
+  const deltaFlushRafRef = useRef(0)
   const [busy, setBusy] = useState(false)
   const [input, setInput] = useState('')
   const [error, setError] = useState(null)
@@ -140,6 +151,18 @@ export default function ChatView({
   useEffect(() => {
     currentIdRef.current = id
   }, [id])
+
+  // Cancel any pending SSE-delta rAF flush when the component unmounts.
+  // Without this, a pending callback can fire after unmount and
+  // trigger React's "set state on unmounted" warning. Cheap insurance.
+  useEffect(() => {
+    return () => {
+      if (deltaFlushRafRef.current !== 0) {
+        cancelAnimationFrame(deltaFlushRafRef.current)
+        deltaFlushRafRef.current = 0
+      }
+    }
+  }, [])
 
   // ----- load conversation + history ----------------------------------------
   useEffect(() => {
@@ -759,18 +782,62 @@ export default function ChatView({
   function handleEvent(evt) {
     switch (evt.type) {
       case 'delta':
-        setLiveContent((s) => s + (evt.text || ''))
+        // Accumulate into a ref and schedule a single paint-aligned
+        // flush. On a 50 tok/s stream this turns 50 setState calls
+        // per second into ~16 (one per frame at 60 Hz). Same final
+        // text, much less reconciler pressure.
+        liveContentBufferRef.current += evt.text || ''
+        if (deltaFlushRafRef.current === 0) {
+          deltaFlushRafRef.current = requestAnimationFrame(() => {
+            deltaFlushRafRef.current = 0
+            const c = liveContentBufferRef.current
+            const t = liveThinkingBufferRef.current
+            if (c) {
+              liveContentBufferRef.current = ''
+              setLiveContent((s) => s + c)
+            }
+            if (t) {
+              liveThinkingBufferRef.current = ''
+              setLiveThinking((s) => s + t)
+            }
+          })
+        }
         break
       case 'thinking':
         // Accumulate reasoning tokens so the UI can show "Thinking…" progress
         // instead of a blank wait. Not all models emit these; for models that
         // don't, the pending bubble still shows a pulse dot so the user at
         // least sees *some* activity during the Ollama round-trip.
-        setLiveThinking((s) => s + (evt.text || ''))
+        // Same rAF batching as 'delta' for the same reason.
+        liveThinkingBufferRef.current += evt.text || ''
+        if (deltaFlushRafRef.current === 0) {
+          deltaFlushRafRef.current = requestAnimationFrame(() => {
+            deltaFlushRafRef.current = 0
+            const c = liveContentBufferRef.current
+            const t = liveThinkingBufferRef.current
+            if (c) {
+              liveContentBufferRef.current = ''
+              setLiveContent((s) => s + c)
+            }
+            if (t) {
+              liveThinkingBufferRef.current = ''
+              setLiveThinking((s) => s + t)
+            }
+          })
+        }
         break
       case 'assistant_message':
         // The server has persisted this iteration's assistant row. Commit
         // the live content into a real message bubble and clear the buffer.
+        // Drop any rAF-pending deltas — `evt.content` is canonical and
+        // includes everything the server saw, so unflushed buffer text
+        // is redundant.
+        if (deltaFlushRafRef.current !== 0) {
+          cancelAnimationFrame(deltaFlushRafRef.current)
+          deltaFlushRafRef.current = 0
+        }
+        liveContentBufferRef.current = ''
+        liveThinkingBufferRef.current = ''
         setMessages((m) => [
           ...m,
           {

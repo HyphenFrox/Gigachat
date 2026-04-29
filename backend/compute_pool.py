@@ -805,6 +805,55 @@ def _ssh_persistent_args() -> list[str]:
     ]
 
 
+def reap_stale_ssh_control_sockets() -> int:
+    """Delete SSH ControlMaster sockets left over from previous backend
+    runs. Called at startup so a long-uptime process doesn't accumulate
+    one zombie socket per worker per restart.
+
+    OpenSSH normally cleans up its own master sockets when the
+    `ControlPersist` timer fires, but a hard kill (Ctrl-C, OS reboot,
+    process crash) bypasses that. The orphan sockets are unusable
+    (the master process is gone) but stay on disk as zero-byte files
+    or named pipes that persist until manually deleted.
+
+    A new ssh invocation handles a stale socket gracefully — it
+    detects the dead master and falls back to a fresh connection —
+    but the warning lines clutter logs and the orphan files
+    accumulate forever otherwise. Reaping at startup is cheap
+    insurance.
+
+    Returns the count of files removed; logs to compute_pool's
+    logger so the operator sees what was reclaimed.
+    """
+    if not _SSH_CONTROL_DIR.is_dir():
+        return 0
+    removed = 0
+    for entry in _SSH_CONTROL_DIR.iterdir():
+        try:
+            # ControlMaster sockets typically have names like
+            # `cm-<32-char-hash>`. We don't try to verify the master
+            # is alive (no easy cross-platform way); the harmless
+            # case is "delete a working socket" which forces ssh to
+            # re-handshake on the next dispatch — same cost we pay
+            # without ControlMaster at all.
+            if entry.is_file() or entry.is_socket():
+                entry.unlink()
+                removed += 1
+            elif entry.is_symlink():
+                entry.unlink()
+                removed += 1
+        except OSError:
+            # Permission denied / file in use — leave it; the OS
+            # will clean it up eventually.
+            continue
+    if removed:
+        log.info(
+            "compute_pool: reaped %d stale SSH ControlMaster socket(s) at %s",
+            removed, _SSH_CONTROL_DIR,
+        )
+    return removed
+
+
 async def _rediscover_lan_ip_via_tailscale(worker: dict) -> str | None:
     """SSH to the worker over Tailscale and return its current LAN IPv4.
 
