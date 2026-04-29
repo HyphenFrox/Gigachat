@@ -748,6 +748,16 @@ _MENTION_FILE_MAX = 40_000
 _MENTION_TOTAL_MAX = 120_000
 
 
+# Bounded mtime-keyed cache for files referenced via `@path` in user
+# messages. Same-mtime hits return the cached body without re-reading
+# from disk; stale-mtime hits re-read and update. Bounded at 64 entries
+# so a long history that mentions many files doesn't keep them all
+# pinned in RAM. Each entry is a string up to `_MENTION_FILE_MAX`
+# (typ. 32 KiB) so the worst-case footprint is ~2 MiB — comfortable.
+_MENTION_CACHE: dict[str, tuple[float, str]] = {}
+_MENTION_CACHE_MAX = 64
+
+
 def _expand_file_mentions(text: str, cwd: str | None) -> str:
     """Append inline `<file>` blocks for every valid `@path` mention in `text`.
 
@@ -758,6 +768,11 @@ def _expand_file_mentions(text: str, cwd: str | None) -> str:
     ignored. Tokens are NOT substituted in-place so the reader (both
     the model and future inspectors of the prompt) can tell where the
     user put the reference vs. the injected body.
+
+    File contents are cached by (path, mtime) so repeated mentions of
+    the same file across consecutive turns skip the disk read. Cache
+    invalidates on any mtime change so a `write_file` mid-conversation
+    is reflected on the next turn.
     """
     if not text or "@" not in text or not cwd:
         return text
@@ -782,7 +797,20 @@ def _expand_file_mentions(text: str, cwd: str | None) -> str:
             p = (root / rel).resolve()
             if not p.is_file() or not p.is_relative_to(root):
                 continue
-            body = p.read_text(encoding="utf-8", errors="replace")
+            mtime = p.stat().st_mtime
+            cached = _MENTION_CACHE.get(str(p))
+            if cached and cached[0] == mtime:
+                body = cached[1]
+            else:
+                body = p.read_text(encoding="utf-8", errors="replace")
+                # Stamp into cache; bound size via FIFO eviction.
+                _MENTION_CACHE[str(p)] = (mtime, body)
+                while len(_MENTION_CACHE) > _MENTION_CACHE_MAX:
+                    try:
+                        oldest = next(iter(_MENTION_CACHE))
+                        del _MENTION_CACHE[oldest]
+                    except (StopIteration, KeyError):
+                        break
         except Exception:
             continue
         truncated = False
