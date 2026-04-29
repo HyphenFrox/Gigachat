@@ -280,6 +280,21 @@ class AuthMiddleware(BaseHTTPMiddleware):
 app.add_middleware(AuthMiddleware)
 
 
+# Gzip compression for large JSON responses. The threshold is generous
+# (1 KiB) so small endpoint replies don't pay the encoding cost; only
+# the chunky ones (codebase index lists, model inventories, settings
+# dumps) get compressed. Streaming responses (chat SSE, model-pull
+# progress) are explicitly StreamingResponse and bypass middleware,
+# preserving the streaming behaviour.
+#
+# gzip is universal across browsers and saves ~70-90% on JSON. CPU
+# cost (~1-2 ms per response at level 5) is dwarfed by network
+# transfer time on any non-localhost client.
+from starlette.middleware.gzip import GZipMiddleware  # noqa: E402
+
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+
+
 # ---------------------------------------------------------------------------
 # Scheduled-tasks background daemon
 #
