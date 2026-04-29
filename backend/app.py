@@ -609,9 +609,11 @@ async def _start_retention_sweeper() -> None:
     if _RETENTION_TASK is not None and not _RETENTION_TASK.done():
         return
     from . import retention
-    from .tools import CHECKPOINT_DIR, MEMORY_DIR
+    from .tools import CHECKPOINT_DIR, MEMORY_DIR, SCREENSHOT_DIR, UPLOAD_DIR
     _RETENTION_TASK = asyncio.create_task(
-        retention.sweep_daemon(CHECKPOINT_DIR, MEMORY_DIR)
+        retention.sweep_daemon(
+            CHECKPOINT_DIR, MEMORY_DIR, UPLOAD_DIR, SCREENSHOT_DIR,
+        )
     )
 
 
