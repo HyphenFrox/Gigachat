@@ -3985,6 +3985,289 @@ def _serve_pwa_file(name: str) -> FileResponse:
     raise HTTPException(404, f"{name} not found")
 
 
+# ----------------------------------------------------------------------
+# Audit log endpoint — read-only cross-conversation list of every tool
+# call the agent ran. Filterable by conversation / tool / since-timestamp
+# so the user can scan "what did the agent do today" without trawling
+# every chat manually. Backed by the audit_log table the dispatcher
+# writes to on every tool call.
+# ----------------------------------------------------------------------
+@app.get("/api/audit-log")
+def api_list_audit_log(
+    limit: int = 200,
+    conversation_id: str | None = None,
+    tool_name: str | None = None,
+    since_ts: float | None = None,
+) -> dict:
+    """List recent tool calls, newest-first.
+
+    Read-only: there is no POST/DELETE endpoint by design. The audit log
+    is append-only from the dispatcher and is not meant to be edited.
+    """
+    rows = db.list_audit_log(
+        limit=limit,
+        conversation_id=conversation_id,
+        tool_name=tool_name,
+        since_ts=since_ts,
+    )
+    return {"audit": rows}
+
+
+# ----------------------------------------------------------------------
+# Skill library endpoints — list / get / delete are exposed to the UI
+# so the user can browse and prune the agent's saved playbooks.
+# Creation is tool-only; the agent decides what's worth banking.
+# ----------------------------------------------------------------------
+@app.get("/api/skills")
+def api_list_skills(limit: int = 200) -> dict:
+    return {"skills": db.list_skills(limit=limit)}
+
+
+@app.get("/api/skills/{name}")
+def api_get_skill(name: str) -> dict:
+    rec = db.get_skill(name)
+    if not rec:
+        raise HTTPException(404, "skill not found")
+    return {"skill": rec}
+
+
+@app.delete("/api/skills/{name}")
+def api_delete_skill(name: str) -> dict:
+    if not db.delete_skill(name):
+        raise HTTPException(404, "skill not found")
+    return {"deleted": True}
+
+
+# ----------------------------------------------------------------------
+# OpenAPI registry endpoints — list, fetch, delete. Loading specs is
+# done via the agent's `openapi_load` tool so the model can register
+# them on demand; this surface lets the user inspect / clean up.
+# ----------------------------------------------------------------------
+@app.get("/api/openapi")
+def api_list_openapi_specs() -> dict:
+    # Strip the heavy spec_json body from the listing — UI only needs
+    # the metadata. The caller can fetch the full operations list via
+    # the per-id endpoint below.
+    return {
+        "specs": [
+            {k: v for k, v in s.items() if k != "operations"}
+            for s in db.list_openapi_specs()
+        ],
+    }
+
+
+@app.get("/api/openapi/{api_id}")
+def api_get_openapi_spec(api_id: str) -> dict:
+    rec = db.get_openapi_spec(api_id)
+    if not rec:
+        raise HTTPException(404, "API spec not found")
+    return {"spec": rec}
+
+
+@app.delete("/api/openapi/{api_id}")
+def api_delete_openapi_spec(api_id: str) -> dict:
+    if not db.delete_openapi_spec(api_id):
+        raise HTTPException(404, "API spec not found")
+    return {"deleted": True}
+
+
+# ----------------------------------------------------------------------
+# Webhook receiver endpoints.
+#
+# `POST /webhook/{token}` — public-ish receiver: anyone with the
+# generated token can fire the corresponding agent turn. The token
+# is 24 url-safe random bytes (~32 chars), drawn from `secrets`, so
+# bruteforcing is computationally infeasible. Body is forwarded to
+# the agent as the user message in `target_conversation_id`.
+#
+# Management endpoints under `/api/webhooks` — list / create / patch
+# / delete. Creation generates a fresh token; the user copies it from
+# the response and uses it in their external service.
+# ----------------------------------------------------------------------
+class WebhookCreateBody(BaseModel):
+    """Body for POST /api/webhooks."""
+    name: str
+    target_conversation_id: str
+    prompt_template: str | None = ""
+
+
+class WebhookPatchBody(BaseModel):
+    """Body for PATCH /api/webhooks/{id}."""
+    name: str | None = None
+    enabled: bool | None = None
+    prompt_template: str | None = None
+
+
+@app.get("/api/webhooks")
+def api_list_webhooks() -> dict:
+    return {"webhooks": db.list_webhooks()}
+
+
+@app.post("/api/webhooks")
+def api_create_webhook(body: WebhookCreateBody) -> dict:
+    try:
+        rec = db.create_webhook(
+            name=body.name,
+            target_conversation_id=body.target_conversation_id,
+            prompt_template=body.prompt_template or "",
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"webhook": rec}
+
+
+@app.patch("/api/webhooks/{wid}")
+def api_update_webhook(wid: str, body: WebhookPatchBody) -> dict:
+    rec = db.update_webhook(
+        wid,
+        enabled=body.enabled,
+        prompt_template=body.prompt_template,
+        name=body.name,
+    )
+    if not rec:
+        raise HTTPException(404, "webhook not found")
+    return {"webhook": rec}
+
+
+@app.delete("/api/webhooks/{wid}")
+def api_delete_webhook(wid: str) -> dict:
+    if not db.delete_webhook(wid):
+        raise HTTPException(404, "webhook not found")
+    return {"deleted": True}
+
+
+@app.post("/webhook/{token}")
+async def public_webhook_receiver(
+    token: str,
+    request: Request,
+) -> dict:
+    """Public webhook fire endpoint. Spawns an agent turn with the
+    request body inlined as the user message.
+
+    This is the ONLY endpoint that does not require a logged-in
+    session — any external service with the token can fire a turn.
+    Defence: the token itself is the credential (24 random bytes), so
+    leaked tokens give the same access-controls as a leaked API key.
+    Rotate by deleting + recreating the webhook record.
+    """
+    rec = db.get_webhook_by_token(token)
+    if not rec or not rec.get("enabled"):
+        # Don't leak whether the webhook exists vs is just disabled —
+        # a probe gets the same response either way.
+        raise HTTPException(404, "not found")
+    # Read the body as text. Limit size so a huge payload can't OOM us.
+    raw_body = await request.body()
+    if len(raw_body) > 256_000:
+        raise HTTPException(413, "payload too large (max 256 KB)")
+    body_text = raw_body.decode("utf-8", errors="replace")
+    template = rec.get("prompt_template") or ""
+    if template:
+        # `{body}` placeholder is replaced with the request body so the
+        # user can wrap it in instructions ("You received this webhook
+        # payload:\n{body}\n\nSummarise it and decide if it warrants action.").
+        prompt = template.replace("{body}", body_text)
+    else:
+        prompt = body_text or "(empty webhook body)"
+    # Persist a user message + spawn a turn the same way the regular
+    # send-message endpoint does. We don't await the agent loop —
+    # webhook callers want a fast 202.
+    try:
+        # Schedule the turn on the existing agent runner. The send
+        # function is async-generator-based; we drive it in the
+        # background with a fire-and-forget task.
+        asyncio.create_task(_drive_webhook_turn(rec, prompt))
+        db.record_webhook_fire(rec["id"])
+    except Exception as e:
+        raise HTTPException(500, f"failed to spawn turn: {e}")
+    return {"accepted": True, "webhook_id": rec["id"]}
+
+
+async def _drive_webhook_turn(webhook: dict, prompt: str) -> None:
+    """Drive the agent loop for a webhook-triggered turn until it ends.
+
+    Errors are logged but never re-raised — the HTTP layer has already
+    returned 202 Accepted by the time this runs in the background.
+    """
+    try:
+        async for _ in agent.run_turn(
+            webhook["target_conversation_id"],
+            user_text=prompt,
+        ):
+            # Drop events on the floor — we don't need to forward them
+            # over SSE for a non-interactive webhook fire. The events
+            # ARE persisted into the conversation history so the user
+            # sees them next time they open the chat.
+            pass
+    except Exception:
+        # The agent loop's own error handlers persist a failure
+        # message into the conversation; nothing more to do here.
+        pass
+
+
+# ----------------------------------------------------------------------
+# File watcher endpoints — same shape as webhooks. The actual watching
+# is done by the file_watcher_runtime module (registered at app
+# startup) which polls the filesystem and fires agent turns.
+# ----------------------------------------------------------------------
+class FileWatcherCreateBody(BaseModel):
+    """Body for POST /api/file-watchers."""
+    name: str
+    target_conversation_id: str
+    path: str
+    glob_pattern: str | None = "*"
+    events: list[str] | None = None
+    prompt_template: str | None = ""
+    debounce_seconds: int | None = 5
+
+
+class FileWatcherPatchBody(BaseModel):
+    name: str | None = None
+    enabled: bool | None = None
+    prompt_template: str | None = None
+
+
+@app.get("/api/file-watchers")
+def api_list_file_watchers() -> dict:
+    return {"watchers": db.list_file_watchers()}
+
+
+@app.post("/api/file-watchers")
+def api_create_file_watcher(body: FileWatcherCreateBody) -> dict:
+    try:
+        rec = db.create_file_watcher(
+            name=body.name,
+            target_conversation_id=body.target_conversation_id,
+            path=body.path,
+            glob_pattern=body.glob_pattern or "*",
+            events=body.events,
+            prompt_template=body.prompt_template or "",
+            debounce_seconds=body.debounce_seconds or 5,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"watcher": rec}
+
+
+@app.patch("/api/file-watchers/{wid}")
+def api_update_file_watcher(wid: str, body: FileWatcherPatchBody) -> dict:
+    rec = db.update_file_watcher(
+        wid,
+        enabled=body.enabled,
+        prompt_template=body.prompt_template,
+        name=body.name,
+    )
+    if not rec:
+        raise HTTPException(404, "file watcher not found")
+    return {"watcher": rec}
+
+
+@app.delete("/api/file-watchers/{wid}")
+def api_delete_file_watcher(wid: str) -> dict:
+    if not db.delete_file_watcher(wid):
+        raise HTTPException(404, "file watcher not found")
+    return {"deleted": True}
+
+
 @app.get("/sw.js")
 def pwa_service_worker() -> FileResponse:
     return _serve_pwa_file("sw.js")

@@ -20,6 +20,7 @@ try/except) so upgrading an existing DB in-place doesn't require a wipe.
 """
 
 import os
+import secrets
 import sqlite3
 import json
 import re
@@ -733,6 +734,118 @@ def init() -> None:
             -- this index is created.
             CREATE INDEX IF NOT EXISTS idx_conversations_sort
                 ON conversations(pinned, last_user_message_at, updated_at);
+
+            -- OpenAPI specs the user has registered. The agent loads a spec
+            -- once with `openapi_load(spec_url)`; afterwards it can call
+            -- any endpoint via `openapi_call(api_id, operation_id, args)`
+            -- without the user having to write a tool per endpoint. The
+            -- spec JSON is normalized to operation_id-keyed entries so
+            -- lookups are O(1).
+            CREATE TABLE IF NOT EXISTS openapi_specs (
+                id TEXT PRIMARY KEY,
+                base_url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                spec_json TEXT NOT NULL,           -- the full normalized spec
+                operations_json TEXT NOT NULL,     -- {operation_id: {...}, ...}
+                default_headers_json TEXT NOT NULL DEFAULT '{}',
+                auth_scheme TEXT,                  -- 'bearer'/'apikey'/'basic'/null
+                auth_secret_name TEXT,             -- references secrets table
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_openapi_specs_title
+                ON openapi_specs(title);
+
+            -- Persistent skill / playbook library. When the agent figures
+            -- out a tricky workflow it distils the procedure as a "skill"
+            -- (markdown body). On future similar tasks it recalls and
+            -- reuses the playbook instead of re-deriving. Distinct from
+            -- factual memory — this is procedural.
+            CREATE TABLE IF NOT EXISTS skills (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                body TEXT NOT NULL,                -- the playbook text
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                last_used_at REAL,
+                use_count INTEGER NOT NULL DEFAULT 0,
+                success_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name);
+            CREATE INDEX IF NOT EXISTS idx_skills_used
+                ON skills(last_used_at DESC);
+
+            -- Cross-conversation audit log of every tool call the agent
+            -- ran. The conversation messages already record tool_calls
+            -- per-row, but a flat queryable log lets the UI show "what
+            -- did the agent do today across all chats" — useful for
+            -- security review and post-mortem of long-running tasks.
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT,
+                tool_name TEXT NOT NULL,
+                category TEXT NOT NULL,            -- 'read'/'write'/'meta'
+                args_json TEXT NOT NULL,
+                result_summary TEXT NOT NULL,      -- short, capped
+                ok INTEGER NOT NULL,               -- 1=success, 0=failure
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_log_conv
+                ON audit_log(conversation_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_recent
+                ON audit_log(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_log_tool
+                ON audit_log(tool_name, created_at DESC);
+
+            -- Webhook receivers. Each row defines a path
+            -- (/webhook/<token>) that, when POSTed to, fires an agent
+            -- turn against `target_conversation_id` with the request
+            -- body as the user message. Token is the random URL slug
+            -- (so the user can rotate it by deleting + recreating).
+            CREATE TABLE IF NOT EXISTS webhooks (
+                id TEXT PRIMARY KEY,
+                token TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                target_conversation_id TEXT NOT NULL,
+                prompt_template TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_fired_at REAL,
+                fire_count INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(target_conversation_id)
+                    REFERENCES conversations(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_webhooks_token
+                ON webhooks(token);
+            CREATE INDEX IF NOT EXISTS idx_webhooks_enabled
+                ON webhooks(enabled);
+
+            -- File-watcher triggers. A small daemon watches each `path`
+            -- (debounced) and fires an agent turn when files inside it
+            -- are created/modified/deleted. Path patterns are filtered
+            -- with `glob_pattern` (e.g. "*.md", "**/*.py").
+            CREATE TABLE IF NOT EXISTS file_watchers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                target_conversation_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                glob_pattern TEXT NOT NULL DEFAULT '*',
+                events_json TEXT NOT NULL DEFAULT '["created","modified"]',
+                prompt_template TEXT NOT NULL DEFAULT '',
+                debounce_seconds INTEGER NOT NULL DEFAULT 5,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_fired_at REAL,
+                fire_count INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(target_conversation_id)
+                    REFERENCES conversations(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_watchers_enabled
+                ON file_watchers(enabled);
             """
         )
 
@@ -4492,4 +4605,617 @@ def _row_to_split_model(row: sqlite3.Row) -> dict:
         "last_error": row["last_error"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+# ===========================================================================
+# OpenAPI specs — registered REST APIs the agent can call generically.
+# ===========================================================================
+
+def create_openapi_spec(
+    *,
+    api_id: str,
+    base_url: str,
+    title: str,
+    description: str | None,
+    spec_obj: dict,
+    operations: dict,
+    default_headers: dict | None = None,
+    auth_scheme: str | None = None,
+    auth_secret_name: str | None = None,
+) -> dict:
+    """Insert one OpenAPI spec. Operations dict is op_id → metadata.
+
+    Validates `api_id` is a slug (so it's safe in tool args), enforces a
+    sane size cap on the spec body (1 MB) so a malicious endpoint can't
+    fill the SQLite DB. The actual call dispatch reads `operations_json`
+    by op_id — full spec_json stays in the table for re-introspection
+    when the agent wants to discover endpoints later.
+    """
+    aid = (api_id or "").strip().lower()
+    if not aid or not all(c.isalnum() or c in "-_" for c in aid):
+        raise ValueError(
+            "api_id must be a slug (lowercase alpha/digits/_/-)"
+        )
+    spec_blob = _json_dumps(spec_obj)
+    if len(spec_blob) > 1_000_000:
+        raise ValueError("spec is larger than 1 MB; refusing to store")
+    now = time.time()
+    with _conn() as c:
+        try:
+            c.execute(
+                "INSERT INTO openapi_specs "
+                "(id, base_url, title, description, spec_json, operations_json, "
+                " default_headers_json, auth_scheme, auth_secret_name, "
+                " created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    aid, base_url.strip(), (title or aid)[:200],
+                    (description or "")[:2000],
+                    spec_blob, _json_dumps(operations),
+                    _json_dumps(default_headers or {}),
+                    (auth_scheme or None),
+                    (auth_secret_name or None),
+                    now, now,
+                ),
+            )
+        except sqlite3.IntegrityError as e:
+            raise ValueError(f"openapi spec {aid!r} already exists") from e
+    return get_openapi_spec(aid) or {}
+
+
+def get_openapi_spec(api_id: str) -> dict | None:
+    """Fetch one spec by id, hydrating JSON columns into native types."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM openapi_specs WHERE id = ?", (api_id,),
+        ).fetchone()
+    return _row_to_openapi_spec(row) if row else None
+
+
+def list_openapi_specs() -> list[dict]:
+    """Every registered API, newest-first."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM openapi_specs ORDER BY created_at DESC"
+        ).fetchall()
+    return [_row_to_openapi_spec(r) for r in rows]
+
+
+def delete_openapi_spec(api_id: str) -> bool:
+    """Remove one spec. Returns True when a row was deleted."""
+    with _conn() as c:
+        cur = c.execute("DELETE FROM openapi_specs WHERE id = ?", (api_id,))
+    return cur.rowcount > 0
+
+
+def _row_to_openapi_spec(row: sqlite3.Row) -> dict:
+    """Hydrate spec row JSON columns. Internal helper."""
+    return {
+        "id": row["id"],
+        "base_url": row["base_url"],
+        "title": row["title"],
+        "description": row["description"] or "",
+        "operations": _json_loads(row["operations_json"]),
+        "default_headers": _json_loads(row["default_headers_json"]),
+        "auth_scheme": row["auth_scheme"],
+        "auth_secret_name": row["auth_secret_name"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+# ===========================================================================
+# Skills — persistent procedural memory ("playbooks").
+# ===========================================================================
+
+def create_skill(
+    *,
+    name: str,
+    description: str,
+    body: str,
+    tags: list[str] | None = None,
+) -> dict:
+    """Insert one skill. Name must be a slug; body is markdown / plain text.
+
+    Skills are how the agent banks "I figured out the steps for X" — the
+    body is a procedure description it recalls and follows on similar
+    future tasks. Body cap (16 KB) keeps a runaway agent from spamming
+    the table; description cap (500 chars) keeps the search index small.
+    """
+    n = (name or "").strip().lower()
+    if not n or not all(c.isalnum() or c in "_-" for c in n):
+        raise ValueError(
+            "skill name must be a slug (lowercase alpha/digits/_/-)"
+        )
+    desc = (description or "").strip()
+    if not desc:
+        raise ValueError("description must not be empty")
+    if len(desc) > 500:
+        raise ValueError("description must be at most 500 characters")
+    txt = (body or "").strip()
+    if not txt:
+        raise ValueError("body must not be empty")
+    if len(txt) > 16_000:
+        raise ValueError("body must be at most 16,000 characters")
+    sid = str(uuid.uuid4())
+    now = time.time()
+    with _conn() as c:
+        try:
+            c.execute(
+                "INSERT INTO skills (id, name, description, tags_json, body, "
+                " created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sid, n, desc,
+                    _json_dumps([str(t).strip() for t in (tags or []) if str(t).strip()]),
+                    txt, now, now,
+                ),
+            )
+        except sqlite3.IntegrityError as e:
+            raise ValueError(f"a skill named {n!r} already exists") from e
+    return get_skill(sid) or {}
+
+
+def update_skill(
+    skill_id: str,
+    *,
+    description: str | None = None,
+    body: str | None = None,
+    tags: list[str] | None = None,
+) -> dict | None:
+    """Patch one skill. Pass None to leave a column alone."""
+    sets, vals = [], []
+    if description is not None:
+        d = description.strip()
+        if not d:
+            raise ValueError("description must not be empty")
+        if len(d) > 500:
+            raise ValueError("description too long")
+        sets.append("description = ?")
+        vals.append(d)
+    if body is not None:
+        b = body.strip()
+        if not b:
+            raise ValueError("body must not be empty")
+        if len(b) > 16_000:
+            raise ValueError("body too long")
+        sets.append("body = ?")
+        vals.append(b)
+    if tags is not None:
+        sets.append("tags_json = ?")
+        vals.append(_json_dumps(
+            [str(t).strip() for t in tags if str(t).strip()]
+        ))
+    if not sets:
+        return get_skill(skill_id)
+    sets.append("updated_at = ?")
+    vals.append(time.time())
+    vals.append(skill_id)
+    with _conn() as c:
+        c.execute(f"UPDATE skills SET {', '.join(sets)} WHERE id = ?", vals)
+    return get_skill(skill_id)
+
+
+def get_skill(skill_id: str) -> dict | None:
+    """Fetch one skill row by primary key OR by name (auto-detected)."""
+    with _conn() as c:
+        # Allow lookup by either id or name — matches what callers want.
+        row = c.execute(
+            "SELECT * FROM skills WHERE id = ? OR name = ? LIMIT 1",
+            (skill_id, skill_id),
+        ).fetchone()
+    return _row_to_skill(row) if row else None
+
+
+def list_skills(limit: int = 100) -> list[dict]:
+    """All skills, recently-used first then newest."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM skills "
+            "ORDER BY COALESCE(last_used_at, 0) DESC, created_at DESC "
+            "LIMIT ?",
+            (max(1, min(int(limit), 1000)),),
+        ).fetchall()
+    return [_row_to_skill(r) for r in rows]
+
+
+def search_skills(query: str, limit: int = 10) -> list[dict]:
+    """LIKE-search over name, description, tags. Cheap pre-filter for the
+    rerank pass — the agent calls `find_skill(query)` and we return a
+    handful of plausible matches by simple substring; the model itself
+    then judges which one (if any) actually applies.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    pat = f"%{q}%"
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM skills "
+            "WHERE LOWER(name) LIKE ? OR LOWER(description) LIKE ? "
+            "   OR LOWER(tags_json) LIKE ? "
+            "ORDER BY COALESCE(last_used_at, 0) DESC, created_at DESC "
+            "LIMIT ?",
+            (pat, pat, pat, max(1, min(int(limit), 50))),
+        ).fetchall()
+    return [_row_to_skill(r) for r in rows]
+
+
+def delete_skill(skill_id: str) -> bool:
+    """Remove one skill. Returns True when a row was deleted."""
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM skills WHERE id = ? OR name = ?",
+            (skill_id, skill_id),
+        )
+    return cur.rowcount > 0
+
+
+def record_skill_use(skill_id: str, success: bool) -> None:
+    """Bump usage counters. Best-effort — never raises."""
+    try:
+        with _conn() as c:
+            c.execute(
+                "UPDATE skills SET use_count = use_count + 1, "
+                "  success_count = success_count + ?, "
+                "  last_used_at = ? "
+                "WHERE id = ? OR name = ?",
+                (1 if success else 0, time.time(), skill_id, skill_id),
+            )
+    except Exception:
+        pass
+
+
+def _row_to_skill(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "description": row["description"],
+        "tags": _json_loads(row["tags_json"]) or [],
+        "body": row["body"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "last_used_at": row["last_used_at"],
+        "use_count": row["use_count"],
+        "success_count": row["success_count"],
+    }
+
+
+# ===========================================================================
+# Audit log — cross-conversation record of every tool call.
+# ===========================================================================
+
+# Cap on the per-row result summary stored in audit_log. Keeps a runaway
+# tool's 50 MB stdout from blowing the table; the full result still lives
+# in `messages.tool_calls` if the user needs to dig further.
+_AUDIT_RESULT_CHARS_MAX = 2000
+
+
+def add_audit_log(
+    *,
+    tool_name: str,
+    category: str,
+    args: dict | list | None,
+    result_summary: str,
+    ok: bool,
+    duration_ms: int = 0,
+    conversation_id: str | None = None,
+) -> str:
+    """Record one tool invocation. Returns the new row id.
+
+    Best-effort: any DB failure here is swallowed (returns "") because
+    audit logging must never break the actual tool dispatch.
+    """
+    try:
+        rid = str(uuid.uuid4())
+        summary = (result_summary or "")[:_AUDIT_RESULT_CHARS_MAX]
+        with _conn() as c:
+            c.execute(
+                "INSERT INTO audit_log "
+                "(id, conversation_id, tool_name, category, args_json, "
+                " result_summary, ok, duration_ms, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    rid, conversation_id, tool_name, category,
+                    _json_dumps(args or {}), summary,
+                    1 if ok else 0, int(duration_ms), time.time(),
+                ),
+            )
+        return rid
+    except Exception:
+        return ""
+
+
+def list_audit_log(
+    limit: int = 200,
+    *,
+    conversation_id: str | None = None,
+    tool_name: str | None = None,
+    since_ts: float | None = None,
+) -> list[dict]:
+    """Return audit rows, newest-first, with optional filters."""
+    where: list[str] = []
+    vals: list = []
+    if conversation_id:
+        where.append("conversation_id = ?")
+        vals.append(conversation_id)
+    if tool_name:
+        where.append("tool_name = ?")
+        vals.append(tool_name)
+    if since_ts is not None:
+        where.append("created_at >= ?")
+        vals.append(float(since_ts))
+    sql = "SELECT * FROM audit_log"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    vals.append(max(1, min(int(limit), 1000)))
+    with _conn() as c:
+        rows = c.execute(sql, vals).fetchall()
+    return [_row_to_audit(r) for r in rows]
+
+
+def _row_to_audit(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "conversation_id": row["conversation_id"],
+        "tool_name": row["tool_name"],
+        "category": row["category"],
+        "args": _json_loads(row["args_json"]) or {},
+        "result_summary": row["result_summary"],
+        "ok": bool(row["ok"]),
+        "duration_ms": row["duration_ms"],
+        "created_at": row["created_at"],
+    }
+
+
+# ===========================================================================
+# Webhooks — inbound triggers that fire an agent turn.
+# ===========================================================================
+
+def create_webhook(
+    *,
+    name: str,
+    target_conversation_id: str,
+    prompt_template: str = "",
+) -> dict:
+    """Create a webhook receiver. Token is auto-generated."""
+    n = (name or "").strip()
+    if not n:
+        raise ValueError("name must not be empty")
+    if not get_conversation(target_conversation_id):
+        raise ValueError("target conversation does not exist")
+    wid = str(uuid.uuid4())
+    # 32-char URL-safe token. Random enough that brute force is
+    # effectively impossible — same security model as a Bearer token.
+    token = secrets.token_urlsafe(24)
+    now = time.time()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO webhooks (id, token, name, target_conversation_id, "
+            " prompt_template, enabled, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?)",
+            (wid, token, n[:200], target_conversation_id,
+             (prompt_template or "")[:2000], now),
+        )
+    return get_webhook(wid) or {}
+
+
+def get_webhook(webhook_id: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM webhooks WHERE id = ?", (webhook_id,),
+        ).fetchone()
+    return _row_to_webhook(row) if row else None
+
+
+def get_webhook_by_token(token: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM webhooks WHERE token = ?", (token,),
+        ).fetchone()
+    return _row_to_webhook(row) if row else None
+
+
+def list_webhooks() -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM webhooks ORDER BY created_at DESC"
+        ).fetchall()
+    return [_row_to_webhook(r) for r in rows]
+
+
+def update_webhook(
+    webhook_id: str,
+    *,
+    enabled: bool | None = None,
+    prompt_template: str | None = None,
+    name: str | None = None,
+) -> dict | None:
+    sets, vals = [], []
+    if enabled is not None:
+        sets.append("enabled = ?")
+        vals.append(1 if enabled else 0)
+    if prompt_template is not None:
+        sets.append("prompt_template = ?")
+        vals.append(prompt_template[:2000])
+    if name is not None:
+        n = name.strip()
+        if not n:
+            raise ValueError("name must not be empty")
+        sets.append("name = ?")
+        vals.append(n[:200])
+    if not sets:
+        return get_webhook(webhook_id)
+    vals.append(webhook_id)
+    with _conn() as c:
+        c.execute(
+            f"UPDATE webhooks SET {', '.join(sets)} WHERE id = ?", vals,
+        )
+    return get_webhook(webhook_id)
+
+
+def delete_webhook(webhook_id: str) -> bool:
+    with _conn() as c:
+        cur = c.execute("DELETE FROM webhooks WHERE id = ?", (webhook_id,))
+    return cur.rowcount > 0
+
+
+def record_webhook_fire(webhook_id: str) -> None:
+    """Bump fire_count + last_fired_at. Best-effort."""
+    try:
+        with _conn() as c:
+            c.execute(
+                "UPDATE webhooks SET fire_count = fire_count + 1, "
+                "last_fired_at = ? WHERE id = ?",
+                (time.time(), webhook_id),
+            )
+    except Exception:
+        pass
+
+
+def _row_to_webhook(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "token": row["token"],
+        "name": row["name"],
+        "target_conversation_id": row["target_conversation_id"],
+        "prompt_template": row["prompt_template"],
+        "enabled": bool(row["enabled"]),
+        "last_fired_at": row["last_fired_at"],
+        "fire_count": row["fire_count"],
+        "created_at": row["created_at"],
+    }
+
+
+# ===========================================================================
+# File watchers — local-FS event triggers that fire agent turns.
+# ===========================================================================
+
+def create_file_watcher(
+    *,
+    name: str,
+    target_conversation_id: str,
+    path: str,
+    glob_pattern: str = "*",
+    events: list[str] | None = None,
+    prompt_template: str = "",
+    debounce_seconds: int = 5,
+) -> dict:
+    """Register one file-watcher trigger."""
+    n = (name or "").strip()
+    if not n:
+        raise ValueError("name must not be empty")
+    if not get_conversation(target_conversation_id):
+        raise ValueError("target conversation does not exist")
+    p = (path or "").strip()
+    if not p:
+        raise ValueError("path must not be empty")
+    valid_events = {"created", "modified", "deleted", "moved"}
+    es = [e for e in (events or ["created", "modified"]) if e in valid_events]
+    if not es:
+        raise ValueError(
+            f"events must include at least one of {sorted(valid_events)}"
+        )
+    fwid = str(uuid.uuid4())
+    now = time.time()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO file_watchers "
+            "(id, name, target_conversation_id, path, glob_pattern, "
+            " events_json, prompt_template, debounce_seconds, enabled, "
+            " created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (
+                fwid, n[:200], target_conversation_id, p, (glob_pattern or "*"),
+                _json_dumps(es), (prompt_template or "")[:2000],
+                max(1, min(int(debounce_seconds), 3600)), now,
+            ),
+        )
+    return get_file_watcher(fwid) or {}
+
+
+def get_file_watcher(watcher_id: str) -> dict | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM file_watchers WHERE id = ?", (watcher_id,),
+        ).fetchone()
+    return _row_to_file_watcher(row) if row else None
+
+
+def list_file_watchers(enabled_only: bool = False) -> list[dict]:
+    with _conn() as c:
+        sql = "SELECT * FROM file_watchers"
+        if enabled_only:
+            sql += " WHERE enabled = 1"
+        sql += " ORDER BY created_at DESC"
+        rows = c.execute(sql).fetchall()
+    return [_row_to_file_watcher(r) for r in rows]
+
+
+def update_file_watcher(
+    watcher_id: str,
+    *,
+    enabled: bool | None = None,
+    prompt_template: str | None = None,
+    name: str | None = None,
+) -> dict | None:
+    sets, vals = [], []
+    if enabled is not None:
+        sets.append("enabled = ?")
+        vals.append(1 if enabled else 0)
+    if prompt_template is not None:
+        sets.append("prompt_template = ?")
+        vals.append(prompt_template[:2000])
+    if name is not None:
+        n = name.strip()
+        if not n:
+            raise ValueError("name must not be empty")
+        sets.append("name = ?")
+        vals.append(n[:200])
+    if not sets:
+        return get_file_watcher(watcher_id)
+    vals.append(watcher_id)
+    with _conn() as c:
+        c.execute(
+            f"UPDATE file_watchers SET {', '.join(sets)} WHERE id = ?", vals,
+        )
+    return get_file_watcher(watcher_id)
+
+
+def delete_file_watcher(watcher_id: str) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM file_watchers WHERE id = ?", (watcher_id,),
+        )
+    return cur.rowcount > 0
+
+
+def record_file_watcher_fire(watcher_id: str) -> None:
+    try:
+        with _conn() as c:
+            c.execute(
+                "UPDATE file_watchers SET fire_count = fire_count + 1, "
+                "last_fired_at = ? WHERE id = ?",
+                (time.time(), watcher_id),
+            )
+    except Exception:
+        pass
+
+
+def _row_to_file_watcher(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "target_conversation_id": row["target_conversation_id"],
+        "path": row["path"],
+        "glob_pattern": row["glob_pattern"],
+        "events": _json_loads(row["events_json"]) or [],
+        "prompt_template": row["prompt_template"],
+        "debounce_seconds": row["debounce_seconds"],
+        "enabled": bool(row["enabled"]),
+        "last_fired_at": row["last_fired_at"],
+        "fire_count": row["fire_count"],
+        "created_at": row["created_at"],
     }

@@ -3397,6 +3397,599 @@ async def http_request(
 
 
 # ---------------------------------------------------------------------------
+# OpenAPI / Swagger — universal API connector
+# ---------------------------------------------------------------------------
+# `openapi_load(spec_url, api_id)` fetches an OpenAPI 3.x or Swagger 2.0
+# JSON spec, normalises it into an `operation_id → metadata` map, and
+# stores it. The agent then calls `openapi_call(api_id, operation_id, args)`
+# to invoke any endpoint without the user having to write a tool per
+# endpoint.
+#
+# Why this matters: most modern REST services publish an OpenAPI spec.
+# Loading one gives the agent ~hundreds of typed endpoints in one move.
+# All calls go through `http_request` underneath, so SSRF guards and
+# secret substitution apply the same way.
+# ---------------------------------------------------------------------------
+
+OPENAPI_MAX_OPERATIONS = 500       # refuse specs bigger than this
+OPENAPI_FETCH_TIMEOUT_SEC = 30.0
+
+
+def _normalize_openapi_operations(spec: dict) -> tuple[dict, str]:
+    """Walk the OpenAPI paths and collapse each operation into a
+    flat metadata dict the dispatcher can use.
+
+    Returns ``(operations, base_url)``. ``operations`` is keyed by
+    ``operationId`` (or a synthesised "<verb>_<path>" fallback when the
+    spec omits it). Each entry holds the resolved path template, HTTP
+    method, parameter list (in/name/required/schema), request-body
+    schema, and a one-line description so the agent can search by intent.
+    """
+    if not isinstance(spec, dict):
+        raise ValueError("spec must be a JSON object")
+    # OpenAPI 3.x uses `servers[].url`; Swagger 2.0 uses `host` + `basePath`.
+    base_url = ""
+    servers = spec.get("servers") or []
+    if isinstance(servers, list) and servers and isinstance(servers[0], dict):
+        base_url = (servers[0].get("url") or "").rstrip("/")
+    if not base_url and spec.get("host"):
+        scheme = (spec.get("schemes") or ["https"])[0]
+        base_url = f"{scheme}://{spec['host']}{(spec.get('basePath') or '').rstrip('/')}"
+    paths = spec.get("paths") or {}
+    if not isinstance(paths, dict):
+        raise ValueError("spec.paths must be a JSON object")
+
+    ops: dict = {}
+    used_ids: set[str] = set()
+    verbs = (
+        "get", "post", "put", "patch", "delete",
+        "head", "options", "trace",
+    )
+    for path_template, path_item in paths.items():
+        if not isinstance(path_item, dict):
+            continue
+        # Path-level parameters apply to every operation under this path
+        # unless overridden — collect them once.
+        path_params = path_item.get("parameters") or []
+        if not isinstance(path_params, list):
+            path_params = []
+        for verb in verbs:
+            op = path_item.get(verb)
+            if not isinstance(op, dict):
+                continue
+            op_id = (op.get("operationId") or "").strip()
+            if not op_id:
+                # Synthesise a stable id when the spec omits one.
+                # Replace path templating with underscores so the result
+                # is a valid identifier-ish slug.
+                slug = re.sub(r"[^A-Za-z0-9]+", "_", path_template).strip("_")
+                op_id = f"{verb}_{slug}"
+            base_id = op_id
+            disambiguator = 2
+            while op_id in used_ids:
+                op_id = f"{base_id}_{disambiguator}"
+                disambiguator += 1
+            used_ids.add(op_id)
+
+            # Merge path-level parameters with operation-level (operation
+            # wins on name+in collision per the OpenAPI spec).
+            seen_keys = set()
+            params: list[dict] = []
+            for raw in (op.get("parameters") or []) + path_params:
+                if not isinstance(raw, dict):
+                    continue
+                key = (raw.get("name", ""), raw.get("in", ""))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                params.append({
+                    "name": raw.get("name", ""),
+                    "in": raw.get("in", "query"),
+                    "required": bool(raw.get("required", False)),
+                    "description": (raw.get("description") or "")[:300],
+                    "schema": raw.get("schema") or raw.get("type") and {"type": raw["type"]} or {},
+                })
+
+            request_body = None
+            rb = op.get("requestBody")
+            if isinstance(rb, dict):
+                content = rb.get("content") or {}
+                # Prefer JSON content when present.
+                if isinstance(content, dict):
+                    for ct, payload in content.items():
+                        if "json" in str(ct).lower():
+                            request_body = (payload or {}).get("schema") or {}
+                            break
+                    if request_body is None and content:
+                        first_key = next(iter(content))
+                        request_body = (content[first_key] or {}).get("schema") or {}
+
+            ops[op_id] = {
+                "method": verb.upper(),
+                "path": path_template,
+                "summary": (op.get("summary") or "")[:300],
+                "description": (op.get("description") or "")[:600],
+                "parameters": params,
+                "request_body": request_body,
+            }
+            if len(ops) > OPENAPI_MAX_OPERATIONS:
+                raise ValueError(
+                    f"spec has more than {OPENAPI_MAX_OPERATIONS} operations; "
+                    "refusing to register (use a smaller subset spec)"
+                )
+    return ops, base_url
+
+
+async def openapi_load(
+    spec_url: str,
+    api_id: str,
+    *,
+    base_url: str | None = None,
+    auth_scheme: str | None = None,
+    auth_secret_name: str | None = None,
+    default_headers: dict | None = None,
+    allow_private: bool = False,
+) -> dict:
+    """Fetch an OpenAPI / Swagger spec and register it for later calls.
+
+    `auth_scheme` is one of: 'bearer', 'apikey', 'basic', or None. The
+    corresponding credential lives in the secrets store under
+    `auth_secret_name` and is substituted into outgoing requests at
+    call time — the model never sees the raw value.
+    """
+    sid = (api_id or "").strip().lower()
+    if not sid:
+        return {"ok": False, "output": "", "error": "api_id is required"}
+    url = (spec_url or "").strip()
+    if not url:
+        return {"ok": False, "output": "", "error": "spec_url is required"}
+
+    # Reuse the already-secure HTTP client. SSRF guard, secret
+    # substitution, redaction — all already handled.
+    fetched = await http_request(
+        url=url, method="GET",
+        timeout=OPENAPI_FETCH_TIMEOUT_SEC,
+        allow_private=allow_private,
+        max_output_chars=2_000_000,
+    )
+    if not fetched.get("ok"):
+        return {
+            "ok": False,
+            "output": "",
+            "error": f"failed to fetch spec: {fetched.get('error') or fetched.get('output', '')[:200]}",
+        }
+    raw_body = fetched.get("output", "")
+    # `http_request` returns a formatted "Response body:\n..." block;
+    # strip the prefix so we have just the JSON.
+    body_marker = "Response body:\n"
+    if body_marker in raw_body:
+        raw_body = raw_body.split(body_marker, 1)[1]
+    try:
+        spec = jsonutil.loads(raw_body)
+    except json.JSONDecodeError as e:
+        return {
+            "ok": False, "output": "",
+            "error": f"spec is not valid JSON: {e}",
+        }
+    if not isinstance(spec, dict):
+        return {"ok": False, "output": "", "error": "spec must be a JSON object"}
+
+    try:
+        operations, discovered_base = _normalize_openapi_operations(spec)
+    except ValueError as e:
+        return {"ok": False, "output": "", "error": str(e)}
+
+    final_base = (base_url or discovered_base or "").rstrip("/")
+    if not final_base:
+        return {
+            "ok": False, "output": "",
+            "error": "spec has no servers/host AND no base_url override given",
+        }
+
+    title = ((spec.get("info") or {}).get("title")) or sid
+    description = ((spec.get("info") or {}).get("description")) or ""
+
+    # Validate auth_scheme
+    if auth_scheme and auth_scheme not in ("bearer", "apikey", "basic"):
+        return {
+            "ok": False, "output": "",
+            "error": f"auth_scheme must be 'bearer', 'apikey', 'basic', or null",
+        }
+    if auth_scheme and not auth_secret_name:
+        return {
+            "ok": False, "output": "",
+            "error": "auth_secret_name required when auth_scheme is set",
+        }
+    # Don't require the secret to actually exist yet — let the user add
+    # it later. We just store the reference.
+
+    # Replace any existing spec under this id (idempotent re-load).
+    db.delete_openapi_spec(sid)
+    try:
+        rec = db.create_openapi_spec(
+            api_id=sid,
+            base_url=final_base,
+            title=str(title)[:200],
+            description=str(description)[:2000],
+            spec_obj=spec,
+            operations=operations,
+            default_headers=default_headers or {},
+            auth_scheme=auth_scheme,
+            auth_secret_name=auth_secret_name,
+        )
+    except ValueError as e:
+        return {"ok": False, "output": "", "error": str(e)}
+
+    op_listing = "\n".join(
+        f"  - {op_id} ({meta['method']} {meta['path']})"
+        + (f" — {meta['summary']}" if meta["summary"] else "")
+        for op_id, meta in list(rec["operations"].items())[:50]
+    )
+    suffix = ""
+    if len(rec["operations"]) > 50:
+        suffix = f"\n  ... and {len(rec['operations']) - 50} more — call openapi_list_ops to see all."
+    return {
+        "ok": True,
+        "output": (
+            f"Registered API {sid!r} ({rec['title']}) with "
+            f"{len(rec['operations'])} operations at {rec['base_url']}.\n"
+            f"Available operations:\n{op_listing}{suffix}\n\n"
+            f"Use openapi_call(api_id={sid!r}, operation_id=<op>, args={{...}}) to invoke."
+        ),
+        "operations_count": len(rec["operations"]),
+    }
+
+
+async def openapi_list_ops(api_id: str, query: str | None = None) -> dict:
+    """Return every operation_id + summary for a registered API.
+
+    Optional ``query`` substring-filters by operation_id, path, or
+    summary so a 400-endpoint spec stays scannable.
+    """
+    sid = (api_id or "").strip().lower()
+    rec = db.get_openapi_spec(sid)
+    if not rec:
+        return {
+            "ok": False, "output": "",
+            "error": f"no API named {sid!r} (use openapi_list to see all)",
+        }
+    q = (query or "").strip().lower()
+    matches = []
+    for op_id, meta in rec["operations"].items():
+        haystack = " ".join([
+            op_id, meta.get("path", ""), meta.get("summary", ""),
+            meta.get("description", ""),
+        ]).lower()
+        if not q or q in haystack:
+            matches.append((op_id, meta))
+    if not matches:
+        return {
+            "ok": True, "output": f"no operations match {q!r}",
+            "count": 0,
+        }
+    listing = "\n".join(
+        f"  - {op_id} ({meta['method']} {meta['path']})"
+        + (f" — {meta['summary']}" if meta["summary"] else "")
+        for op_id, meta in matches[:200]
+    )
+    suffix = (
+        f"\n  ... and {len(matches) - 200} more, narrow your query."
+        if len(matches) > 200 else ""
+    )
+    return {
+        "ok": True,
+        "output": (
+            f"API {sid!r}: {len(matches)} operation(s)"
+            f"{f' matching {q!r}' if q else ''}.\n{listing}{suffix}"
+        ),
+        "count": len(matches),
+    }
+
+
+async def openapi_list() -> dict:
+    """List every registered API."""
+    specs = db.list_openapi_specs()
+    if not specs:
+        return {
+            "ok": True,
+            "output": (
+                "No APIs registered yet. Use openapi_load(spec_url, api_id) "
+                "to register one."
+            ),
+            "count": 0,
+        }
+    out = "\n".join(
+        f"  - {s['id']} — {s['title']} ({len(s['operations'])} ops, {s['base_url']})"
+        for s in specs
+    )
+    return {
+        "ok": True,
+        "output": f"Registered APIs ({len(specs)}):\n{out}",
+        "count": len(specs),
+    }
+
+
+async def openapi_describe(api_id: str, operation_id: str) -> dict:
+    """Return the full parameter / body schema for one operation.
+
+    Use this BEFORE calling an unfamiliar endpoint so the agent knows
+    what `args` shape `openapi_call` expects.
+    """
+    sid = (api_id or "").strip().lower()
+    rec = db.get_openapi_spec(sid)
+    if not rec:
+        return {"ok": False, "output": "", "error": f"no API named {sid!r}"}
+    meta = rec["operations"].get(operation_id)
+    if not meta:
+        return {
+            "ok": False, "output": "",
+            "error": f"no operation {operation_id!r} in {sid!r}",
+        }
+    return {
+        "ok": True,
+        "output": jsonutil.dumps({
+            "operation_id": operation_id,
+            "method": meta["method"],
+            "path": meta["path"],
+            "summary": meta.get("summary", ""),
+            "description": meta.get("description", ""),
+            "parameters": meta.get("parameters", []),
+            "request_body": meta.get("request_body"),
+            "base_url": rec["base_url"],
+        }, indent=2),
+    }
+
+
+async def openapi_call(
+    api_id: str,
+    operation_id: str,
+    args: dict | None = None,
+    *,
+    extra_headers: dict | None = None,
+    timeout: float = 60.0,
+) -> dict:
+    """Invoke a registered API endpoint by operation id.
+
+    `args` should contain values for every required parameter:
+      - path parameters substituted into the URL template,
+      - query parameters appended as ?key=value,
+      - header parameters merged with the spec's default_headers,
+      - body parameters JSON-encoded as the request body.
+
+    Auth is automatic — if the API was registered with an auth_scheme +
+    auth_secret_name, the corresponding header is added at call time.
+    The model never sees the credential value.
+    """
+    sid = (api_id or "").strip().lower()
+    rec = db.get_openapi_spec(sid)
+    if not rec:
+        return {"ok": False, "output": "", "error": f"no API named {sid!r}"}
+    meta = rec["operations"].get(operation_id)
+    if not meta:
+        return {
+            "ok": False, "output": "",
+            "error": f"no operation {operation_id!r} in {sid!r}",
+        }
+    args = args or {}
+
+    # Path substitution. Spec uses {param} placeholders.
+    path = meta["path"]
+    body_keys: set[str] = set()
+    query: dict = {}
+    headers: dict = dict(rec.get("default_headers") or {})
+    if extra_headers:
+        headers.update(extra_headers)
+
+    for p in meta.get("parameters", []):
+        name = p.get("name")
+        loc = p.get("in")
+        if not name or name not in args:
+            if p.get("required"):
+                return {
+                    "ok": False, "output": "",
+                    "error": f"missing required parameter {name!r} ({loc})",
+                }
+            continue
+        val = args[name]
+        if loc == "path":
+            path = path.replace("{" + name + "}", str(val))
+        elif loc == "query":
+            query[name] = val
+        elif loc == "header":
+            headers[name] = str(val)
+        elif loc == "cookie":
+            # Cookies aren't a common case for REST APIs; refuse to
+            # silently drop. The agent can still send them via
+            # extra_headers={"Cookie": "..."}.
+            return {
+                "ok": False, "output": "",
+                "error": "cookie parameters not supported; use extra_headers",
+            }
+        body_keys.add(name)
+
+    # Anything else in `args` becomes the request body when the
+    # operation accepts one. This lets the agent pass {"name": "...",
+    # "labels": [...]} for a POST without nesting it under a "body" key.
+    body_obj = None
+    if meta.get("request_body") is not None:
+        body_obj = {
+            k: v for k, v in args.items() if k not in body_keys
+        }
+        if not body_obj:
+            body_obj = None
+
+    # Auth header injection. Use the placeholder substitution that
+    # http_request already supports — never put the raw secret value
+    # into headers here, so it gets redacted from the audit/log layer
+    # automatically.
+    if rec["auth_scheme"] == "bearer" and rec["auth_secret_name"]:
+        headers.setdefault(
+            "Authorization",
+            f"Bearer {{{{secret:{rec['auth_secret_name']}}}}}",
+        )
+    elif rec["auth_scheme"] == "apikey" and rec["auth_secret_name"]:
+        headers.setdefault(
+            "X-API-Key",
+            f"{{{{secret:{rec['auth_secret_name']}}}}}",
+        )
+    elif rec["auth_scheme"] == "basic" and rec["auth_secret_name"]:
+        headers.setdefault(
+            "Authorization",
+            f"Basic {{{{secret:{rec['auth_secret_name']}}}}}",
+        )
+
+    # Build the absolute URL.
+    full_url = rec["base_url"].rstrip("/") + (
+        path if path.startswith("/") else "/" + path
+    )
+
+    return await http_request(
+        url=full_url,
+        method=meta["method"],
+        headers=headers,
+        body=body_obj,
+        query=query,
+        timeout=timeout,
+    )
+
+
+async def openapi_unload(api_id: str) -> dict:
+    """Remove a registered API spec."""
+    sid = (api_id or "").strip().lower()
+    if db.delete_openapi_spec(sid):
+        return {"ok": True, "output": f"removed API {sid!r}"}
+    return {"ok": False, "output": "", "error": f"no API named {sid!r}"}
+
+
+# ---------------------------------------------------------------------------
+# Skill library — persistent procedural memory
+# ---------------------------------------------------------------------------
+# A "skill" is a named playbook the agent saves when it figures out how
+# to do something tricky. Future similar tasks recall the playbook and
+# follow its steps instead of re-deriving from scratch. Distinct from
+# the existing memory system: memories are facts ("user prefers SCSS"),
+# skills are procedures ("how to deploy this app").
+# ---------------------------------------------------------------------------
+
+async def save_skill(
+    name: str,
+    description: str,
+    body: str,
+    tags: list[str] | None = None,
+) -> dict:
+    """Save a named procedure / playbook the agent can recall later.
+
+    `name` must be a unique slug; calling save_skill twice with the
+    same name fails. Use update_skill to amend an existing one.
+    """
+    try:
+        rec = db.create_skill(
+            name=name, description=description, body=body, tags=tags or [],
+        )
+        return {
+            "ok": True,
+            "output": f"saved skill {rec['name']!r} ({len(body)} chars body)",
+            "id": rec["id"],
+        }
+    except ValueError as e:
+        return {"ok": False, "output": "", "error": str(e)}
+
+
+async def update_skill(
+    name: str,
+    *,
+    description: str | None = None,
+    body: str | None = None,
+    tags: list[str] | None = None,
+) -> dict:
+    """Amend an existing skill in place. Pass only the fields you want changed."""
+    rec = db.get_skill(name)
+    if not rec:
+        return {"ok": False, "output": "", "error": f"no skill named {name!r}"}
+    try:
+        updated = db.update_skill(
+            rec["id"],
+            description=description, body=body, tags=tags,
+        )
+        return {
+            "ok": True,
+            "output": f"updated skill {updated['name']!r}",
+        }
+    except ValueError as e:
+        return {"ok": False, "output": "", "error": str(e)}
+
+
+async def find_skill(query: str) -> dict:
+    """Find skills by name / description / tag substring.
+
+    Returns up to 10 plausible matches. The model itself decides which
+    one (if any) actually applies before calling `recall_skill`.
+    """
+    matches = db.search_skills(query, limit=10)
+    if not matches:
+        return {"ok": True, "output": f"no skills match {query!r}", "count": 0}
+    out_lines = []
+    for s in matches:
+        tag_blurb = f" [tags: {', '.join(s['tags'])}]" if s["tags"] else ""
+        used_blurb = (
+            f" (used {s['use_count']}× last {time.strftime('%Y-%m-%d', time.localtime(s['last_used_at']))})"
+            if s["last_used_at"] else ""
+        )
+        out_lines.append(
+            f"  - {s['name']}{tag_blurb}{used_blurb} — {s['description']}"
+        )
+    return {
+        "ok": True,
+        "output": f"Found {len(matches)} skill(s):\n" + "\n".join(out_lines),
+        "count": len(matches),
+    }
+
+
+async def recall_skill(name: str) -> dict:
+    """Return the full body of a skill so the agent can follow its steps.
+
+    Records use stats on retrieval — useful for surfacing the most
+    valuable skills in the UI later.
+    """
+    rec = db.get_skill(name)
+    if not rec:
+        return {"ok": False, "output": "", "error": f"no skill named {name!r}"}
+    db.record_skill_use(rec["id"], success=True)  # caller can correct via report_skill_outcome
+    tag_blurb = f"\n[Tags: {', '.join(rec['tags'])}]" if rec["tags"] else ""
+    return {
+        "ok": True,
+        "output": (
+            f"Skill: {rec['name']}\n"
+            f"Description: {rec['description']}{tag_blurb}\n\n"
+            f"--- PLAYBOOK ---\n{rec['body']}\n--- END PLAYBOOK ---"
+        ),
+    }
+
+
+async def list_skills_tool(limit: int = 30) -> dict:
+    """List all saved skills, recently-used first."""
+    skills = db.list_skills(limit=limit)
+    if not skills:
+        return {"ok": True, "output": "No skills saved yet.", "count": 0}
+    out = "\n".join(
+        f"  - {s['name']} (used {s['use_count']}×) — {s['description']}"
+        for s in skills
+    )
+    return {
+        "ok": True,
+        "output": f"Saved skills ({len(skills)}):\n{out}",
+        "count": len(skills),
+    }
+
+
+async def delete_skill_tool(name: str) -> dict:
+    """Remove a saved skill."""
+    if db.delete_skill(name):
+        return {"ok": True, "output": f"deleted skill {name!r}"}
+    return {"ok": False, "output": "", "error": f"no skill named {name!r}"}
+
+
+# ---------------------------------------------------------------------------
 # File editing / search / listing tools
 #
 # edit_file   — surgical exact-string replacement (cheaper than read+write).
@@ -10205,6 +10798,22 @@ TOOL_REGISTRY = {
     "web_search": web_search,
     "fetch_url": fetch_url,
     "http_request": http_request,
+    # universal API connector — register an OpenAPI spec once,
+    # then call any of its endpoints by operation_id
+    "openapi_load": openapi_load,
+    "openapi_list": openapi_list,
+    "openapi_list_ops": openapi_list_ops,
+    "openapi_describe": openapi_describe,
+    "openapi_call": openapi_call,
+    "openapi_unload": openapi_unload,
+    # persistent skill library — bank a playbook the model can recall
+    # on similar future tasks (procedural memory, distinct from facts)
+    "save_skill": save_skill,
+    "update_skill": update_skill,
+    "find_skill": find_skill,
+    "recall_skill": recall_skill,
+    "list_skills": list_skills_tool,
+    "delete_skill": delete_skill_tool,
     # scheduling
     "schedule_task": schedule_task,
     "list_scheduled_tasks": list_scheduled_tasks,
@@ -10338,6 +10947,23 @@ TOOL_CATEGORIES: dict[str, str] = {
     # side effects on a poorly-designed API, and the model shouldn't be able
     # to hit arbitrary endpoints in read-only mode.
     "http_request": "write",
+    # OpenAPI: same write-class rationale as http_request — call dispatches
+    # to the registered API which can trigger arbitrary side effects.
+    # Listing / describing operations is read; load is write because it
+    # writes a row into openapi_specs.
+    "openapi_load": "write",
+    "openapi_list": "read",
+    "openapi_list_ops": "read",
+    "openapi_describe": "read",
+    "openapi_call": "write",
+    "openapi_unload": "write",
+    # Skills: read for find/recall/list, write for save/update/delete.
+    "save_skill": "write",
+    "update_skill": "write",
+    "find_skill": "read",
+    "recall_skill": "read",
+    "list_skills": "read",
+    "delete_skill": "write",
     # scheduling — queuing a future run has real external effect, so write.
     "schedule_task": "write",
     "list_scheduled_tasks": "read",
@@ -10812,8 +11438,76 @@ def _default_subagent_model() -> str:
     return "gemma4:e4b"
 
 
-@timed_tool
 async def dispatch(
+    name: str,
+    args: dict[str, Any],
+    cwd: str,
+    conv_id: str | None = None,
+    model: str | None = None,
+    tool_call_id: str | None = None,
+) -> dict:
+    """Public dispatch entry point: runs the underlying dispatcher and
+    records one row in the audit_log so the user can review every
+    tool call across every conversation.
+
+    Wrapping it this way (rather than scattering audit calls through the
+    branch-heavy `_dispatch_core` body) keeps the audit hook in exactly
+    one place and ensures it fires on every code path including the
+    "unknown tool" early returns.
+    """
+    started = time.time()
+    try:
+        result = await _dispatch_core(
+            name, args, cwd, conv_id=conv_id,
+            model=model, tool_call_id=tool_call_id,
+        )
+    except Exception as e:
+        # Exceptions from a dispatched tool propagate up. Record the
+        # failure first so audit reflects what actually happened, then
+        # re-raise so the caller's existing error path runs unchanged.
+        try:
+            db.add_audit_log(
+                tool_name=name,
+                category=classify_tool(name),
+                args=args or {},
+                result_summary=f"[exception] {type(e).__name__}: {e}",
+                ok=False,
+                duration_ms=int((time.time() - started) * 1000),
+                conversation_id=conv_id,
+            )
+        except Exception:
+            pass
+        raise
+    # Successful dispatch (the result itself may signal ok=False; that's
+    # normal for tools that report errors via their return shape).
+    try:
+        ok = bool(result.get("ok")) if isinstance(result, dict) else True
+        if isinstance(result, dict):
+            summary = (
+                result.get("output")
+                or result.get("error")
+                or ""
+            )
+        else:
+            summary = str(result)
+        db.add_audit_log(
+            tool_name=name,
+            category=classify_tool(name),
+            args=args or {},
+            result_summary=str(summary),
+            ok=ok,
+            duration_ms=int((time.time() - started) * 1000),
+            conversation_id=conv_id,
+        )
+    except Exception:
+        # Audit logging is best-effort; never let a logging failure
+        # corrupt a successful tool dispatch.
+        pass
+    return result
+
+
+@timed_tool
+async def _dispatch_core(
     name: str,
     args: dict[str, Any],
     cwd: str,
@@ -11077,6 +11771,62 @@ async def dispatch(
                 bool(args.get("allow_private", False)),
                 args.get("max_output_chars", HTTP_REQUEST_DEFAULT_OUTPUT_CHARS),
             )
+        # ----- OpenAPI dispatch -----
+        if name == "openapi_load":
+            return await fn(
+                args.get("spec_url", ""),
+                args.get("api_id", ""),
+                base_url=args.get("base_url"),
+                auth_scheme=args.get("auth_scheme"),
+                auth_secret_name=args.get("auth_secret_name"),
+                default_headers=args.get("default_headers"),
+                allow_private=bool(args.get("allow_private", False)),
+            )
+        if name == "openapi_list":
+            return await fn()
+        if name == "openapi_list_ops":
+            return await fn(
+                args.get("api_id", ""),
+                args.get("query"),
+            )
+        if name == "openapi_describe":
+            return await fn(
+                args.get("api_id", ""),
+                args.get("operation_id", ""),
+            )
+        if name == "openapi_call":
+            return await fn(
+                args.get("api_id", ""),
+                args.get("operation_id", ""),
+                args.get("args") or {},
+                extra_headers=args.get("extra_headers"),
+                timeout=float(args.get("timeout", 60.0)),
+            )
+        if name == "openapi_unload":
+            return await fn(args.get("api_id", ""))
+        # ----- Skill library dispatch -----
+        if name == "save_skill":
+            return await fn(
+                args.get("name", ""),
+                args.get("description", ""),
+                args.get("body", ""),
+                args.get("tags") or [],
+            )
+        if name == "update_skill":
+            return await fn(
+                args.get("name", ""),
+                description=args.get("description"),
+                body=args.get("body"),
+                tags=args.get("tags"),
+            )
+        if name == "find_skill":
+            return await fn(args.get("query", ""))
+        if name == "recall_skill":
+            return await fn(args.get("name", ""))
+        if name == "list_skills":
+            return await fn(int(args.get("limit", 30)))
+        if name == "delete_skill":
+            return await fn(args.get("name", ""))
         if name == "todo_write":
             return await fn(args.get("todos", []))
         if name == "remember":

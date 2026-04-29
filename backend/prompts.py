@@ -886,6 +886,210 @@ TOOL_SCHEMAS = [
             }),
         },
     },
+    # ----- universal API connector (OpenAPI / Swagger) -----
+    {
+        "type": "function",
+        "function": {
+            "name": "openapi_load",
+            "description": (
+                "Register a REST API by its OpenAPI / Swagger JSON spec. After this, "
+                "you can call any of its endpoints with `openapi_call(api_id, operation_id, args)` "
+                "without writing a tool per endpoint. Supply `auth_scheme` + `auth_secret_name` "
+                "to inject `Authorization: Bearer {{secret:NAME}}` (or apikey / basic) on every "
+                "outgoing request — the raw credential never reaches the model. "
+                "Calling load again with the same `api_id` replaces the prior registration."
+            ),
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "spec_url": {"type": "string", "description": "URL to the OpenAPI 3.x or Swagger 2.0 JSON spec (e.g. https://api.github.com/openapi.json)."},
+                    "api_id": {"type": "string", "description": "Short slug you'll pass to subsequent openapi_call invocations (e.g. 'github', 'stripe')."},
+                    "base_url": {"type": "string", "description": "Override the spec's servers[].url. Useful when the spec uses {variables} in its server URL."},
+                    "auth_scheme": {"type": "string", "enum": ["bearer", "apikey", "basic"], "description": "Auth header style. Omit for unauthenticated APIs."},
+                    "auth_secret_name": {"type": "string", "description": "Secret-store key holding the credential. Required when auth_scheme is set. The raw value is fetched at call time and never echoed back."},
+                    "default_headers": {"type": "object", "description": "Headers sent on every call (e.g. {'X-API-Version': '2023-10-01'})."},
+                    "allow_private": {"type": "boolean", "description": "Allow fetching the spec from a LAN/private host."},
+                },
+                "required": ["spec_url", "api_id"],
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "openapi_list",
+            "description": "List every registered API and its operation count.",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {},
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "openapi_list_ops",
+            "description": "List operations available in one registered API. Optional `query` substring-filters by operation_id, path, or summary.",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "api_id": {"type": "string", "description": "Slug from openapi_load."},
+                    "query": {"type": "string", "description": "Optional substring filter."},
+                },
+                "required": ["api_id"],
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "openapi_describe",
+            "description": "Return the full parameter / body schema for one operation. Call this BEFORE openapi_call when you don't already know the args shape.",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "api_id": {"type": "string"},
+                    "operation_id": {"type": "string", "description": "operationId from the spec (or the synthesised slug shown by openapi_list_ops)."},
+                },
+                "required": ["api_id", "operation_id"],
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "openapi_call",
+            "description": (
+                "Invoke a registered REST endpoint by operation_id. "
+                "`args` should hold every parameter the operation needs — path params get "
+                "substituted into the URL template, query params get appended as ?key=value, "
+                "header params get merged into headers, and any remaining keys form the JSON "
+                "request body. Auth header is injected automatically when the API was "
+                "registered with auth_scheme."
+            ),
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "api_id": {"type": "string"},
+                    "operation_id": {"type": "string"},
+                    "args": {"type": "object", "description": "Parameter values keyed by name."},
+                    "extra_headers": {"type": "object", "description": "Extra request headers. May contain {{secret:NAME}} placeholders."},
+                    "timeout": {"type": "number", "description": "Seconds to wait (default 60, max 120)."},
+                },
+                "required": ["api_id", "operation_id"],
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "openapi_unload",
+            "description": "Remove a registered API spec.",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "api_id": {"type": "string"},
+                },
+                "required": ["api_id"],
+            }),
+        },
+    },
+    # ----- skill library (procedural memory / playbooks) -----
+    {
+        "type": "function",
+        "function": {
+            "name": "save_skill",
+            "description": (
+                "Save a named procedure / playbook for future recall. Use this when you've "
+                "figured out a non-trivial sequence of steps that's likely to come up again "
+                "(deploy a service, set up a new repo, file a bug report against project X). "
+                "The body is markdown-friendly text — write it as instructions to your future self. "
+                "Distinct from `remember` (facts): skills are HOW, memories are WHAT."
+            ),
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Unique slug (lowercase alpha/digits/_/-, ≤48 chars)."},
+                    "description": {"type": "string", "description": "One-line summary of when to use it (≤500 chars). This is what `find_skill` matches against."},
+                    "body": {"type": "string", "description": "The playbook itself. Steps, gotchas, code snippets — whatever you'll need to follow it later (≤16,000 chars)."},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional labels for grouping (e.g. ['deploy', 'docker'])."},
+                },
+                "required": ["name", "description", "body"],
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_skill",
+            "description": "Amend an existing skill in place. Pass only the fields you want changed.",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "body": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["name"],
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_skill",
+            "description": "Search saved skills by name / description / tag substring. Returns up to 10 plausible matches; YOU decide which (if any) actually applies before calling `recall_skill`.",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Words from the user's task or your current goal."},
+                },
+                "required": ["query"],
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_skill",
+            "description": "Return the full body of a saved skill so you can follow its steps. Bumps usage stats.",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                },
+                "required": ["name"],
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_skills",
+            "description": "List saved skills, recently-used first.",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max rows to return (default 30, max 1000)."},
+                },
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_skill",
+            "description": "Remove a saved skill.",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                },
+                "required": ["name"],
+            }),
+        },
+    },
     # ----- planning / meta -----
     {
         "type": "function",
