@@ -1623,10 +1623,45 @@ def api_create(body: CreateConversation) -> dict:
 
 
 @app.get("/api/conversations/{cid}")
-def api_get(cid: str) -> dict:
+def api_get(
+    cid: str,
+    limit: int | None = None,
+    before_id: str | None = None,
+) -> dict:
+    """Return one conversation plus its messages.
+
+    ``limit`` and ``before_id`` are optional pagination parameters:
+
+      * No query params (legacy behaviour) → return EVERY message
+        oldest-first. Fast for typical chats; slow for ones that
+        grew to thousands of messages.
+      * ``?limit=200`` → return only the most-recent 200 messages
+        plus a `total` field so the UI can render
+        "showing N of TOTAL". The page is still oldest-first
+        within itself.
+      * ``?limit=200&before_id=<msg_id>`` → "load more" path —
+        returns the 200 messages immediately preceding ``before_id``.
+        Frontend prepends to its existing list.
+
+    Backward-compatible: clients that don't pass `limit` see the
+    same shape they always did.
+    """
     conv = db.get_conversation(cid)
     if not conv:
         raise HTTPException(404, "not found")
+    if limit is not None:
+        capped = max(1, min(int(limit), 1000))
+        messages, total = db.list_messages_paginated(
+            cid, limit=capped, before_id=before_id,
+        )
+        return {
+            "conversation": conv,
+            "messages": messages,
+            "total": total,
+            "has_more": len(messages) < total and (
+                before_id is None or bool(messages)
+            ),
+        }
     return {"conversation": conv, "messages": db.list_messages(cid)}
 
 

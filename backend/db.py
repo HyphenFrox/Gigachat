@@ -1523,13 +1523,77 @@ def count_embedded_vs_total() -> tuple[int, int]:
 
 
 def list_messages(cid: str) -> list[dict]:
-    """Return every message for a conversation, oldest-first."""
+    """Return every message for a conversation, oldest-first.
+
+    For very long conversations prefer ``list_messages_paginated`` —
+    the unbounded version pulls every row, which can be slow on
+    chats that grew to thousands of messages over weeks of use.
+    """
     with _conn() as c:
         rows = c.execute(
             "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC",
             (cid,),
         ).fetchall()
     return [_row_to_message(r) for r in rows]
+
+
+def list_messages_paginated(
+    cid: str,
+    *,
+    limit: int,
+    before_id: str | None = None,
+) -> tuple[list[dict], int]:
+    """Return up to ``limit`` most-recent messages plus the conversation's
+    total message count. Used for the scroll-up pagination path on
+    large conversations.
+
+    When ``before_id`` is set the page returns messages strictly older
+    than that one (for scroll-up "load more" gestures). When unset
+    the page returns the most-recent ``limit`` messages — the typical
+    initial load.
+
+    Result is always oldest-first within the page so the frontend
+    can append pages above its existing list without re-sorting.
+    Total count is computed in the same connection so the caller can
+    show "showing 200 of 1834".
+    """
+    with _conn() as c:
+        if before_id:
+            cutoff_row = c.execute(
+                "SELECT created_at FROM messages "
+                "WHERE id = ? AND conversation_id = ?",
+                (before_id, cid),
+            ).fetchone()
+            if not cutoff_row:
+                # Unknown anchor — return empty page so the UI
+                # doesn't double-render the existing tail.
+                total_row = c.execute(
+                    "SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?",
+                    (cid,),
+                ).fetchone()
+                total = int(total_row["n"]) if total_row else 0
+                return [], total
+            rows = c.execute(
+                "SELECT * FROM messages "
+                "WHERE conversation_id = ? AND created_at < ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (cid, cutoff_row["created_at"], int(limit)),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM messages "
+                "WHERE conversation_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (cid, int(limit)),
+            ).fetchall()
+        total_row = c.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?",
+            (cid,),
+        ).fetchone()
+        total = int(total_row["n"]) if total_row else 0
+    # Reverse so the page is oldest-first within itself.
+    rows = list(reversed(rows))
+    return [_row_to_message(r) for r in rows], total
 
 
 def list_pinned_messages(cid: str) -> list[dict]:
