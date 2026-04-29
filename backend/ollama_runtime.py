@@ -168,6 +168,28 @@ def _spawn_ollama(executable: str) -> subprocess.Popen | None:
     env = os.environ.copy()
     if not env.get("OLLAMA_NUM_PARALLEL"):
         env["OLLAMA_NUM_PARALLEL"] = str(_recommend_ollama_num_parallel())
+    # OLLAMA_KEEP_ALIVE controls how long models stay loaded after the
+    # last request. Default is 5 minutes — generous for casual chat,
+    # too short for long-form coding sessions where the user thinks
+    # for 10+ minutes between turns. Bumping to 60 minutes keeps the
+    # model warm across the typical "research → think → code" cycle
+    # without consuming extra GPU memory beyond what was already
+    # allocated. User-set value still wins.
+    if not env.get("OLLAMA_KEEP_ALIVE"):
+        env["OLLAMA_KEEP_ALIVE"] = "60m"
+    # OLLAMA_NUM_THREAD overrides the runner's CPU thread count.
+    # Default is logical core count which over-subscribes the FPU on
+    # hyperthreaded CPUs — physical core count is typically faster
+    # for AVX2 matmul. Same logic as split_lifecycle._recommend_thread_counts.
+    if not env.get("OLLAMA_NUM_THREAD"):
+        try:
+            import psutil
+            physical = psutil.cpu_count(logical=False)
+            logical = psutil.cpu_count(logical=True)
+            if physical and logical and logical > physical and physical > 1:
+                env["OLLAMA_NUM_THREAD"] = str(min(32, int(physical)))
+        except Exception:
+            pass
     kwargs: dict = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
