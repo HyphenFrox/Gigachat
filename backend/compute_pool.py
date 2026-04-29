@@ -81,7 +81,17 @@ _THROUGHPUT_BENCH_TOKENS = 20
 
 # Cached host throughput, keyed by model name. Measured lazily on
 # first route decision and refreshed every TTL.
+#
+# Long-session leak guard: a backend that's been up for weeks and has
+# served many ephemeral model pulls would accumulate a stale entry per
+# model name. The TTL only stops *reads* from using stale tps numbers —
+# expired entries still occupy memory until a new measurement happens
+# to overwrite them. We bound the dict with a small FIFO LRU: when it
+# exceeds `_HOST_THROUGHPUT_CACHE_MAX`, the oldest entry is evicted on
+# every insert. Evicting an active model is a cheap re-measure on next
+# route decision.
 _HOST_THROUGHPUT_CACHE: dict[str, tuple[float, float]] = {}  # model -> (tps, measured_at)
+_HOST_THROUGHPUT_CACHE_MAX = 64
 
 # Subagent fan-out performance gate. A worker is included in the
 # parallel-subagent target list only if its measured TPS is at least
@@ -1406,7 +1416,14 @@ async def _measure_host_throughput(model_name: str) -> float:
         return cached[0]
     tps, _ = await _measure_throughput("http://localhost:11434", None, model_name)
     if tps > 0:
+        # Re-insertion order is preserved on dict (CPython 3.7+); pop
+        # then set so the freshly measured model moves to the back.
+        # Evict the oldest entry if we'd exceed the cap.
+        _HOST_THROUGHPUT_CACHE.pop(model_name, None)
         _HOST_THROUGHPUT_CACHE[model_name] = (tps, now)
+        if len(_HOST_THROUGHPUT_CACHE) > _HOST_THROUGHPUT_CACHE_MAX:
+            oldest = next(iter(_HOST_THROUGHPUT_CACHE))
+            _HOST_THROUGHPUT_CACHE.pop(oldest, None)
     return tps
 
 

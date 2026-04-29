@@ -1610,6 +1610,13 @@ def api_delete(cid: str) -> dict:
         compute_pool.forget_conv_affinity(cid)
     except Exception:
         pass
+    # Drop agent-loop process-local state (failure counters, stop flags,
+    # subagent buses) so long-lived backends don't accumulate one entry
+    # per ever-deleted conversation.
+    try:
+        agent.forget_conv_state(cid)
+    except Exception:
+        pass
     return {"ok": True}
 
 

@@ -171,18 +171,60 @@ _SUBAGENT_PROGRESS_BUS: dict[str, asyncio.Queue] = {}
 # Process-local: resets on backend restart, which is fine because the
 # user-facing cap (`hooks.max_fires_per_conv`) is what bounds runaway
 # loops; this tracker is just the trigger.
+#
+# Long-session leak guard: a backend that runs for weeks and serves
+# thousands of conversations would accumulate one entry per conv id
+# forever (the bucket is never cleared on conversation end / delete).
+# The per-conv inner dict is tiny (one int per tool name), but the
+# outer dict scales with cumulative conversations. We bound the outer
+# size with simple FIFO eviction — when the dict exceeds
+# `_CONSEC_FAILURES_MAX`, the oldest 10 % of entries are dropped.
+# Losing the count for an inactive conv is harmless: it just means
+# the next failure on that conv starts the counter at 1 again, which
+# is exactly the desired semantics on a "stale" conv.
 _CONSEC_FAILURES: dict[str, dict[str, int]] = {}
+_CONSEC_FAILURES_MAX = 1024
+
+
+def _evict_consec_failures_if_full() -> None:
+    """Drop the oldest ~10 % of entries when the tracker exceeds
+    `_CONSEC_FAILURES_MAX`. dict insertion order in CPython 3.7+ is
+    stable, so iterating gives FIFO order — the conversations that
+    haven't bumped a failure most recently are evicted first.
+    """
+    n = len(_CONSEC_FAILURES)
+    if n <= _CONSEC_FAILURES_MAX:
+        return
+    drop = max(1, n // 10)
+    for cid in list(_CONSEC_FAILURES.keys())[:drop]:
+        _CONSEC_FAILURES.pop(cid, None)
 
 
 def _bump_consec_failures(conv_id: str, tool_name: str, ok: bool) -> int:
     """Update the consecutive-failure tally for (conv, tool). Returns the
     NEW count after the update. Resets to 0 on success."""
-    bucket = _CONSEC_FAILURES.setdefault(conv_id, {})
+    # Refresh recency by popping then re-inserting so this conv moves
+    # to the back of the FIFO queue. Cheap (O(1) on a dict) and means
+    # active conversations never get evicted.
+    bucket = _CONSEC_FAILURES.pop(conv_id, None) or {}
+    _CONSEC_FAILURES[conv_id] = bucket
     if ok:
         bucket[tool_name] = 0
         return 0
     bucket[tool_name] = bucket.get(tool_name, 0) + 1
+    _evict_consec_failures_if_full()
     return bucket[tool_name]
+
+
+def forget_conv_state(conv_id: str) -> None:
+    """Drop process-local state for a deleted/archived conversation.
+
+    Called from the conversation-delete endpoint so per-conv buckets
+    don't outlive their owning row. Idempotent — missing keys are no-ops.
+    """
+    _CONSEC_FAILURES.pop(conv_id, None)
+    _SUBAGENT_PROGRESS_BUS.pop(conv_id, None)
+    _stop_requests.discard(conv_id)
 
 
 def _register_subagent_bus(parent_conv_id: str) -> asyncio.Queue:
