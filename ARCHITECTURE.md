@@ -266,6 +266,19 @@ A handful of tables defined in `backend/db.py`'s schema block:
 | Change compaction-target selection           | `compute_pool.pick_compaction_target` |
 | Tune sync-draft-SCP size / timeout           | `compute_pool.py` (`_SYNC_DRAFT_SCP_MAX_BYTES`, `_SYNC_DRAFT_SCP_TIMEOUT_SEC`, `await_draft_for`) |
 | Add a new per-worker capability flag         | `compute_pool._probe_worker_specs_via_ssh` PowerShell payload — extend the `$out` JSON shape (e.g. `cached_overrides`, `disk_free_gb`) |
+| Tune adaptive `-b`/`-ub` batch sizes         | `split_lifecycle._compute_optimal_batch_sizes` |
+| Tune SQLite PRAGMAs                          | `db._conn` (`synchronous`, `temp_store`, `cache_size`, `mmap_size`) |
+| Tune SSH ControlMaster persistence           | `compute_pool.py` (`_ssh_persistent_args`, `_SSH_CONTROL_DIR`, `reap_stale_ssh_control_sockets`) |
+| Tune VACUUM cadence / floor                  | `retention.py` (`DB_VACUUM_INTERVAL_SECONDS`, `DB_VACUUM_MIN_BYTES`, `db_maintenance(allow_vacuum=...)`) |
+| Tune mega-model warning threshold            | `compute_pool.route_chat_for` — `is_mega_model` check + `mega_model` flag in result dict |
+| Tune embedding LRU cache size                | `tools.py` (`_EMBED_CACHE_MAX`) |
+| Tune list_compute_workers cache TTL          | `db.py` (`_COMPUTE_WORKERS_CACHE_TTL`, `_invalidate_compute_workers_cache`) |
+| Tune tool-manifest section cache TTL         | `prompts.py` (`_TOOL_MANIFEST_TTL_SEC`) |
+| Tune model-caps cache size                   | `agent.py` (`_MODEL_CAPS_CACHE_MAX`, `_evict_model_caps_cache_if_full`) |
+| Adjust message pagination caps               | `db.list_messages_paginated` + `app.api_get` (caps to `[1, 1000]`) |
+| Adjust conversation list pagination caps     | `db.list_conversations_paginated` + `app.api_list` (caps to `[1, 500]`) |
+| Tune shared httpx client pool                | `http_client.py` (`_POOL_LIMITS`, `keepalive_expiry`, `_HAS_HTTP2`) |
+| Tune gzip compression threshold              | `app.py` `GZipMiddleware(minimum_size=…, compresslevel=…)` |
 
 ---
 
