@@ -38,7 +38,14 @@ from typing import Any
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from pywebpush import WebPushException, webpush
+
+# pywebpush is imported lazily inside `send_to_all` because it
+# transitively pulls in aiohttp (~250 ms of cold-start time on
+# Windows). Push notifications are an opt-in feature — most users
+# never send one — so paying the import cost up-front penalises
+# every backend boot for the minority that do. The two functions
+# from pywebpush we use (`webpush`, `WebPushException`) are only
+# referenced inside `send_to_all`, so deferral is safe.
 
 from . import db
 
@@ -162,6 +169,11 @@ def send_to_all(payload: dict[str, Any]) -> dict[str, int]:
             f"push payload too large "
             f"({len(body)} bytes, max {MAX_PUSH_PAYLOAD_BYTES})"
         )
+
+    # Lazy pywebpush import — see module-level comment for the
+    # cold-start rationale. Module is loaded on first `send_to_all`
+    # call and cached in sys.modules thereafter.
+    from pywebpush import WebPushException, webpush
 
     sent = 0
     pruned = 0
