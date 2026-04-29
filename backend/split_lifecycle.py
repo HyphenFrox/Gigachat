@@ -934,6 +934,34 @@ def _should_use_row_split(worker_ids: list[str]) -> bool:
     return True
 
 
+def _should_mlock_weights(target_size_bytes: int) -> bool:
+    """Return True when locking the GGUF in RAM is safe + likely useful.
+
+    `--mlock` pins weight pages so the OS can't page them out under
+    memory pressure. On a system with plenty of free RAM this is a
+    small but real win — token-rate degrades over hours when memory
+    fragmentation forces the kernel to evict warm weight pages.
+
+    Engages only when the model file is comfortably smaller than free
+    RAM (target ≤ 50 % of free) so locking can't OOM the system or
+    starve other processes. Below that threshold, mmap-on-demand is
+    the safer default and llama.cpp falls back to it cleanly.
+
+    Returns False on any read failure so undetectable-memory hosts
+    keep llama.cpp's default mmap behavior.
+    """
+    if target_size_bytes <= 0:
+        return False
+    try:
+        import psutil
+        free_ram_bytes = int(psutil.virtual_memory().available)
+    except Exception:
+        return False
+    if free_ram_bytes <= 0:
+        return False
+    return target_size_bytes * 2 <= free_ram_bytes
+
+
 def _recommend_thread_counts() -> tuple[int, int] | tuple[None, None]:
     """Pick `--threads` (decode) and `--threads-batch` (prefill) values.
 
@@ -995,6 +1023,7 @@ def _build_command(
     ubatch_size: int | None = None,
     threads: int | None = None,
     threads_batch: int | None = None,
+    mlock: bool = False,
 ) -> list[str]:
     """Assemble the argv for `llama-server`.
 
@@ -1248,6 +1277,13 @@ def _build_command(
         # matmul scales with logical core count more cleanly than
         # single-token decode does.
         cmd.extend(["--threads-batch", str(int(threads_batch))])
+    if mlock:
+        # Pin weights in RAM so the OS can't page them out on memory
+        # pressure. Real win on long-running hosts where token-rate
+        # would otherwise degrade as memory fragments. The picker
+        # (`_should_mlock_weights`) only engages when free RAM is at
+        # least 2× the model size, so locking can't OOM the system.
+        cmd.append("--mlock")
     return cmd
 
 
@@ -1597,6 +1633,11 @@ async def start(split_id: str) -> dict:
     # logical (it's batched matmul that benefits from SMT).
     threads, threads_batch = _recommend_thread_counts()
 
+    # Adaptive --mlock: pin weights in RAM so the OS can't page them
+    # out under memory pressure. Engages only when free RAM is at
+    # least 2× the model file so locking can't OOM the system.
+    use_mlock = _should_mlock_weights(target_size_bytes)
+
     cmd = _build_command(
         llama_server=server,
         gguf_path=row["gguf_path"],
@@ -1615,6 +1656,7 @@ async def start(split_id: str) -> dict:
         ubatch_size=ubatch_size,
         threads=threads,
         threads_batch=threads_batch,
+        mlock=use_mlock,
     )
     log_path = _log_path_for(split_id)
 
