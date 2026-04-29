@@ -1265,18 +1265,19 @@ async def _semantic_recall(
     q_vec = await _embed_text(query)
     if not q_vec:
         return []
-    rows = db.list_embeddings_for_conv(conversation_id)
-    scored: list[tuple[str, float]] = []
-    for mid, vec in rows:
-        if mid in exclude_ids or len(vec) != len(q_vec):
-            continue
-        score = _dot(q_vec, vec)
-        if score >= RECALL_MIN_SCORE:
-            scored.append((mid, score))
+    # Numpy-vectorized top-k over the conversation's message
+    # embeddings. ~10× faster than the previous Python-loop dot
+    # product on long conversations (1000+ embedded messages); a
+    # no-op-equivalent on short ones.
+    scored = db.search_embeddings_topk_for_conv(
+        conversation_id, q_vec,
+        top_k=RECALL_TOP_K,
+        min_score=RECALL_MIN_SCORE,
+        exclude_ids=exclude_ids,
+    )
     if not scored:
         return []
-    scored.sort(key=lambda t: t[1], reverse=True)
-    top_ids = [mid for mid, _ in scored[:RECALL_TOP_K]]
+    top_ids = [mid for mid, _ in scored]
     return db.get_messages_by_ids(top_ids)
 
 

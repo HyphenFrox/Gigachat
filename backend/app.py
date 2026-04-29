@@ -189,7 +189,30 @@ async def lifespan(_app: FastAPI):
     await _close_shared_http_client()
 
 
-app = FastAPI(title="Gigachat", lifespan=lifespan)
+# orjson is a Rust-based JSON encoder ~3-5× faster than the stdlib
+# `json` module that FastAPI uses by default. Setting the default
+# response class to ORJSONResponse propagates that to every endpoint
+# that returns a dict (`return {"ok": True, ...}`). Streaming endpoints
+# (chat SSE, model-pull progress) explicitly use StreamingResponse and
+# aren't affected.
+#
+# `orjson` is an optional dep: it ships in `requirements.txt` but if
+# the install was bypassed (developer setup, edge environment),
+# `ORJSONResponse` would raise ImportError at import time. We probe
+# once and fall back to the default class so the server starts cleanly
+# either way.
+try:
+    from fastapi.responses import ORJSONResponse  # type: ignore
+    _DEFAULT_RESPONSE_CLASS = ORJSONResponse
+except ImportError:
+    _DEFAULT_RESPONSE_CLASS = JSONResponse
+
+
+app = FastAPI(
+    title="Gigachat",
+    lifespan=lifespan,
+    default_response_class=_DEFAULT_RESPONSE_CLASS,
+)
 db.init()
 
 
