@@ -7029,6 +7029,406 @@ async def ocr_screenshot(
 
 
 # ---------------------------------------------------------------------------
+# Audio transcription — `transcribe_audio`
+#
+# Wraps `faster-whisper` (CTranslate2-backed Whisper). Local, no network.
+# The model file is downloaded automatically on first use into the
+# user's HF cache. We default to `base` (~75 MB, fast) since most agent
+# use-cases need transcripts of voice notes / call recordings rather
+# than archival-quality output. Larger models can be chosen explicitly.
+#
+# Lazy import so a fresh install without faster-whisper still loads the
+# tools module — the user gets a clean install hint when they actually
+# call the tool. This mirrors the OCR tool's pattern.
+# ---------------------------------------------------------------------------
+
+# Sticky cache: loading a Whisper model takes a few seconds + ~hundreds
+# of MB. Keeping one in memory across calls makes follow-up
+# transcription cheap. Keyed by (model_name, device, compute_type).
+_WHISPER_MODEL_CACHE: dict[tuple, Any] = {}
+
+
+def _whisper_load(
+    model_name: str = "base",
+    *,
+    device: str = "auto",
+    compute_type: str = "auto",
+):
+    """Lazy-load a faster-whisper model, caching across calls.
+
+    Returns the WhisperModel instance, or raises ImportError with a
+    clean install hint when the dep is missing. `auto` device/compute
+    means "use CUDA if available, else CPU + int8" — the library
+    handles fallback internally.
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as e:
+        raise ImportError(
+            "transcribe_audio needs `faster-whisper`. Install with:\n"
+            "  pip install faster-whisper\n"
+            f"(original import error: {e})"
+        ) from e
+    key = (model_name, device, compute_type)
+    cached = _WHISPER_MODEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    # Resolve `auto` defaults so we don't surprise users on CPU-only
+    # boxes with a half-loaded GPU model.
+    dev = device
+    ct = compute_type
+    if dev == "auto":
+        try:
+            import torch  # type: ignore
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            dev = "cpu"
+    if ct == "auto":
+        ct = "float16" if dev == "cuda" else "int8"
+    model = WhisperModel(model_name, device=dev, compute_type=ct)
+    _WHISPER_MODEL_CACHE[key] = model
+    return model
+
+
+async def transcribe_audio(
+    cwd: str,
+    path: str,
+    *,
+    model_name: str = "base",
+    language: str | None = None,
+    conv_id: str | None = None,
+) -> dict:
+    """Transcribe an audio file (wav / mp3 / m4a / ogg / flac / etc.).
+
+    `model_name` is one of: tiny, base, small, medium, large-v3 (in
+    increasing accuracy / VRAM cost). `language` is an ISO-639-1 code
+    like 'en' / 'es' / 'fr'; auto-detected when None (slightly slower).
+
+    Returns the full transcript text plus per-segment timestamps so
+    the agent can quote specific moments in long recordings.
+    """
+    p = (path or "").strip()
+    if not p:
+        return {"ok": False, "output": "", "error": "path is required"}
+    abs_path = _resolve(cwd, p, conv_id)
+    if not abs_path.is_file():
+        return {
+            "ok": False, "output": "",
+            "error": f"file not found: {abs_path}",
+        }
+    # Reasonable size cap so the model doesn't spend hours on a 4-hour
+    # podcast unintentionally — the agent can split with ffmpeg.
+    if abs_path.stat().st_size > 500_000_000:
+        return {
+            "ok": False, "output": "",
+            "error": (
+                f"file is {abs_path.stat().st_size / 1e6:.0f} MB, refuse to load "
+                f"(cap is 500 MB). Split with `bash ffmpeg ...` first."
+            ),
+        }
+
+    def _transcribe_blocking() -> dict:
+        try:
+            model = _whisper_load(model_name)
+        except ImportError as e:
+            return {"ok": False, "output": "", "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "output": "", "error": f"model load failed: {e}"}
+        try:
+            segments, info = model.transcribe(
+                str(abs_path),
+                language=language,
+                # vad_filter trims silence — much more useful transcripts
+                # for typical voice memos with long pauses.
+                vad_filter=True,
+            )
+            seg_list = []
+            full_text_parts = []
+            for s in segments:
+                seg_list.append({
+                    "start": round(float(s.start), 2),
+                    "end": round(float(s.end), 2),
+                    "text": s.text.strip(),
+                })
+                full_text_parts.append(s.text)
+            full_text = "".join(full_text_parts).strip()
+            return {
+                "ok": True,
+                "output": full_text or "(no speech detected)",
+                "language": info.language,
+                "language_probability": round(float(info.language_probability), 3),
+                "duration": round(float(info.duration), 2),
+                "segments": seg_list[:200],  # cap for sanity
+            }
+        except Exception as e:
+            return {
+                "ok": False, "output": "",
+                "error": f"transcription failed: {type(e).__name__}: {e}",
+            }
+
+    return await asyncio.to_thread(_transcribe_blocking)
+
+
+# ---------------------------------------------------------------------------
+# SSH — `ssh_exec`, `ssh_put`, `ssh_get`
+#
+# Lets the agent reach out to remote machines. Auth is via the user's
+# system SSH agent / keys (asyncssh resolves them automatically) OR via
+# a password stored in the secrets store and referenced by name. Raw
+# passwords never appear in the conversation.
+#
+# Secret reference: pass `password_secret="MY_HOST_PASSWORD"` to look up
+# the value at call time; the model never sees it.
+# ---------------------------------------------------------------------------
+
+SSH_DEFAULT_TIMEOUT_SEC = 30
+SSH_MAX_TIMEOUT_SEC = 600
+SSH_OUTPUT_CAP_CHARS = 16_000
+
+
+def _resolve_ssh_password(
+    password: str | None,
+    password_secret: str | None,
+) -> tuple[str | None, str | None]:
+    """Return ``(resolved_password, error)`` from the two arg styles.
+
+    Either or neither — never both. When `password_secret` is given we
+    fetch the value from the secrets table; when missing we surface a
+    clean error rather than silently authenticating without a password.
+    """
+    if password and password_secret:
+        return None, "pass exactly one of `password` or `password_secret`"
+    if password_secret:
+        v = db.get_secret_value(password_secret)
+        if v is None:
+            return None, f"secret {password_secret!r} not found"
+        return v, None
+    return password, None
+
+
+async def ssh_exec(
+    host: str,
+    command: str,
+    *,
+    user: str | None = None,
+    port: int = 22,
+    password: str | None = None,
+    password_secret: str | None = None,
+    timeout: int = SSH_DEFAULT_TIMEOUT_SEC,
+) -> dict:
+    """Run a command over SSH and return its combined stdout+stderr.
+
+    Auth resolution order: (1) password / password_secret if supplied,
+    (2) asyncssh's default behaviour — system ssh-agent, ~/.ssh/id_*
+    keys, ~/.ssh/config. The agent's network access is gated by the
+    same approval flow as `bash`, so a write-class run still pauses
+    for user confirmation in approve_edits mode.
+    """
+    if not (host or "").strip():
+        return {"ok": False, "output": "", "error": "host is required"}
+    if not (command or "").strip():
+        return {"ok": False, "output": "", "error": "command is required"}
+    try:
+        import asyncssh  # type: ignore
+    except ImportError as e:
+        return {
+            "ok": False, "output": "",
+            "error": (
+                "ssh_exec needs `asyncssh`. Install with:\n"
+                "  pip install asyncssh\n"
+                f"(original import error: {e})"
+            ),
+        }
+    pw, err = _resolve_ssh_password(password, password_secret)
+    if err:
+        return {"ok": False, "output": "", "error": err}
+    t = max(1, min(int(timeout or SSH_DEFAULT_TIMEOUT_SEC), SSH_MAX_TIMEOUT_SEC))
+    connect_kwargs: dict[str, Any] = {
+        "host": host.strip(),
+        "port": int(port or 22),
+        "known_hosts": None,  # accept new hosts; safer is system known_hosts
+        # If we wired strict host-key checking we'd surface MITM warnings
+        # — but a local agent talking to the user's own boxes is the
+        # threat model, and using `known_hosts` would refuse first-time
+        # connections. The user can layer ssh-config strictness via
+        # `~/.ssh/config` if they care.
+    }
+    if user:
+        connect_kwargs["username"] = user
+    if pw:
+        connect_kwargs["password"] = pw
+
+    try:
+        async with asyncssh.connect(**connect_kwargs) as conn:
+            r = await asyncio.wait_for(
+                conn.run(command, check=False), timeout=t,
+            )
+    except asyncio.TimeoutError:
+        return {
+            "ok": False, "output": "",
+            "error": f"ssh_exec timed out after {t}s",
+        }
+    except Exception as e:
+        return {
+            "ok": False, "output": "",
+            "error": f"{type(e).__name__}: {e}",
+        }
+    out = (r.stdout or "") + (r.stderr or "")
+    if len(out) > SSH_OUTPUT_CAP_CHARS:
+        out = (
+            out[:SSH_OUTPUT_CAP_CHARS]
+            + f"\n\n... [output truncated, "
+            f"{len(out) - SSH_OUTPUT_CAP_CHARS} chars omitted]"
+        )
+    return {
+        "ok": (r.exit_status or 0) == 0,
+        "output": out or "(no output)",
+        "exit_code": int(r.exit_status or 0),
+    }
+
+
+async def ssh_put(
+    cwd: str,
+    host: str,
+    local_path: str,
+    remote_path: str,
+    *,
+    user: str | None = None,
+    port: int = 22,
+    password: str | None = None,
+    password_secret: str | None = None,
+    conv_id: str | None = None,
+) -> dict:
+    """Upload one local file to the remote host via SCP.
+
+    Same auth resolution as `ssh_exec`. Refuses to send files larger
+    than 100 MB by default — the model can override with bash + scp
+    for special cases.
+    """
+    abs_local = _resolve(cwd, local_path or "", conv_id)
+    if not abs_local.is_file():
+        return {
+            "ok": False, "output": "",
+            "error": f"local file not found: {abs_local}",
+        }
+    if abs_local.stat().st_size > 100_000_000:
+        return {
+            "ok": False, "output": "",
+            "error": (
+                f"file is {abs_local.stat().st_size / 1e6:.0f} MB; "
+                "refuse to send (cap 100 MB). Use `bash scp ...` for special cases."
+            ),
+        }
+    try:
+        import asyncssh  # type: ignore
+    except ImportError as e:
+        return {
+            "ok": False, "output": "",
+            "error": (
+                "ssh_put needs `asyncssh`. Install with:\n"
+                "  pip install asyncssh\n"
+                f"(original import error: {e})"
+            ),
+        }
+    pw, err = _resolve_ssh_password(password, password_secret)
+    if err:
+        return {"ok": False, "output": "", "error": err}
+
+    connect_kwargs: dict[str, Any] = {
+        "host": host.strip(),
+        "port": int(port or 22),
+        "known_hosts": None,
+    }
+    if user:
+        connect_kwargs["username"] = user
+    if pw:
+        connect_kwargs["password"] = pw
+
+    try:
+        async with asyncssh.connect(**connect_kwargs) as conn:
+            await asyncssh.scp(
+                str(abs_local), (conn, remote_path or abs_local.name),
+            )
+    except Exception as e:
+        return {
+            "ok": False, "output": "",
+            "error": f"{type(e).__name__}: {e}",
+        }
+    return {
+        "ok": True,
+        "output": (
+            f"uploaded {abs_local.name} "
+            f"({abs_local.stat().st_size} bytes) to "
+            f"{user + '@' if user else ''}{host}:{remote_path}"
+        ),
+    }
+
+
+async def ssh_get(
+    cwd: str,
+    host: str,
+    remote_path: str,
+    local_path: str,
+    *,
+    user: str | None = None,
+    port: int = 22,
+    password: str | None = None,
+    password_secret: str | None = None,
+    conv_id: str | None = None,
+) -> dict:
+    """Download one file from the remote host via SCP."""
+    if not (remote_path or "").strip():
+        return {"ok": False, "output": "", "error": "remote_path is required"}
+    abs_local = _resolve(cwd, local_path or "", conv_id)
+    try:
+        import asyncssh  # type: ignore
+    except ImportError as e:
+        return {
+            "ok": False, "output": "",
+            "error": (
+                "ssh_get needs `asyncssh`. Install with:\n"
+                "  pip install asyncssh\n"
+                f"(original import error: {e})"
+            ),
+        }
+    pw, err = _resolve_ssh_password(password, password_secret)
+    if err:
+        return {"ok": False, "output": "", "error": err}
+
+    connect_kwargs: dict[str, Any] = {
+        "host": host.strip(),
+        "port": int(port or 22),
+        "known_hosts": None,
+    }
+    if user:
+        connect_kwargs["username"] = user
+    if pw:
+        connect_kwargs["password"] = pw
+
+    try:
+        async with asyncssh.connect(**connect_kwargs) as conn:
+            await asyncssh.scp((conn, remote_path), str(abs_local))
+    except Exception as e:
+        return {
+            "ok": False, "output": "",
+            "error": f"{type(e).__name__}: {e}",
+        }
+    if not abs_local.exists():
+        return {
+            "ok": False, "output": "",
+            "error": "scp completed but local file not found",
+        }
+    return {
+        "ok": True,
+        "output": (
+            f"downloaded {remote_path} from "
+            f"{user + '@' if user else ''}{host} to "
+            f"{abs_local} ({abs_local.stat().st_size} bytes)"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Browser automation via Chrome DevTools Protocol — `browser_*`
 #
 # Pixel-clicking a browser is a vision gamble. If the user has Chrome running
@@ -10798,6 +11198,12 @@ TOOL_REGISTRY = {
     "web_search": web_search,
     "fetch_url": fetch_url,
     "http_request": http_request,
+    # audio transcription (Whisper, local)
+    "transcribe_audio": transcribe_audio,
+    # SSH — remote command exec + file copy
+    "ssh_exec": ssh_exec,
+    "ssh_put": ssh_put,
+    "ssh_get": ssh_get,
     # universal API connector — register an OpenAPI spec once,
     # then call any of its endpoints by operation_id
     "openapi_load": openapi_load,
@@ -10947,6 +11353,16 @@ TOOL_CATEGORIES: dict[str, str] = {
     # side effects on a poorly-designed API, and the model shouldn't be able
     # to hit arbitrary endpoints in read-only mode.
     "http_request": "write",
+    # ASR / SSH:
+    # transcribe_audio is read (read a local file, no network in default
+    # path; faster-whisper does the work in-process).
+    # ssh_exec is write — runs arbitrary commands remotely.
+    # ssh_put is write (touches remote FS).
+    # ssh_get is write (touches local FS — could overwrite a file).
+    "transcribe_audio": "read",
+    "ssh_exec": "write",
+    "ssh_put": "write",
+    "ssh_get": "write",
     # OpenAPI: same write-class rationale as http_request — call dispatches
     # to the registered API which can trigger arbitrary side effects.
     # Listing / describing operations is read; load is write because it
@@ -11770,6 +12186,49 @@ async def _dispatch_core(
                 args.get("timeout", HTTP_REQUEST_TIMEOUT_SEC),
                 bool(args.get("allow_private", False)),
                 args.get("max_output_chars", HTTP_REQUEST_DEFAULT_OUTPUT_CHARS),
+            )
+        # ----- Audio transcription -----
+        if name == "transcribe_audio":
+            return await fn(
+                cwd, args.get("path", ""),
+                model_name=args.get("model_name", "base"),
+                language=args.get("language"),
+                conv_id=conv_id,
+            )
+        # ----- SSH dispatch -----
+        if name == "ssh_exec":
+            return await fn(
+                args.get("host", ""),
+                args.get("command", ""),
+                user=args.get("user"),
+                port=int(args.get("port", 22)),
+                password=args.get("password"),
+                password_secret=args.get("password_secret"),
+                timeout=int(args.get("timeout", SSH_DEFAULT_TIMEOUT_SEC)),
+            )
+        if name == "ssh_put":
+            return await fn(
+                cwd,
+                args.get("host", ""),
+                args.get("local_path", ""),
+                args.get("remote_path", ""),
+                user=args.get("user"),
+                port=int(args.get("port", 22)),
+                password=args.get("password"),
+                password_secret=args.get("password_secret"),
+                conv_id=conv_id,
+            )
+        if name == "ssh_get":
+            return await fn(
+                cwd,
+                args.get("host", ""),
+                args.get("remote_path", ""),
+                args.get("local_path", ""),
+                user=args.get("user"),
+                port=int(args.get("port", 22)),
+                password=args.get("password"),
+                password_secret=args.get("password_secret"),
+                conv_id=conv_id,
             )
         # ----- OpenAPI dispatch -----
         if name == "openapi_load":

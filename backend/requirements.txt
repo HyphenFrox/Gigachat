@@ -61,6 +61,16 @@ pywebpush==2.3.0
 #     separately). Used as fallback / on non-Windows / on Python 3.14+.
 winsdk==1.0.0b10 ; platform_system == "Windows" and python_version < "3.14"
 pytesseract==0.3.13
+# ASR (transcription) for the `transcribe_audio` tool. faster-whisper is the
+# lighter, faster CTranslate2-backed implementation of OpenAI Whisper —
+# loads a quantised model once and runs entirely locally. Optional dep:
+# the tool reports a clean install hint if the package is missing rather
+# than failing at module import.
+faster-whisper==1.1.0
+# SSH client for the `ssh_exec` / `ssh_put` / `ssh_get` tools. asyncssh is
+# pure-Python (no libssh2 build) and integrates with asyncio so calls don't
+# block the agent loop. Optional — same lazy-import pattern as faster-whisper.
+asyncssh==2.21.0
 # ----- Test-only dependencies (install with `pip install -r requirements.txt`
 # then `pip install pytest pytest-asyncio`, OR see `backend/tests/README` for
 # the standalone test-runner script). Pinned to current stable releases. -----

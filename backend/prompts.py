@@ -886,6 +886,95 @@ TOOL_SCHEMAS = [
             }),
         },
     },
+    # ----- audio transcription -----
+    {
+        "type": "function",
+        "function": {
+            "name": "transcribe_audio",
+            "description": (
+                "Transcribe an audio file (wav / mp3 / m4a / ogg / flac / etc.) using "
+                "local Whisper. Returns the full transcript plus per-segment timestamps "
+                "so you can quote specific moments. The first call downloads the chosen "
+                "model (~75 MB for `base`); subsequent calls are fast. Voice activity "
+                "detection trims silence automatically."
+            ),
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Audio file path, relative to cwd."},
+                    "model_name": {"type": "string", "description": "Whisper model size: tiny | base (default) | small | medium | large-v3. Larger = more accurate but slower / more memory."},
+                    "language": {"type": "string", "description": "ISO-639-1 code (e.g. 'en', 'es', 'fr'). Auto-detected when omitted (slightly slower)."},
+                },
+                "required": ["path"],
+            }),
+        },
+    },
+    # ----- SSH -----
+    {
+        "type": "function",
+        "function": {
+            "name": "ssh_exec",
+            "description": (
+                "Run a command on a remote machine via SSH. Returns combined stdout+stderr "
+                "and the exit code. Auth resolution: pass `password_secret` to look up a "
+                "stored secret by name (the value never reaches you), or omit auth args to "
+                "use the system ssh-agent / ~/.ssh keys."
+            ),
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string", "description": "Hostname or IP."},
+                    "command": {"type": "string"},
+                    "user": {"type": "string", "description": "SSH username (defaults to system default)."},
+                    "port": {"type": "integer", "description": "Default 22."},
+                    "password_secret": {"type": "string", "description": "Name of a secret containing the SSH password. Pass instead of `password` so the value never appears in the conversation."},
+                    "password": {"type": "string", "description": "Plaintext password (avoid; use password_secret instead)."},
+                    "timeout": {"type": "integer", "description": "Seconds to wait (default 30, max 600)."},
+                },
+                "required": ["host", "command"],
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ssh_put",
+            "description": "Upload one local file to a remote host via SCP. 100 MB cap.",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string"},
+                    "local_path": {"type": "string"},
+                    "remote_path": {"type": "string"},
+                    "user": {"type": "string"},
+                    "port": {"type": "integer"},
+                    "password_secret": {"type": "string"},
+                    "password": {"type": "string"},
+                },
+                "required": ["host", "local_path", "remote_path"],
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ssh_get",
+            "description": "Download one file from a remote host via SCP into the local cwd.",
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "host": {"type": "string"},
+                    "remote_path": {"type": "string"},
+                    "local_path": {"type": "string"},
+                    "user": {"type": "string"},
+                    "port": {"type": "integer"},
+                    "password_secret": {"type": "string"},
+                    "password": {"type": "string"},
+                },
+                "required": ["host", "remote_path", "local_path"],
+            }),
+        },
+    },
     # ----- universal API connector (OpenAPI / Swagger) -----
     {
         "type": "function",
