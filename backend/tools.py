@@ -7646,6 +7646,28 @@ def _chunk_text(text: str, size: int, overlap: int) -> list[str]:
     return out
 
 
+# Bounded LRU cache for embed-call results. Keyed by (model, sha256(text))
+# so the same (text, model) pair returns instantly on the second call.
+# OrderedDict gives us O(1) move-to-end on hit; eviction pops the oldest.
+# The cache size is small on purpose — chunk text varies per file and
+# wouldn't benefit, but search queries (especially repeat searches in
+# the same session) absorb most of the wins.
+import collections as _embed_collections
+_EMBED_CACHE_MAX = 256
+_EMBED_CACHE: "_embed_collections.OrderedDict[tuple[str, str], list[float]]" = (
+    _embed_collections.OrderedDict()
+)
+
+
+def _embed_cache_key(text: str, model: str) -> tuple[str, str]:
+    """Hash the text so the cache key stays short regardless of input
+    size. SHA-256 is overkill for keying but it's stdlib and we
+    already use it elsewhere in the project."""
+    import hashlib
+    h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+    return (model, h)
+
+
 async def _ollama_embed(client, text: str, model: str) -> list[float]:
     """Call Ollama's /api/embeddings and return the vector.
 
@@ -7655,7 +7677,19 @@ async def _ollama_embed(client, text: str, model: str) -> list[float]:
     Ollama when no worker is eligible. Net effect for codebase /
     document indexing: throughput scales with the number of workers,
     not bottlenecked by a single node.
+
+    Bounded LRU cache (`_EMBED_CACHE`, 256 entries) hits whenever the
+    same (text, model) pair is requested twice — common for repeat
+    searches in the same session. Cache miss falls through to the
+    network round-trip. Worth ~50-200 ms saved per cached call.
     """
+    key = _embed_cache_key(text, model)
+    cached = _EMBED_CACHE.get(key)
+    if cached is not None:
+        # Move to end so the entry doesn't get evicted as "old".
+        _EMBED_CACHE.move_to_end(key)
+        return cached
+
     from . import compute_pool
     base_url = "http://127.0.0.1:11434"
     headers: dict[str, str] = {}
@@ -7674,6 +7708,12 @@ async def _ollama_embed(client, text: str, model: str) -> list[float]:
     vec = data.get("embedding")
     if not vec:
         raise RuntimeError(f"ollama /api/embeddings returned no vector: {data}")
+
+    # Cache on success only. FIFO evict when over capacity — popitem(last=False)
+    # drops the oldest, keeping recent embeds warm.
+    _EMBED_CACHE[key] = vec
+    if len(_EMBED_CACHE) > _EMBED_CACHE_MAX:
+        _EMBED_CACHE.popitem(last=False)
     return vec
 
 

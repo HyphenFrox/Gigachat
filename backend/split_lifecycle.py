@@ -191,7 +191,7 @@ def _resolve_rpc_endpoints(worker_ids: list[str]) -> list[str]:
 def _is_moe_model(gguf_path: str) -> bool:
     """Heuristic: does this GGUF describe a Mixture-of-Experts model?
 
-    Reads `<arch>.expert_count` from the metadata; > 0 means MoE.
+    Reads `<arch>.expert_count` from the cached metadata; > 0 means MoE.
     Used to decide whether to add the `-ot` flag that pins MoE expert
     tensors to the host CUDA backend (see `_build_command` docstring
     for why).
@@ -199,29 +199,9 @@ def _is_moe_model(gguf_path: str) -> bool:
     Returns False on any read error so non-MoE models keep their
     current command path unchanged.
     """
-    try:
-        import gguf
-        reader = gguf.GGUFReader(gguf_path)
-    except Exception:
-        return False
-
-    arch_field = reader.fields.get("general.architecture")
-    if not arch_field or not arch_field.types:
-        return False
-    try:
-        arch = arch_field.parts[arch_field.data[0]].tobytes().decode(
-            "utf-8", errors="replace",
-        )
-    except Exception:
-        return False
-
-    f = reader.fields.get(f"{arch}.expert_count")
-    if f and f.data:
-        try:
-            return int(f.parts[f.data[0]][0]) > 0
-        except Exception:
-            return False
-    return False
+    metadata = _get_gguf_metadata(gguf_path)
+    expert_count = metadata.get("expert_count") or 0
+    return int(expert_count) > 0
 
 
 def _host_primary_backend() -> str:
@@ -271,52 +251,16 @@ def _model_needs_fit_off(gguf_path: str) -> bool:
     so they're never matched and keep llama-server's normal
     adaptive-fit behavior.
     """
-    try:
-        import gguf
-    except ImportError:
+    metadata = _get_gguf_metadata(gguf_path)
+    if not metadata:
         return False
-    try:
-        reader = gguf.GGUFReader(gguf_path)
-    except Exception:
+    if metadata.get("arch") not in ("gemma4", "gemma3n"):
         return False
-    arch_field = reader.fields.get("general.architecture")
-    if not arch_field:
-        return False
-    try:
-        arch = arch_field.parts[arch_field.data[0]].tobytes().decode(
-            "utf-8", errors="replace",
-        )
-    except Exception:
-        return False
-    if arch not in ("gemma4", "gemma3n"):
-        return False
-    # PLE marker present?
-    has_ple = False
-    for key in (
-        f"{arch}.embedding_length_per_layer_input",
-        "gemma3n.embedding_length_per_layer_input",
-    ):
-        f = reader.fields.get(key)
-        if f and f.data:
-            try:
-                if int(f.parts[f.data[0]][0]) > 0:
-                    has_ple = True
-                    break
-            except Exception:
-                continue
-    if not has_ple:
+    if not (metadata.get("ple_embedding_length") or 0) > 0:
         return False
     # Graph-width guard: E2B (block_count=30) is fine; E4B (35)+ trips it.
-    for key in (f"{arch}.block_count", "gemma3n.block_count",
-                "gemma4.block_count"):
-        f = reader.fields.get(key)
-        if f and f.data:
-            try:
-                blocks = int(f.parts[f.data[0]][0])
-                return blocks > 30
-            except Exception:
-                continue
-    return False
+    blocks = metadata.get("block_count") or 0
+    return blocks > 30
 
 
 def _read_gguf_int(reader, arch: str, *keys: str) -> int | None:
@@ -336,6 +280,92 @@ def _read_gguf_int(reader, arch: str, *keys: str) -> int | None:
     return None
 
 
+# Per-path cache for parsed GGUF metadata. Keyed by (gguf_path) →
+# (mtime, fields_dict). Six different helpers in this module open the
+# same GGUF on every llama-server spawn — `_is_moe_model`,
+# `_model_needs_fit_off`, `_estimate_kv_bytes_per_slot`,
+# `_compute_optimal_ngl`, `_compute_optimal_ctx_size`,
+# `_compute_optimal_batch_sizes`. Each open mmaps the file and parses
+# headers (typ. 10-50 ms); 6× per spawn is 60-300 ms of redundant
+# work. Caching by mtime lets a re-quantized blob trigger a re-parse
+# while a stable file is parsed exactly once per backend lifetime.
+_GGUF_METADATA_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _get_gguf_metadata(gguf_path: str) -> dict:
+    """Return cached GGUF metadata for ``gguf_path``.
+
+    The dict carries the architecture name plus every integer field
+    the helpers in this module read. Cache invalidates on mtime
+    change so an in-place rewrite (rare) is picked up on the next
+    spawn. Returns an empty dict on any read failure — callers fall
+    through to their default behaviour.
+    """
+    try:
+        mtime = os.path.getmtime(gguf_path)
+    except OSError:
+        return {}
+    cached = _GGUF_METADATA_CACHE.get(gguf_path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        import gguf
+        reader = gguf.GGUFReader(gguf_path)
+    except Exception:
+        return {}
+
+    arch_field = reader.fields.get("general.architecture")
+    if not arch_field or not arch_field.types:
+        return {}
+    try:
+        arch = arch_field.parts[arch_field.data[0]].tobytes().decode(
+            "utf-8", errors="replace",
+        )
+    except Exception:
+        return {}
+
+    metadata: dict = {
+        "arch": arch,
+        "block_count": _read_gguf_int(
+            reader, arch,
+            f"{arch}.block_count", "llama.block_count", "general.block_count",
+        ),
+        "embedding_length": _read_gguf_int(
+            reader, arch,
+            f"{arch}.embedding_length", "llama.embedding_length",
+        ),
+        "head_count": _read_gguf_int(
+            reader, arch,
+            f"{arch}.attention.head_count", "llama.attention.head_count",
+        ),
+        "head_count_kv": _read_gguf_int(
+            reader, arch,
+            f"{arch}.attention.head_count_kv",
+            "llama.attention.head_count_kv",
+        ),
+        "context_length": _read_gguf_int(
+            reader, arch,
+            f"{arch}.context_length", "llama.context_length",
+        ),
+        "expert_count": _read_gguf_int(
+            reader, arch, f"{arch}.expert_count",
+        ),
+        # Gemma 3n PLE marker — read both the architecture-prefixed
+        # form and the explicit gemma3n key so older / newer
+        # quantisations both match.
+        "ple_embedding_length": _read_gguf_int(
+            reader, arch,
+            f"{arch}.embedding_length_per_layer_input",
+            "gemma3n.embedding_length_per_layer_input",
+        ),
+    }
+    # Drop the reader so its mmap can release; we've extracted
+    # everything we cared about into the dict.
+    del reader
+    _GGUF_METADATA_CACHE[gguf_path] = (mtime, metadata)
+    return metadata
+
+
 def _estimate_kv_bytes_per_slot(gguf_path: str, ctx_size: int = 4096) -> int:
     """Estimate the KV-cache size for ONE parallel slot at the given context.
 
@@ -353,47 +383,20 @@ def _estimate_kv_bytes_per_slot(gguf_path: str, ctx_size: int = 4096) -> int:
     Returns 0 on any metadata miss so callers fall back to a conservative
     `--parallel 1`.
     """
-    try:
-        import gguf
-    except ImportError:
+    metadata = _get_gguf_metadata(gguf_path)
+    if not metadata:
         return 0
-    try:
-        reader = gguf.GGUFReader(gguf_path)
-    except Exception:
-        return 0
-
-    arch_field = reader.fields.get("general.architecture")
-    if not arch_field or not arch_field.types:
-        return 0
-    try:
-        arch = arch_field.parts[arch_field.data[0]].tobytes().decode(
-            "utf-8", errors="replace",
-        )
-    except Exception:
-        return 0
-
-    n_layers = _read_gguf_int(
-        reader, arch, f"{arch}.block_count", "llama.block_count",
-    )
-    embedding_length = _read_gguf_int(
-        reader, arch, f"{arch}.embedding_length", "llama.embedding_length",
-    )
-    n_heads = _read_gguf_int(
-        reader, arch, f"{arch}.attention.head_count", "llama.attention.head_count",
-    )
+    n_layers = metadata.get("block_count") or 0
+    embedding_length = metadata.get("embedding_length") or 0
+    n_heads = metadata.get("head_count") or 0
     if not n_layers or not embedding_length or not n_heads:
         return 0
-
-    n_kv_heads = _read_gguf_int(
-        reader, arch,
-        f"{arch}.attention.head_count_kv",
-        "llama.attention.head_count_kv",
-    ) or n_heads
-
+    # MHA fallback: when head_count_kv is absent the model uses
+    # multi-head attention so kv heads == query heads.
+    n_kv_heads = metadata.get("head_count_kv") or n_heads
     head_dim = embedding_length // n_heads
     if head_dim <= 0:
         return 0
-
     # 2 (K+V) × layers × kv_heads × head_dim × bytes_per_element (FP16=2)
     kv_per_token = 2 * n_layers * n_kv_heads * head_dim * 2
     return int(kv_per_token * max(ctx_size, 1))
@@ -617,21 +620,9 @@ def _compute_optimal_ctx_size(
 
     # Read model's training-time max context (don't exceed it — the
     # weights only learned positional encodings up to that length).
-    try:
-        import gguf
-        reader = gguf.GGUFReader(gguf_path)
-        arch_field = reader.fields.get("general.architecture")
-        arch = (
-            arch_field.parts[arch_field.data[0]].tobytes().decode("utf-8", errors="replace")
-            if arch_field and arch_field.types
-            else None
-        )
-        model_max_ctx = (
-            _read_gguf_int(reader, arch, f"{arch}.context_length", "llama.context_length")
-            if arch else None
-        ) or _CTX_SIZE_CEILING
-    except Exception:
-        model_max_ctx = _CTX_SIZE_CEILING
+    # Comes from the cached metadata so a re-read doesn't re-mmap.
+    metadata = _get_gguf_metadata(gguf_path)
+    model_max_ctx = metadata.get("context_length") or _CTX_SIZE_CEILING
 
     # Bottleneck-node free memory (same shape as parallel computation).
     try:
@@ -708,25 +699,9 @@ def _compute_optimal_batch_sizes(
     where activation memory is constrained, or when GGUF metadata
     can't be read (no informed call possible).
     """
-    try:
-        import gguf
-        reader = gguf.GGUFReader(gguf_path)
-        arch_field = reader.fields.get("general.architecture")
-        if not arch_field or not arch_field.types:
-            return None, None
-        arch = arch_field.parts[arch_field.data[0]].tobytes().decode(
-            "utf-8", errors="replace",
-        )
-        embedding_length = _read_gguf_int(
-            reader, arch,
-            f"{arch}.embedding_length", "llama.embedding_length",
-        )
-        block_count = _read_gguf_int(
-            reader, arch,
-            f"{arch}.block_count", "llama.block_count",
-        )
-    except Exception:
-        return None, None
+    metadata = _get_gguf_metadata(gguf_path)
+    embedding_length = metadata.get("embedding_length") or 0
+    block_count = metadata.get("block_count") or 0
     if not embedding_length or not block_count:
         return None, None
 
@@ -1383,11 +1358,6 @@ def _compute_optimal_ngl(
     llama.cpp's old behaviour where it works (small models that fit
     comfortably).
     """
-    try:
-        import gguf
-    except ImportError:
-        return _DEFAULT_NGL
-
     # File size as a proxy for total weight bytes — close enough since
     # quantization metadata + tokenizer KV are small relative to weights.
     try:
@@ -1397,33 +1367,10 @@ def _compute_optimal_ngl(
     if file_size <= 0:
         return _DEFAULT_NGL
 
-    # Read block count from the GGUF metadata (the correct metadata key
-    # is architecture-specific: `gemma4.block_count`, `llama.block_count`,
-    # etc.). We probe the file once and walk known keys.
-    try:
-        reader = gguf.GGUFReader(gguf_path)
-    except Exception:
-        return _DEFAULT_NGL
-
-    arch_field = reader.fields.get("general.architecture")
-    if not arch_field or not arch_field.types:
-        return _DEFAULT_NGL
-    try:
-        arch = arch_field.parts[arch_field.data[0]].tobytes().decode(
-            "utf-8", errors="replace",
-        )
-    except Exception:
-        return _DEFAULT_NGL
-
-    n_layers = 0
-    for key in (f"{arch}.block_count", "llama.block_count", "general.block_count"):
-        f = reader.fields.get(key)
-        if f and f.data:
-            try:
-                n_layers = int(f.parts[f.data[0]][0])
-                break
-            except Exception:
-                continue
+    # Block count from cached metadata (mtime-keyed, parses each GGUF
+    # exactly once across helpers).
+    metadata = _get_gguf_metadata(gguf_path)
+    n_layers = metadata.get("block_count") or 0
     if n_layers <= 0:
         return _DEFAULT_NGL
 
