@@ -35,17 +35,20 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-
-# pywebpush is imported lazily inside `send_to_all` because it
-# transitively pulls in aiohttp (~250 ms of cold-start time on
-# Windows). Push notifications are an opt-in feature — most users
-# never send one — so paying the import cost up-front penalises
-# every backend boot for the minority that do. The two functions
-# from pywebpush we use (`webpush`, `WebPushException`) are only
-# referenced inside `send_to_all`, so deferral is safe.
+# All push-related heavy imports are deferred to call time:
+#
+# * `pywebpush` transitively pulls aiohttp (~250 ms cold-start on
+#   Windows). Imported inside `send_to_all`.
+# * `cryptography` (`hazmat.backends`, `hazmat.primitives.serialization`,
+#   `hazmat.primitives.asymmetric.ec`) collectively cost ~30-60 ms on
+#   import and are only needed by `_generate_vapid_keys`, which fires
+#   once on first push setup. Most users never enable push, so paying
+#   that cost up-front on every backend boot penalises the majority
+#   for the minority case. The disk-cached VAPID file is read with
+#   stdlib only.
+#
+# After first call, sys.modules caches everything so subsequent push
+# operations have zero re-import cost.
 
 from . import db
 
@@ -78,7 +81,14 @@ def _generate_vapid_keys() -> dict[str, str]:
       accepts the raw b64url form).
     - `public_key` is the uncompressed 65-byte form (leading 0x04 + X + Y),
       which is exactly what `applicationServerKey` in the browser needs.
+
+    Lazily imports `cryptography` here — see the module-level comment
+    for the cold-start rationale.
     """
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
     priv = ec.generate_private_key(ec.SECP256R1(), default_backend())
     priv_number = priv.private_numbers().private_value
     priv_bytes = priv_number.to_bytes(32, "big")
