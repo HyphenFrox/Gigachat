@@ -401,7 +401,20 @@ DB_VACUUM_MIN_BYTES = 50 * 1024 * 1024
 _VACUUM_LAST_RUN_SETTING = "_retention_db_vacuum_last_run"
 
 
-def db_maintenance(*, allow_vacuum: bool = False) -> dict:
+# Cadence for PRAGMA integrity_check: weekly is fine for diagnostic
+# corruption detection. SQLite is genuinely robust under WAL + NORMAL
+# sync, but power loss / disk failure / OS crash can rarely produce
+# subtly bad pages that the checker catches. Result is informational
+# — we log warnings; recovery (.dump + re-create) is operator-driven.
+DB_INTEGRITY_INTERVAL_SECONDS = 7 * 86400
+
+# Settings key for last-run timestamp, mirrors the VACUUM tracker.
+_INTEGRITY_LAST_RUN_SETTING = "_retention_db_integrity_last_run"
+
+
+def db_maintenance(
+    *, allow_vacuum: bool = False, allow_integrity_check: bool = False,
+) -> dict:
     """Run lightweight SQLite housekeeping on the primary DB.
 
     * ``wal_checkpoint(TRUNCATE)`` flushes the WAL back into the main
@@ -417,6 +430,10 @@ def db_maintenance(*, allow_vacuum: bool = False) -> dict:
       deletes. Caller is responsible for the cadence — the daemon
       gates this behind ``DB_VACUUM_INTERVAL_SECONDS`` so we don't
       VACUUM on every sweep.
+    * ``integrity_check`` (when ``allow_integrity_check=True``):
+      cheap diagnostic run weekly. Logs a warning if the page graph
+      reports anything other than ``ok``. Recovery is operator-driven
+      (``.dump`` to a fresh DB) — we just want early detection.
 
     Returns a dict of counts so the sweep log shows what happened.
     Errors per pragma are caught and surfaced as a False flag — the
@@ -427,6 +444,7 @@ def db_maintenance(*, allow_vacuum: bool = False) -> dict:
         "optimize_ok": False,
         "vacuum_ok": False,
         "vacuum_reclaimed_bytes": 0,
+        "integrity_ok": None,
     }
     try:
         with db._conn() as c:
@@ -448,6 +466,34 @@ def db_maintenance(*, allow_vacuum: bool = False) -> dict:
                 counts["optimize_ok"] = True
             except sqlite3.Error:
                 pass
+            if allow_integrity_check:
+                # PRAGMA integrity_check returns one row per problem,
+                # or a single row with content "ok" when clean. We
+                # cap at a few rows so a corrupted DB doesn't blow up
+                # log volume; the first error is enough to alert.
+                try:
+                    rows = c.execute(
+                        "PRAGMA integrity_check(8)"
+                    ).fetchall()
+                    issues = [
+                        (r[0] if r and r[0] else "")
+                        for r in rows
+                        if r and (r[0] or "") != "ok"
+                    ]
+                    counts["integrity_ok"] = not issues
+                    if issues:
+                        log = get_logger("retention")
+                        log.warning(
+                            "db integrity check found %d issue(s): %s",
+                            len(issues),
+                            "; ".join(issues[:3]),
+                            extra={
+                                "event": "db_integrity_failed",
+                                "issue_count": len(issues),
+                            },
+                        )
+                except sqlite3.Error:
+                    pass
     except sqlite3.Error:
         pass
 
@@ -563,6 +609,7 @@ async def sweep_daemon(
     interval_seconds: float = SWEEP_INTERVAL_SECONDS,
     db_maintenance_interval: float = DB_MAINTENANCE_INTERVAL_SECONDS,
     db_vacuum_interval: float = DB_VACUUM_INTERVAL_SECONDS,
+    db_integrity_interval: float = DB_INTEGRITY_INTERVAL_SECONDS,
 ) -> None:
     """Background task: sweep forever at `interval_seconds` cadence.
 
@@ -628,18 +675,41 @@ async def sweep_daemon(
                     allow_vacuum = True
             except Exception:
                 allow_vacuum = False
+            allow_integrity_check = False
             try:
-                stats = db_maintenance(allow_vacuum=allow_vacuum)
+                last_integrity = float(
+                    db.get_setting(_INTEGRITY_LAST_RUN_SETTING, 0.0) or 0.0
+                )
+                if (now - last_integrity) >= db_integrity_interval:
+                    allow_integrity_check = True
+            except Exception:
+                allow_integrity_check = False
+            try:
+                stats = db_maintenance(
+                    allow_vacuum=allow_vacuum,
+                    allow_integrity_check=allow_integrity_check,
+                )
                 if stats.get("vacuum_ok"):
                     try:
                         db.set_setting(_VACUUM_LAST_RUN_SETTING, now)
+                    except Exception:
+                        pass
+                if allow_integrity_check and stats.get("integrity_ok") is not None:
+                    # Whether the check passed or failed, record the
+                    # timestamp so we don't re-run for another week.
+                    # Failed-integrity rows are already logged as
+                    # WARNING by db_maintenance; the persistence here
+                    # is purely cadence-tracking.
+                    try:
+                        db.set_setting(_INTEGRITY_LAST_RUN_SETTING, now)
                     except Exception:
                         pass
                 log.info(
                     f"db_maintenance checkpoint_pages={stats['checkpoint_pages']} "
                     f"optimize_ok={stats['optimize_ok']} "
                     f"vacuum_ok={stats.get('vacuum_ok')} "
-                    f"vacuum_reclaimed_bytes={stats.get('vacuum_reclaimed_bytes', 0)}",
+                    f"vacuum_reclaimed_bytes={stats.get('vacuum_reclaimed_bytes', 0)} "
+                    f"integrity_ok={stats.get('integrity_ok')}",
                     extra={"event": "db_maintenance", **stats},
                 )
                 last_db_maint = now
