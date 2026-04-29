@@ -29,23 +29,34 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-# orjson is a Rust-based JSON parser ~3-5x faster than stdlib json
-# for the row-hydration hot path (every message LIST query parses
-# `tool_calls` + `images` columns through this). Falls back to
-# stdlib json when orjson isn't installed; behaviour identical.
+# orjson is a Rust-based JSON encoder/decoder ~3-5x faster than stdlib
+# json on both parse + dump paths. Used everywhere we touch JSON in
+# the hot row-hydration / row-write code: _row_to_message,
+# _row_to_compute_worker, get_setting, save-side encoding for
+# capabilities_json, args_json, env_json, tool_calls, images, etc.
+# Falls back to stdlib json when orjson isn't installed; behaviour
+# identical for the payloads we serialize (UTF-8 output, same parse
+# semantics).
 try:
     import orjson as _orjson  # type: ignore
 
     def _json_loads(data: str) -> Any:
-        # orjson.loads accepts both str and bytes; we get str from
-        # sqlite3 by default. The orjson decoder is strict about
-        # trailing whitespace where stdlib is lenient — every JSON
-        # value we store is dumped via json.dumps (or orjson) without
-        # trailing whitespace, so this matches in practice.
         return _orjson.loads(data)
+
+    def _json_dumps(obj: Any) -> str:
+        # orjson.dumps returns bytes; SQLite TEXT columns want str.
+        # The decode is sub-microsecond and net is still 3-5x faster
+        # than stdlib json.dumps for typical payloads.
+        return _orjson.dumps(obj).decode("utf-8")
 except ImportError:
     def _json_loads(data: str) -> Any:
         return json.loads(data)
+
+    def _json_dumps(obj: Any) -> str:
+        # ensure_ascii=False matches orjson's UTF-8 output; saves
+        # bytes vs the json default for non-ASCII content (CJK,
+        # emoji, etc.) and avoids \uXXXX bloat in stored JSON.
+        return json.dumps(obj, ensure_ascii=False)
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
 
@@ -926,7 +937,7 @@ def update_conversation(cid: str, **fields: Any) -> dict | None:
             # is the canonical "no tags" state.
             if isinstance(v, (list, tuple)):
                 cleaned = [str(t).strip() for t in v if str(t).strip()]
-                v = json.dumps(cleaned) if cleaned else None
+                v = _json_dumps(cleaned) if cleaned else None
             else:
                 continue
         sets.append(f"{k} = ?")
@@ -1054,7 +1065,7 @@ def add_loaded_tools(cid: str, names: list[str]) -> list[str]:
             merged.append(n)
         c.execute(
             "UPDATE conversations SET loaded_tools_json = ? WHERE id = ?",
-            (json.dumps(merged), cid),
+            (_json_dumps(merged), cid),
         )
     return merged
 
@@ -1087,7 +1098,7 @@ def list_conversations_by_state(state: str) -> list[dict]:
 def enqueue_user_input(cid: str, text: str, images: list[str] | None) -> str:
     """Append one queued user-input row. Returns the new row id."""
     qid = str(uuid.uuid4())
-    payload_images = json.dumps(images) if images else None
+    payload_images = _json_dumps(images) if images else None
     with _conn() as c:
         c.execute(
             "INSERT INTO queued_inputs (id, conversation_id, text, images, created_at) "
@@ -1154,8 +1165,8 @@ def add_message(
     """
     mid = str(uuid.uuid4())
     now = time.time()
-    tc = json.dumps(tool_calls) if tool_calls else None
-    imgs = json.dumps(images) if images else None
+    tc = _json_dumps(tool_calls) if tool_calls else None
+    imgs = _json_dumps(images) if images else None
     with _conn() as c:
         c.execute(
             "INSERT INTO messages (id, conversation_id, role, content, tool_calls, images, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1276,7 +1287,7 @@ def _build_compressed_payload(original: str) -> str:
         "[older tool output compacted — head + tail preserved for context]\n\n"
         + snippet
     )
-    return json.dumps({"ok": True, "output": body})
+    return _json_dumps({"ok": True, "output": body})
 
 
 def compress_tool_outputs(ids: list[str]) -> int:
@@ -3021,8 +3032,8 @@ def create_mcp_server(
                 sid,
                 name,
                 command,
-                json.dumps(list(args or [])),
-                json.dumps(dict(env or {})),
+                _json_dumps(list(args or [])),
+                _json_dumps(dict(env or {})),
                 1 if enabled else 0,
                 now,
                 now,
@@ -3058,10 +3069,10 @@ def update_mcp_server(sid: str, patch: dict) -> dict | None:
             continue
         if k == "args":
             fields.append("args_json = ?")
-            values.append(json.dumps(list(v or [])))
+            values.append(_json_dumps(list(v or [])))
         elif k == "env":
             fields.append("env_json = ?")
-            values.append(json.dumps(dict(v or {})))
+            values.append(_json_dumps(dict(v or {})))
         elif k == "enabled":
             fields.append("enabled = ?")
             values.append(1 if v else 0)
@@ -3143,7 +3154,7 @@ def get_setting(key: str, default: Any = None) -> Any:
 
 def set_setting(key: str, value: Any) -> None:
     """Insert-or-replace one setting. `value` must be JSON-serialisable."""
-    payload = json.dumps(value)
+    payload = _json_dumps(value)
     with _conn() as c:
         c.execute(
             """
@@ -3524,9 +3535,9 @@ def create_user_tool(
                     tid,
                     n,
                     desc,
-                    json.dumps(schema_obj, ensure_ascii=False),
+                    _json_dumps(schema_obj),
                     body,
-                    json.dumps(deps_list, ensure_ascii=False),
+                    _json_dumps(deps_list),
                     cat,
                     t,
                     1 if enabled else 0,
@@ -3600,11 +3611,11 @@ def update_user_tool(tid: str, **fields: Any) -> dict | None:
     if "schema" in fields and fields["schema"] is not None:
         schema_obj = fields["schema"] if isinstance(fields["schema"], dict) else {}
         sets.append("schema_json = ?")
-        values.append(json.dumps(schema_obj, ensure_ascii=False))
+        values.append(_json_dumps(schema_obj))
     if "deps" in fields and fields["deps"] is not None:
         deps_list = [str(d).strip() for d in fields["deps"] if str(d).strip()]
         sets.append("deps_json = ?")
-        values.append(json.dumps(deps_list, ensure_ascii=False))
+        values.append(_json_dumps(deps_list))
     if "category" in fields and fields["category"] is not None:
         cat = str(fields["category"]).strip().lower()
         if cat not in USER_TOOL_CATEGORIES:
@@ -4062,7 +4073,7 @@ def update_compute_worker_capabilities(
     values: list[Any] = []
     if capabilities is not None:
         sets.append("capabilities_json = ?")
-        values.append(json.dumps(capabilities))
+        values.append(_json_dumps(capabilities))
     if last_seen is not None:
         sets.append("last_seen = ?")
         values.append(float(last_seen))
@@ -4237,7 +4248,7 @@ def create_split_model(
                 path,
                 mmproj,
                 draft,
-                json.dumps(wids),
+                _json_dumps(wids),
                 port,
                 1 if enabled else 0,
                 now, now,
@@ -4318,7 +4329,7 @@ def update_split_model(sid: str, **fields: Any) -> dict | None:
                 if not isinstance(w, str) or not w.strip():
                     raise ValueError(f"worker_ids[{i}] must be a non-empty string")
             cols.append("worker_ids_json = ?")
-            vals.append(json.dumps(wids))
+            vals.append(_json_dumps(wids))
         elif k == "llama_port":
             port = int(v) if v is not None else SPLIT_MODEL_DEFAULT_PORT
             if port < 1 or port > 65535:
