@@ -35,7 +35,7 @@ from typing import Any
 
 import httpx
 
-from . import db, split_runtime, sysdetect
+from . import db, jsonutil, split_runtime, sysdetect
 
 log = logging.getLogger(__name__)
 
@@ -172,7 +172,7 @@ async def _measure_throughput(
                     if not line.strip():
                         continue
                     try:
-                        obj = json.loads(line)
+                        obj = jsonutil.loads(line)
                     except json.JSONDecodeError:
                         continue
                     if obj.get("response"):
@@ -333,7 +333,7 @@ async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
     if not text:
         return {}
     try:
-        data = json.loads(text)
+        data = jsonutil.loads(text)
     except json.JSONDecodeError:
         return {}
     if isinstance(data, list):
@@ -3181,7 +3181,7 @@ def _resolve_ollama_manifest(model_name: str) -> dict | None:
     candidate = _OLLAMA_MODELS_DIR / "manifests" / "registry.ollama.ai" / "library" / bare / tag
     if candidate.is_file():
         try:
-            return json.loads(candidate.read_text(encoding="utf-8"))
+            return jsonutil.loads(candidate.read_text(encoding="utf-8"))
         except Exception:
             return None
 
@@ -3195,7 +3195,7 @@ def _resolve_ollama_manifest(model_name: str) -> dict | None:
         for fname in files:
             if fname == tag and Path(root).name == bare:
                 try:
-                    return json.loads(Path(root, fname).read_text(encoding="utf-8"))
+                    return jsonutil.loads(Path(root, fname).read_text(encoding="utf-8"))
                 except Exception:
                     continue
     return None
@@ -3788,7 +3788,7 @@ async def dispatch_web_search_to_worker(
         )
         return False, [], stderr
     try:
-        hits = json.loads((stdout or b"").decode("utf-8", errors="replace") or "[]")
+        hits = jsonutil.loads((stdout or b"").decode("utf-8", errors="replace") or "[]")
     except json.JSONDecodeError as e:
         return False, [], f"worker returned non-JSON: {e}"
     if not isinstance(hits, list):
@@ -4739,7 +4739,7 @@ def _draft_override_for(target_model_name: str) -> str | None:
     if not raw:
         return None
     try:
-        mapping = json.loads(raw)
+        mapping = jsonutil.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(mapping, dict):
@@ -5290,7 +5290,7 @@ async def ensure_worker_chat_server(
         "        out[name] = None\n"
         "        continue\n"
         "    try:\n"
-        "        m = json.loads(manifest.read_text())\n"
+        "        m = jsonutil.loads(manifest.read_text())\n"
         "    except Exception:\n"
         "        out[name] = None\n"
         "        continue\n"
@@ -5314,7 +5314,7 @@ async def ensure_worker_chat_server(
     if not ok:
         raise RuntimeError(f"worker model resolve failed: {stderr}")
     try:
-        paths = json.loads((stdout or b"").decode("utf-8", errors="replace") or "{}")
+        paths = jsonutil.loads((stdout or b"").decode("utf-8", errors="replace") or "{}")
     except json.JSONDecodeError as e:
         raise RuntimeError(f"worker returned non-JSON resolve payload: {e}")
     target_on_worker = paths.get(model_name)
