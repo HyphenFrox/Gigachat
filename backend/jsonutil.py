@@ -56,4 +56,10 @@ else:
     def dumps(obj: Any) -> str:
         # ensure_ascii=False matches orjson's UTF-8 output — saves
         # bytes on non-ASCII content and avoids \uXXXX escape bloat.
-        return _stdlib_json.dumps(obj, ensure_ascii=False)
+        # separators=(",", ":") matches orjson's compact format so
+        # call sites that put the output into a size-constrained
+        # context (HTTP body, prompt embedding) get the same byte
+        # count regardless of which backend is active.
+        return _stdlib_json.dumps(
+            obj, ensure_ascii=False, separators=(",", ":"),
+        )

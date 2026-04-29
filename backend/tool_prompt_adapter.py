@@ -341,9 +341,8 @@ def build_tools_system_block(tool_schemas: list[dict[str, Any]]) -> str:
         # like ``list_models`` or ``get_cwd``.
         if params:
             try:
-                params_json = json.dumps(
-                    params, ensure_ascii=False, separators=(",", ":"),
-                )
+                from . import jsonutil as _ju
+                params_json = _ju.dumps(params)
             except (TypeError, ValueError):
                 params_json = "{}"
             lines.append(f"<parameters>{params_json}</parameters>")
@@ -430,9 +429,12 @@ def _try_parse_tool_body(body: str) -> dict[str, Any] | None:
     body = _FENCE_SUFFIX_RE.sub("", body)
     if not body:
         return None
-    # Try JSON first — cheap and precise.
+    # Try JSON first — cheap and precise. Use jsonutil for the
+    # orjson-backed fast path; the fallback path is identical to
+    # the prior stdlib behaviour.
+    from . import jsonutil as _ju
     try:
-        parsed = json.loads(body)
+        parsed = _ju.loads(body)
     except Exception:
         parsed = None
     # Repair pass: Windows paths are the #1 cause of JSON parse failure
@@ -443,7 +445,7 @@ def _try_parse_tool_body(body: str) -> dict[str, Any] | None:
     if parsed is None:
         repaired = _BAD_BACKSLASH_RE.sub(r"\\\\", body)
         try:
-            parsed = json.loads(repaired)
+            parsed = _ju.loads(repaired)
         except Exception:
             parsed = None
     # Repair pass #2: missing trailing braces. Small models stream long
@@ -462,7 +464,7 @@ def _try_parse_tool_body(body: str) -> dict[str, Any] | None:
         deficit = opens - closes
         if 1 <= deficit <= 2:
             try:
-                candidate = json.loads(body + ("}" * deficit))
+                candidate = _ju.loads(body + ("}" * deficit))
                 if isinstance(candidate, dict):
                     parsed = candidate
             except Exception:

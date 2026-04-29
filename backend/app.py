@@ -1886,8 +1886,15 @@ def api_conv_usage(cid: str) -> dict:
 
 
 def _sse(event: dict) -> str:
-    """Render a dict as one SSE `data:` record."""
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    """Render a dict as one SSE `data:` record.
+
+    Hot path — fires on every event yielded out of `agent.run_turn`,
+    which is dozens-to-hundreds per chat turn (token deltas, thinking
+    blocks, tool events). Routed through jsonutil so orjson speeds
+    up the per-event encode by 3-5x when installed.
+    """
+    from . import jsonutil as _ju
+    return f"data: {_ju.dumps(event)}\n\n"
 
 
 def _safe_upload_name(name: str) -> str | None:
