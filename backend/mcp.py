@@ -324,7 +324,8 @@ class MCPSession:
         await self._write_line({"jsonrpc": "2.0", "method": method, "params": params})
 
     async def _write_line(self, payload: dict) -> None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n"
+        from . import jsonutil as _ju
+        data = _ju.dumps(payload).encode("utf-8") + b"\n"
         stdin = self._proc.stdin if self._proc else None
         if stdin is None:
             raise RuntimeError("MCP session stdin not available")
@@ -351,7 +352,8 @@ class MCPSession:
                 log.warning("mcp: %r line too large (%d bytes); skipping", self.name, len(line))
                 continue
             try:
-                msg = json.loads(line.decode("utf-8", errors="replace"))
+                from . import jsonutil as _ju
+                msg = _ju.loads(line.decode("utf-8", errors="replace"))
             except json.JSONDecodeError:
                 # MCP servers sometimes spill non-JSON logs to stdout. Ignore
                 # instead of crashing — they'll also appear on stderr.
