@@ -304,8 +304,8 @@ async def pull_model(name: str, on_progress=None) -> dict:
                     if not line:
                         continue
                     try:
-                        import json as _json
-                        evt = _json.loads(line)
+                        from . import jsonutil as _ju
+                        evt = _ju.loads(line)
                     except Exception:
                         continue
                     if on_progress:
