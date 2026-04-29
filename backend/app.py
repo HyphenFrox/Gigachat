@@ -1465,7 +1465,29 @@ def api_default_cwd() -> dict:
 
 
 @app.get("/api/conversations")
-def api_list() -> dict:
+def api_list(
+    limit: int | None = None,
+    offset: int = 0,
+) -> dict:
+    """List conversations.
+
+    Backward-compatible: no params → return everything (legacy shape).
+    With ``limit`` set, returns one page plus a ``total`` count so
+    the sidebar can render "showing 50 of 312" and offer "load more".
+
+    The cap is [1, 500] — even paginated, more than 500 rows in one
+    shot becomes a noticeable JSON marshal hitch on the threadpool.
+    """
+    if limit is not None:
+        capped = max(1, min(int(limit), 500))
+        convs, total = db.list_conversations_paginated(
+            limit=capped, offset=max(0, int(offset)),
+        )
+        return {
+            "conversations": convs,
+            "total": total,
+            "has_more": (max(0, int(offset)) + len(convs)) < total,
+        }
     return {"conversations": db.list_conversations()}
 
 

@@ -736,7 +736,14 @@ def create_conversation(
 
 
 def list_conversations() -> list[dict]:
-    """Return all conversations, pinned first then most-recently-updated."""
+    """Return all conversations, pinned first then most-recently-updated.
+
+    For sidebars that want pagination instead, see
+    ``list_conversations_paginated``. The unbounded version is fine
+    when the user has up to a few hundred chats; beyond that the
+    JSON marshalling alone becomes a noticeable hitch on every
+    sidebar refresh.
+    """
     with _conn() as c:
         rows = c.execute(
             # Sidebar sort. Primary key is `last_user_message_at` so a
@@ -750,6 +757,40 @@ def list_conversations() -> list[dict]:
             "last_user_message_at DESC, updated_at DESC"
         ).fetchall()
     return [_row_to_conversation(r) for r in rows]
+
+
+def list_conversations_paginated(
+    *,
+    limit: int,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """Return one page of conversations + the total count.
+
+    Same sort order as ``list_conversations`` (pinned first, then
+    last-user-message-at desc, then updated_at desc) so paged loads
+    stitch together correctly. The total count comes from the same
+    connection, eliminating the race between page fetch and count
+    query that two-trip pagination would otherwise have.
+
+    Cap is enforced at the DB layer via SQL ``LIMIT``; offset uses
+    ``OFFSET`` which is fine at the ~thousand-conversation scale a
+    user might reach. Beyond that, keyset pagination (``WHERE
+    last_user_message_at < ?``) would be more scalable, but the
+    sort key isn't strictly monotonic across the pinned/unpinned
+    boundary so offset is the simpler correct choice here.
+    """
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM conversations ORDER BY pinned DESC, "
+            "last_user_message_at DESC, updated_at DESC "
+            "LIMIT ? OFFSET ?",
+            (int(limit), int(offset)),
+        ).fetchall()
+        total_row = c.execute(
+            "SELECT COUNT(*) AS n FROM conversations"
+        ).fetchone()
+        total = int(total_row["n"]) if total_row else 0
+    return [_row_to_conversation(r) for r in rows], total
 
 
 def search_conversations(query: str, limit: int = 50) -> list[dict]:
