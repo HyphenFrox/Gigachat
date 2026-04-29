@@ -1014,12 +1014,21 @@ async def _summarize_block_with_ollama(model: str, history_block: list[dict]) ->
         base_url = OLLAMA_URL
         headers = {}
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(
-                f"{base_url}/api/chat", json=payload, headers=headers,
-            )
-            r.raise_for_status()
-            data = r.json()
+        # Reuse the process-wide AsyncClient so the compaction call
+        # rides a warm keepalive connection to Ollama / a worker
+        # instead of paying a fresh TCP+TLS handshake. Per-call
+        # timeout is passed explicitly because the shared client is
+        # configured with `timeout=None`.
+        from . import http_client as _hc
+        client = await _hc.get_shared_client()
+        r = await client.post(
+            f"{base_url}/api/chat",
+            json=payload,
+            headers=headers,
+            timeout=60.0,
+        )
+        r.raise_for_status()
+        data = r.json()
         return (data.get("message") or {}).get("content") or ""
     except Exception as e:
         return f"[summary failed: {type(e).__name__}: {e}]"
