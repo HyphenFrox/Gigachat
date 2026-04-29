@@ -3905,18 +3905,61 @@ def create_compute_worker(
                 now, now,
             ),
         )
+    _invalidate_compute_workers_cache()
     return wid
 
 
+# Tiny in-process cache for the worker roster. The routing layer
+# consults `list_compute_workers` on every chat turn, every embed
+# call, every tool dispatch — for a 100-chunk indexing run that's
+# 100+ identical SELECTs against an unchanging table. A 1-second
+# TTL collapses the burst into a single read while keeping the
+# data fresh for the periodic probe loop's writes.
+#
+# Cache holds both flavours (enabled_only=True/False) keyed
+# separately. Writes (`update_compute_worker`,
+# `update_compute_worker_capabilities`, `delete_compute_worker`,
+# `add_compute_worker`) call `_invalidate_compute_workers_cache`
+# so a fresh probe result becomes visible on the next read with
+# zero TTL wait.
+_COMPUTE_WORKERS_CACHE: dict[bool, tuple[float, list[dict]]] = {}
+_COMPUTE_WORKERS_CACHE_TTL = 1.0
+
+
+def _invalidate_compute_workers_cache() -> None:
+    """Drop both flavours of the cached worker list. Called from every
+    write path so subsequent reads see the change immediately.
+    """
+    _COMPUTE_WORKERS_CACHE.clear()
+
+
 def list_compute_workers(*, enabled_only: bool = False) -> list[dict]:
-    """Return every registered worker, newest-first."""
+    """Return every registered worker, newest-first.
+
+    Cached for ``_COMPUTE_WORKERS_CACHE_TTL`` seconds across all
+    callers — the routing layer can call this dozens of times per
+    second on a busy indexing burst, but the underlying table only
+    changes when a probe lands or the user edits a worker row in
+    Settings. Both events explicitly invalidate the cache so users
+    don't wait the full TTL for their changes to land.
+    """
+    cached = _COMPUTE_WORKERS_CACHE.get(enabled_only)
+    now = time.time()
+    if cached and (now - cached[0]) < _COMPUTE_WORKERS_CACHE_TTL:
+        # Return a defensive copy so callers can't mutate the cached
+        # list. The dicts inside are also references — callers don't
+        # mutate those by convention, so we don't deep-copy.
+        return list(cached[1])
+
     sql = "SELECT * FROM compute_workers"
     if enabled_only:
         sql += " WHERE enabled = 1"
     sql += " ORDER BY created_at DESC"
     with _conn() as c:
         rows = c.execute(sql).fetchall()
-    return [_row_to_compute_worker(r) for r in rows]
+    workers = [_row_to_compute_worker(r) for r in rows]
+    _COMPUTE_WORKERS_CACHE[enabled_only] = (now, workers)
+    return list(workers)
 
 
 def get_compute_worker(wid: str) -> dict | None:
@@ -3980,6 +4023,7 @@ def update_compute_worker(wid: str, **fields: Any) -> dict | None:
             f"UPDATE compute_workers SET {', '.join(sets)} WHERE id = ?",
             values,
         )
+    _invalidate_compute_workers_cache()
     return get_compute_worker(wid)
 
 
@@ -4018,6 +4062,7 @@ def update_compute_worker_capabilities(
             f"UPDATE compute_workers SET {', '.join(sets)} WHERE id = ?",
             values,
         )
+    _invalidate_compute_workers_cache()
 
 
 def delete_compute_worker(wid: str) -> int:
@@ -4026,6 +4071,7 @@ def delete_compute_worker(wid: str) -> int:
             "DELETE FROM compute_workers WHERE id = ?", (wid,),
         )
         rowcount = cur.rowcount or 0
+    _invalidate_compute_workers_cache()
     return rowcount
 
 
