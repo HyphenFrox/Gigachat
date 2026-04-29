@@ -294,7 +294,8 @@ async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
     # zero whitespace mangling.
     import base64
     encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
-    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+    cmd = ["ssh", *_ssh_persistent_args(), "-o", "BatchMode=yes",
+           "-o", "ConnectTimeout=5",
            ssh_host, "powershell", "-NoProfile", "-EncodedCommand", encoded]
     import subprocess as _sp
     def _run() -> tuple[int, bytes, bytes]:
@@ -423,7 +424,8 @@ async def _attempt_rpc_server_restart(
     )
     import base64
     encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
-    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+    cmd = ["ssh", *_ssh_persistent_args(), "-o", "BatchMode=yes",
+           "-o", "ConnectTimeout=8",
            ssh_host, "powershell", "-NoProfile", "-EncodedCommand", encoded]
 
     import subprocess as _sp
@@ -745,6 +747,54 @@ _LAN_REPAIR_LAST_ATTEMPT: dict[str, float] = {}
 _LAN_REPAIR_COOLDOWN_SEC = 60.0
 
 
+# ---------------------------------------------------------------------------
+# Persistent SSH connections via OpenSSH's ControlMaster
+#
+# Every distributed-tool dispatch (`fetch_url`, `web_search`, `read_doc`,
+# `python_exec`), every model-sync, and every probe-restart opens an SSH
+# connection. TCP+SSH handshake is ~50-150 ms per connection; for a
+# single chat turn that fires 5 dispatches, that's ~500 ms of dead
+# wall-clock time spent on the same handshake to the same worker.
+#
+# ControlMaster opens one master connection per (user@host:port) and
+# reuses it for every subsequent ssh/scp invocation. Setup cost on
+# subsequent calls drops to ~5 ms — purely the local FIFO/named-pipe
+# round-trip to the master.
+#
+# ControlPath uses %C (hash of conn-tuple) so masters auto-key per host.
+# ControlPersist=60s keeps the connection alive for a minute after the
+# last invocation — covers the typical "burst of 3-5 calls in a turn"
+# pattern without leaking idle connections forever.
+#
+# Cross-platform: Windows OpenSSH (8.x+) supports ControlMaster on
+# named pipes; older builds print a warning and continue without
+# multiplexing, which is harmless. macOS/Linux use UNIX sockets.
+# ---------------------------------------------------------------------------
+import tempfile as _tempfile_cm
+_SSH_CONTROL_DIR = Path(_tempfile_cm.gettempdir()) / "gigachat-ssh-cm"
+try:
+    _SSH_CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+
+def _ssh_persistent_args() -> list[str]:
+    """Return `-o` flags that enable SSH connection multiplexing.
+
+    Prepend to every ssh/scp argv so the first dispatch pays the
+    handshake cost and subsequent dispatches reuse the master. When
+    the local OpenSSH client doesn't support ControlMaster (very old
+    builds), it prints a warning and ignores the options — behaviour
+    falls back to the previous one-handshake-per-call path with no
+    correctness impact.
+    """
+    return [
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={_SSH_CONTROL_DIR / 'cm-%C'}",
+        "-o", "ControlPersist=60",
+    ]
+
+
 async def _rediscover_lan_ip_via_tailscale(worker: dict) -> str | None:
     """SSH to the worker over Tailscale and return its current LAN IPv4.
 
@@ -778,7 +828,8 @@ async def _rediscover_lan_ip_via_tailscale(worker: dict) -> str | None:
     # ConnectTimeout caps the dial wait so a dead Tailscale link doesn't
     # block the periodic sweep.
     cmd = [
-        "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+        "ssh", *_ssh_persistent_args(),
+        "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
         tailscale_host,
         "powershell", "-NoProfile", "-EncodedCommand", encoded,
     ]
@@ -2654,7 +2705,8 @@ async def _lan_pull_override(worker: dict, filename: str, dst: Path) -> bool:
 
     # Step 1: confirm it exists. Use `stat -c %s` to get a byte count
     # we can sanity-check (skip empty / partial files).
-    check_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+    check_cmd = ["ssh", *_ssh_persistent_args(),
+                 "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                  ssh_host, f'stat -c "%s" {remote_path} 2>/dev/null || echo MISSING']
 
     import subprocess as _sp
@@ -2677,7 +2729,8 @@ async def _lan_pull_override(worker: dict, filename: str, dst: Path) -> bool:
     tmp = dst.with_suffix(dst.suffix + ".lan-part")
     if tmp.exists():
         tmp.unlink()
-    scp_cmd = ["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+    scp_cmd = ["scp", *_ssh_persistent_args(),
+               "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                f"{ssh_host}:{remote_path}", str(tmp)]
     log.info(
         "compute_pool: lan-pull %s from %s (%.2f GB)",
@@ -2735,7 +2788,8 @@ async def _distribute_override_to_workers(model_name: str) -> None:
             ssh_host = worker["ssh_host"].strip()
             remote_path = f"~/.gigachat/llama-cpp/models/{path.name}"
             # Skip if the worker already has the file at full size.
-            check_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+            check_cmd = ["ssh", *_ssh_persistent_args(),
+                         "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                          ssh_host,
                          f'stat -c "%s" {remote_path} 2>/dev/null || echo MISSING']
             r = await asyncio.to_thread(
@@ -2746,12 +2800,14 @@ async def _distribute_override_to_workers(model_name: str) -> None:
                 if out.isdigit() and int(out) == local_size:
                     continue  # already there
             # Ensure the dir exists, then push the file.
-            mkdir_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+            mkdir_cmd = ["ssh", *_ssh_persistent_args(),
+                         "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                          ssh_host, "mkdir -p ~/.gigachat/llama-cpp/models"]
             await asyncio.to_thread(
                 lambda c=mkdir_cmd: _sp.run(c, capture_output=True, text=True, timeout=15),
             )
-            scp_cmd = ["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            scp_cmd = ["scp", *_ssh_persistent_args(),
+                       "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                        str(path), f"{ssh_host}:{remote_path}"]
             log.info(
                 "compute_pool: distributing %s to %s (%.2f GB)",
@@ -3341,7 +3397,8 @@ async def dispatch_to_worker_powershell(
     import base64
     encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
     cmd = [
-        "ssh", "-o", "BatchMode=yes",
+        "ssh", *_ssh_persistent_args(),
+        "-o", "BatchMode=yes",
         "-o", f"ConnectTimeout={int(min(timeout_sec, 30))}",
         ssh_host,
         "powershell", "-NoProfile", "-EncodedCommand", encoded,
@@ -3475,7 +3532,8 @@ async def dispatch_fetch_url_to_worker(url: str) -> tuple[bool, bytes, str] | No
     import base64
     encoded = base64.b64encode(ps_cmd.encode("utf-16-le")).decode("ascii")
     cmd = [
-        "ssh", "-o", "BatchMode=yes",
+        "ssh", *_ssh_persistent_args(),
+        "-o", "BatchMode=yes",
         "-o", f"ConnectTimeout={int(_DISPATCH_FETCH_TIMEOUT_SEC)}",
         ssh_host,
         "powershell", "-NoProfile", "-EncodedCommand", encoded,

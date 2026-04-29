@@ -166,7 +166,8 @@ async def _ssh_check_blobs(ssh_host: str, digests: list[str]) -> set[str]:
     everything") — better to over-copy than miss a blob.
     """
     cmd = [
-        "ssh", "-o", "BatchMode=yes", ssh_host,
+        "ssh", *compute_pool._ssh_persistent_args(),
+        "-o", "BatchMode=yes", ssh_host,
         # Cross-shell-friendly: use python -c to read the blobs dir
         # rather than ls + glob (Windows cmd.exe doesn't glob, PowerShell
         # globs differently, etc.).
@@ -217,7 +218,10 @@ def plan(model_name: str, worker_id: str) -> CopyPlan:
 
 async def _scp(local: Path, remote_target: str) -> None:
     """Run `scp` synchronously. Surfaces stderr on non-zero exit."""
-    cmd = ["scp", "-o", "BatchMode=yes", str(local), remote_target]
+    cmd = [
+        "scp", *compute_pool._ssh_persistent_args(),
+        "-o", "BatchMode=yes", str(local), remote_target,
+    ]
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -239,7 +243,8 @@ async def _ssh_mkdir(ssh_host: str, remote_dir: str) -> None:
     the same call works whether the worker's default shell is cmd or
     pwsh or bash."""
     cmd = [
-        "ssh", "-o", "BatchMode=yes", ssh_host,
+        "ssh", *compute_pool._ssh_persistent_args(),
+        "-o", "BatchMode=yes", ssh_host,
         "powershell", "-NoProfile", "-Command",
         f'"New-Item -ItemType Directory -Force -Path \\"{remote_dir}\\" | Out-Null"',
     ]

@@ -66,3 +66,19 @@ pytesseract==0.3.13
 # the standalone test-runner script). Pinned to current stable releases. -----
 pytest==9.0.3
 pytest-asyncio==1.3.0
+# uvloop replaces stdlib asyncio with a libuv-based event loop on POSIX
+# systems — typically 10-20 % faster for I/O-heavy workloads (every chat
+# turn streams SSE; every indexer fans out HTTP). Skipped on Windows
+# because uvloop has no Windows port; the marker keeps `pip install`
+# from erroring on `pip install -r requirements.txt` there.
+uvloop==0.21.0 ; platform_system != "Windows"
+# HTTP/2 support for httpx — lets the shared AsyncClient multiplex
+# concurrent streams to localhost Ollama / llama-server over a single
+# connection, avoiding head-of-line blocking under embed fan-out.
+# httpx auto-detects the package; absence falls back to HTTP/1.1.
+h2==4.3.0
+# orjson — drop-in JSON encoder ~3-5× faster than stdlib `json` for
+# the chat-streaming hot path. FastAPI uses it via ORJSONResponse
+# when available; we also use it directly in tools that produce
+# large JSON payloads.
+orjson==3.11.4

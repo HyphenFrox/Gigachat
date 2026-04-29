@@ -77,6 +77,19 @@ if sys.platform == "win32":
         # If the platform exposes an unexpected policy name (e.g. on some
         # Python builds) fall back to the default rather than crashing.
         pass
+else:
+    # uvloop on Linux/macOS: drop-in asyncio replacement that's typically
+    # 10-20% faster for I/O-heavy workloads (every chat turn streams SSE,
+    # every indexer fans out HTTP). Falls through silently when uvloop
+    # isn't installed — it's an optional `pip install uvloop` not a hard
+    # dependency, so unsupported environments (Windows; some niche
+    # platforms) keep working with the stdlib loop.
+    try:
+        import uvloop  # type: ignore
+        uvloop.install()
+    except Exception:
+        # Module missing or install rejected — stdlib loop is fine.
+        pass
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
@@ -173,6 +186,7 @@ async def lifespan(_app: FastAPI):
     await _stop_compute_pool_probe()
     await _stop_stale_watchdog()
     await _stop_scheduler()
+    await _close_shared_http_client()
 
 
 app = FastAPI(title="Gigachat", lifespan=lifespan)
@@ -938,6 +952,17 @@ async def _stop_mcp() -> None:
     """Terminate every MCP subprocess before uvicorn exits."""
     try:
         await mcp.shutdown()
+    except Exception:
+        pass
+
+
+async def _close_shared_http_client() -> None:
+    """Close the process-wide shared `httpx.AsyncClient`. Idempotent —
+    safe to call even if the client was never lazily-created.
+    """
+    try:
+        from . import http_client
+        await http_client.aclose_shared_client()
     except Exception:
         pass
 

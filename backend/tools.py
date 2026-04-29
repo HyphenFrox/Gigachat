@@ -908,26 +908,35 @@ async def _reembed_codebase_file(path_str: str, model: str) -> None:
     try:
         import asyncio as _asyncio
         from . import compute_pool as _cp
+        from . import http_client as _hc
         sem = _asyncio.Semaphore(_cp.embed_concurrency_limit(model))
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async def _embed_one(chunk: str) -> list[float] | None:
-                async with sem:
-                    try:
-                        return await _ollama_embed(client, chunk, model)
-                    except Exception:
-                        return None
-            # Per-file fan-out across the embed pool — same pattern as
-            # `_codebase_index_cwd_impl`. Touched files re-embed faster
-            # the more workers the user has registered.
-            vectors = await _asyncio.gather(*(_embed_one(c) for c in chunks))
-            for ci, (chunk, vec) in enumerate(zip(chunks, vectors)):
-                if vec is None:
-                    continue
+        client = await _hc.get_shared_client()
+
+        async def _embed_one(chunk: str) -> list[float] | None:
+            async with sem:
                 try:
-                    _db.insert_doc_chunk(
-                        path=path_str, ordinal=ci, text=chunk,
-                        vector=vec, model=model,
-                    )
+                    return await _ollama_embed(client, chunk, model)
+                except Exception:
+                    return None
+        # Per-file fan-out across the embed pool — same pattern as
+        # `_codebase_index_cwd_impl`. Touched files re-embed faster
+        # the more workers the user has registered.
+        vectors = await _asyncio.gather(*(_embed_one(c) for c in chunks))
+        # Bulk insert: one transaction for the whole file's chunks.
+        batch_rows = [
+            {"path": path_str, "ordinal": ci, "text": chunk,
+             "vector": vec, "model": model}
+            for ci, (chunk, vec) in enumerate(zip(chunks, vectors))
+            if vec is not None
+        ]
+        try:
+            _db.insert_doc_chunks_batch(batch_rows)
+        except Exception:
+            # Bulk write failed — best-effort fallback to per-row inserts
+            # so a single bad row doesn't lose the whole file.
+            for r in batch_rows:
+                try:
+                    _db.insert_doc_chunk(**r)
                 except Exception:
                     continue
     except Exception:
@@ -7722,37 +7731,42 @@ async def doc_index(
         # `_codebase_index_cwd_impl` — each chunk's embed routes through
         # `pick_embed_target` (round-robin across host + workers) and a
         # semaphore caps concurrent calls so all backends stay busy
-        # without overwhelming the slowest.
+        # without overwhelming the slowest. Shares the process-wide
+        # `httpx.AsyncClient` so connections to Ollama / workers stay
+        # warm across the entire indexing build.
         import asyncio as _asyncio
         from . import compute_pool as _cp
+        from . import http_client as _hc
         sem = _asyncio.Semaphore(_cp.embed_concurrency_limit(m))
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async def _embed_one(chunk: str) -> list[float] | None:
-                async with sem:
-                    try:
-                        return await _ollama_embed(client, chunk, m)
-                    except Exception:
-                        return None
+        client = await _hc.get_shared_client()
 
-            for f in files:
+        async def _embed_one(chunk: str) -> list[float] | None:
+            async with sem:
                 try:
-                    text = f.read_text(encoding="utf-8", errors="replace")
+                    return await _ollama_embed(client, chunk, m)
                 except Exception:
-                    continue
-                if not text.strip():
-                    continue
-                chunks = _chunk_text(text, _DOC_INDEX_CHUNK_CHARS, _DOC_INDEX_CHUNK_OVERLAP)
-                # Ditch any previous rows for this file BEFORE embedding so
-                # a partial failure leaves us in a clean state on retry.
-                _db.delete_doc_chunks_for(str(f))
-                vectors = await _asyncio.gather(*(_embed_one(c) for c in chunks))
-                for ci, (chunk, vec) in enumerate(zip(chunks, vectors)):
-                    if vec is None:
-                        continue
-                    _db.insert_doc_chunk(
-                        path=str(f), ordinal=ci, text=chunk, vector=vec, model=m,
-                    )
-                    chunks_total += 1
+                    return None
+
+        for f in files:
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if not text.strip():
+                continue
+            chunks = _chunk_text(text, _DOC_INDEX_CHUNK_CHARS, _DOC_INDEX_CHUNK_OVERLAP)
+            # Ditch any previous rows for this file BEFORE embedding so
+            # a partial failure leaves us in a clean state on retry.
+            _db.delete_doc_chunks_for(str(f))
+            vectors = await _asyncio.gather(*(_embed_one(c) for c in chunks))
+            # Bulk insert: one transaction per file vs one per chunk.
+            batch_rows = [
+                {"path": str(f), "ordinal": ci, "text": chunk,
+                 "vector": vec, "model": m}
+                for ci, (chunk, vec) in enumerate(zip(chunks, vectors))
+                if vec is not None
+            ]
+            chunks_total += _db.insert_doc_chunks_batch(batch_rows)
         return {
             "ok": True,
             "output": f"indexed {chunks_total} chunk(s) across {len(files)} file(s) under {p} (model={m})",
@@ -7922,14 +7936,18 @@ async def _codebase_index_cwd_impl(cwd: str, model: str | None = None) -> dict:
     a host+2-worker pool indexes ~3× faster than the previous serial
     loop.
 
+    Uses the process-wide shared `httpx.AsyncClient` so connections to
+    Ollama / workers stay warm across indexing calls (no per-call
+    TCP+TLS handshake).
+
     Safe to call concurrently with the same cwd — the 'indexing' status
     in the registry is advisory only; duplicate work wastes CPU but
     never corrupts data (each file's chunks are deleted before re-insert).
     """
     import asyncio as _asyncio
-    import httpx
     from . import compute_pool as _cp
     from . import db as _db
+    from . import http_client as _hc
     m = (model or _DEFAULT_EMBED_MODEL).strip()
     root = Path(cwd).expanduser().resolve()
     if not root.exists() or not root.is_dir():
@@ -7942,37 +7960,41 @@ async def _codebase_index_cwd_impl(cwd: str, model: str | None = None) -> dict:
         files = _codebase_list_files(root)
         chunks_total = 0
         sem = _asyncio.Semaphore(_cp.embed_concurrency_limit(m))
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async def _embed_one(chunk: str) -> list[float] | None:
-                """Embed under semaphore, swallow per-chunk failures."""
-                async with sem:
-                    try:
-                        return await _ollama_embed(client, chunk, m)
-                    except Exception:
-                        return None
+        client = await _hc.get_shared_client()
 
-            for f in files:
+        async def _embed_one(chunk: str) -> list[float] | None:
+            """Embed under semaphore, swallow per-chunk failures."""
+            async with sem:
                 try:
-                    text = f.read_text(encoding="utf-8", errors="replace")
+                    return await _ollama_embed(client, chunk, m)
                 except Exception:
-                    continue
-                if not text.strip():
-                    continue
-                chunks = _chunk_text(
-                    text, _DOC_INDEX_CHUNK_CHARS, _DOC_INDEX_CHUNK_OVERLAP,
-                )
-                _db.delete_doc_chunks_for(str(f))
-                # Fan-out: every chunk's embed runs concurrently against
-                # the pool. Order is preserved by `gather`'s output list,
-                # so we still write `ordinal=ci` correctly.
-                vectors = await _asyncio.gather(*(_embed_one(c) for c in chunks))
-                for ci, (chunk, vec) in enumerate(zip(chunks, vectors)):
-                    if vec is None:
-                        continue
-                    _db.insert_doc_chunk(
-                        path=str(f), ordinal=ci, text=chunk, vector=vec, model=m,
-                    )
-                    chunks_total += 1
+                    return None
+
+        for f in files:
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if not text.strip():
+                continue
+            chunks = _chunk_text(
+                text, _DOC_INDEX_CHUNK_CHARS, _DOC_INDEX_CHUNK_OVERLAP,
+            )
+            _db.delete_doc_chunks_for(str(f))
+            # Fan-out: every chunk's embed runs concurrently against
+            # the pool. Order is preserved by `gather`'s output list,
+            # so we still write `ordinal=ci` correctly.
+            vectors = await _asyncio.gather(*(_embed_one(c) for c in chunks))
+            # Bulk insert via a single transaction — one fsync per file
+            # instead of one per chunk. Successful chunks (non-None vec)
+            # get rows; failed ones drop silently.
+            batch_rows = [
+                {"path": str(f), "ordinal": ci, "text": chunk,
+                 "vector": vec, "model": m}
+                for ci, (chunk, vec) in enumerate(zip(chunks, vectors))
+                if vec is not None
+            ]
+            chunks_total += _db.insert_doc_chunks_batch(batch_rows)
         import time as _time
         _db.upsert_codebase_index(
             str(root),
@@ -8299,17 +8321,14 @@ async def _docs_url_crawl_impl(did: str, model: str | None = None) -> dict:
                 page_vectors = await _asyncio_doc.gather(
                     *(_embed_one(c) for c in chunks)
                 )
-                for ci, (chunk, vec) in enumerate(zip(chunks, page_vectors)):
-                    if vec is None:
-                        continue
-                    _db.insert_doc_chunk(
-                        path=chunk_path,
-                        ordinal=ci,
-                        text=chunk,
-                        vector=vec,
-                        model=m,
-                    )
-                    chunks_total += 1
+                # Bulk insert this page's chunks in a single transaction.
+                page_rows = [
+                    {"path": chunk_path, "ordinal": ci, "text": chunk,
+                     "vector": vec, "model": m}
+                    for ci, (chunk, vec) in enumerate(zip(chunks, page_vectors))
+                    if vec is not None
+                ]
+                chunks_total += _db.insert_doc_chunks_batch(page_rows)
 
                 # Progress ping so the UI can show a rising count without
                 # blocking on the full crawl.

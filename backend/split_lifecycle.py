@@ -675,6 +675,122 @@ def _compute_optimal_ctx_size(
     return fits
 
 
+def _compute_optimal_batch_sizes(
+    gguf_path: str,
+    *,
+    parallel: int,
+    ctx_size: int,
+    cache_type: str | None,
+    target_size_bytes: int,
+    draft_size_bytes: int = 0,
+) -> tuple[int, int] | tuple[None, None]:
+    """Pick `-b` (logical) and `-ub` (physical) batch sizes for prefill.
+
+    llama-server defaults: ``-b 2048 -ub 512``. Bigger ``-ub`` makes
+    prefill 2-4× faster on capable GPUs (per-token matmul amortizes
+    over the batch) but costs activation memory roughly proportional
+    to ``ub × hidden_size × n_layers``. On a workstation GPU with
+    plenty of headroom the default leaves a lot of speed on the
+    table; on a tight pool the default is exactly right.
+
+    Algorithm:
+      * Estimate activation memory per ubatch token from GGUF
+        metadata (embedding_length × block_count × FP16 + 4× scratch).
+      * Compute free VRAM after target+draft weights and KV cache.
+      * Pick the largest ``ub`` whose activation budget fits half the
+        remaining free VRAM (the other half is for scratch / paging /
+        OS overhead).
+      * Round to the next power of two so llama.cpp's batched kernels
+        hit fast paths.
+
+    Returns ``(b, ub)`` when bumping above defaults is safe; returns
+    ``(None, None)`` to keep llama.cpp's defaults — for tight pools
+    where activation memory is constrained, or when GGUF metadata
+    can't be read (no informed call possible).
+    """
+    try:
+        import gguf
+        reader = gguf.GGUFReader(gguf_path)
+        arch_field = reader.fields.get("general.architecture")
+        if not arch_field or not arch_field.types:
+            return None, None
+        arch = arch_field.parts[arch_field.data[0]].tobytes().decode(
+            "utf-8", errors="replace",
+        )
+        embedding_length = _read_gguf_int(
+            reader, arch,
+            f"{arch}.embedding_length", "llama.embedding_length",
+        )
+        block_count = _read_gguf_int(
+            reader, arch,
+            f"{arch}.block_count", "llama.block_count",
+        )
+    except Exception:
+        return None, None
+    if not embedding_length or not block_count:
+        return None, None
+
+    # Activation memory per token in the prefill pipeline:
+    #   FP16 hidden state × layers × scratch multiplier
+    # The 4× multiplier covers attn / FFN intermediate buffers that
+    # llama.cpp allocates per layer; empirically matches what nvprof
+    # shows on standard transformers.
+    activation_per_token = embedding_length * block_count * 2 * 4
+
+    # Free VRAM after weights + KV cache.
+    try:
+        from . import sysdetect
+        spec = sysdetect.detect_system()
+        host_vram = int(float(spec.get("vram_gb") or 0) * (1024 ** 3))
+    except Exception:
+        return None, None
+    if host_vram <= 0:
+        return None, None  # CPU-only — keep defaults; -ub bump won't help
+
+    # KV bytes already accounted for by the parallel decision.
+    kv_bytes = _estimate_kv_bytes_per_slot(gguf_path, ctx_size) * max(1, parallel)
+    if cache_type == "q8_0":
+        kv_bytes = kv_bytes // 2
+
+    free_after = int(host_vram * (1.0 - _PARALLEL_VRAM_HEADROOM))
+    free_after -= int(target_size_bytes or 0) + int(draft_size_bytes or 0)
+    free_after -= kv_bytes
+    if free_after <= 0:
+        return None, None
+
+    # Use half of remaining free VRAM for prefill activation. The
+    # other half is reserve for kernel scratch / OS / driver overhead.
+    activation_budget = free_after // 2
+    max_ub_by_memory = activation_budget // max(1, activation_per_token)
+
+    # Round down to the largest power of two ≤ max_ub. Fast llama.cpp
+    # kernels are sized for power-of-two ubatches; non-aligned values
+    # work but lose performance on some backends.
+    if max_ub_by_memory < 1024:
+        return None, None  # default 512 is already aggressive enough
+    if max_ub_by_memory >= 4096:
+        ub = 4096
+    elif max_ub_by_memory >= 2048:
+        ub = 2048
+    elif max_ub_by_memory >= 1024:
+        ub = 1024
+    else:
+        return None, None
+
+    # `-b` (logical) is generally 2× `-ub` (physical) — gives the
+    # scheduler room to pack multiple ubatches per logical batch.
+    # llama.cpp caps `-b` at 8192 internally on most builds.
+    b = min(8192, ub * 2)
+    log.info(
+        "split_lifecycle: adaptive batch sizes: free_vram=%.2f GB "
+        "activation_per_token=%d MiB -> -b %d -ub %d",
+        free_after / (1024 ** 3),
+        activation_per_token / (1024 ** 2),
+        b, ub,
+    )
+    return b, ub
+
+
 # Heterogeneity threshold — only emit `-ts` (per-device layer weights)
 # when the pool is meaningfully uneven. Below this ratio, llama.cpp's
 # internal per-device memory query already produces near-optimal splits
@@ -858,6 +974,8 @@ def _build_command(
     cache_type: str | None = None,
     ctx_size: int = _CTX_SIZE_FLOOR,
     prompt_cache_path: str | None = None,
+    batch_size: int | None = None,
+    ubatch_size: int | None = None,
 ) -> list[str]:
     """Assemble the argv for `llama-server`.
 
@@ -1092,6 +1210,14 @@ def _build_command(
         # (model, permission_mode) — every chat after a model switch
         # starts hot instead of cold.
         cmd.extend(["--prompt-cache", prompt_cache_path, "--prompt-cache-all"])
+    if batch_size and ubatch_size:
+        # Adaptive prompt-eval batch sizes. llama-server defaults
+        # (`-b 2048 -ub 512`) are conservative — bumping `-ub` can
+        # speed prefill 2-4× on capable GPUs at the cost of activation
+        # memory. `_compute_optimal_batch_sizes` only returns values
+        # when the pool has the headroom to absorb the extra activation
+        # memory; tight pools keep llama.cpp's defaults.
+        cmd.extend(["-b", str(batch_size), "-ub", str(ubatch_size)])
     return cmd
 
 
@@ -1450,6 +1576,19 @@ async def start(split_id: str) -> dict:
     # the cached system-prompt KV instead of re-decoding from scratch.
     prompt_cache_path = _resolve_prompt_cache_path(row["gguf_path"], cache_type)
 
+    # Adaptive prompt-eval batch sizes. Returns (None, None) on tight
+    # pools so llama.cpp's defaults stay in effect there; bumps `-b`
+    # and `-ub` on workstations with VRAM headroom for 2-4× faster
+    # prefill on long prompts.
+    batch_size, ubatch_size = _compute_optimal_batch_sizes(
+        row["gguf_path"],
+        parallel=parallel,
+        ctx_size=ctx_size,
+        cache_type=cache_type,
+        target_size_bytes=target_size_bytes,
+        draft_size_bytes=draft_size,
+    )
+
     cmd = _build_command(
         llama_server=server,
         gguf_path=row["gguf_path"],
@@ -1464,6 +1603,8 @@ async def start(split_id: str) -> dict:
         cache_type=cache_type,
         ctx_size=ctx_size,
         prompt_cache_path=prompt_cache_path,
+        batch_size=batch_size,
+        ubatch_size=ubatch_size,
     )
     log_path = _log_path_for(split_id)
 
