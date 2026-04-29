@@ -29,6 +29,24 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+# orjson is a Rust-based JSON parser ~3-5x faster than stdlib json
+# for the row-hydration hot path (every message LIST query parses
+# `tool_calls` + `images` columns through this). Falls back to
+# stdlib json when orjson isn't installed; behaviour identical.
+try:
+    import orjson as _orjson  # type: ignore
+
+    def _json_loads(data: str) -> Any:
+        # orjson.loads accepts both str and bytes; we get str from
+        # sqlite3 by default. The orjson decoder is strict about
+        # trailing whitespace where stdlib is lenient — every JSON
+        # value we store is dumped via json.dumps (or orjson) without
+        # trailing whitespace, so this matches in practice.
+        return _orjson.loads(data)
+except ImportError:
+    def _json_loads(data: str) -> Any:
+        return json.loads(data)
+
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
 
 
@@ -996,7 +1014,7 @@ def get_loaded_tools(cid: str) -> list[str]:
         return []
     raw = row["loaded_tools_json"] or "[]"
     try:
-        names = json.loads(raw)
+        names = _json_loads(raw)
     except Exception:
         return []
     if not isinstance(names, list):
@@ -1022,7 +1040,7 @@ def add_loaded_tools(cid: str, names: list[str]) -> list[str]:
         if not row:
             return []
         try:
-            current = json.loads(row["loaded_tools_json"] or "[]")
+            current = _json_loads(row["loaded_tools_json"] or "[]")
             if not isinstance(current, list):
                 current = []
         except Exception:
@@ -1099,7 +1117,7 @@ def drain_queued_inputs(cid: str) -> list[dict]:
     for r in rows:
         imgs = None
         try:
-            imgs = json.loads(r["images"]) if r["images"] else None
+            imgs = _json_loads(r["images"]) if r["images"] else None
         except Exception:
             imgs = None
         out.append({"text": r["text"] or "", "images": imgs})
@@ -2960,13 +2978,13 @@ def count_push_subscriptions() -> int:
 # ---------------------------------------------------------------------------
 def _row_to_mcp_server(row: sqlite3.Row) -> dict:
     try:
-        args = json.loads(row["args_json"] or "[]")
+        args = _json_loads(row["args_json"] or "[]")
         if not isinstance(args, list):
             args = []
     except Exception:
         args = []
     try:
-        env = json.loads(row["env_json"] or "{}")
+        env = _json_loads(row["env_json"] or "{}")
         if not isinstance(env, dict):
             env = {}
     except Exception:
@@ -3116,7 +3134,7 @@ def get_setting(key: str, default: Any = None) -> Any:
         _SETTING_CACHE[key] = None
         return default
     try:
-        value = json.loads(row["value"])
+        value = _json_loads(row["value"])
     except (json.JSONDecodeError, TypeError):
         return default
     _SETTING_CACHE[key] = value
@@ -3159,7 +3177,7 @@ def get_all_settings() -> dict[str, Any]:
     out: dict[str, Any] = {}
     for r in rows:
         try:
-            out[r["key"]] = json.loads(r["value"])
+            out[r["key"]] = _json_loads(r["value"])
             _SETTING_CACHE[r["key"]] = out[r["key"]]
         except (json.JSONDecodeError, TypeError):
             continue
@@ -3179,7 +3197,7 @@ def _row_to_conversation(row: sqlite3.Row) -> dict:
     except (IndexError, KeyError):
         raw_tags = None
     try:
-        tags = json.loads(raw_tags) if raw_tags else []
+        tags = _json_loads(raw_tags) if raw_tags else []
     except (json.JSONDecodeError, TypeError):
         tags = []
     try:
@@ -3250,8 +3268,8 @@ def _row_to_message(row: sqlite3.Row) -> dict:
         "conversation_id": row["conversation_id"],
         "role": row["role"],
         "content": row["content"],
-        "tool_calls": json.loads(row["tool_calls"]) if row["tool_calls"] else [],
-        "images": json.loads(raw_images) if raw_images else [],
+        "tool_calls": _json_loads(row["tool_calls"]) if row["tool_calls"] else [],
+        "images": _json_loads(raw_images) if raw_images else [],
         "pinned": pinned,
         "created_at": row["created_at"],
     }
@@ -3431,11 +3449,11 @@ USER_TOOL_TIMEOUT_MAX = 600
 def _row_to_user_tool(row: sqlite3.Row) -> dict:
     """Unpack a user_tools row, deserialising JSON columns."""
     try:
-        schema = json.loads(row["schema_json"]) if row["schema_json"] else {}
+        schema = _json_loads(row["schema_json"]) if row["schema_json"] else {}
     except Exception:
         schema = {}
     try:
-        deps = json.loads(row["deps_json"]) if row["deps_json"] else []
+        deps = _json_loads(row["deps_json"]) if row["deps_json"] else []
     except Exception:
         deps = []
     return {
@@ -4078,7 +4096,7 @@ def delete_compute_worker(wid: str) -> int:
 def _row_to_compute_worker(row: sqlite3.Row) -> dict:
     caps_raw = row["capabilities_json"]
     try:
-        caps = json.loads(caps_raw) if caps_raw else None
+        caps = _json_loads(caps_raw) if caps_raw else None
     except Exception:
         caps = None
     # ssh_host / tailscale_host may not exist on older DBs that haven't
@@ -4373,7 +4391,7 @@ def delete_split_model(sid: str) -> int:
 
 def _row_to_split_model(row: sqlite3.Row) -> dict:
     try:
-        wids = json.loads(row["worker_ids_json"]) if row["worker_ids_json"] else []
+        wids = _json_loads(row["worker_ids_json"]) if row["worker_ids_json"] else []
     except Exception:
         wids = []
     # `mmproj_path` and `draft_gguf_path` were added in later migrations
