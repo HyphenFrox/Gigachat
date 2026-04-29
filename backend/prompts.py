@@ -195,6 +195,16 @@ def _load_agents_md(cwd: str) -> str:
     return "".join(body_parts)
 
 
+# Tool-manifest section is identical across every chat turn unless the
+# user adds an MCP server or a user-defined tool — both rare events.
+# Caching the rendered string for 30 s collapses every per-turn rebuild
+# into a single physical render. The TTL bound keeps fresh tools
+# visible after 30 s without the operator restarting the backend.
+import time as _time_for_manifest_cache
+_TOOL_MANIFEST_CACHE: dict[str, tuple[float, str]] = {}
+_TOOL_MANIFEST_TTL_SEC = 30.0
+
+
 def _build_tool_manifest_section() -> str:
     """Render a compact `name — summary` list of every loadable tool.
 
@@ -204,9 +214,19 @@ def _build_tool_manifest_section() -> str:
     tools cost ~5 KB / 1.2K tokens — about 1/15th of the full schema
     payload.
 
+    Cached for ``_TOOL_MANIFEST_TTL_SEC`` seconds — the manifest rarely
+    changes (only when an MCP server is added or a user-defined tool
+    is registered), and rendering it on every turn was redundant work
+    on a hot path. Cache miss is the same physical render the previous
+    code did.
+
     Imported lazily so this module doesn't take a hard dep on tools.py
     at import time (avoids the prompts → tools → prompts cycle).
     """
+    now = _time_for_manifest_cache.monotonic()
+    cached = _TOOL_MANIFEST_CACHE.get("section")
+    if cached and (now - cached[0]) < _TOOL_MANIFEST_TTL_SEC:
+        return cached[1]
     try:
         from . import tools as _tools_mod
         manifest = _tools_mod._full_manifest()
@@ -260,7 +280,12 @@ def _build_tool_manifest_section() -> str:
             line += f" · required: {', '.join(req)}"
         lines.append(line)
     lines.append("")
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    # Cache so subsequent turns within the TTL skip the full render.
+    _TOOL_MANIFEST_CACHE["section"] = (
+        _time_for_manifest_cache.monotonic(), rendered,
+    )
+    return rendered
 
 
 def build_system_prompt(
