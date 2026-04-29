@@ -8829,6 +8829,12 @@ def load_project_memory_for_prompt(cwd: str | None) -> str:
     Memories are grouped by `topic` for readability — same shape as
     `load_global_memory_for_prompt` so the prompt visually distinguishes
     project from global only by section heading.
+
+    Deliberately uncached: a TTL cache here would surface stale memory
+    for up to TTL_seconds after the agent calls
+    `remember(scope="project", ...)`. The DB query is sub-millisecond
+    (indexed on cwd) so the read-cache savings don't justify the
+    correctness penalty.
     """
     key = (cwd or "").strip()
     if not key:
@@ -8864,18 +8870,6 @@ def load_project_memory_for_prompt(cwd: str | None) -> str:
     )
 
 
-# Render-cache for the global memory section. The underlying rows
-# rarely change (user-curated durable preferences) but the render
-# pass — group-by-topic, collapse newlines, format markdown — runs
-# on every chat turn. A short TTL lets new memories appear in
-# subsequent turns without explicit invalidation hooks (the user's
-# wait between turns is human-paced, easily long enough to expire
-# the cache). Invalidation on `remember`/`forget` would be cleaner
-# but costs cross-module coupling for a sub-ms render saving.
-_GLOBAL_MEMORY_RENDER_CACHE: dict[str, tuple[float, str]] = {}
-_GLOBAL_MEMORY_RENDER_TTL_SEC = 5.0
-
-
 def load_global_memory_for_prompt() -> str:
     """Return the global memory rows wrapped in a system-prompt section.
 
@@ -8887,17 +8881,11 @@ def load_global_memory_for_prompt() -> str:
     rendered under a generic "General" heading so the prompt stays well
     structured even when the user hasn't bothered to categorise.
 
-    Cached for ``_GLOBAL_MEMORY_RENDER_TTL_SEC`` seconds. The render is
-    cheap individually (~ms) but happens every turn for every chat,
-    including subagent fan-outs that fire dozens of system-prompt
-    builds in parallel. Cache invalidates on TTL — fresh memories
-    appear within seconds.
+    Deliberately uncached for the same correctness reason as
+    `load_project_memory_for_prompt`: a TTL cache here would surface
+    stale memory after `remember(scope="global")` fires, and the
+    sub-millisecond DB read isn't worth that race.
     """
-    import time as _time
-    now = _time.monotonic()
-    cached = _GLOBAL_MEMORY_RENDER_CACHE.get("section")
-    if cached and (now - cached[0]) < _GLOBAL_MEMORY_RENDER_TTL_SEC:
-        return cached[1]
     try:
         rows = db.list_global_memories()
     except Exception:
@@ -8907,34 +8895,29 @@ def load_global_memory_for_prompt() -> str:
         return ""
     if not rows:
         return ""
-    if not rows:
-        rendered = ""
-    else:
-        # Group by topic, preserving creation order within each group.
-        groups: dict[str, list[dict]] = {}
-        for r in rows:
-            groups.setdefault(r["topic"] or "General", []).append(r)
-        body_parts: list[str] = []
-        for topic, items in groups.items():
-            body_parts.append(f"### {topic}")
-            for it in items:
-                # Single-line bullets — collapse internal newlines so the prompt
-                # markdown stays clean.
-                content = " ".join(it["content"].split())
-                body_parts.append(f"- {content}")
-            body_parts.append("")
-        rendered = (
-            "\n\n## Global long-term memory (applies to every conversation)\n\n"
-            "The notes below are durable user preferences, project conventions, "
-            "and facts the user has curated in Settings → Memories. Treat them "
-            "as authoritative — they apply to all your work, not just this one "
-            "conversation. To add or remove globally-scoped notes, use "
-            "`remember(scope=\"global\", ...)` and `forget(scope=\"global\", ...)`.\n\n"
-            + "\n".join(body_parts).rstrip()
-            + "\n"
-        )
-    _GLOBAL_MEMORY_RENDER_CACHE["section"] = (now, rendered)
-    return rendered
+    # Group by topic, preserving creation order within each group.
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(r["topic"] or "General", []).append(r)
+    body_parts: list[str] = []
+    for topic, items in groups.items():
+        body_parts.append(f"### {topic}")
+        for it in items:
+            # Single-line bullets — collapse internal newlines so the prompt
+            # markdown stays clean.
+            content = " ".join(it["content"].split())
+            body_parts.append(f"- {content}")
+        body_parts.append("")
+    return (
+        "\n\n## Global long-term memory (applies to every conversation)\n\n"
+        "The notes below are durable user preferences, project conventions, "
+        "and facts the user has curated in Settings → Memories. Treat them "
+        "as authoritative — they apply to all your work, not just this one "
+        "conversation. To add or remove globally-scoped notes, use "
+        "`remember(scope=\"global\", ...)` and `forget(scope=\"global\", ...)`.\n\n"
+        + "\n".join(body_parts).rstrip()
+        + "\n"
+    )
 
 
 # ---------------------------------------------------------------------------
