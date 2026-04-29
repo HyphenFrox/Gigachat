@@ -2161,4 +2161,28 @@ TOOL_SCHEMAS = [
             }),
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "orchestrate",
+            "description": (
+                "One-call multi-agent pipeline for complex tasks: an ARCHITECT subagent plans, a "
+                "GENERAL subagent executes the plan against the cwd, and a REVIEWER subagent inspects "
+                "the result. Same chat model is used in all three roles — diversity comes from the "
+                "system-prompt overlays each subagent ships with. Use this for non-trivial tasks "
+                "where the standalone `delegate` would require you to manage the sequencing yourself; "
+                "for simple tasks, just call the appropriate tool directly. Pass `skip_review=true` "
+                "when the parent already runs its own review pass (e.g. quality_mode=refine)."
+            ),
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "The task to orchestrate, in natural language."},
+                    "max_iterations": {"type": "integer", "description": "Per-stage tool-call budget (default 10, max 20)."},
+                    "skip_review": {"type": "boolean", "description": "When true, omit the reviewer stage. Default false."},
+                },
+                "required": ["task"],
+            }),
+        },
+    },
 ]

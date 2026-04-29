@@ -173,6 +173,11 @@ async def lifespan(_app: FastAPI):
     # MCP servers last so they can talk to Ollama + the compute pool when
     # they need to.
     await _start_mcp()
+    # Event runtime — file-watcher polling daemon. Webhook firing is
+    # inline in the route handler, but the watcher needs its own loop.
+    # Kept after MCP so any tool-system bootstrap finishes first.
+    from . import event_runtime as _evrt
+    await _evrt.start_event_runtime()
 
     yield
 
@@ -181,6 +186,8 @@ async def lifespan(_app: FastAPI):
     # processes first, then the daemons. Each handler is independently
     # robust — failures during shutdown are swallowed inside each helper so
     # uvicorn always exits cleanly.
+    from . import event_runtime as _evrt
+    await _evrt.stop_event_runtime()
     await _stop_mcp()
     await _stop_split_models()
     await _stop_compute_pool_probe()

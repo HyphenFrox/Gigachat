@@ -4591,3 +4591,136 @@ async def run_subagents_parallel(
         "any_ok": any_ok,
         "count": len(cleaned),
     }
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent orchestration — planner → executor → reviewer pipeline.
+#
+# The existing subagent infrastructure (`run_subagent`, SUBAGENT_TYPES) lets
+# the model spawn a single specialist; the model has to manage the sequencing
+# itself. For a complex task that needs all three stages (plan, execute,
+# review) that's three round-trips of the model deciding what to do next.
+#
+# `run_orchestrated` wraps the pattern in one call: ARCHITECT produces a
+# plan, GENERAL executes the plan against the cwd, REVIEWER inspects the
+# result. Same chat model throughout — distinct roles come from system-prompt
+# overlays (the existing SUBAGENT_TYPES "prompt" field).
+# ---------------------------------------------------------------------------
+
+async def run_orchestrated(
+    task: str,
+    cwd: str,
+    model: str,
+    *,
+    max_iterations: int = 10,
+    skip_review: bool = False,
+    parent_conv_id: str | None = None,
+    parent_tool_call_id: str | None = None,
+) -> dict:
+    """Run a planner → executor → reviewer pipeline for one task.
+
+    Steps:
+      1. Architect subagent produces a numbered plan (read-only).
+      2. General subagent executes the plan against `cwd` (full tools).
+      3. Reviewer subagent inspects the result (read-only).
+
+    The output concatenates each stage's report with section headers,
+    so the parent agent (and the user) can see what was planned,
+    what was actually done, and what the reviewer flagged. When
+    `skip_review=True` the third stage is omitted — useful when the
+    parent already has its own review pass (e.g. quality_mode=refine).
+    """
+    if not (task or "").strip():
+        return {"ok": False, "output": "", "error": "task must not be empty"}
+    blocks: list[str] = []
+
+    # ----- Stage 1: ARCHITECT (plan) -----
+    plan_result = await run_subagent(
+        task=(
+            f"Produce a step-by-step implementation plan for this task. "
+            f"Be concrete: file paths, function names, what changes "
+            f"where, in what order.\n\nTask: {task.strip()}"
+        ),
+        cwd=cwd,
+        model=model,
+        max_iterations=max_iterations,
+        subagent_type="architect",
+        parent_conv_id=parent_conv_id,
+        parent_tool_call_id=parent_tool_call_id,
+    )
+    plan_text = (plan_result.get("output") or "").strip()
+    blocks.append(f"=== PLAN (architect) ===\n{plan_text or '(empty plan)'}")
+    if not plan_result.get("ok") or not plan_text:
+        # Plan failed; abort early — executing without a plan defeats
+        # the orchestration's purpose. Surface the failure plainly.
+        return {
+            "ok": False,
+            "output": "\n\n".join(blocks),
+            "error": "architect stage failed; aborting orchestration",
+        }
+
+    # ----- Stage 2: GENERAL (execute) -----
+    exec_result = await run_subagent(
+        task=(
+            "Execute the following plan against the current working "
+            "directory. Use tools to make the actual changes — do not "
+            "describe what you would do, do it. Report what you changed "
+            "and any deviations from the plan.\n\n"
+            f"--- ORIGINAL TASK ---\n{task.strip()}\n--- END ---\n\n"
+            f"--- PLAN ---\n{plan_text}\n--- END ---"
+        ),
+        cwd=cwd,
+        model=model,
+        max_iterations=max_iterations,
+        subagent_type="general",
+        parent_conv_id=parent_conv_id,
+        parent_tool_call_id=parent_tool_call_id,
+    )
+    exec_text = (exec_result.get("output") or "").strip()
+    blocks.append(
+        f"=== EXECUTION (general) ===\n{exec_text or '(no execution output)'}"
+    )
+    if not exec_result.get("ok"):
+        # Execution failed; still include the failure for context but
+        # skip the review stage — there's nothing useful to review.
+        return {
+            "ok": False,
+            "output": "\n\n".join(blocks),
+            "error": "general executor stage failed; skipping review",
+        }
+
+    if skip_review:
+        return {
+            "ok": True,
+            "output": "\n\n".join(blocks),
+            "stages": ["architect", "general"],
+        }
+
+    # ----- Stage 3: REVIEWER (verify) -----
+    review_result = await run_subagent(
+        task=(
+            "Review the changes the general subagent just made. Look "
+            "for bugs, missing requirements vs the original task, "
+            "security issues, and inconsistencies with the rest of "
+            "the codebase. Use read-only tools (grep / read_file / "
+            "list_dir) to ground your review.\n\n"
+            f"--- ORIGINAL TASK ---\n{task.strip()}\n--- END ---\n\n"
+            f"--- PLAN ---\n{plan_text}\n--- END ---\n\n"
+            f"--- WHAT THE EXECUTOR REPORTED ---\n{exec_text}\n--- END ---"
+        ),
+        cwd=cwd,
+        model=model,
+        max_iterations=max_iterations,
+        subagent_type="reviewer",
+        parent_conv_id=parent_conv_id,
+        parent_tool_call_id=parent_tool_call_id,
+    )
+    review_text = (review_result.get("output") or "").strip()
+    blocks.append(
+        f"=== REVIEW (reviewer) ===\n{review_text or '(no review output)'}"
+    )
+    return {
+        "ok": True,
+        "output": "\n\n".join(blocks),
+        "stages": ["architect", "general", "reviewer"],
+    }

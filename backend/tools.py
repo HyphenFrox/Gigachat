@@ -10166,7 +10166,7 @@ async def create_tool(
     if _utr.is_disabled():
         return {"ok": False, "output": "", "error": "user tools are disabled via GIGACHAT_DISABLE_USER_TOOLS"}
     clean_name = (name or "").strip().lower()
-    if clean_name in TOOL_REGISTRY or clean_name in {"delegate", "delegate_parallel"}:
+    if clean_name in TOOL_REGISTRY or clean_name in {"delegate", "delegate_parallel", "orchestrate"}:
         return {
             "ok": False,
             "output": "",
@@ -11255,6 +11255,9 @@ TOOL_REGISTRY = {
     # reentry into the agent module; see dispatch() below.
     "delegate": None,
     "delegate_parallel": None,
+    # one-call multi-agent pipeline: architect → general → reviewer.
+    # Same chat model throughout, distinct roles via prompt overlays.
+    "orchestrate": None,
     # docker / sandboxed containers — run any language or piece of software
     # in an isolated container without polluting the host. Foreground +
     # background variants mirror the bash / bash_bg pair the agent already
@@ -11426,6 +11429,7 @@ TOOL_CATEGORIES: dict[str, str] = {
     # bypass the restriction by delegating.
     "delegate": "write",
     "delegate_parallel": "write",
+    "orchestrate": "write",
     # docker — every container start executes user-controlled code (the
     # image's CMD or our `sh -c <command>`), which is the textbook
     # definition of a write-class side effect. Pulling an image also writes
@@ -11817,7 +11821,7 @@ def resolve_tool_alias(name: str, args: dict | None) -> tuple[str, dict]:
             return name, args or {}
     except Exception:
         pass
-    if raw in TOOL_REGISTRY or raw in {"delegate", "delegate_parallel"}:
+    if raw in TOOL_REGISTRY or raw in {"delegate", "delegate_parallel", "orchestrate"}:
         return name, args or {}
     entry = _SILENT_TOOL_REDIRECTS.get(raw.lower())
     if not entry:
@@ -12015,7 +12019,7 @@ async def _dispatch_core(
         )
 
     fn = TOOL_REGISTRY.get(name)
-    if fn is None and name not in {"delegate", "delegate_parallel"}:
+    if fn is None and name not in {"delegate", "delegate_parallel", "orchestrate"}:
         hint = _suggest_tool_name(name)
         suffix = f" — did you mean `{hint}`?" if hint else ""
         return {
@@ -12568,6 +12572,18 @@ async def _dispatch_core(
             return await fn()
         if name == "docker_pull":
             return await fn(args.get("image", ""))
+        # ----- Multi-agent orchestration (planner→executor→reviewer) -----
+        if name == "orchestrate":
+            from .agent import run_orchestrated
+            return await run_orchestrated(
+                task=args.get("task", ""),
+                cwd=cwd,
+                model=model or _default_subagent_model(),
+                max_iterations=int(args.get("max_iterations", 10)),
+                skip_review=bool(args.get("skip_review", False)),
+                parent_conv_id=conv_id,
+                parent_tool_call_id=tool_call_id,
+            )
     except Exception as e:
         return {"ok": False, "output": "", "error": f"{type(e).__name__}: {e}"}
     # Tool was found in TOOL_REGISTRY but no `if name == ...` branch above
