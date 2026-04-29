@@ -975,6 +975,107 @@ TOOL_SCHEMAS = [
             }),
         },
     },
+    # ----- email (SMTP send + IMAP read) -----
+    {
+        "type": "function",
+        "function": {
+            "name": "email_send",
+            "description": (
+                "Send one email via SMTP. Auth credential lives in the secrets store under "
+                "`password_secret` and is never echoed back. Defaults to SSL (port 465); set "
+                "use_ssl=false to use STARTTLS on port 587. For Gmail / Outlook / Fastmail use "
+                "an APP password, not your account password."
+            ),
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "smtp_host": {"type": "string", "description": "e.g. smtp.gmail.com / smtp.fastmail.com / mail.example.com."},
+                    "smtp_port": {"type": "integer", "description": "Default 465 (SSL) or 587 (STARTTLS)."},
+                    "user": {"type": "string", "description": "SMTP username (usually the email address)."},
+                    "password_secret": {"type": "string", "description": "Name of the secret holding the SMTP password / app password."},
+                    "to": {"description": "Recipient email address (string or list).", "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string", "description": "Plaintext message body."},
+                    "cc": {"description": "CC recipients (optional).", "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "bcc": {"description": "BCC recipients (optional).", "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "from_addr": {"type": "string", "description": "From address (defaults to `user`)."},
+                    "use_ssl": {"type": "boolean", "description": "Default true. Set false to use STARTTLS instead."},
+                },
+                "required": ["smtp_host", "user", "password_secret", "to", "subject", "body"],
+            }),
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "email_read",
+            "description": (
+                "Read recent emails from an IMAP folder. Returns up to `limit` messages "
+                "(newest-first) with from / to / subject / date / body preview. Body previews "
+                "are truncated to ~2 KB to keep the context tidy."
+            ),
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "imap_host": {"type": "string", "description": "e.g. imap.gmail.com."},
+                    "imap_port": {"type": "integer", "description": "Default 993 (IMAPS)."},
+                    "user": {"type": "string"},
+                    "password_secret": {"type": "string", "description": "Name of the secret holding the IMAP password / app password."},
+                    "folder": {"type": "string", "description": "Default 'INBOX'."},
+                    "limit": {"type": "integer", "description": "Max messages (1-50, default 10)."},
+                    "unseen_only": {"type": "boolean", "description": "When true, return only unread messages."},
+                },
+                "required": ["imap_host", "user", "password_secret"],
+            }),
+        },
+    },
+    # ----- notifications (Slack / Discord / Telegram / generic) -----
+    {
+        "type": "function",
+        "function": {
+            "name": "notify",
+            "description": (
+                "Send a notification to a registered channel. The webhook URL lives in the secrets "
+                "store under `WEBHOOK_<CHANNEL>` (uppercased) — the URL itself never appears in the "
+                "conversation, only the channel alias. Auto-detects Slack, Discord, and Telegram "
+                "Bot API URLs and adapts the JSON shape accordingly. Generic URLs receive {title, message}."
+            ),
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "description": "Channel alias matching a stored secret (e.g. 'ops' → secret WEBHOOK_OPS)."},
+                    "message": {"type": "string", "description": "Message body. Markdown supported on Slack / Discord."},
+                    "title": {"type": "string", "description": "Optional header rendered in bold above the message."},
+                },
+                "required": ["channel", "message"],
+            }),
+        },
+    },
+    # ----- smart home (Home Assistant) -----
+    {
+        "type": "function",
+        "function": {
+            "name": "home_assistant_call",
+            "description": (
+                "Read or write a Home Assistant entity via the local REST API. "
+                "`action`='list_entities' | 'get_state' | 'call_service'. Long-lived access "
+                "token lives in the secrets store under `token_secret` (default HOME_ASSISTANT_TOKEN)."
+            ),
+            "parameters": _with_reason({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list_entities", "get_state", "call_service"]},
+                    "base_url": {"type": "string", "description": "Default http://homeassistant.local:8123."},
+                    "token_secret": {"type": "string", "description": "Default 'HOME_ASSISTANT_TOKEN'."},
+                    "entity_id": {"type": "string", "description": "Required for get_state. Optional for call_service (auto-merged into service_data)."},
+                    "domain": {"type": "string", "description": "Service domain (e.g. 'light', 'switch'). Required for call_service."},
+                    "service": {"type": "string", "description": "Service name (e.g. 'turn_on', 'turn_off'). Required for call_service."},
+                    "service_data": {"type": "object", "description": "Extra service params (e.g. {'brightness': 200})."},
+                },
+                "required": ["action"],
+            }),
+        },
+    },
     # ----- universal API connector (OpenAPI / Swagger) -----
     {
         "type": "function",

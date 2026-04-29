@@ -110,12 +110,62 @@ The model can literally see your desktop (requires a multimodal Ollama model suc
 
 `docker_run`, `docker_run_bg`, `docker_logs`, `docker_exec`, `docker_stop`, `docker_list`, `docker_pull` — run **any language or piece of software** inside an isolated container. Defaults: `--rm`, `--security-opt=no-new-privileges`, 512 MB memory, 1 CPU, conversation cwd mounted **read-only** at `/workspace`, bridge networking (inbound blocked unless explicitly published). Opt into `mount_mode: "rw"`, `network: "none"`, or published ports as needed. Image name is allowlist-validated; docker CLI invoked with argv list (no `shell=True`). Container management is scoped to containers Gigachat itself started (`gigachat_*` name prefix), so the agent can't tamper with your other containers.
 
+### Universal API connector (OpenAPI / Swagger)
+
+Register any REST API by its OpenAPI spec, then call any of its endpoints without writing a per-endpoint tool.
+
+- **`openapi_load(spec_url, api_id, [auth_scheme, auth_secret_name, default_headers])`** — fetches and registers a spec. Auth schemes: `bearer` / `apikey` / `basic`, the credential is stored in the secrets table by name and substituted at call time so the raw value never reaches the model.
+- **`openapi_list`** / **`openapi_list_ops(api_id, [query])`** / **`openapi_describe(api_id, operation_id)`** — discovery surface so the agent can browse big specs (capped at 500 ops per spec, 1 MB body).
+- **`openapi_call(api_id, operation_id, args)`** — invoke. Path / query / header / body parameters dispatched per the spec; remaining args become the JSON body.
+- All calls go through the existing `http_request`, so SSRF guard, secret redaction, and audit logging apply unchanged.
+
+### Audio (transcription)
+
+- **`transcribe_audio(path, [model_name, language])`** — local Whisper via faster-whisper. Returns full transcript + per-segment timestamps. Models: tiny / base / small / medium / large-v3. VAD trims silence. 500 MB file cap.
+
+### SSH (remote machines)
+
+- **`ssh_exec(host, command, [user, port, password_secret])`** — run a remote command, return combined stdout+stderr + exit code. Auth: stored secret, OR system ssh-agent / ~/.ssh keys.
+- **`ssh_put` / `ssh_get`** — SCP a file up or down; 100 MB cap.
+
+### Email
+
+- **`email_send(smtp_host, smtp_port, user, password_secret, to, subject, body, ...)`** — stdlib smtplib, SSL by default. Use an APP password for Gmail / Outlook / Fastmail.
+- **`email_read(imap_host, user, password_secret, [folder, limit, unseen_only])`** — stdlib imaplib, returns recent messages with ~2 KB body previews.
+
+### Notifications (Slack / Discord / Telegram / generic)
+
+- **`notify(channel, message, [title])`** — webhook URL lives in the secrets table under `WEBHOOK_<CHANNEL>` (uppercased). Auto-detects Slack, Discord, and Telegram Bot API URLs and adapts the JSON shape; generic targets receive `{title, message}`. The URL itself never appears in the conversation, only the channel alias.
+
+### Smart home (Home Assistant)
+
+- **`home_assistant_call(action, [base_url, entity_id, domain, service, service_data])`** — list_entities / get_state / call_service over the local HA REST API. Long-lived access token in secrets under `HOME_ASSISTANT_TOKEN`.
+
+### Skill library (procedural memory)
+
+- **`save_skill(name, description, body, [tags])`** — bank a named playbook the agent figured out. Distinct from `remember` (facts): skills are how-to procedures.
+- **`find_skill(query)`** — search by substring; **`recall_skill(name)`** returns the full body (and bumps usage stats).
+- **`list_skills` / `update_skill` / `delete_skill`** — round out the surface. Browse / prune in Settings → **Skills** later (API at `/api/skills`).
+
+### Multi-agent orchestration
+
+- **`orchestrate(task, [skip_review])`** — one-call ARCHITECT (plan) → GENERAL (execute) → REVIEWER (verify) pipeline. Same chat model in all three roles; diversity comes from the SUBAGENT_TYPES prompt overlays. For complex tasks where managing the sequencing yourself with raw `delegate` would be wasteful.
+
+### Event-driven triggers
+
+- **Webhooks** — `POST /api/webhooks` mints a `/webhook/<token>` URL; any service hitting that URL fires an agent turn against the configured target conversation, with the request body as the user message (or templated via `{body}`).
+- **File watchers** — `POST /api/file-watchers` registers a path + glob; a 2-second polling daemon coalesces created / modified / deleted events into one debounced turn.
+
 ### Other tools
 
 - **`clipboard_read` / `clipboard_write`** — share small bits of text with the desktop without typing.
 - **`create_worktree(branch, base_ref)`** — `git worktree add` on a throwaway branch so the agent can do risky edits without touching your working tree. Pair with `list_worktrees` / `remove_worktree(id)`. Branch and base_ref regex-validated.
 - **MCP servers** — connect external [Model Context Protocol](https://modelcontextprotocol.io) servers over stdio. Each server runs as a local subprocess and every advertised tool is auto-merged into the palette as `mcp__<server>__<tool>`. Settings → **MCP** for CRUD; live tool counts + stderr tail for troubleshooting. 20 s handshake timeout, 120 s tool-call ceiling.
 - **User-defined Python tools** — Settings → **Tools** lets *you* register Python snippets that become first-class entries in the tool palette. Each has a `def run(args)` entry point, optional pip dependencies (PEP 508 subset, blocklist on pip/setuptools/wheel), JSON-schema parameters, and a stored `category` + `timeout_seconds` the model cannot override. **The LLM has no route to create, edit, or delete these** — deliberate safety boundary against self-extension. Kill switch: `GIGACHAT_DISABLE_USER_TOOLS=1`.
+
+### Audit log
+
+Every tool call across every conversation is recorded in the `audit_log` table — tool name, category, args, result summary (capped at 2 KB), ok/duration. `GET /api/audit-log` exposes a filterable read-only view: by conversation, by tool name, since-timestamp. Useful for "what did the agent do today" reviews and for post-mortem of long-running tasks.
 
 ---
 

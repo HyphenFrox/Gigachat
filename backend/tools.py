@@ -7429,6 +7429,464 @@ async def ssh_get(
 
 
 # ---------------------------------------------------------------------------
+# Email — `email_send`, `email_read`
+#
+# stdlib smtplib + imaplib so there's no extra dep. The model passes host
+# / port / user explicitly; the password is referenced by secret name so
+# the actual value never enters the conversation. Designed to work with
+# Gmail app passwords, Fastmail, ProtonMail Bridge, any standard SMTP /
+# IMAP server.
+# ---------------------------------------------------------------------------
+
+EMAIL_DEFAULT_TIMEOUT_SEC = 30
+EMAIL_BODY_CAP_CHARS = 50_000
+
+
+async def email_send(
+    *,
+    smtp_host: str,
+    smtp_port: int,
+    user: str,
+    password_secret: str,
+    to: str | list[str],
+    subject: str,
+    body: str,
+    cc: str | list[str] | None = None,
+    bcc: str | list[str] | None = None,
+    from_addr: str | None = None,
+    use_ssl: bool = True,
+) -> dict:
+    """Send one email via SMTP and return success / error.
+
+    Auth credential lives in the secrets store under `password_secret`.
+    Defaults to SSL (port 465 typical) — set use_ssl=False to use
+    STARTTLS on port 587. From address defaults to `user`.
+    """
+    import smtplib
+    from email.message import EmailMessage
+
+    if not (smtp_host or "").strip():
+        return {"ok": False, "output": "", "error": "smtp_host is required"}
+    if not (user or "").strip():
+        return {"ok": False, "output": "", "error": "user is required"}
+    if not (password_secret or "").strip():
+        return {
+            "ok": False, "output": "",
+            "error": "password_secret is required (refer to a stored secret)",
+        }
+    pw = db.get_secret_value(password_secret)
+    if pw is None:
+        return {
+            "ok": False, "output": "",
+            "error": f"secret {password_secret!r} not found",
+        }
+
+    def _split(addr: str | list[str] | None) -> list[str]:
+        if not addr:
+            return []
+        if isinstance(addr, list):
+            return [a.strip() for a in addr if str(a).strip()]
+        return [a.strip() for a in str(addr).split(",") if a.strip()]
+
+    to_list = _split(to)
+    if not to_list:
+        return {"ok": False, "output": "", "error": "at least one `to` address is required"}
+    cc_list = _split(cc)
+    bcc_list = _split(bcc)
+
+    msg = EmailMessage()
+    msg["From"] = from_addr or user
+    msg["To"] = ", ".join(to_list)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+    msg["Subject"] = subject or ""
+    msg.set_content(body or "")
+
+    recipients = to_list + cc_list + bcc_list
+
+    def _send_blocking() -> dict:
+        try:
+            if use_ssl:
+                with smtplib.SMTP_SSL(
+                    smtp_host, int(smtp_port or 465),
+                    timeout=EMAIL_DEFAULT_TIMEOUT_SEC,
+                ) as s:
+                    s.login(user, pw)
+                    s.send_message(msg, to_addrs=recipients)
+            else:
+                with smtplib.SMTP(
+                    smtp_host, int(smtp_port or 587),
+                    timeout=EMAIL_DEFAULT_TIMEOUT_SEC,
+                ) as s:
+                    s.starttls()
+                    s.login(user, pw)
+                    s.send_message(msg, to_addrs=recipients)
+            return {
+                "ok": True,
+                "output": (
+                    f"sent email to {len(recipients)} recipient(s) "
+                    f"(subject: {subject[:80]!r})"
+                ),
+            }
+        except smtplib.SMTPAuthenticationError as e:
+            return {
+                "ok": False, "output": "",
+                "error": (
+                    f"SMTP auth failed: {e}. "
+                    "For Gmail / Outlook / Fastmail you need an app password "
+                    "(not your account password); for self-hosted servers "
+                    "double-check the secret + user."
+                ),
+            }
+        except smtplib.SMTPException as e:
+            return {
+                "ok": False, "output": "",
+                "error": f"SMTP error: {type(e).__name__}: {e}",
+            }
+        except OSError as e:
+            return {
+                "ok": False, "output": "",
+                "error": f"connection failed: {e}",
+            }
+
+    return await asyncio.to_thread(_send_blocking)
+
+
+async def email_read(
+    *,
+    imap_host: str,
+    imap_port: int = 993,
+    user: str,
+    password_secret: str,
+    folder: str = "INBOX",
+    limit: int = 10,
+    unseen_only: bool = False,
+) -> dict:
+    """Read recent message headers + body previews from an IMAP folder.
+
+    Returns the most recent ``limit`` messages, newest-first. Body
+    previews are truncated to ~2 KB each so a long thread doesn't
+    blow the agent's context. Use the returned `uid` to fetch a
+    specific message in full via a follow-up call (or via `bash`
+    with `imapclient` for advanced operations).
+    """
+    import imaplib
+
+    if not (imap_host or "").strip():
+        return {"ok": False, "output": "", "error": "imap_host is required"}
+    pw = db.get_secret_value(password_secret)
+    if pw is None:
+        return {
+            "ok": False, "output": "",
+            "error": f"secret {password_secret!r} not found",
+        }
+    n = max(1, min(int(limit or 10), 50))
+
+    def _read_blocking() -> dict:
+        try:
+            with imaplib.IMAP4_SSL(
+                imap_host, int(imap_port or 993),
+                timeout=EMAIL_DEFAULT_TIMEOUT_SEC,
+            ) as M:
+                M.login(user, pw)
+                M.select(folder, readonly=True)
+                criterion = "UNSEEN" if unseen_only else "ALL"
+                typ, data = M.search(None, criterion)
+                if typ != "OK":
+                    return {
+                        "ok": False, "output": "",
+                        "error": f"IMAP search failed: {typ} {data}",
+                    }
+                uids = (data[0] or b"").split()
+                # Newest last in IMAP — slice from the end and reverse.
+                target_uids = uids[-n:][::-1]
+                if not target_uids:
+                    return {
+                        "ok": True,
+                        "output": (
+                            f"no messages in {folder!r} matching {criterion}"
+                        ),
+                        "messages": [],
+                    }
+                msgs: list[dict] = []
+                for uid_b in target_uids:
+                    uid = uid_b.decode("ascii", errors="replace")
+                    typ, fetch = M.fetch(uid_b, "(RFC822)")
+                    if typ != "OK" or not fetch:
+                        continue
+                    raw = b""
+                    for piece in fetch:
+                        if isinstance(piece, tuple) and len(piece) >= 2:
+                            raw = piece[1]
+                            break
+                    if not raw:
+                        continue
+                    try:
+                        from email import message_from_bytes
+                        em = message_from_bytes(raw)
+                    except Exception:
+                        continue
+                    body_preview = ""
+                    if em.is_multipart():
+                        for part in em.walk():
+                            ctype = part.get_content_type()
+                            if ctype == "text/plain":
+                                try:
+                                    body_preview = (
+                                        part.get_payload(decode=True) or b""
+                                    ).decode(
+                                        part.get_content_charset() or "utf-8",
+                                        errors="replace",
+                                    )
+                                    break
+                                except Exception:
+                                    pass
+                    else:
+                        try:
+                            body_preview = (
+                                em.get_payload(decode=True) or b""
+                            ).decode(
+                                em.get_content_charset() or "utf-8",
+                                errors="replace",
+                            )
+                        except Exception:
+                            body_preview = ""
+                    if len(body_preview) > 2000:
+                        body_preview = body_preview[:2000] + "…"
+                    msgs.append({
+                        "uid": uid,
+                        "from": em.get("From", ""),
+                        "to": em.get("To", ""),
+                        "subject": em.get("Subject", ""),
+                        "date": em.get("Date", ""),
+                        "body_preview": body_preview.strip(),
+                    })
+                lines = [
+                    f"[{m['date']}] {m['from']} → {m['to']}\n"
+                    f"  Subject: {m['subject']}\n"
+                    f"  {m['body_preview'][:400]}"
+                    for m in msgs
+                ]
+                return {
+                    "ok": True,
+                    "output": (
+                        f"Most recent {len(msgs)} message(s) in {folder!r}:\n\n"
+                        + "\n\n".join(lines)
+                    ),
+                    "messages": msgs,
+                }
+        except imaplib.IMAP4.error as e:
+            return {
+                "ok": False, "output": "",
+                "error": f"IMAP error: {e}",
+            }
+        except OSError as e:
+            return {
+                "ok": False, "output": "",
+                "error": f"connection failed: {e}",
+            }
+
+    return await asyncio.to_thread(_read_blocking)
+
+
+# ---------------------------------------------------------------------------
+# Notification webhooks — Slack / Discord / Telegram / generic
+#
+# Slack and Discord both expose "incoming webhook" URLs that accept a
+# JSON POST. The model registers the URL once via `notify_register` and
+# subsequent calls just supply a channel alias and message text.
+# ---------------------------------------------------------------------------
+
+
+async def notify(
+    *,
+    channel: str,
+    message: str,
+    title: str | None = None,
+) -> dict:
+    """Send a notification to a registered Slack / Discord / Telegram /
+    generic webhook channel.
+
+    The webhook URL is stored in the secrets table under the name
+    ``WEBHOOK_<channel>`` (uppercased). E.g. for `channel="ops"`,
+    the secret name is `WEBHOOK_OPS`. The URL itself never appears
+    in the conversation — only its name does.
+
+    Slack and Discord webhooks accept different JSON shapes; this
+    helper auto-detects the platform by URL pattern and adapts the
+    payload accordingly. For Telegram bots use the Bot API URL
+    (`https://api.telegram.org/bot<token>/sendMessage`) and we'll
+    POST the standard JSON shape. Generic targets (any other URL)
+    receive `{"title", "message"}` and let the receiver parse.
+    """
+    secret_name = f"WEBHOOK_{(channel or '').strip().upper()}"
+    url = db.get_secret_value(secret_name)
+    if not url:
+        return {
+            "ok": False, "output": "",
+            "error": (
+                f"no webhook URL registered for channel {channel!r}. "
+                f"Add it to secrets as {secret_name!r}."
+            ),
+        }
+    msg = (message or "").strip()
+    if not msg:
+        return {"ok": False, "output": "", "error": "message is required"}
+    if len(msg) > 8000:
+        msg = msg[:8000] + "…"
+
+    headers = {"Content-Type": "application/json"}
+    body: dict[str, Any]
+    if "hooks.slack.com" in url:
+        # Slack incoming webhook. Title becomes a bold header.
+        text = f"*{title}*\n{msg}" if title else msg
+        body = {"text": text}
+    elif "discord.com/api/webhooks" in url or "discordapp.com/api/webhooks" in url:
+        text = f"**{title}**\n{msg}" if title else msg
+        body = {"content": text}
+    elif "api.telegram.org/bot" in url:
+        # Bot API sendMessage: needs a chat_id, which we pull from a
+        # second secret (`TELEGRAM_CHAT_<channel>`). Otherwise refuse —
+        # without a chat_id Telegram returns 400.
+        chat_secret = f"TELEGRAM_CHAT_{(channel or '').strip().upper()}"
+        chat_id = db.get_secret_value(chat_secret)
+        if not chat_id:
+            return {
+                "ok": False, "output": "",
+                "error": (
+                    f"Telegram webhook needs {chat_secret!r} secret "
+                    "(the target chat_id)."
+                ),
+            }
+        text = f"*{title}*\n{msg}" if title else msg
+        body = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+        }
+    else:
+        body = {"title": title or "", "message": msg}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(url, json=body, headers=headers)
+            r.raise_for_status()
+        return {
+            "ok": True,
+            "output": (
+                f"sent {len(msg)}-char message to {channel!r} "
+                f"(HTTP {r.status_code})"
+            ),
+        }
+    except httpx.HTTPStatusError as e:
+        return {
+            "ok": False, "output": "",
+            "error": f"HTTP {e.response.status_code}: {e.response.text[:200]}",
+        }
+    except Exception as e:
+        return {
+            "ok": False, "output": "",
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Home Assistant — `home_assistant_call`
+#
+# Thin wrapper over the HA REST API (`/api/states` to read, `/api/services/
+# <domain>/<service>` to act). Bearer token lives in the secrets store.
+# ---------------------------------------------------------------------------
+
+
+async def home_assistant_call(
+    action: str,
+    *,
+    base_url: str | None = None,
+    token_secret: str = "HOME_ASSISTANT_TOKEN",
+    entity_id: str | None = None,
+    domain: str | None = None,
+    service: str | None = None,
+    service_data: dict | None = None,
+) -> dict:
+    """Read or write a Home Assistant entity via the local REST API.
+
+    `action` is one of:
+      - "list_entities" — return every entity_id + state.
+      - "get_state" — return one entity's full state. `entity_id` required.
+      - "call_service" — fire a service. `domain`, `service`,
+        `service_data` (optional) describe the call. Examples:
+        domain="light", service="turn_on", service_data={"entity_id": "light.kitchen"}.
+
+    `base_url` defaults to `http://homeassistant.local:8123` and is
+    overridable per call. `token_secret` defaults to
+    `HOME_ASSISTANT_TOKEN`. Calls hit the local network so the SSRF
+    guard is opted out (allow_private=True).
+    """
+    base = (base_url or "").strip() or "http://homeassistant.local:8123"
+    token = db.get_secret_value(token_secret)
+    if not token:
+        return {
+            "ok": False, "output": "",
+            "error": (
+                f"no token in secret {token_secret!r}; create a long-lived "
+                "access token in HA → user profile → security."
+            ),
+        }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    if action == "list_entities":
+        r = await http_request(
+            url=f"{base.rstrip('/')}/api/states",
+            method="GET",
+            headers=headers,
+            allow_private=True,
+            timeout=20.0,
+            max_output_chars=200_000,
+        )
+        return r
+    if action == "get_state":
+        if not entity_id:
+            return {
+                "ok": False, "output": "",
+                "error": "entity_id is required for get_state",
+            }
+        r = await http_request(
+            url=f"{base.rstrip('/')}/api/states/{entity_id}",
+            method="GET",
+            headers=headers,
+            allow_private=True,
+        )
+        return r
+    if action == "call_service":
+        if not domain or not service:
+            return {
+                "ok": False, "output": "",
+                "error": "domain and service are required for call_service",
+            }
+        body: dict = dict(service_data or {})
+        if entity_id and "entity_id" not in body:
+            body["entity_id"] = entity_id
+        r = await http_request(
+            url=f"{base.rstrip('/')}/api/services/{domain}/{service}",
+            method="POST",
+            headers=headers,
+            body=body,
+            allow_private=True,
+        )
+        return r
+    return {
+        "ok": False, "output": "",
+        "error": (
+            f"unknown action {action!r} "
+            "(use list_entities | get_state | call_service)"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Browser automation via Chrome DevTools Protocol — `browser_*`
 #
 # Pixel-clicking a browser is a vision gamble. If the user has Chrome running
@@ -11204,6 +11662,13 @@ TOOL_REGISTRY = {
     "ssh_exec": ssh_exec,
     "ssh_put": ssh_put,
     "ssh_get": ssh_get,
+    # Email — SMTP send + IMAP read. Stdlib only.
+    "email_send": email_send,
+    "email_read": email_read,
+    # Notifications — Slack / Discord / Telegram / generic webhook.
+    "notify": notify,
+    # Smart home — Home Assistant local REST API.
+    "home_assistant_call": home_assistant_call,
     # universal API connector — register an OpenAPI spec once,
     # then call any of its endpoints by operation_id
     "openapi_load": openapi_load,
@@ -11366,6 +11831,14 @@ TOOL_CATEGORIES: dict[str, str] = {
     "ssh_exec": "write",
     "ssh_put": "write",
     "ssh_get": "write",
+    # Email: send is write (sends mail to other people!), read is read.
+    "email_send": "write",
+    "email_read": "read",
+    # Notifications: write — sends a message to other systems.
+    "notify": "write",
+    # Smart home: write — turning on lights / locks / climate has real-world
+    # effect even when the action is reversible.
+    "home_assistant_call": "write",
     # OpenAPI: same write-class rationale as http_request — call dispatches
     # to the registered API which can trigger arbitrary side effects.
     # Listing / describing operations is read; load is write because it
@@ -12233,6 +12706,49 @@ async def _dispatch_core(
                 password=args.get("password"),
                 password_secret=args.get("password_secret"),
                 conv_id=conv_id,
+            )
+        # ----- Email dispatch -----
+        if name == "email_send":
+            return await fn(
+                smtp_host=args.get("smtp_host", ""),
+                smtp_port=int(args.get("smtp_port", 465)),
+                user=args.get("user", ""),
+                password_secret=args.get("password_secret", ""),
+                to=args.get("to", []),
+                subject=args.get("subject", ""),
+                body=args.get("body", ""),
+                cc=args.get("cc"),
+                bcc=args.get("bcc"),
+                from_addr=args.get("from_addr"),
+                use_ssl=bool(args.get("use_ssl", True)),
+            )
+        if name == "email_read":
+            return await fn(
+                imap_host=args.get("imap_host", ""),
+                imap_port=int(args.get("imap_port", 993)),
+                user=args.get("user", ""),
+                password_secret=args.get("password_secret", ""),
+                folder=args.get("folder", "INBOX"),
+                limit=int(args.get("limit", 10)),
+                unseen_only=bool(args.get("unseen_only", False)),
+            )
+        # ----- Notification dispatch -----
+        if name == "notify":
+            return await fn(
+                channel=args.get("channel", ""),
+                message=args.get("message", ""),
+                title=args.get("title"),
+            )
+        # ----- Home Assistant dispatch -----
+        if name == "home_assistant_call":
+            return await fn(
+                args.get("action", ""),
+                base_url=args.get("base_url"),
+                token_secret=args.get("token_secret", "HOME_ASSISTANT_TOKEN"),
+                entity_id=args.get("entity_id"),
+                domain=args.get("domain"),
+                service=args.get("service"),
+                service_data=args.get("service_data"),
             )
         # ----- OpenAPI dispatch -----
         if name == "openapi_load":
