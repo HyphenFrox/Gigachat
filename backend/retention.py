@@ -383,7 +383,25 @@ def _delete_orphan_files(
 
 # --- SQLite maintenance ---------------------------------------------------
 
-def db_maintenance() -> dict:
+# Cadence for VACUUM: SQLite VACUUM rewrites the entire DB file to
+# reclaim pages freed by deletes, defragmenting indexes in the
+# process. Heavy operation — blocks all writers for the duration —
+# but cheap on a healthy DB and reclaims real disk space when it
+# isn't. Monthly is a sane default: a chat backend typically sheds
+# tens-of-thousands of message rows in that window via auto-compaction
+# and conversation deletes.
+DB_VACUUM_INTERVAL_SECONDS = 30 * 86400
+
+# Floor below which VACUUM is skipped. Below 50 MB the reclaim isn't
+# worth the brief writer block — pages will be reused on next insert.
+DB_VACUUM_MIN_BYTES = 50 * 1024 * 1024
+
+# Settings key the daemon writes after a successful VACUUM so it
+# survives process restarts. Stored as a unix timestamp.
+_VACUUM_LAST_RUN_SETTING = "_retention_db_vacuum_last_run"
+
+
+def db_maintenance(*, allow_vacuum: bool = False) -> dict:
     """Run lightweight SQLite housekeeping on the primary DB.
 
     * ``wal_checkpoint(TRUNCATE)`` flushes the WAL back into the main
@@ -394,12 +412,22 @@ def db_maintenance() -> dict:
     * ``optimize`` runs ANALYZE on tables whose stats have drifted —
       crucial as messages and embeddings tables grow by orders of
       magnitude over a long session.
+    * ``VACUUM`` (when ``allow_vacuum=True`` and the per-DB cadence
+      gate has elapsed): rewrites the file to reclaim pages freed by
+      deletes. Caller is responsible for the cadence — the daemon
+      gates this behind ``DB_VACUUM_INTERVAL_SECONDS`` so we don't
+      VACUUM on every sweep.
 
     Returns a dict of counts so the sweep log shows what happened.
     Errors per pragma are caught and surfaced as a False flag — the
     daemon must keep running even if the DB is briefly locked.
     """
-    counts: dict = {"checkpoint_pages": 0, "optimize_ok": False}
+    counts: dict = {
+        "checkpoint_pages": 0,
+        "optimize_ok": False,
+        "vacuum_ok": False,
+        "vacuum_reclaimed_bytes": 0,
+    }
     try:
         with db._conn() as c:
             try:
@@ -422,6 +450,26 @@ def db_maintenance() -> dict:
                 pass
     except sqlite3.Error:
         pass
+
+    if allow_vacuum:
+        # VACUUM cannot run inside a transaction (the context manager
+        # opens one implicitly), so we use a fresh raw connection and
+        # `isolation_level=None` to keep it out of a BEGIN block.
+        try:
+            size_before = db.DB_PATH.stat().st_size if db.DB_PATH.is_file() else 0
+            if size_before >= DB_VACUUM_MIN_BYTES:
+                conn = sqlite3.connect(db.DB_PATH, isolation_level=None)
+                try:
+                    conn.execute("VACUUM")
+                finally:
+                    conn.close()
+                counts["vacuum_ok"] = True
+                size_after = db.DB_PATH.stat().st_size if db.DB_PATH.is_file() else 0
+                counts["vacuum_reclaimed_bytes"] = max(0, size_before - size_after)
+        except (sqlite3.Error, OSError):
+            # VACUUM failures are non-fatal; the next cycle retries.
+            pass
+
     return counts
 
 
@@ -514,6 +562,7 @@ async def sweep_daemon(
     screenshot_dir: Path | None = None,
     interval_seconds: float = SWEEP_INTERVAL_SECONDS,
     db_maintenance_interval: float = DB_MAINTENANCE_INTERVAL_SECONDS,
+    db_vacuum_interval: float = DB_VACUUM_INTERVAL_SECONDS,
 ) -> None:
     """Background task: sweep forever at `interval_seconds` cadence.
 
@@ -524,8 +573,22 @@ async def sweep_daemon(
     DB maintenance runs on a coarser cadence (`db_maintenance_interval`)
     because `wal_checkpoint(TRUNCATE)` is a brief writer-blocker we
     don't need every six hours.
+
+    VACUUM runs on the coarsest cadence (`db_vacuum_interval`,
+    monthly by default). Last-run timestamp is persisted via the
+    settings store so it survives backend restarts — no point
+    VACUUM-ing every fresh boot just because the in-process counter
+    reset.
+
+    Generation-2 GC runs once per cycle. On a process up for weeks,
+    Python's reference-counting reclaim handles most garbage, but
+    cycles in long-lived structures (event-loop machinery, asyncio
+    tasks, closure cells in subagent code) can leak generation-2.
+    A periodic full collection clears them; the cost (~10-50 ms) is
+    invisible against the surrounding I/O sweep.
     """
     import asyncio
+    import gc
 
     log = get_logger("retention")
     last_db_maint = 0.0
@@ -539,15 +602,44 @@ async def sweep_daemon(
                 f"retention sweep failed: {type(exc).__name__}: {exc}",
                 extra={"event": "retention_sweep_error"},
             )
+        # Generation-2 GC clears cycle-collected garbage in long-lived
+        # structures. Run after the disk sweep so freed objects from
+        # checkpoint deletes can settle first. Generation 2 is full —
+        # it scans every tracked container — but on a 30-min cadence
+        # the cost is invisible.
+        try:
+            gc.collect(2)
+        except Exception:
+            pass
         # DB maintenance lives next to the disk sweep; both are slow
         # janitors that benefit from running off-peak together.
         now = time.time()
         if (now - last_db_maint) >= db_maintenance_interval:
+            # Decide whether this maintenance pass should also VACUUM.
+            # Cadence is checked against a persisted timestamp so a
+            # process restart doesn't trigger a VACUUM that a previous
+            # process already ran.
+            allow_vacuum = False
             try:
-                stats = db_maintenance()
+                last_vacuum = float(
+                    db.get_setting(_VACUUM_LAST_RUN_SETTING, 0.0) or 0.0
+                )
+                if (now - last_vacuum) >= db_vacuum_interval:
+                    allow_vacuum = True
+            except Exception:
+                allow_vacuum = False
+            try:
+                stats = db_maintenance(allow_vacuum=allow_vacuum)
+                if stats.get("vacuum_ok"):
+                    try:
+                        db.set_setting(_VACUUM_LAST_RUN_SETTING, now)
+                    except Exception:
+                        pass
                 log.info(
                     f"db_maintenance checkpoint_pages={stats['checkpoint_pages']} "
-                    f"optimize_ok={stats['optimize_ok']}",
+                    f"optimize_ok={stats['optimize_ok']} "
+                    f"vacuum_ok={stats.get('vacuum_ok')} "
+                    f"vacuum_reclaimed_bytes={stats.get('vacuum_reclaimed_bytes', 0)}",
                     extra={"event": "db_maintenance", **stats},
                 )
                 last_db_maint = now

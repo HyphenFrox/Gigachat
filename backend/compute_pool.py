@@ -5647,11 +5647,41 @@ async def route_chat_for(model_name: str) -> dict:
             (w.get("capabilities") or {}).get("max_vram_seen_bytes") or 0
             for w in rpc_workers
         )
+        # Pool memory ceiling: VRAM + every worker's free RAM (workers
+        # pre-allocate RPC buffers from system RAM for layer streams).
+        # Used to detect the "mega-model" case where the GGUF exceeds
+        # everything we can fit in actual hardware memory.
+        rpc_pool_total = rpc_pool_vram + sum(
+            int(float((w.get("capabilities") or {}).get("ram_free_gb") or 0)
+                * (1024 ** 3))
+            for w in rpc_workers
+        )
         host_can_run_alone = host_total > 0 and size_bytes <= host_total
         worst_lan_latency_ms = max(
             (w.get("capabilities") or {}).get("probe_latency_ms") or 0
             for w in rpc_workers
         )
+
+        # Mega-model: model exceeds combined pool memory. Engages
+        # split anyway — llama.cpp's adaptive `-ngl` puts as many
+        # layers as fit on GPU/RPC devices, and the rest cascade to
+        # host CPU+mmap from the GGUF on disk. Inference WILL be
+        # slow (disk-paged forward pass per token; expect minutes
+        # per token on consumer NVMe) but the path is correct.
+        # We log loudly so the operator sees this is what's happening.
+        is_mega_model = (
+            rpc_pool_total > 0 and size_bytes > rpc_pool_total
+        )
+        if is_mega_model:
+            log.warning(
+                "compute_pool: MEGA-MODEL path engaged for %s — "
+                "size %.1f GB exceeds combined pool memory %.1f GB. "
+                "Layers beyond pool capacity will page from host disk "
+                "via mmap; expect very slow per-token rate. "
+                "GGUF must remain on host SSD for this to work.",
+                model_name, size_bytes / (1024 ** 3),
+                rpc_pool_total / (1024 ** 3),
+            )
 
         # Decision: engage split if host can't run alone (mandatory
         # — only path that might work) OR if pool VRAM covers it AND
@@ -5746,6 +5776,18 @@ async def route_chat_for(model_name: str) -> dict:
             if split_draft:
                 result["speculative_draft"] = split_draft["name"]
                 result["speculative_match"] = split_draft.get("match", "family")
+            if is_mega_model:
+                # Surface the mega-model status so the chat layer can
+                # render a "this will be slow" banner in the UI. The
+                # actual per-token rate depends on host disk read
+                # bandwidth and the fraction of layers paging from
+                # disk — could be anywhere from 0.1 tok/s to 1 tok/s
+                # on consumer hardware.
+                result["mega_model"] = True
+                result["pool_memory_gb"] = round(
+                    rpc_pool_total / (1024 ** 3), 1,
+                )
+                result["model_size_gb"] = round(size_bytes / (1024 ** 3), 1)
             return result
 
     # Tier 3: no eligible RPC workers were found, OR Tier 2 decided
@@ -5754,7 +5796,23 @@ async def route_chat_for(model_name: str) -> dict:
     # spill so even larger-than-VRAM models run (slowly, via disk
     # paging) without needing the pool.
     await stop_all_running_splits()
-    return {"engine": "ollama"}
+    result: dict = {"engine": "ollama"}
+    # Flag mega-model on this path too: when the model exceeds host
+    # total memory, Ollama will disk-page each forward pass via mmap.
+    # The chat will work but at 0.1-1 tok/s; UI should render a
+    # "this is going to be slow" banner.
+    if host_total > 0 and size_bytes > host_total:
+        log.warning(
+            "compute_pool: MEGA-MODEL on host-only path — %s "
+            "(size %.1f GB > host total %.1f GB). Forward pass will "
+            "disk-page via mmap; expect 0.1-1 tok/s.",
+            model_name, size_bytes / (1024 ** 3),
+            host_total / (1024 ** 3),
+        )
+        result["mega_model"] = True
+        result["pool_memory_gb"] = round(host_total / (1024 ** 3), 1)
+        result["model_size_gb"] = round(size_bytes / (1024 ** 3), 1)
+    return result
 
 
 def list_subagent_workers(model: str) -> list[tuple[str, str | None]]:

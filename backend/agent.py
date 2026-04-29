@@ -1964,6 +1964,29 @@ async def _run_turn_impl(
         if decision.get("engine") == "llama_server":
             split_target = (decision["base_url"], decision["label"])
 
+        # Mega-model warning: surface to the UI when the chosen path
+        # is going to disk-page (model bigger than total pool memory).
+        # The chat still works but will be very slow; a banner gives
+        # the user accurate expectations instead of the appearance
+        # of a hung backend.
+        if decision.get("mega_model"):
+            yield {
+                "type": "mega_model_warning",
+                "model": conv["model"],
+                "model_size_gb": decision.get("model_size_gb"),
+                "pool_memory_gb": decision.get("pool_memory_gb"),
+                "message": (
+                    f"{conv['model']!r} is "
+                    f"{decision.get('model_size_gb', '?')} GB but the "
+                    f"pool only has {decision.get('pool_memory_gb', '?')} GB "
+                    "of available memory. Layers beyond capacity will "
+                    "page from disk on each forward pass — expect "
+                    "very slow per-token rates (typically 0.1-1 tok/s). "
+                    "Consider a smaller quant or a smaller model for "
+                    "interactive use."
+                ),
+            }
+
         # Compute-pool Phase 1 routing for the parent chat turn (only
         # when the auto-router didn't pick a split target). Same picker
         # rules as embeddings/subagents — pick a worker iff one is

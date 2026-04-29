@@ -304,7 +304,14 @@ def test_route_uses_ollama_when_model_fits_host_vram(isolated_db, monkeypatch):
 def test_route_falls_back_to_ollama_when_model_too_big_but_no_workers(isolated_db, monkeypatch):
     """Model exceeds host VRAM but no eligible workers exist → fall
     back to Ollama. Ollama's CPU offload handles it (slowly) — strictly
-    better than refusing."""
+    better than refusing.
+
+    The decision MAY carry extra fields (`mega_model`, `model_size_gb`,
+    `pool_memory_gb`) when the model exceeds host total memory — those
+    are advisory metadata for the UI, not behavioural changes. We
+    assert on `engine` only so the test doesn't break when the
+    metadata schema evolves.
+    """
     monkeypatch.setattr(compute_pool, "db", isolated_db)
     monkeypatch.setattr(
         compute_pool, "resolve_ollama_model",
@@ -312,7 +319,7 @@ def test_route_falls_back_to_ollama_when_model_too_big_but_no_workers(isolated_d
     )
     monkeypatch.setattr(compute_pool, "_host_vram_budget_bytes", lambda: 8 * 1024 ** 3 * 85 // 100)
     decision = _run(compute_pool.route_chat_for("big:27b"))
-    assert decision == {"engine": "ollama"}
+    assert decision.get("engine") == "ollama"
 
 
 def test_route_engages_split_when_model_too_big_and_workers_eligible(isolated_db, monkeypatch):
