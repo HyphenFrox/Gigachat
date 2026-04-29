@@ -403,10 +403,10 @@ def _estimate_kv_bytes_per_slot(gguf_path: str, ctx_size: int = 4096) -> int:
 
 
 # How much VRAM headroom to leave free after target + draft + KV slots.
-# 15% mirrors the safety margin sysdetect already bakes into vram budgeting
-# elsewhere — covers OS / display / driver overhead and small allocations
-# llama.cpp does outside the headline buffers.
-_PARALLEL_VRAM_HEADROOM = 0.15
+# Per the project's "use all resources available" policy this is zero —
+# every reported free byte counts toward the inference budget. Trades a
+# soft headroom for the OOM killer as the failure mode.
+_PARALLEL_VRAM_HEADROOM = 0.0
 
 # Hard cap on `--parallel`. llama-server's batched-verify is most efficient
 # at 4-8 slots; beyond that, scheduling overhead and sub-slot cache
@@ -731,10 +731,15 @@ def _compute_optimal_batch_sizes(
 
     # Round down to the largest power of two ≤ max_ub. Fast llama.cpp
     # kernels are sized for power-of-two ubatches; non-aligned values
-    # work but lose performance on some backends.
+    # work but lose performance on some backends. Ceiling raised to
+    # 8192 — with Flash Attention + Q8 KV freeing ~half the activation
+    # budget vs the legacy FP16 path, big-VRAM workstations can absorb
+    # the larger ubatch and prefill 2-4× faster on long prompts.
     if max_ub_by_memory < 1024:
         return None, None  # default 512 is already aggressive enough
-    if max_ub_by_memory >= 4096:
+    if max_ub_by_memory >= 8192:
+        ub = 8192
+    elif max_ub_by_memory >= 4096:
         ub = 4096
     elif max_ub_by_memory >= 2048:
         ub = 2048
@@ -745,8 +750,8 @@ def _compute_optimal_batch_sizes(
 
     # `-b` (logical) is generally 2× `-ub` (physical) — gives the
     # scheduler room to pack multiple ubatches per logical batch.
-    # llama.cpp caps `-b` at 8192 internally on most builds.
-    b = min(8192, ub * 2)
+    # llama.cpp caps `-b` at 16384 in recent builds; 2×ub is safe.
+    b = min(16384, ub * 2)
     log.info(
         "split_lifecycle: adaptive batch sizes: free_vram=%.2f GB "
         "activation_per_token=%d MiB -> -b %d -ub %d",
