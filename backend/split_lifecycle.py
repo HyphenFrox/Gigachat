@@ -934,6 +934,48 @@ def _should_use_row_split(worker_ids: list[str]) -> bool:
     return True
 
 
+def _recommend_thread_counts() -> tuple[int, int] | tuple[None, None]:
+    """Pick `--threads` (decode) and `--threads-batch` (prefill) values.
+
+    llama-server defaults to ``os.cpu_count()`` which on hyperthreaded
+    CPUs is the LOGICAL count — typically 2× the physical count. For
+    AVX2 / matmul workloads, hyperthreads compete for the same FPU and
+    physical core count usually wins by 5-15 % on decode. Prefill is
+    more parallel-friendly, so it can use the logical count.
+
+    Returns ``(decode_threads, prefill_threads)`` when psutil reports
+    a physical / logical split worth acting on; ``(None, None)`` keeps
+    the llama-server default. Single-core or unable-to-detect → fall
+    through to default.
+    """
+    try:
+        import psutil
+        physical = psutil.cpu_count(logical=False)
+        logical = psutil.cpu_count(logical=True)
+    except Exception:
+        return None, None
+    if not physical or not logical:
+        return None, None
+    if physical <= 1:
+        return None, None
+    # Only override when there's a meaningful split (hyperthreading
+    # active). On a system where logical == physical (no SMT), the
+    # default already matches and there's no benefit to overriding.
+    if logical <= physical:
+        return None, None
+    # Decode: physical cores. Prefill: logical (or physical*2 if even
+    # higher SMT). Cap at 32 — beyond that NUMA and cache-line
+    # contention erode the win on consumer hardware.
+    decode_threads = min(32, int(physical))
+    prefill_threads = min(32, int(logical))
+    log.info(
+        "split_lifecycle: adaptive threads — decode=%d prefill=%d "
+        "(physical=%d logical=%d)",
+        decode_threads, prefill_threads, physical, logical,
+    )
+    return decode_threads, prefill_threads
+
+
 def _build_command(
     *,
     llama_server: Path,
@@ -951,6 +993,8 @@ def _build_command(
     prompt_cache_path: str | None = None,
     batch_size: int | None = None,
     ubatch_size: int | None = None,
+    threads: int | None = None,
+    threads_batch: int | None = None,
 ) -> list[str]:
     """Assemble the argv for `llama-server`.
 
@@ -1193,6 +1237,17 @@ def _build_command(
         # when the pool has the headroom to absorb the extra activation
         # memory; tight pools keep llama.cpp's defaults.
         cmd.extend(["-b", str(batch_size), "-ub", str(ubatch_size)])
+    if threads:
+        # Decode threads — defaults to logical CPU count which on
+        # hyperthreaded CPUs over-subscribes the FPU. Physical core
+        # count typically wins 5-15 % on AVX2 decode; the picker
+        # only returns a value when there's a meaningful SMT split.
+        cmd.extend(["--threads", str(int(threads))])
+    if threads_batch:
+        # Prefill threads — separate from decode because batched
+        # matmul scales with logical core count more cleanly than
+        # single-token decode does.
+        cmd.extend(["--threads-batch", str(int(threads_batch))])
     return cmd
 
 
@@ -1536,6 +1591,12 @@ async def start(split_id: str) -> dict:
         draft_size_bytes=draft_size,
     )
 
+    # Adaptive thread counts: on hyperthreaded CPUs the llama-server
+    # default (logical core count) over-subscribes the FPU and slows
+    # decode. Decode runs at physical core count; prefill stays at
+    # logical (it's batched matmul that benefits from SMT).
+    threads, threads_batch = _recommend_thread_counts()
+
     cmd = _build_command(
         llama_server=server,
         gguf_path=row["gguf_path"],
@@ -1552,6 +1613,8 @@ async def start(split_id: str) -> dict:
         prompt_cache_path=prompt_cache_path,
         batch_size=batch_size,
         ubatch_size=ubatch_size,
+        threads=threads,
+        threads_batch=threads_batch,
     )
     log_path = _log_path_for(split_id)
 
