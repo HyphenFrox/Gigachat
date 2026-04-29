@@ -222,6 +222,14 @@ def detect_system() -> dict:
       2. AMD (rocm-smi)                  — ROCm-capable Radeons
       3. Apple Silicon (sysctl)          — arm64 macOS unified memory
       4. Intel (Win32_VideoController)   — iGPUs + Arc dGPUs on Windows
+
+    Sequential-with-early-exit is faster than parallel here because the
+    Intel WMI probe is dramatically slower than the others (~700 ms
+    spawning PowerShell on Windows). Running it last means a Windows
+    NVIDIA / AMD host pays only the cheap probe; only Intel-only
+    hosts pay the slow one. Parallel execution would regress NVIDIA
+    Windows boots by always paying the Intel-WMI cost.
+
     The first one that reports nonzero memory wins. `gpu_kind` ∈
     {"nvidia", "amd", "apple", "intel", ""}; the empty string means
     no usable GPU detected (CPU-only host).
