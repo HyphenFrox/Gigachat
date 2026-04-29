@@ -3241,7 +3241,8 @@ async def http_request(
         pass
     elif isinstance(body, (dict, list)):
         try:
-            body_str = json.dumps(body)
+            from . import jsonutil as _ju
+            body_str = _ju.dumps(body)
         except (TypeError, ValueError) as e:
             return {"ok": False, "output": "", "error": f"body not JSON-serialisable: {e}"}
         body_str, rb, mb = _substitute_secrets(body_str)
@@ -6474,7 +6475,7 @@ async def _cdp_send(ws, method: str, params: dict | None = None) -> dict:
     own monotonic id so we correctly pair responses when multiple commands
     are in flight.
     """
-    import json as _json
+    from . import jsonutil as _json
     _cdp_send.counter = getattr(_cdp_send, "counter", 0) + 1
     msg_id = _cdp_send.counter
     payload = {"id": msg_id, "method": method, "params": params or {}}
@@ -6598,7 +6599,7 @@ async def browser_goto(
 
 def _js_literal(s: str) -> str:
     """Encode a Python string as a JSON-safe JS string literal."""
-    import json as _json
+    from . import jsonutil as _json
     return _json.dumps(s)
 
 
@@ -6756,7 +6757,7 @@ async def browser_eval(
             val = r.get("result", {})
             v = val.get("value")
             # Serialize for display — compact JSON for objects, raw for scalars.
-            import json as _json
+            from . import jsonutil as _json
             if isinstance(v, (dict, list)):
                 text = _json.dumps(v)[:8000]
             else:
@@ -8953,7 +8954,11 @@ async def _run_single_hook(hook: dict, payload: dict) -> dict:
     """
     cmd = hook.get("command") or ""
     timeout = int(hook.get("timeout_seconds") or 10)
-    stdin_blob = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    # Hooks fire on every tool call when configured; keep the JSON
+    # encode on the orjson-backed fast path. UTF-8 encode is necessary
+    # for stdin (subprocess wants bytes); jsonutil.dumps returns str.
+    from . import jsonutil as _ju
+    stdin_blob = _ju.dumps(payload).encode("utf-8")
 
     # Use asyncio.create_subprocess_shell where available; fall back to a
     # thread-wrapped subprocess.run on Windows selector loops (same pattern
