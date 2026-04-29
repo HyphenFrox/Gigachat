@@ -11,6 +11,8 @@ import {
   X as XIcon,
   Hourglass,
   SquareDashedBottomCode,
+  Loader2,
+  Sparkles,
 } from 'lucide-react'
 import BrandLogo from './BrandLogo'
 import {
@@ -68,6 +70,9 @@ function Message({
   images,
   pinned = false,
   queued = false,
+  refining = false,
+  refiningMode = null,
+  refined = false,
   onTogglePin,
   onEdit,
   canEdit = false,
@@ -199,6 +204,28 @@ function Message({
             >
               <Hourglass className="size-3" />
               queued
+            </span>
+          )}
+          {!isUser && refining && (
+            <span
+              className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-400"
+              title={
+                refiningMode
+                  ? `Quality-mode pass running (${refiningMode}) — same model spending more compute on this answer.`
+                  : 'Quality-mode pass running — same model spending more compute on this answer.'
+              }
+            >
+              <Loader2 className="size-3 animate-spin" />
+              {refiningMode || 'refining'}
+            </span>
+          )}
+          {!isUser && refined && !refining && (
+            <span
+              className="inline-flex items-center gap-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400"
+              title="This answer was post-processed by a quality-mode pass (same model, more compute) and the model decided to revise it."
+            >
+              <Sparkles className="size-3" />
+              refined
             </span>
           )}
           {onTogglePin && (

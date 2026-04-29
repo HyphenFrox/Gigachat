@@ -584,6 +584,20 @@ def init() -> None:
             # actually used. Survives restarts so a long conversation
             # doesn't have to re-load everything after a backend bounce.
             "ALTER TABLE conversations ADD COLUMN loaded_tools_json TEXT NOT NULL DEFAULT '[]'",
+            # Quality-mode wrapper around the chat call. Values:
+            #   'standard'  — single-pass chat, current behaviour.
+            #   'refine'    — after the model produces a final answer,
+            #                 same model critiques + revises if issues
+            #                 found. ~2x compute, big lift on small
+            #                 models for code / writing / reasoning.
+            #   'consensus' — N parallel samples of the same prompt,
+            #                 same model synthesizes the best response.
+            #                 ~3-5x compute, biggest lift on math /
+            #                 logic. Uses pool workers when available
+            #                 to keep wall-time near 1x.
+            # Per-conversation; defaults to 'standard' so existing chats
+            # behave identically until the user opts in.
+            "ALTER TABLE conversations ADD COLUMN quality_mode TEXT NOT NULL DEFAULT 'standard'",
             # Workflow extension columns on `hooks`. The hooks table started
             # life as a simple "fire shell on lifecycle event" pipe; these
             # turn it into a general workflow trigger system without
@@ -885,8 +899,19 @@ def update_conversation(cid: str, **fields: Any) -> dict | None:
         "budget_tokens",
         "permission_mode",
         "project",
+        "quality_mode",
     }
     valid_modes = {"read_only", "plan", "approve_edits", "allow_all"}
+    # Quality-mode whitelist. Any value outside this set is silently
+    # dropped — the column has a NOT NULL DEFAULT 'standard' so a
+    # rejected value just leaves the existing row alone. New modes:
+    #   * personas — sample N candidates with diverse persona overlays,
+    #                synthesize. MoA-style without using a second model.
+    #   * auto     — pick refine / consensus / personas (or skip) per
+    #                turn based on the prompt's complexity.
+    valid_quality_modes = {
+        "standard", "refine", "consensus", "personas", "auto",
+    }
     sets = []
     values = []
     for k, v in fields.items():
@@ -905,6 +930,11 @@ def update_conversation(cid: str, **fields: Any) -> dict | None:
             # column. Legitimate UI callers only ever pass one of the three
             # known values.
             if str(v) not in valid_modes:
+                continue
+            v = str(v)
+        elif k == "quality_mode":
+            # Same pattern as permission_mode — reject unknown values.
+            if str(v) not in valid_quality_modes:
                 continue
             v = str(v)
         elif k == "persona":
@@ -1330,6 +1360,28 @@ def set_message_pinned(mid: str, pinned: bool) -> dict | None:
             "UPDATE messages SET pinned = ? WHERE id = ?",
             (1 if pinned else 0, mid),
         )
+        row = c.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone()
+    return _row_to_message(row) if row else None
+
+
+def update_message_content(mid: str, content: str) -> dict | None:
+    """Replace the content of one message regardless of role.
+
+    Used by the self-refine pass to swap a freshly-revised answer in
+    place of the original assistant text. Unlike `update_user_message_content`
+    which is locked to user rows (so the UI's "edit & regenerate" flow
+    can't tamper with assistant history), this helper accepts any row
+    — the agent loop is the only caller and it explicitly checks the
+    role before invoking. We do NOT bump `last_user_message_at` here
+    because a self-refine is bookkeeping, not a fresh user action.
+    """
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            (content or "", mid),
+        )
+        if cur.rowcount == 0:
+            return None
         row = c.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone()
     return _row_to_message(row) if row else None
 
@@ -3234,6 +3286,14 @@ def _row_to_conversation(row: sqlite3.Row) -> dict:
         project = row["project"] or None
     except (IndexError, KeyError):
         project = None
+    # Quality mode wraps the chat path with self-refine / self-consistency
+    # passes when set. Default 'standard' preserves existing behaviour.
+    try:
+        quality_mode = row["quality_mode"] or "standard"
+    except (IndexError, KeyError):
+        quality_mode = "standard"
+    if quality_mode not in {"standard", "refine", "consensus", "personas", "auto"}:
+        quality_mode = "standard"
     # Permission mode supersedes the old auto_approve bit, but we keep the
     # legacy field in the response so any code still reading conv["auto_approve"]
     # keeps working during the transition. Source of truth is permission_mode.
@@ -3259,6 +3319,7 @@ def _row_to_conversation(row: sqlite3.Row) -> dict:
         "budget_turns": budget_turns,
         "budget_tokens": budget_tokens,
         "project": project,
+        "quality_mode": quality_mode,
     }
 
 

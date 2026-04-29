@@ -1029,6 +1029,64 @@ export default function ChatView({
       case 'turn_done':
         // nothing to do; the finally block handles cleanup
         break
+      case 'quality_mode_start':
+        // Post-turn refinement pass started. Show a small badge on the
+        // most-recent assistant bubble so the user knows the model is
+        // re-checking its work — without this the UI looks idle while
+        // the same model spends another 2-5x compute polishing the answer.
+        // `mode` is the resolved mode (e.g. "refine" / "consensus" /
+        // "personas"); for `auto` the resolved mode is forwarded too.
+        setMessages((m) => {
+          if (!m.length) return m
+          const last = m[m.length - 1]
+          if (last.role !== 'assistant') return m
+          return [
+            ...m.slice(0, -1),
+            { ...last, refining: true, refining_mode: evt.mode || null },
+          ]
+        })
+        break
+      case 'assistant_message_refined':
+        // The post-turn pass replaced the assistant bubble's text. Swap
+        // the content in place (the message id matches the original
+        // bubble) — no new row, no scroll jump. The "refined" flag stays
+        // set so the bubble can render a small badge indicating the
+        // text was post-processed (useful for transparency: the user
+        // can re-read knowing the model second-guessed itself).
+        setMessages((m) =>
+          m.map((row) =>
+            row.id === evt.id
+              ? {
+                  ...row,
+                  content: evt.content,
+                  refined: true,
+                  refining: false,
+                }
+              : row,
+          ),
+        )
+        break
+      case 'quality_mode_end':
+        // Pass finished (revised or not). Clear the spinner badge. When
+        // the heuristic decided no pass was needed (auto picking
+        // "standard") we also fall through here — same UI cleanup.
+        setMessages((m) => {
+          if (!m.length) return m
+          const last = m[m.length - 1]
+          if (last.role !== 'assistant') return m
+          // Strip the in-flight flag; preserve `refined` if it was set
+          // by an earlier `assistant_message_refined` event.
+          const { refining: _r, refining_mode: _rm, ...rest } = last
+          return [...m.slice(0, -1), rest]
+        })
+        if (evt.error) {
+          // Non-fatal: the original answer is still in DB and rendered.
+          // Surface a toast so the user knows the polish step failed.
+          toast.error('Quality-mode pass failed', {
+            description: evt.error,
+          })
+        }
+        break
       case 'hook_ran': {
         // A lifecycle hook fired. Surface it as a non-blocking toast so the
         // user can confirm their configured shell command actually ran — and
@@ -1521,6 +1579,9 @@ export default function ChatView({
                 images={m.images}
                 pinned={!!m.pinned}
                 queued={!!m._queued}
+                refining={!!m.refining}
+                refiningMode={m.refining_mode}
+                refined={!!m.refined}
                 onTogglePin={
                   typeof m.id === 'string' && !m.id.startsWith('tmp-')
                     ? () => togglePin(m.id, !m.pinned)

@@ -149,7 +149,7 @@ export const api = {
   /** Fetch one conversation's metadata and its full message history. */
   getConversation: (id) => request(`/api/conversations/${id}`),
 
-  /** Patch title / model / cwd / permission_mode / pinned / tags / persona / budget_* on a conversation. */
+  /** Patch title / model / cwd / permission_mode / quality_mode / pinned / tags / persona / budget_* on a conversation. */
   updateConversation: (id, patch) =>
     request(`/api/conversations/${id}`, {
       method: 'PATCH',

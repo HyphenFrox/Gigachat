@@ -138,6 +138,37 @@ Tool categorisation lives in `backend/tools.py` (`TOOL_CATEGORIES` + `classify_t
 
 ---
 
+## Quality modes (close the gap between small and proprietary models)
+
+A second header dropdown picks a per-conversation **quality mode**. Every mode uses **only the chat model the user picked** — small models close the gap to GPT-4 / Claude class by spending more compute on the same model, not by routing to a stronger judge.
+
+| Mode | Compute | Best for |
+|---|---|---|
+| **Standard** *(default)* | 1× | Cheap chat, low latency. Baseline behaviour. |
+| **Refine** | ~2× | Code, writing, reasoning. The same model critiques its own answer (under JSON-schema-constrained decoding so the verdict can't be misparsed) and revises if the critique flagged issues. Madaan et al. 2023 "Self-Refine". |
+| **Consensus** | ~3-4× | Math and logic. Generate, then sample additional candidates at varied temperatures, then synthesize the best answer. Self-consistency (Wang et al. 2022). |
+| **Personas** | ~4× | Hard, open-ended questions. Same model, different reasoning-style overlays per sample (analyst / pragmatist / skeptic), then synthesize. Mixture-of-Agents-style lift without using a second model. |
+| **Auto** | adaptive | Best default for varied chat. Difficulty heuristic over the prompt picks refine / consensus / personas — or skips the pass entirely on trivial turns. |
+
+Implementation:
+
+- All passes use the **same chat target** (model + endpoint) the streaming turn used. Captured into `_LAST_CHAT_TARGET[conversation_id]` inside `_run_turn_impl`, consumed by `run_turn` after the impl finishes. No double-routing, no side-effects on a still-warm split target.
+- The critique pass uses **grammar-constrained JSON decoding** — Ollama gets the schema in the `format` field, llama-server gets `response_format = {"type": "json_schema", ...}`. Verdict (`good` / `issues`) is parsed deterministically.
+- Consensus and personas fan out additional samples in parallel — the compute pool's worker dispatch keeps wall-time near 1× when workers are available.
+- Failures in the post-turn pass never break the turn: the original answer stays in DB, a `quality_mode_end` event with an `error` field surfaces in the SSE stream, and the UI shows a non-fatal toast.
+
+UI:
+
+- **Spinner badge** appears on the most-recent assistant bubble while the pass runs (e.g. "refining" / "consensus" / "personas").
+- **"refined" badge** stays on the bubble after the answer was rewritten, so the user knows the displayed text is the post-processed version.
+- **Auto mode** events include `auto_picked` so the UI can show "Auto: refine" instead of just "Auto" — the resolved mode is visible in the spinner badge.
+
+## RAG with LLM-as-reranker
+
+Semantic recall (`_semantic_recall`) now fetches a wider candidate pool from the embedding index, then **reranks with the same chat model** under a JSON-schema response (`{"relevant": [{"index": <int>, "relevance": 1|2|3}, ...]}`). Top 3 of the reranked hits are injected as a system note. Reported lift in the 2025 RAG literature: MRR 56.7% → 66.4%, hallucinations down ~35%. No separate reranker model — same model the user picked, one extra non-streaming call (~50-200 ms on a 7B).
+
+---
+
 ## UI
 
 - **Activity panel** (desktop only, right strip) — active tool with reason and 3-key args summary; "Thinking" card while drafting; recent-calls log with status icons. No need to scroll the transcript to see what's running.

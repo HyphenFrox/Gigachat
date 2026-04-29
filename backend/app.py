@@ -1077,6 +1077,24 @@ class UpdateConversation(BaseModel):
     # clears the grouping (stored as NULL); None means "don't touch". The DB
     # layer normalizes whitespace and caps length at 80 chars.
     project: str | None = None
+    # Quality-mode toggle for the chat path. One of:
+    #   * "standard"  — single-pass chat (default).
+    #   * "refine"    — generate, then critique + revise with the same
+    #                   model. ~2× compute, big lift on small models.
+    #   * "consensus" — sample N parallel responses with the same model
+    #                   then synthesize the best one. ~3-5× compute,
+    #                   biggest lift on math / logic.
+    #   * "personas"  — fan out across diverse "reasoning style" overlays
+    #                   on the same model, then synthesize. MoA-style
+    #                   without using a second model. ~4× compute.
+    #   * "auto"      — pick refine / consensus / personas (or skip
+    #                   entirely) per turn based on a difficulty
+    #                   heuristic over the user's prompt. Cheapest mode
+    #                   that still gives a measurable lift on most chats.
+    # All modes use ONLY the user's selected model — never a different
+    # one — so the user's "I picked this model" intent is preserved.
+    # Validated at the DB layer (unknown values silently dropped).
+    quality_mode: str | None = None
 
 
 class SendMessage(BaseModel):

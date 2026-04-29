@@ -12,6 +12,11 @@ import {
   Database,
   CircleAlert,
   RefreshCw,
+  Sparkles,
+  RotateCcw,
+  Users,
+  Wand2,
+  Gauge,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -133,6 +138,8 @@ export default function ChatHeader({
 
       <PermissionModePicker conv={conv} onPatch={patch} />
 
+      <QualityModePicker conv={conv} onPatch={patch} />
+
       <ConversationActions
         conv={conv}
         onUpdate={onUpdate}
@@ -221,6 +228,129 @@ function PermissionModePicker({ conv, onPatch }) {
             <DropdownMenuItem
               key={key}
               onClick={() => !selected && onPatch({ permission_mode: key })}
+              className="items-start gap-2"
+            >
+              <Icon className={`size-4 mt-0.5 shrink-0 ${meta.color}`} />
+              <div className="flex-1">
+                <div className="flex items-center gap-2 text-sm">
+                  {meta.label}
+                  {selected && (
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      current
+                    </span>
+                  )}
+                </div>
+                <div className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+                  {meta.description}
+                </div>
+              </div>
+            </DropdownMenuItem>
+          )
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+/**
+ * QualityModePicker — selector for the post-turn "quality mode" pass that
+ * trades extra compute (on the SAME model the user picked) for better
+ * answers. Mirrors the backend's `quality_mode` column.
+ *
+ * Modes:
+ *   - standard  — single-pass chat, current behaviour (default).
+ *   - refine    — generate, then critique-and-revise with the same model.
+ *                 ~2× compute, big lift on coding / writing / reasoning.
+ *   - consensus — sample N additional responses then synthesize.
+ *                 ~3-4× compute, biggest lift on math / logic.
+ *   - personas  — sample N candidates each with a different reasoning-style
+ *                 overlay (analyst / pragmatist / skeptic) on the same
+ *                 model, then synthesize. MoA-style without using a
+ *                 second model. ~4× compute.
+ *   - auto      — pick refine / consensus / personas (or skip) per turn
+ *                 based on prompt complexity. Best default for varied
+ *                 chat: cheap turns stay cheap, hard ones get the lift.
+ *
+ * Critical constraint: every mode uses ONLY the user's chosen chat model.
+ * The lift comes from the model spending more compute, not from a stronger
+ * judge model. That's why the dropdown is in the header next to the
+ * permission picker — it's a per-conversation knob, not a global setting.
+ */
+function QualityModePicker({ conv, onPatch }) {
+  const mode = conv.quality_mode || 'standard'
+
+  const config = {
+    standard: {
+      label: 'Standard',
+      short: 'Std',
+      Icon: Gauge,
+      color: 'text-slate-400',
+      description:
+        'Single-pass response (default). Lowest latency and lowest cost — the baseline behaviour your selected model would give without any extra passes.',
+    },
+    refine: {
+      label: 'Refine',
+      short: 'Refine',
+      Icon: RotateCcw,
+      color: 'text-emerald-400',
+      description:
+        'After answering, the same model critiques itself with grammar-constrained JSON output and revises if it found issues. ~2× compute. Big lift on code, writing, and reasoning.',
+    },
+    consensus: {
+      label: 'Consensus',
+      short: 'Cons',
+      Icon: Sparkles,
+      color: 'text-sky-400',
+      description:
+        'Generate, then sample additional candidates at varied temperatures and synthesize the best answer. ~3-4× compute. Biggest lift on math and logic where multiple samples expose mistakes.',
+    },
+    personas: {
+      label: 'Personas',
+      short: 'Pers',
+      Icon: Users,
+      color: 'text-fuchsia-400',
+      description:
+        'Same model, different reasoning-style overlays per sample (analyst / pragmatist / skeptic). Synthesizer unifies them. Mixture-of-Agents-style lift without using a second model. ~4× compute.',
+    },
+    auto: {
+      label: 'Auto',
+      short: 'Auto',
+      Icon: Wand2,
+      color: 'text-amber-400',
+      description:
+        'Picks refine / consensus / personas (or skips) per turn based on prompt complexity. Best default for varied chat: trivial turns stay free, tricky ones get the full pass.',
+    },
+  }
+  const active = config[mode] || config.standard
+  const ActiveIcon = active.Icon
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          className="ml-1 gap-1.5 text-xs"
+          title={active.description}
+        >
+          <ActiveIcon className={`size-3.5 ${active.color}`} />
+          <span className="hidden sm:inline">{active.label}</span>
+          <span className="sm:hidden">{active.short}</span>
+          <ChevronDown className="size-3 opacity-60" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-80">
+        <DropdownMenuLabel className="text-xs">
+          Quality mode (same model, more compute)
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        {Object.entries(config).map(([key, meta]) => {
+          const Icon = meta.Icon
+          const selected = key === mode
+          return (
+            <DropdownMenuItem
+              key={key}
+              onClick={() => !selected && onPatch({ quality_mode: key })}
               className="items-start gap-2"
             >
               <Icon className={`size-4 mt-0.5 shrink-0 ${meta.color}`} />
