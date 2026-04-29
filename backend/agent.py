@@ -1311,7 +1311,27 @@ def _format_recall(hits: list[dict]) -> str:
 # /api/chat every turn — a TTL-less in-proc cache is fine because model caps
 # only change when the user re-pulls a model, which restarts the server via
 # the Ollama host anyway. Value is the raw list from /api/show.
+#
+# Long-session leak guard: bound the dict so a backend that's been up for
+# weeks and serves many (model, worker_base_url) combos doesn't grow
+# without bound. FIFO eviction at `_MODEL_CAPS_CACHE_MAX`; a typical
+# pool only has ~60 unique combos so the cap rarely fires, but a setup
+# with dynamic worker rosters or many model variants stays bounded.
 _MODEL_CAPS_CACHE: dict[tuple[str, str], list[str]] = {}
+_MODEL_CAPS_CACHE_MAX = 256
+
+
+def _evict_model_caps_cache_if_full() -> None:
+    """Drop the oldest entry when the cache exceeds its cap. dict
+    insertion order is FIFO in CPython 3.7+, so iterating gives the
+    least-recently-cached entry first.
+    """
+    while len(_MODEL_CAPS_CACHE) > _MODEL_CAPS_CACHE_MAX:
+        try:
+            oldest_key = next(iter(_MODEL_CAPS_CACHE))
+            del _MODEL_CAPS_CACHE[oldest_key]
+        except (StopIteration, KeyError):
+            break
 
 
 async def _model_capabilities(
@@ -1350,6 +1370,7 @@ async def _model_capabilities(
     except Exception:
         caps = []
     _MODEL_CAPS_CACHE[cache_key] = caps
+    _evict_model_caps_cache_if_full()
     return caps
 
 
