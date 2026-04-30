@@ -202,13 +202,38 @@ class _GigachatListener:
         try:
             paired = db.get_paired_device(device_id)
             if paired and ip:
+                # Only log + propagate when the address actually
+                # changed — a stable peer's mDNS keep-alive should
+                # not spam the log.
+                address_changed = paired.get("ip") != ip or paired.get("port") != port
                 db.update_paired_device_last_seen(
                     device_id, ip=ip, port=port, label=label,
                 )
-                log.info(
-                    "p2p: paired peer %s reappeared at %s:%d (label=%r)",
-                    device_id, ip, port, label,
-                )
+                if address_changed:
+                    log.info(
+                        "p2p: paired peer %s moved to %s:%d (label=%r)",
+                        device_id, ip, port, label,
+                    )
+                    # Phase 2: keep the compute_workers row in sync.
+                    # Same identity, new address. Routing scoring +
+                    # probe data are preserved by the targeted
+                    # `update_compute_worker_address` helper.
+                    try:
+                        worker = db.get_compute_worker_by_device_id(device_id)
+                        if worker:
+                            db.update_compute_worker_address(
+                                worker["id"],
+                                address=ip,
+                                # mDNS-advertised port is Gigachat's
+                                # FastAPI port, NOT Ollama's. Leave
+                                # ollama_port alone (the column has
+                                # its own value the user set).
+                                label=label,
+                            )
+                    except Exception as e:
+                        log.debug(
+                            "p2p: compute_worker address update failed: %s", e,
+                        )
         except Exception as e:
             log.debug("p2p: paired-device refresh failed: %s", e)
 

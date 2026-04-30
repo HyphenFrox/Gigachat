@@ -457,11 +457,18 @@ def init() -> None:
                 capabilities_json TEXT,
                 last_seen REAL,
                 last_error TEXT,
+                gigachat_device_id TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_compute_workers_enabled
                 ON compute_workers(enabled);
+            -- idx_compute_workers_device_id is created in the additive
+            -- migration block below so that on existing DBs the index
+            -- creation runs AFTER the ALTER that adds the column. On
+            -- fresh DBs the column exists from the CREATE TABLE above
+            -- and the migration block re-runs the CREATE INDEX as a
+            -- harmless idempotent op.
 
             -- Split-model definitions (Phase 2 of the compute-pool feature).
             --
@@ -654,6 +661,22 @@ def init() -> None:
             # for this worker — a stale address triggers an
             # "unreachable" status until the user updates it manually.
             "ALTER TABLE compute_workers ADD COLUMN tailscale_host TEXT",
+            # Optional link back to the P2P paired device that auto-created
+            # this worker row. NULL means "manually added by the user via
+            # Settings → Compute"; non-NULL means "pair flow auto-created
+            # this row". Used by the auto-reconnect path (mDNS-discovered
+            # peer with a new IP triggers an UPDATE on the row keyed by
+            # this column) and by the unpair path (delete-or-decouple
+            # decision). The column is indexed in the canonical CREATE
+            # for new installs; the migration here adds it to existing DBs.
+            "ALTER TABLE compute_workers ADD COLUMN gigachat_device_id TEXT",
+            # Index on the device-id column for the auto-reconnect
+            # lookup. Lives here (not in the canonical CREATE block
+            # above) so the index creation always runs AFTER the
+            # column exists, regardless of whether this is a fresh
+            # DB or a migrated one.
+            "CREATE INDEX IF NOT EXISTS idx_compute_workers_device_id "
+            "ON compute_workers(gigachat_device_id)",
             # Phase 2 commit 24: optional path to a multimodal projector
             # GGUF (mmproj). When set, llama-server is launched with
             # `--mmproj <path>` so vision/image inputs work via Phase 2
@@ -4082,6 +4105,7 @@ def create_compute_worker(
     use_for_chat: bool = True,
     use_for_embeddings: bool = True,
     use_for_subagents: bool = True,
+    gigachat_device_id: str | None = None,
 ) -> str:
     """Insert a new compute worker and return its id.
 
@@ -4093,6 +4117,10 @@ def create_compute_worker(
     `tailscale_host` is optional and used ONLY for the auto-repair
     routine in `compute_pool.py`. It exists so a stale `address` after
     a DHCP rebind can be rediscovered without user intervention.
+
+    `gigachat_device_id` is set when the row was auto-created from a
+    P2P pairing (so the mDNS auto-reconnect path can find the worker
+    by the device's stable identity even after a DHCP rebind).
     """
     lbl = (label or "").strip()
     if not lbl:
@@ -4118,8 +4146,8 @@ def create_compute_worker(
             "INSERT INTO compute_workers ("
             "id, label, address, ollama_port, auth_token, ssh_host, "
             "tailscale_host, enabled, use_for_chat, use_for_embeddings, "
-            "use_for_subagents, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "use_for_subagents, gigachat_device_id, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 wid, lbl, addr, port, auth_token,
                 ssh_host_clean, tailscale_clean,
@@ -4127,11 +4155,68 @@ def create_compute_worker(
                 1 if use_for_chat else 0,
                 1 if use_for_embeddings else 0,
                 1 if use_for_subagents else 0,
+                (gigachat_device_id or None),
                 now, now,
             ),
         )
     _invalidate_compute_workers_cache()
     return wid
+
+
+def get_compute_worker_by_device_id(device_id: str) -> dict | None:
+    """Look up a worker row by the P2P device id that auto-created it.
+
+    Returns ``None`` for manually-added workers (their
+    ``gigachat_device_id`` is NULL) and for unknown device ids. Used
+    by the pair → worker sync to decide insert-vs-update.
+    """
+    if not device_id:
+        return None
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM compute_workers WHERE gigachat_device_id = ? LIMIT 1",
+            (device_id,),
+        ).fetchone()
+    return _row_to_compute_worker(row) if row else None
+
+
+def update_compute_worker_address(
+    worker_id: str, *, address: str, ollama_port: int | None = None,
+    label: str | None = None,
+) -> dict | None:
+    """Update the network address of a worker without disturbing
+    capability probe data, enabled-ness, or use_for_* flags.
+
+    Called by the mDNS auto-reconnect path when a paired device
+    reappears at a new IP after a DHCP rebind / Wi-Fi switch — keeps
+    the existing routing scoring while pointing it at the new address.
+    Cache invalidated so the next probe sees the change immediately.
+    """
+    addr = (address or "").strip()
+    if not addr:
+        raise ValueError("address must not be empty")
+    sets: list[str] = ["address = ?"]
+    vals: list = [addr]
+    if ollama_port is not None:
+        sets.append("ollama_port = ?")
+        vals.append(max(1, min(int(ollama_port), 65535)))
+    if label is not None:
+        l = label.strip()
+        if l:
+            sets.append("label = ?")
+            vals.append(l[:80])
+    sets.append("updated_at = ?")
+    vals.append(time.time())
+    vals.append(worker_id)
+    with _conn() as c:
+        cur = c.execute(
+            f"UPDATE compute_workers SET {', '.join(sets)} WHERE id = ?",
+            vals,
+        )
+        if cur.rowcount == 0:
+            return None
+    _invalidate_compute_workers_cache()
+    return get_compute_worker(worker_id)
 
 
 # Tiny in-process cache for the worker roster. The routing layer
@@ -4317,6 +4402,10 @@ def _row_to_compute_worker(row: sqlite3.Row) -> dict:
         tailscale_host = row["tailscale_host"]
     except IndexError:
         tailscale_host = None
+    try:
+        gigachat_device_id = row["gigachat_device_id"]
+    except IndexError:
+        gigachat_device_id = None
     return {
         "id": row["id"],
         "label": row["label"],
@@ -4329,6 +4418,11 @@ def _row_to_compute_worker(row: sqlite3.Row) -> dict:
         "auth_token_set": bool(row["auth_token"]),
         "ssh_host": ssh_host,
         "tailscale_host": tailscale_host,
+        # Populated when the row was auto-created from a P2P pair flow.
+        # Surfaced so the UI can label these "Paired device" rather
+        # than letting the user accidentally try to edit them as if
+        # they were manually added.
+        "gigachat_device_id": gigachat_device_id,
         "enabled": bool(row["enabled"]),
         "use_for_chat": bool(row["use_for_chat"]),
         "use_for_embeddings": bool(row["use_for_embeddings"]),

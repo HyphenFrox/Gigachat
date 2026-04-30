@@ -298,12 +298,64 @@ def accept_pairing(
         "p2p: paired with device_id=%s label=%r",
         claimant_device_id, claimant_label,
     )
+    # Phase 2: paired devices become routable compute workers
+    # automatically. We materialise a row in compute_workers keyed
+    # by the device_id so the existing routing / probe / scoring
+    # code transparently includes the paired peer. Default
+    # `ollama_port=11434` matches the Ollama install convention;
+    # callers can override via the worker's edit form. Failure is
+    # non-fatal — the pairing record itself is the trust anchor;
+    # compute integration is a convenience.
+    if claimant_ip:
+        try:
+            existing = db.get_compute_worker_by_device_id(claimant_device_id)
+            if not existing:
+                db.create_compute_worker(
+                    label=claimant_label or claimant_device_id,
+                    address=claimant_ip,
+                    ollama_port=11434,
+                    enabled=True,
+                    use_for_chat=True,
+                    use_for_embeddings=True,
+                    use_for_subagents=True,
+                    gigachat_device_id=claimant_device_id,
+                )
+                log.info(
+                    "p2p: auto-created compute_worker for paired device %s "
+                    "at %s:11434",
+                    claimant_device_id, claimant_ip,
+                )
+        except Exception as e:
+            log.info(
+                "p2p: compute_worker auto-create failed (%s); pairing "
+                "stored but the device won't appear in the worker pool "
+                "until manually added",
+                e,
+            )
     return paired
 
 
 def unpair(device_id: str) -> bool:
-    """Drop a pairing record. The other side keeps theirs until
-    they delete it on their own device — there's no remote-revoke
-    in v1 because that would require a transport channel we
-    haven't built yet."""
+    """Drop a pairing record AND its auto-created compute_worker row.
+
+    The other side keeps their pairing record until they delete it on
+    their own device — there's no remote-revoke in v1 because that
+    would require a transport channel we haven't built yet. Removing
+    the worker too keeps the routing layer from trying to talk to a
+    peer the user has decided not to trust anymore.
+    """
+    # Order matters: delete the worker BEFORE the pairing so the
+    # "find the worker by device_id" lookup still succeeds.
+    try:
+        worker = db.get_compute_worker_by_device_id(device_id)
+        if worker:
+            db.delete_compute_worker(worker["id"])
+            log.info(
+                "p2p: removed auto-paired compute_worker %s for device %s",
+                worker["id"], device_id,
+            )
+    except Exception as e:
+        log.info(
+            "p2p: compute_worker cleanup on unpair failed: %s", e,
+        )
     return db.delete_paired_device(device_id)
