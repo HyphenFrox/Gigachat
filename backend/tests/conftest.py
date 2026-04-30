@@ -30,12 +30,20 @@ def isolated_db(tmp_path, monkeypatch):
     Use this fixture in any test that calls `db.create_conversation`,
     `db.add_message`, etc. The file is deleted automatically when the test
     finishes (tmp_path cleanup is handled by pytest).
+
+    Also resets module-level routing state (`_HOST_MEGA_MODEL_BUSY_UNTIL`)
+    so an earlier test that engaged the mega-model path doesn't leak its
+    "host is busy" flag into a routing test that expects the host to be
+    in the rotation. Strictly an isolation hygiene fix, not a behaviour
+    change in production.
     """
     from backend import db as _db
+    from backend import compute_pool as _cp
 
     db_path = tmp_path / "test_app.db"
     monkeypatch.setattr(_db, "DB_PATH", db_path)
     _db.init()
+    _cp._HOST_MEGA_MODEL_BUSY_UNTIL = 0.0
     return _db
 
 

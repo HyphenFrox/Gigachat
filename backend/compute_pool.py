@@ -2032,8 +2032,17 @@ def pick_chat_target(
 
     if worker_score <= host_score:
         # Host wins (using measured throughput when available, else
-        # falling back to GPU/VRAM/RAM/CPU heuristics). Stay local.
-        return None
+        # falling back to GPU/VRAM/RAM/CPU heuristics). Normally we'd
+        # stay local — but when the host is currently mmapping a
+        # mega-model from disk, ANY in-flight chat that ALSO routes
+        # to host competes with that page-in stream for I/O bandwidth
+        # and slows everyone down. Bias to the worker in that case
+        # even when the worker is technically less capable: a slower-
+        # running worker beats a host whose disk is saturated. If no
+        # eligible worker exists, the picker returns None (host) which
+        # is unchanged behaviour.
+        if not is_host_mega_busy():
+            return None
     return (_worker_base_url(w), db.get_compute_worker_auth_token(w["id"]))
 
 
@@ -2104,6 +2113,54 @@ _HOST_TOTAL_USE_FRACTION = 0.70
 # must exceed host VRAM by 50 % before we engage split, which avoids
 # regressing setups where pool ≈ host but split LAN-cost dominates.
 _POOL_VRAM_OUTSCALE_FACTOR = 1.5
+
+
+# ---------------------------------------------------------------------------
+# Mega-model busy tracker
+#
+# When the host engages the mega-model path (model > pool memory →
+# layers page from host SSD via mmap on every forward pass), the disk
+# is the bottleneck. Other in-flight work that ALSO routes to the host
+# (parallel subagents, embedding fan-out, side chats) competes with
+# that mmap traffic for I/O bandwidth and slows everyone down.
+#
+# Solution: when the mega-model path engages, mark the host "mega-busy"
+# for a short window. Routing functions then bias toward workers so the
+# host disk stays dedicated to the mmap stream. Each new mega-model
+# turn refreshes the window; otherwise it expires naturally so a quick
+# follow-up chat after the mega turn is over goes to the strongest
+# node again.
+# ---------------------------------------------------------------------------
+
+# Wall-clock until which we consider host's disk subsystem mega-busy.
+# Set on every mega-model engagement; checked by routing helpers.
+_HOST_MEGA_MODEL_BUSY_UNTIL: float = 0.0
+
+# How long one mega-model engagement keeps the host marked busy. 5 min
+# matches Ollama's default model-keep-alive window — long enough to
+# cover a typical mega-model turn end-to-end (load + prefill + decode
+# + tool calls), short enough to recover quickly when the mega-model
+# session ends and the user switches to a smaller chat.
+_HOST_MEGA_MODEL_BUSY_TTL_SEC = 300.0
+
+
+def _mark_host_mega_busy() -> None:
+    """Stamp the host as mega-busy for the next `_HOST_MEGA_MODEL_BUSY_TTL_SEC`
+    seconds. Called by `route_chat_for` whenever it commits to the
+    mega-model path (model exceeds pool memory). Idempotent and cheap —
+    overlapping mega turns just keep refreshing the deadline.
+    """
+    global _HOST_MEGA_MODEL_BUSY_UNTIL
+    _HOST_MEGA_MODEL_BUSY_UNTIL = time.time() + _HOST_MEGA_MODEL_BUSY_TTL_SEC
+
+
+def is_host_mega_busy() -> bool:
+    """True when the host is currently mmapping a mega-model from disk.
+    Routing helpers consult this to bias parallel work toward workers
+    so the host's disk subsystem stays dedicated to the mega-model
+    page-in stream.
+    """
+    return time.time() < _HOST_MEGA_MODEL_BUSY_UNTIL
 
 # Adaptive routing — per-model TPS history. Reserved for a future
 # commit that wires post-turn realised-TPS recording from agent.py;
@@ -5927,6 +5984,11 @@ async def route_chat_for(model_name: str) -> dict:
                     rpc_pool_total / (1024 ** 3), 1,
                 )
                 result["model_size_gb"] = round(size_bytes / (1024 ** 3), 1)
+                # Mark host's disk subsystem busy so subsequent parallel
+                # work (subagents / embeddings / side chats) is biased
+                # toward workers — keeps the host disk dedicated to the
+                # mmap page-in stream.
+                _mark_host_mega_busy()
             return result
 
     # Tier 3: no eligible RPC workers were found, OR Tier 2 decided
@@ -5951,6 +6013,9 @@ async def route_chat_for(model_name: str) -> dict:
         result["mega_model"] = True
         result["pool_memory_gb"] = round(host_total / (1024 ** 3), 1)
         result["model_size_gb"] = round(size_bytes / (1024 ** 3), 1)
+        # Same reasoning as the Tier-2 mega path above: bias parallel
+        # work to workers while the host disk is busy mmapping.
+        _mark_host_mega_busy()
     return result
 
 
@@ -5983,7 +6048,15 @@ def list_subagent_workers(model: str) -> list[tuple[str, str | None]]:
     host_score = _host_capability_score(model)
     host_tps = host_score[0]
 
-    if host_tps > 0:
+    # Mega-busy override: when the host is mmapping a mega-model, ANY
+    # worker beats the host's disk-saturated state. Skip the perf-ratio
+    # gate so the fan-out picks up every eligible worker — even slow
+    # ones — to keep the host's I/O bandwidth focused on the mega-model
+    # page-in stream. The caller still composes `[host] + workers`, so
+    # the host gets at most one task; the workers absorb the rest.
+    mega_busy = is_host_mega_busy()
+
+    if host_tps > 0 and not mega_busy:
         min_tps = host_tps * _SUBAGENT_MIN_PERF_RATIO
         gated = []
         for w in cands:
@@ -6002,6 +6075,12 @@ def list_subagent_workers(model: str) -> list[tuple[str, str | None]]:
                     _SUBAGENT_MIN_PERF_RATIO * 100, host_tps,
                 )
         cands = gated
+    elif mega_busy:
+        log.info(
+            "subagent fan-out: host mega-busy, skipping perf-ratio gate "
+            "to push all %d worker(s) into the rotation",
+            len(cands),
+        )
 
     return [
         (_worker_base_url(w), db.get_compute_worker_auth_token(w["id"]))

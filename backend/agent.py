@@ -4550,6 +4550,17 @@ async def run_subagents_parallel(
         # belt-and-braces: a routing layer hiccup must never break the
         # core delegate_parallel call. Stay host-only.
         pass
+    # Mega-busy override: when the host is mmapping a mega-model, drop
+    # host from the target rotation entirely so subagent fan-out lands
+    # exclusively on workers. Keeps the host's disk dedicated to the
+    # mmap page-in stream rather than fighting for I/O bandwidth with
+    # parallel subagent inference. Only effective when at least one
+    # worker is eligible — otherwise we keep host as the only option.
+    try:
+        if compute_pool.is_host_mega_busy() and len(targets) > 1:
+            targets = targets[1:]
+    except Exception:
+        pass
 
     # Fan out. return_exceptions=True turns a single subagent crash into a
     # value in the results list rather than aborting the gather.
