@@ -403,10 +403,11 @@ def _estimate_kv_bytes_per_slot(gguf_path: str, ctx_size: int = 4096) -> int:
 
 
 # How much VRAM headroom to leave free after target + draft + KV slots.
-# Per the project's "use all resources available" policy this is zero —
-# every reported free byte counts toward the inference budget. Trades a
-# soft headroom for the OOM killer as the failure mode.
-_PARALLEL_VRAM_HEADROOM = 0.0
+# 5 % buffer to absorb allocator alignment overhead and avoid crashes
+# on overcommit — the empirical floor where llama-server reliably
+# loads a model that fits on paper. Smaller would push throughput
+# higher in theory but tips into OOM crashes in practice.
+_PARALLEL_VRAM_HEADROOM = 0.05
 
 # Hard cap on `--parallel`. llama-server's batched-verify is most efficient
 # at 4-8 slots; beyond that, scheduling overhead and sub-slot cache
@@ -950,8 +951,9 @@ def _compute_optimal_n_cpu_moe(
 
     # GPU pool budget: host VRAM + each worker's free RAM (workers
     # exposing iGPU SYCL via shared system memory, so RAM is the
-    # right proxy). Per the zero-margin policy elsewhere we use 100%
-    # of reported free memory.
+    # right proxy). Apply the same 5 % buffer used by the
+    # adaptive-ngl decision so the n-cpu-moe placement stays in
+    # sync with what `-ngl` will actually try to fit on GPU.
     pool_bytes = 0
     try:
         from . import sysdetect
@@ -965,6 +967,7 @@ def _compute_optimal_n_cpu_moe(
             continue
         caps = w.get("capabilities") or {}
         pool_bytes += int(float(caps.get("ram_free_gb") or 0) * (1024 ** 3))
+    pool_bytes = int(pool_bytes * 0.95)
     if pool_bytes <= 0:
         return None
 
@@ -1558,7 +1561,7 @@ async def _wait_for_health(
 
 
 def _compute_optimal_ngl(
-    gguf_path: str, worker_ids: list[str], *, safety: float = 1.0,
+    gguf_path: str, worker_ids: list[str], *, safety: float = 0.95,
 ) -> int:
     """Decide how many layers to put on GPU pools (rest stay on host
     CPU + RAM, paged from disk via mmap).
@@ -1584,12 +1587,11 @@ def _compute_optimal_ngl(
     the GGUF metadata), clamp to [0, n_layers]. Returns the integer
     `-ngl` value to pass.
 
-    `safety=1.0` means "use 100% of the reported free pool memory" —
-    no headroom reserved. Per the user's explicit policy: every
-    available byte should be used for inference; the OOM killer is
-    an acceptable price for pushing throughput. Drop `safety` below
-    1.0 only when a specific failure mode (e.g. a worker that lies
-    about its `ram_free_gb`) demands it.
+    `safety=0.95` means "use 95 % of the reported free pool memory" —
+    a 5 % buffer purely to absorb allocator alignment overhead and
+    avoid crashes on overcommit. The user-set policy is "use as much
+    as possible without crashing"; 5 % is the empirical sweet spot
+    where llama-server reliably loads a model that fits on paper.
 
     Falls back to `_DEFAULT_NGL` if any input is missing — e.g.
     a worker without a probe yet, or a GGUF without the
@@ -1623,10 +1625,9 @@ def _compute_optimal_ngl(
     try:
         from . import sysdetect
         spec = sysdetect.detect_system()
-        # Host VRAM (CUDA / dGPU) — `vram_gb` is total. Per the
-        # zero-margin policy we treat all of it as available; the
-        # GPU allocator is left to error out on overcommit rather
-        # than us pre-reserving headroom.
+        # Host VRAM (CUDA / dGPU) — `vram_gb` is total. The 5 % buffer
+        # is applied uniformly via the `safety` factor below, so we
+        # take 100 % of the reported total here.
         pool_free_bytes += int(float(spec.get("vram_gb") or 0) * (1024 ** 3))
     except Exception:
         pass

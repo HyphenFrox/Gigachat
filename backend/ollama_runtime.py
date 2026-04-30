@@ -207,12 +207,23 @@ def _spawn_ollama(executable: str) -> subprocess.Popen | None:
     if not env.get("OLLAMA_SCHED_SPREAD"):
         env["OLLAMA_SCHED_SPREAD"] = "1"
     # OLLAMA_GPU_OVERHEAD reserves bytes of VRAM as a safety buffer
-    # against allocator overcommit. Per the project's zero-margin
-    # policy ("use every available byte for inference"), we set this
-    # to 0 — Ollama will let the GPU runtime error on overcommit
-    # rather than pre-reserving headroom we don't otherwise need.
+    # against allocator overcommit. Set to 5 % of detected VRAM to
+    # match the project's 5 %-margin policy elsewhere — small enough
+    # that nearly all VRAM still goes to inference, big enough to
+    # prevent the OOM crashes that pure-zero buffer caused on tight
+    # setups. Falls back to 0 (no buffer) when sysdetect can't read
+    # VRAM size, which preserves the prior behaviour.
     if not env.get("OLLAMA_GPU_OVERHEAD"):
-        env["OLLAMA_GPU_OVERHEAD"] = "0"
+        try:
+            from . import sysdetect
+            vram_gb = float(sysdetect.detect_system().get("vram_gb") or 0)
+        except Exception:
+            vram_gb = 0.0
+        if vram_gb > 0:
+            overhead_bytes = int(vram_gb * (1024 ** 3) * 0.05)
+            env["OLLAMA_GPU_OVERHEAD"] = str(overhead_bytes)
+        else:
+            env["OLLAMA_GPU_OVERHEAD"] = "0"
     # OLLAMA_NUM_THREAD overrides the runner's CPU thread count.
     # Default is logical core count which over-subscribes the FPU on
     # hyperthreaded CPUs — physical core count is typically faster

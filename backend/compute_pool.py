@@ -3372,11 +3372,12 @@ _SPECULATIVE_MIN_TARGET_BYTES = 1_500_000_000
 
 # VRAM headroom multiplier — we only engage speculative if the executing
 # node has at least (target_size + draft_size) * this factor in VRAM.
-# Covers KV cache for both models. Set to 1.10 per the zero-margin
-# policy: just enough for KV (a 30 B target's KV cache at 4 K ctx is
-# ~3-4 GB on 35 GB combined weight ≈ 11 %); anything more is reserved
-# headroom we no longer pay for.
-_SPECULATIVE_VRAM_HEADROOM = 1.10
+# 1.15 = ~10 % real KV-cache need + ~5 % allocator/alignment buffer to
+# avoid load-time OOM when (target+draft) genuinely fits on paper.
+# Tightened from the historical 1.30 once flash-attn + KV-q8 freed
+# half the per-slot KV cost; lowered further to 1.15 under the
+# 5 %-margin policy.
+_SPECULATIVE_VRAM_HEADROOM = 1.15
 
 
 # Process-level cache of GGUF tokenizer fingerprints, keyed by absolute
@@ -5101,9 +5102,9 @@ _WORKER_CHAT_SERVERS: dict[str, dict] = {}
 _WORKER_LLAMA_PORT = 11600
 
 # Worker VRAM headroom factor for the target + draft pair. Same idea
-# as `_SPECULATIVE_VRAM_HEADROOM` for host. Lowered to 1.10 for the
-# zero-margin policy — just enough for KV cache, no discretionary slack.
-_WORKER_SPECULATIVE_VRAM_HEADROOM = 1.10
+# as `_SPECULATIVE_VRAM_HEADROOM` for host. 1.15 mirrors that constant
+# under the 5 %-margin policy.
+_WORKER_SPECULATIVE_VRAM_HEADROOM = 1.15
 
 
 def _worker_has_model_locally(worker: dict, model_name: str) -> bool:

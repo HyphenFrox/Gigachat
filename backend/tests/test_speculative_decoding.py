@@ -841,16 +841,17 @@ def test_worker_has_vram_for_pair_uses_proven_vram():
     """The headroom check uses `max_vram_seen_bytes` as the upper
     bound. A worker that's never loaded enough → can't host both.
 
-    Headroom factor is `_WORKER_SPECULATIVE_VRAM_HEADROOM` (1.10 under
-    the zero-margin policy). The boundary needs to land between the two
-    cases for the test to remain meaningful: pick a target+draft size
-    that fits 16 GB at 1.10× and a larger pair that doesn't.
+    Headroom factor is `_WORKER_SPECULATIVE_VRAM_HEADROOM` (1.15 under
+    the 5 %-margin policy: ~10 % real KV need + 5 % allocator buffer).
+    The boundary needs to land between the two cases for the test to
+    remain meaningful: pick a target+draft size that fits 16 GB at
+    1.15× and a larger pair that doesn't.
     """
     worker = {"capabilities": {"max_vram_seen_bytes": 16_000_000_000}}
-    # 5 GB target + 1 GB draft → 6 GB × 1.10 = 6.6 GB ≤ 16 GB.
+    # 5 GB target + 1 GB draft → 6 GB × 1.15 = 6.9 GB ≤ 16 GB.
     assert compute_pool._worker_has_vram_for_pair(worker, 5_000_000_000, 1_000_000_000) is True
-    # 16 GB target + 1 GB draft → 17 GB × 1.10 = 18.7 GB > 16 GB.
-    assert compute_pool._worker_has_vram_for_pair(worker, 16_000_000_000, 1_000_000_000) is False
+    # 14 GB target + 1 GB draft → 15 GB × 1.15 = 17.25 GB > 16 GB.
+    assert compute_pool._worker_has_vram_for_pair(worker, 14_000_000_000, 1_000_000_000) is False
 
 
 def test_worker_has_vram_for_pair_refuses_unbenched_worker():
