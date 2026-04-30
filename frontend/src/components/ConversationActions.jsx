@@ -29,7 +29,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { cn } from '@/lib/utils'
+import { cn, formatMessageTime, formatFullTimestamp } from '@/lib/utils'
 import { api } from '@/lib/api'
 
 /**
@@ -442,7 +442,9 @@ function PinnedMessagesDialog({ open, onClose, conv, onScrollToMessage }) {
                   <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-wide text-muted-foreground">
                     <span className="font-medium text-foreground">{m.role}</span>
                     <span>·</span>
-                    <span>{new Date(m.created_at * 1000).toLocaleString()}</span>
+                    <span title={formatFullTimestamp(m.created_at)}>
+                      {formatMessageTime(m.created_at)}
+                    </span>
                     <div className="ml-auto flex items-center gap-1">
                       {onScrollToMessage ? (
                         <Button
