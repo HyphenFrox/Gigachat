@@ -23,7 +23,7 @@ import {
 } from '@/components/ui/dialog'
 import { Textarea } from '@/components/ui/textarea'
 import { Button } from '@/components/ui/button'
-import { cn } from '@/lib/utils'
+import { cn, formatMessageTime, formatFullTimestamp } from '@/lib/utils'
 import { languageToArtifactKind, CODE_ARTIFACT_MIN_LINES } from './ArtifactPanel'
 
 /**
@@ -73,6 +73,7 @@ function Message({
   refining = false,
   refiningMode = null,
   refined = false,
+  createdAt = null,
   onTogglePin,
   onEdit,
   canEdit = false,
@@ -275,6 +276,22 @@ function Message({
               <Pencil className="size-3.5" />
             </button>
           )}
+          {/* Inline timestamp — same idea as a messaging app. Inline
+              display follows the chat-app convention of "smart" relative
+              formatting (HH:MM today, weekday + time within the week,
+              month-day + time same year, full date older). Hover shows
+              the exact moment, with seconds + weekday. The whole
+              element is `ml-auto` so the time floats to the row's
+              trailing edge regardless of how many badges precede it. */}
+          {createdAt ? (
+            <time
+              dateTime={new Date(createdAt * 1000).toISOString()}
+              className="ml-auto select-none text-[10px] tabular-nums text-muted-foreground/70"
+              title={formatFullTimestamp(createdAt)}
+            >
+              {formatMessageTime(createdAt)}
+            </time>
+          ) : null}
         </div>
         {hasImages && <UserImageStrip names={images} />}
 

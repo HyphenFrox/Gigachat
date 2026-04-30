@@ -147,7 +147,23 @@ export const api = {
     }),
 
   /** Fetch one conversation's metadata and its full message history. */
-  getConversation: (id) => request(`/api/conversations/${id}`),
+  /**
+   * Fetch one conversation's metadata and a page of its messages.
+   *
+   * - No options → entire transcript (legacy behaviour, backwards-compatible).
+   * - `{ limit }` → most-recent N messages plus a `total` count + `has_more`
+   *   flag. Used as the initial load for chat-app-style scroll-up paging.
+   * - `{ limit, beforeId }` → the N messages strictly older than
+   *   `beforeId`. Used by the scroll-up "load more" gesture.
+   */
+  getConversation: (id, opts = null) => {
+    if (!opts) return request(`/api/conversations/${id}`)
+    const qs = new URLSearchParams()
+    if (opts.limit) qs.set('limit', String(opts.limit))
+    if (opts.beforeId) qs.set('before_id', opts.beforeId)
+    const sep = qs.toString() ? `?${qs.toString()}` : ''
+    return request(`/api/conversations/${id}${sep}`)
+  },
 
   /** Patch title / model / cwd / permission_mode / quality_mode / pinned / tags / persona / budget_* on a conversation. */
   updateConversation: (id, patch) =>

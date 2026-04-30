@@ -14,7 +14,7 @@ import ArtifactPanel from './ArtifactPanel'
 import BrandLogo from './BrandLogo'
 import { api } from '@/lib/api'
 import { postEventStream } from '@/lib/sse'
-import { cn } from '@/lib/utils'
+import { cn, formatDayLabel, sameCalendarDay } from '@/lib/utils'
 
 // Selector-safe escape for message ids (UUIDs are already safe but we
 // defend against any future id scheme that might include punctuation).
@@ -49,6 +49,18 @@ const cssEscape = (s) =>
  *   turn_done        -> clear live buffers, mark not busy
  *   error            -> toast.error, mark not busy
  */
+// Pagination — chat-app-style scroll-up history.
+// Initial page is the most recent N messages; further pages stream
+// in 50 at a time as the user scrolls toward the top. Sized so a
+// fully-rendered page comfortably exceeds typical viewport height
+// (so `loadOlder` doesn't fire repeatedly to fill one screenful).
+const INITIAL_PAGE_SIZE = 50
+const OLDER_PAGE_SIZE = 50
+// Distance from the top of the scroll container at which we trigger
+// the next `loadOlder()` fetch. Generous so the page lands before
+// the user actually hits the boundary — avoids the "loading…" flash.
+const LOAD_OLDER_TRIGGER_PX = 400
+
 export default function ChatView({
   id,
   models,
@@ -61,6 +73,16 @@ export default function ChatView({
 }) {
   const [conv, setConv] = useState(null)
   const [messages, setMessages] = useState([])
+  // Lazy-load pagination state for chat-app-style scroll-up history.
+  // The initial load fetches only the most recent `INITIAL_PAGE_SIZE`
+  // messages; older pages stream in as the user scrolls toward the
+  // top of the transcript. Big wins for memory + first-paint latency
+  // on long-running conversations (thousands of messages).
+  //   * `hasMoreOlder`  — true when the server reports more pages exist.
+  //   * `loadingOlder`  — true while a load_older fetch is in flight,
+  //                       used to debounce the scroll trigger.
+  const [hasMoreOlder, setHasMoreOlder] = useState(false)
+  const [loadingOlder, setLoadingOlder] = useState(false)
   // Per-tool-call UI state. Shape:
   //   { [callId]: {
   //       status: 'await'|'running'|'done'|'rejected',
@@ -191,8 +213,17 @@ export default function ChatView({
       setSideTasks([])
       setScheduledWakeup(null)
       setActiveLoop(null)
+      setHasMoreOlder(false)
+      setLoadingOlder(false)
       return
     }
+    // Switching to a new conversation — drop any pagination state
+    // from the previous one before the async load below populates
+    // it again. Without this, scrolling the new chat upward could
+    // briefly trigger a `loadOlder` against the previous chat's
+    // anchor message id (returns []).
+    setHasMoreOlder(false)
+    setLoadingOlder(false)
     let cancelled = false
     // Clear the transient banners/chips the moment the user switches chats —
     // they're always per-conversation and stale wakeup/question state would
@@ -203,10 +234,20 @@ export default function ChatView({
     setActiveLoop(null)
     ;(async () => {
       try {
-        const data = await api.getConversation(id)
+        // Lazy-load: fetch only the most recent page on initial open.
+        // Older pages stream in via `loadOlder()` as the user scrolls
+        // up. Big wins on long conversations: a 5,000-message chat
+        // hydrates ~100x faster + uses ~100x less memory at first
+        // paint.
+        const data = await api.getConversation(id, {
+          limit: INITIAL_PAGE_SIZE,
+        })
         if (cancelled) return
         setConv(data.conversation)
         setMessages(data.messages)
+        // `has_more` is only present on the paginated path. When
+        // backend-returned, drives the scroll-up trigger below.
+        setHasMoreOlder(Boolean(data.has_more))
         setToolStates(buildToolStatesFromHistory(data.messages))
         setTodos(extractLatestTodos(data.messages))
         // Backfill a missing title on load. Catches conversations
@@ -331,6 +372,83 @@ export default function ChatView({
   const lastProgScrollAtRef = useRef(0)
   const _PROG_SCROLL_WINDOW_MS = 150
 
+  // Lazy-load older messages on scroll-up.
+  //
+  // Saves the scroll height before prepending so we can restore the
+  // user's view position relative to where they were — without this
+  // the prepended rows would push the existing content down and the
+  // user would lose their place.
+  const loadOlder = useCallback(async () => {
+    if (!id) return
+    if (loadingOlder) return
+    if (!hasMoreOlder) return
+    if (!messages.length) return
+    const oldestId = messages[0]?.id
+    if (!oldestId) return
+    const el = scrollRef.current
+    const beforeScrollHeight = el ? el.scrollHeight : 0
+    const beforeScrollTop = el ? el.scrollTop : 0
+    setLoadingOlder(true)
+    try {
+      const data = await api.getConversation(id, {
+        limit: OLDER_PAGE_SIZE,
+        beforeId: oldestId,
+      })
+      if (currentIdRef.current !== id) return
+      const olderPage = Array.isArray(data?.messages) ? data.messages : []
+      if (!olderPage.length) {
+        // Server says no more — flip the flag so the trigger stops
+        // firing. Real exhaustion case (rare race when a message
+        // is deleted between pages); also covers the unknown-anchor
+        // edge case in `list_messages_paginated`.
+        setHasMoreOlder(false)
+        return
+      }
+      // Prepend the new page. The page is oldest-first within itself,
+      // matching what the rest of the codebase expects.
+      setMessages((prev) => {
+        // Defensive: skip rows we already have (shouldn't happen
+        // because `before_id` is exclusive, but cheap to guard).
+        const known = new Set(prev.map((r) => r.id))
+        const fresh = olderPage.filter((r) => !known.has(r.id))
+        return [...fresh, ...prev]
+      })
+      // Merge tool states from the newly-loaded older messages so
+      // any tool cards in the prepended block render correctly.
+      try {
+        const olderToolStates = buildToolStatesFromHistory(olderPage)
+        if (olderToolStates && Object.keys(olderToolStates).length) {
+          setToolStates((prev) => ({ ...olderToolStates, ...prev }))
+        }
+      } catch {
+        // Tool-state hydration is best-effort.
+      }
+      setHasMoreOlder(Boolean(data.has_more))
+      // After React paints the prepended rows, restore the scroll
+      // position so the user's view doesn't jump. The new height
+      // exceeds the old by exactly the prepended block's height;
+      // shifting scrollTop by the same delta keeps the visible
+      // anchor row at the same on-screen Y.
+      requestAnimationFrame(() => {
+        const e2 = scrollRef.current
+        if (!e2) return
+        const delta = e2.scrollHeight - beforeScrollHeight
+        if (delta > 0) {
+          // Stamp the programmatic-scroll window so the user-pin
+          // logic in onScroll doesn't react to this adjustment.
+          lastProgScrollAtRef.current = Date.now()
+          e2.scrollTop = beforeScrollTop + delta
+        }
+      })
+    } catch (e) {
+      toast.error('Could not load older messages', {
+        description: e?.message || String(e),
+      })
+    } finally {
+      setLoadingOlder(false)
+    }
+  }, [id, loadingOlder, hasMoreOlder, messages])
+
   // Update nearBottomRef whenever the user scrolls. Using a ref (not state)
   // so we don't cause a re-render on every wheel tick.
   useEffect(() => {
@@ -348,6 +466,16 @@ export default function ChatView({
       const top = el.scrollTop
       const distanceFromBottom = el.scrollHeight - top - el.clientHeight
       nearBottomRef.current = distanceFromBottom < 200
+      // Lazy-load trigger: when the user scrolls within
+      // `LOAD_OLDER_TRIGGER_PX` of the top of the transcript AND the
+      // server reports more pages exist, fetch the next page. The
+      // `loadingOlder` debounce inside `loadOlder` itself stops
+      // back-to-back fires while a fetch is in flight.
+      if (top < LOAD_OLDER_TRIGGER_PX && hasMoreOlder && !loadingOlder) {
+        // Fire-and-forget; loadOlder handles its own state updates,
+        // including scroll-position preservation.
+        loadOlder()
+      }
       // If this scroll event was triggered by our own programmatic
       // write (`el.scrollTop = el.scrollHeight` from the auto-scroll
       // effects), skip the pin updates entirely — programmatic
@@ -419,7 +547,11 @@ export default function ChatView({
       el.removeEventListener('touchmove', onTouchMove)
       el.removeEventListener('keydown', onKey)
     }
-  }, [])
+    // Re-bind the listener whenever the lazy-load inputs change so
+    // `onScroll` reads the up-to-date `hasMoreOlder` / `loadingOlder`
+    // / `loadOlder` from closure rather than stale values from the
+    // first mount. Cheap — listener teardown/setup is microseconds.
+  }, [hasMoreOlder, loadingOlder, loadOlder])
 
   // Shared gate for both auto-scroll paths below. Returns true when the
   // viewport should be pinned to the bottom right now: the user hasn't
@@ -1560,12 +1692,53 @@ export default function ChatView({
             <WelcomeTips cwd={conv.cwd} />
           )}
 
-          {visibleMessages.map((m) => (
-            // data-message-id lets the semantic-search jump logic find this
-            // row via querySelector. The ring class flashes for ~2s after
-            // a jump so the user's eye lands on the right message.
+          {/* Lazy-load affordance: when the server reports more older
+              messages exist, render a small pill at the top so users
+              can explicitly fetch the next page (in addition to the
+              automatic scroll-up trigger). Doubles as a "loading…"
+              indicator while a fetch is in flight. */}
+          {hasMoreOlder && visibleMessages.length > 0 && (
+            <div className="my-2 flex items-center justify-center">
+              <button
+                type="button"
+                onClick={loadOlder}
+                disabled={loadingOlder}
+                className={cn(
+                  'rounded-full border bg-background px-3 py-1 text-[11px] font-medium text-muted-foreground shadow-sm transition-colors',
+                  'hover:bg-accent hover:text-foreground',
+                  'disabled:cursor-not-allowed disabled:opacity-60',
+                )}
+              >
+                {loadingOlder ? 'Loading older messages…' : 'Load older messages'}
+              </button>
+            </div>
+          )}
+
+          {visibleMessages.map((m, idx) => {
+            // Insert a day-separator pill above the first message of
+            // each calendar day — same convention messaging apps use
+            // (Today / Yesterday / weekday / Mar 4). Computed against
+            // the previous visible message so a transcript that spans
+            // multiple days groups cleanly without a separator above
+            // the very first message of the chat.
+            const prev = idx > 0 ? visibleMessages[idx - 1] : null
+            const showDay =
+              !prev ||
+              !sameCalendarDay(prev.created_at, m.created_at)
+            return (
+              <React.Fragment key={m.id}>
+                {showDay && m.created_at ? (
+                  <div className="my-4 flex items-center justify-center">
+                    <span className="rounded-full bg-muted px-3 py-1 text-[11px] font-medium text-muted-foreground shadow-sm">
+                      {formatDayLabel(m.created_at)}
+                    </span>
+                  </div>
+                ) : null}
+                {/* data-message-id lets the semantic-search jump logic
+                    find this row via querySelector. The ring class
+                    flashes for ~2s after a jump so the user's eye
+                    lands on the right message. */}
             <div
-              key={m.id}
               data-message-id={m.id}
               className={cn(
                 'rounded-md transition-shadow duration-500',
@@ -1582,6 +1755,7 @@ export default function ChatView({
                 refining={!!m.refining}
                 refiningMode={m.refining_mode}
                 refined={!!m.refined}
+                createdAt={m.created_at}
                 onTogglePin={
                   typeof m.id === 'string' && !m.id.startsWith('tmp-')
                     ? () => togglePin(m.id, !m.pinned)
@@ -1642,7 +1816,9 @@ export default function ChatView({
                   })}
               </Message>
             </div>
-          ))}
+              </React.Fragment>
+            )
+          })}
 
           {(busy || liveContent || liveThinking) && (
             <PendingAssistantBubble
