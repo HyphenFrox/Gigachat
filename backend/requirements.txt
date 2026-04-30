@@ -71,6 +71,12 @@ faster-whisper==1.1.0
 # pure-Python (no libssh2 build) and integrates with asyncio so calls don't
 # block the agent loop. Optional — same lazy-import pattern as faster-whisper.
 asyncssh==2.21.0
+# mDNS (zero-config) discovery for the local-network compute pool. Pure-Python,
+# MIT-licensed. Used by backend/p2p_discovery.py to advertise a Gigachat
+# instance on the LAN as `_gigachat._tcp.local.` and browse for peers — same
+# protocol Bonjour / Avahi use. Cross-platform; works on Windows out of the
+# box (uses the Bonjour service if present, otherwise its own listener).
+zeroconf==0.146.5
 # ----- Test-only dependencies (install with `pip install -r requirements.txt`
 # then `pip install pytest pytest-asyncio`, OR see `backend/tests/README` for
 # the standalone test-runner script). Pinned to current stable releases. -----

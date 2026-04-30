@@ -824,6 +824,28 @@ def init() -> None:
             CREATE INDEX IF NOT EXISTS idx_webhooks_enabled
                 ON webhooks(enabled);
 
+            -- P2P paired devices. Identity-based (not IP-based) so a
+            -- device that changes Wi-Fi networks / DHCP leases reconnects
+            -- automatically when its mDNS advertisement reappears with
+            -- the same `device_id`. The mDNS browser updates `ip`/`port`
+            -- each time the peer is re-seen; pairing record itself is
+            -- the public-key signature trust anchor.
+            CREATE TABLE IF NOT EXISTS paired_devices (
+                id TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL UNIQUE,
+                public_key_b64 TEXT NOT NULL,
+                label TEXT NOT NULL,
+                ip TEXT,
+                port INTEGER,
+                last_seen_at REAL,
+                paired_at REAL NOT NULL,
+                role TEXT NOT NULL DEFAULT 'local'
+            );
+            CREATE INDEX IF NOT EXISTS idx_paired_devices_device_id
+                ON paired_devices(device_id);
+            CREATE INDEX IF NOT EXISTS idx_paired_devices_role
+                ON paired_devices(role);
+
             -- File-watcher triggers. A small daemon watches each `path`
             -- (debounced) and fires an agent turn when files inside it
             -- are created/modified/deleted. Path patterns are filtered
@@ -5218,4 +5240,147 @@ def _row_to_file_watcher(row: sqlite3.Row) -> dict:
         "last_fired_at": row["last_fired_at"],
         "fire_count": row["fire_count"],
         "created_at": row["created_at"],
+    }
+
+
+# ===========================================================================
+# P2P paired devices — LAN compute peers reachable via mDNS.
+# ===========================================================================
+
+def upsert_paired_device(
+    *,
+    device_id: str,
+    public_key_b64: str,
+    label: str,
+    ip: str | None = None,
+    port: int | None = None,
+    role: str = "local",
+) -> dict:
+    """Insert or update a pairing record.
+
+    `device_id` is the trust anchor — same device id ⇒ same physical
+    peer. IP / port refresh on every re-seeing via mDNS so a paired
+    laptop that hopped Wi-Fi networks reconnects automatically. The
+    public_key_b64 is captured at first pairing and never updated;
+    a peer that wants to rotate keys must explicitly re-pair.
+
+    `role` is one of:
+      * 'local'  — paired on the LAN (the only role v1 produces)
+      * 'friend' — paired as an internet friend (future phase)
+    """
+    if not device_id or not public_key_b64:
+        raise ValueError("device_id and public_key_b64 are required")
+    now = time.time()
+    with _conn() as c:
+        existing = c.execute(
+            "SELECT id, public_key_b64 FROM paired_devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if existing:
+            # Refresh address + label + last_seen, keep the trust-anchor
+            # public_key. If a peer with the same device_id presents a
+            # different pubkey this is either MITM or a re-install — we
+            # prefer the original (the user's prior trust decision wins).
+            c.execute(
+                "UPDATE paired_devices SET label = ?, ip = ?, port = ?, "
+                "last_seen_at = ? WHERE id = ?",
+                (label[:64], ip, port, now, existing["id"]),
+            )
+            return get_paired_device(device_id) or {}
+        # New row.
+        rid = str(uuid.uuid4())
+        c.execute(
+            "INSERT INTO paired_devices "
+            "(id, device_id, public_key_b64, label, ip, port, "
+            " last_seen_at, paired_at, role) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rid, device_id, public_key_b64, label[:64],
+                ip, port, now, now, role,
+            ),
+        )
+    return get_paired_device(device_id) or {}
+
+
+def get_paired_device(device_id: str) -> dict | None:
+    """Look up a pairing by canonical device id."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM paired_devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+    return _row_to_paired_device(row) if row else None
+
+
+def list_paired_devices(role: str | None = None) -> list[dict]:
+    """List all paired devices. Optional `role` filter ('local'/'friend')."""
+    with _conn() as c:
+        if role is None:
+            rows = c.execute(
+                "SELECT * FROM paired_devices ORDER BY paired_at DESC"
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM paired_devices WHERE role = ? "
+                "ORDER BY paired_at DESC",
+                (role,),
+            ).fetchall()
+    return [_row_to_paired_device(r) for r in rows]
+
+
+def delete_paired_device(device_id: str) -> bool:
+    """Remove one pairing. Returns True when a row was deleted."""
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM paired_devices WHERE device_id = ?",
+            (device_id,),
+        )
+    return cur.rowcount > 0
+
+
+def update_paired_device_last_seen(
+    device_id: str, *,
+    ip: str | None = None, port: int | None = None,
+    label: str | None = None,
+) -> dict | None:
+    """Update transient address/label fields on a paired device.
+
+    Called by the mDNS browser whenever a paired peer's advertisement
+    is re-seen — the IP may have changed (different DHCP lease, Wi-Fi
+    network change), and the user may have updated the label remotely.
+    Keeps the trust-anchor public_key + paired_at fields untouched.
+    """
+    sets: list[str] = ["last_seen_at = ?"]
+    vals: list = [time.time()]
+    if ip is not None:
+        sets.append("ip = ?")
+        vals.append(ip)
+    if port is not None:
+        sets.append("port = ?")
+        vals.append(port)
+    if label is not None:
+        sets.append("label = ?")
+        vals.append(label[:64])
+    vals.append(device_id)
+    with _conn() as c:
+        cur = c.execute(
+            f"UPDATE paired_devices SET {', '.join(sets)} WHERE device_id = ?",
+            vals,
+        )
+        if cur.rowcount == 0:
+            return None
+    return get_paired_device(device_id)
+
+
+def _row_to_paired_device(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "device_id": row["device_id"],
+        "public_key_b64": row["public_key_b64"],
+        "label": row["label"],
+        "ip": row["ip"],
+        "port": row["port"],
+        "last_seen_at": row["last_seen_at"],
+        "paired_at": row["paired_at"],
+        "role": row["role"],
     }

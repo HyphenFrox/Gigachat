@@ -178,6 +178,19 @@ async def lifespan(_app: FastAPI):
     # Kept after MCP so any tool-system bootstrap finishes first.
     from . import event_runtime as _evrt
     await _evrt.start_event_runtime()
+    # P2P LAN discovery (mDNS). Advertises this install on
+    # `_gigachat._tcp.local.` and listens for peer ads — the Bluetooth-
+    # style pairing UX rides on top. Best-effort: failure (e.g. multicast
+    # blocked by the OS firewall) logs a warning and the rest of the app
+    # boots normally.
+    try:
+        from . import p2p_discovery as _p2pd
+        # Pick the same port FastAPI is serving on so peers know
+        # exactly where to reach us. uvicorn sets PORT in env.
+        adv_port = int(os.environ.get("PORT", "8000"))
+        await _p2pd.start(advertise_port=adv_port)
+    except Exception as e:
+        log.warning("p2p_discovery startup failed: %s", e)
 
     yield
 
@@ -186,6 +199,11 @@ async def lifespan(_app: FastAPI):
     # processes first, then the daemons. Each handler is independently
     # robust — failures during shutdown are swallowed inside each helper so
     # uvicorn always exits cleanly.
+    try:
+        from . import p2p_discovery as _p2pd
+        await _p2pd.stop()
+    except Exception as e:
+        log.warning("p2p_discovery shutdown failed: %s", e)
     from . import event_runtime as _evrt
     await _evrt.stop_event_runtime()
     await _stop_mcp()
@@ -3990,6 +4008,216 @@ def _serve_pwa_file(name: str) -> FileResponse:
         if path.is_file():
             return FileResponse(path, media_type=media_type, headers=headers)
     raise HTTPException(404, f"{name} not found")
+
+
+# ----------------------------------------------------------------------
+# P2P pool — mDNS discovery + PIN-based pairing + public-pool toggle.
+#
+# The user-visible UX:
+#   1. Open Settings → Compute → "Add a device on this network"
+#   2. Other devices on the LAN appear in the list as their mDNS ads land
+#   3. Click one → Gigachat shows a 6-digit PIN
+#   4. On the chosen device, type the PIN
+#   5. Both sides verify the Ed25519 signature, store the pairing, done.
+#
+# After pairing, peers reconnect automatically when their IP changes —
+# the trust anchor is the device's public key, not its address.
+#
+# Public-pool toggle is a separate concept: when ON (default), this
+# install donates spare compute to the wider P2P network and benefits
+# from cooperative model-weight distribution. Prompts NEVER leave the
+# local pool regardless of the toggle's state. Off → fully isolated
+# to local pool only.
+# ----------------------------------------------------------------------
+class P2PPairAcceptBody(BaseModel):
+    """Body for POST /api/p2p/pair/accept (host-side claim acceptance).
+
+    The HOST receives this from the claimant device — usually a
+    direct LAN POST from the device the user is pairing. Same shape
+    is used by the simulated same-host pair flow in tests.
+    """
+    pairing_id: str
+    pin: str
+    claimant_device_id: str
+    claimant_label: str
+    claimant_public_key_b64: str
+    signature_b64: str
+    claimant_ip: str | None = None
+    claimant_port: int | None = None
+
+
+class P2PIdentityLabelBody(BaseModel):
+    """Body for PATCH /api/p2p/identity (rename my own device label)."""
+    label: str
+
+
+class P2PPublicPoolBody(BaseModel):
+    """Body for PATCH /api/p2p/public-pool — opt in or out of the
+    swarm. Toggle off → instantly disconnect from rendezvous +
+    close swarm sockets (when those exist; v1 just persists the
+    bit so other phases can read it)."""
+    enabled: bool
+
+
+@app.get("/api/p2p/identity")
+def api_p2p_identity() -> dict:
+    """Return THIS install's public identity — what other peers see."""
+    from . import identity as _ident
+    me = _ident.get_identity()
+    return {
+        "device_id": me.device_id,
+        "device_id_pretty": _ident.format_device_id(me.device_id),
+        "label": me.label,
+        "public_key_b64": me.public_key_b64,
+    }
+
+
+@app.patch("/api/p2p/identity")
+def api_p2p_set_label(body: P2PIdentityLabelBody) -> dict:
+    """Rename the local device. Identity (keypair) is unchanged —
+    only the friendly label other peers see in their pairing UI."""
+    from . import identity as _ident
+    if not (body.label or "").strip():
+        raise HTTPException(400, "label must not be empty")
+    me = _ident.set_label(body.label)
+    return {
+        "device_id": me.device_id,
+        "device_id_pretty": _ident.format_device_id(me.device_id),
+        "label": me.label,
+        "public_key_b64": me.public_key_b64,
+    }
+
+
+@app.get("/api/p2p/discover")
+def api_p2p_discover() -> dict:
+    """Snapshot of currently-discovered LAN peers (excluding self).
+
+    The UI polls this endpoint at ~2 s cadence to populate the
+    "Available devices" list. Stale entries are pruned on read so
+    a peer that went offline disappears within `_DISCOVERY_TTL_SEC`.
+    """
+    from . import p2p_discovery as _p2pd
+    return {
+        "running": _p2pd.is_running(),
+        "devices": _p2pd.list_discovered(),
+    }
+
+
+@app.post("/api/p2p/pair/start")
+def api_p2p_pair_start() -> dict:
+    """Generate a fresh PIN to display. The other device claims it
+    by POSTing to /api/p2p/pair/accept within the TTL window."""
+    from . import p2p_pairing as _pair
+    return _pair.start_pairing()
+
+
+@app.delete("/api/p2p/pair/{pairing_id}")
+def api_p2p_pair_cancel(pairing_id: str) -> dict:
+    """Drop a pending pairing offer (user closed the dialog)."""
+    from . import p2p_pairing as _pair
+    if not _pair.cancel_pairing(pairing_id):
+        raise HTTPException(404, "pairing offer not found")
+    return {"cancelled": True}
+
+
+@app.get("/api/p2p/pair/pending")
+def api_p2p_pair_pending() -> dict:
+    """List active pairing offers — used by the UI to restore the
+    "PIN displayed, waiting…" panel after a refresh."""
+    from . import p2p_pairing as _pair
+    return {"pending": _pair.list_pending()}
+
+
+@app.post("/api/p2p/pair/accept")
+def api_p2p_pair_accept(body: P2PPairAcceptBody) -> dict:
+    """Verify a pairing claim and persist the trust anchor.
+
+    Called by the OTHER device (the claimant) — the device whose
+    user just typed the PIN. Body carries the claimant's
+    Ed25519-signed proof of PIN knowledge.
+    """
+    from . import p2p_pairing as _pair
+    try:
+        rec = _pair.accept_pairing(
+            pairing_id=body.pairing_id,
+            pin=body.pin,
+            claimant_device_id=body.claimant_device_id,
+            claimant_label=body.claimant_label,
+            claimant_public_key_b64=body.claimant_public_key_b64,
+            signature_b64=body.signature_b64,
+            claimant_ip=body.claimant_ip,
+            claimant_port=body.claimant_port,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"paired": rec}
+
+
+@app.post("/api/p2p/pair/build-claim")
+def api_p2p_pair_build_claim(body: dict) -> dict:
+    """Build a signed pairing claim FROM this device's identity.
+
+    Called by the claimant's frontend after the user enters the PIN
+    they read off the host's screen. The frontend then POSTs the
+    returned blob to the host's `/api/p2p/pair/accept` endpoint.
+
+    Body: {pin, nonce, host_public_key_b64}.
+    """
+    pin = (body.get("pin") or "").strip()
+    nonce = (body.get("nonce") or "").strip()
+    host_pubkey = (body.get("host_public_key_b64") or "").strip()
+    if not all((pin, nonce, host_pubkey)):
+        raise HTTPException(400, "pin, nonce, host_public_key_b64 are required")
+    from . import p2p_pairing as _pair
+    return _pair.build_claim_signature(
+        pin=pin, nonce_b64=nonce, host_public_key_b64=host_pubkey,
+    )
+
+
+@app.get("/api/p2p/paired")
+def api_p2p_list_paired() -> dict:
+    """List devices we've paired with (any role)."""
+    return {"paired": db.list_paired_devices()}
+
+
+@app.delete("/api/p2p/paired/{device_id}")
+def api_p2p_unpair(device_id: str) -> dict:
+    """Drop a pairing record. The other side keeps theirs until
+    they unpair on their own device."""
+    if not db.delete_paired_device(device_id):
+        raise HTTPException(404, "device not paired")
+    return {"unpaired": True}
+
+
+@app.get("/api/p2p/public-pool")
+def api_p2p_public_pool_status() -> dict:
+    """Read the public-pool opt-in flag.
+
+    Default: enabled. The flag itself lives in the user_settings
+    table so it survives restarts. v1 stores the bit; subsequent
+    phases will gate the rendezvous client + donation worker on it.
+    """
+    val = db.get_setting("p2p_public_pool_enabled")
+    if val is None:
+        enabled = True  # default ON
+    else:
+        enabled = str(val).lower() in ("1", "true", "yes", "on")
+    return {"enabled": enabled}
+
+
+@app.patch("/api/p2p/public-pool")
+def api_p2p_public_pool_set(body: P2PPublicPoolBody) -> dict:
+    """Toggle the public-pool flag. Effect:
+      * ON  — donate spare compute to the swarm; benefit from
+              cooperative model-weight distribution. Prompts STILL
+              never leave the local pool.
+      * OFF — fully isolated to local pool only; no rendezvous
+              registration, no swarm sockets.
+    """
+    db.set_setting(
+        "p2p_public_pool_enabled", "1" if body.enabled else "0",
+    )
+    return {"enabled": bool(body.enabled)}
 
 
 # ----------------------------------------------------------------------

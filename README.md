@@ -167,6 +167,49 @@ Register any REST API by its OpenAPI spec, then call any of its endpoints withou
 
 Every tool call across every conversation is recorded in the `audit_log` table — tool name, category, args, result summary (capped at 2 KB), ok/duration. `GET /api/audit-log` exposes a filterable read-only view: by conversation, by tool name, since-timestamp. Useful for "what did the agent do today" reviews and for post-mortem of long-running tasks.
 
+### P2P pool — LAN pairing + public pool toggle (Phase 1)
+
+Settings → **Network** lets you pair other Gigachat installs on the same Wi-Fi the way phones pair Bluetooth devices: click, show a 6-digit PIN, type it on the other side, done. After pairing, the trust anchor is the device's Ed25519 public key — IP changes (Wi-Fi networks, DHCP leases) don't break pairing because mDNS rediscovery refreshes the address automatically.
+
+**How it works:**
+
+- **Identity** — every install generates an Ed25519 keypair on first launch and stores it under `data/identity.json` (mode 0600 on POSIX). The public key, base32-truncated, is the device's `device_id` (e.g. `PBJ4-GCBV-5NH3-PGXH`). Identity persists across restarts; reinstalls regenerate.
+- **Discovery** — each install advertises itself as `_gigachat._tcp.local.` via mDNS (zero-conf / Bonjour / Avahi). Cross-platform: Windows mDNS service, macOS Bonjour, Linux Avahi all interoperate. The TXT record carries `{device_id, label, version, public_key}` so peers can verify identity at pair-time without an extra round-trip.
+- **PIN-based pairing** — host generates a 6-digit PIN with a 5-minute TTL and a 16-byte nonce. The claimant signs `H("gigachat-p2p-pair-v1" || pin || nonce || claimant_pubkey || host_pubkey)` with their identity key. Host verifies the signature, sanity-checks that the claimant's claimed `device_id` matches their public key, and persists the pairing record. PIN is consumed atomically (single-use). Replay-proof because the signature is bound to the host's per-offer nonce.
+- **Auto-reconnect** — the mDNS browser stays running. When a paired device's advertisement reappears with the same `device_id` (different IP), the backend updates the address in place. The user does nothing.
+
+**Public pool toggle** (Settings → Network → "Public pool", default ON):
+
+- **ON** — your install donates idle compute to the wider Gigachat swarm and benefits from cooperative model-weight distribution. **Your prompts still run only on your local pool — they never leave this network**, regardless of the toggle's state. The public-pool path is donate-only for prompt-bearing inference; the privacy boundary is enforced at the routing layer, not just by policy.
+- **OFF** — fully isolated to your local pool. No rendezvous registration, no swarm sockets.
+
+**v1 scope (this commit):**
+
+- ✅ mDNS discovery + advertisement
+- ✅ PIN-based pairing handshake (Ed25519-signed)
+- ✅ Auto-reconnect on IP change via identity-keyed lookup
+- ✅ Public-pool opt-in toggle (default ON), persisted in `user_settings`
+- ⏳ P2P transport over QUIC (next phase) — actual cross-LAN inference, friend pool
+- ⏳ Rendezvous service (GCP Cloud Run) — peer discovery beyond LAN
+- ⏳ Real-time fairness scheduler — credit-based with per-user min/max bounds
+
+**API surface:**
+
+| Endpoint | Use |
+|---|---|
+| `GET /api/p2p/identity` | This install's identity (device_id, label, public key) |
+| `PATCH /api/p2p/identity` | Rename the local device |
+| `GET /api/p2p/discover` | Snapshot of LAN peers from mDNS browser |
+| `POST /api/p2p/pair/start` | Generate a pairing PIN |
+| `POST /api/p2p/pair/build-claim` | Build a signed pairing claim from this device's identity |
+| `POST /api/p2p/pair/accept` | Accept a pairing claim (host side) |
+| `DELETE /api/p2p/pair/{id}` | Cancel a pending pairing offer |
+| `GET /api/p2p/pair/pending` | List active pairing offers |
+| `GET /api/p2p/paired` | List paired devices |
+| `DELETE /api/p2p/paired/{device_id}` | Unpair |
+| `GET /api/p2p/public-pool` | Read public-pool toggle |
+| `PATCH /api/p2p/public-pool` | Toggle public-pool on/off |
+
 ---
 
 ## Permission modes

@@ -808,4 +808,73 @@ export const api = {
    * Response shape: `{cwd: string}`.
    */
   getDefaultCwd: () => request('/api/fs/default-cwd'),
+
+  /* -------------------- P2P (LAN pairing + public pool) ----------------- */
+  /** This install's identity (device_id, label, public key). */
+  p2pIdentity: () => request('/api/p2p/identity'),
+
+  /** Rename the local device (label only — keypair is unchanged). */
+  p2pSetLabel: (label) =>
+    request('/api/p2p/identity', {
+      method: 'PATCH',
+      body: JSON.stringify({ label }),
+    }),
+
+  /** Snapshot of LAN peers currently advertising via mDNS. */
+  p2pDiscover: () => request('/api/p2p/discover'),
+
+  /** Generate a fresh PIN to display on this device. */
+  p2pPairStart: () =>
+    request('/api/p2p/pair/start', { method: 'POST' }),
+
+  /** Cancel a pending pairing offer. */
+  p2pPairCancel: (pairingId) =>
+    request(`/api/p2p/pair/${pairingId}`, { method: 'DELETE' }),
+
+  /** List currently-active pairing offers (for UI restore on refresh). */
+  p2pPairPending: () => request('/api/p2p/pair/pending'),
+
+  /**
+   * Build a signed pairing claim FROM this device's identity.
+   * Used when the user is on this device and types the PIN displayed
+   * on the host. Returns the blob to POST to the host's accept endpoint.
+   */
+  p2pPairBuildClaim: (pin, nonce, hostPublicKey) =>
+    request('/api/p2p/pair/build-claim', {
+      method: 'POST',
+      body: JSON.stringify({
+        pin,
+        nonce,
+        host_public_key_b64: hostPublicKey,
+      }),
+    }),
+
+  /**
+   * Accept a pairing claim (host side). Receives the signed proof
+   * from the claimant, verifies, persists trust anchor.
+   */
+  p2pPairAccept: (body) =>
+    request('/api/p2p/pair/accept', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** List paired devices. */
+  p2pListPaired: () => request('/api/p2p/paired'),
+
+  /** Remove a pairing record (this side only). */
+  p2pUnpair: (deviceId) =>
+    request(`/api/p2p/paired/${encodeURIComponent(deviceId)}`, {
+      method: 'DELETE',
+    }),
+
+  /** Read the public-pool opt-in state. Default: enabled. */
+  p2pPublicPoolStatus: () => request('/api/p2p/public-pool'),
+
+  /** Toggle the public-pool opt-in. */
+  p2pPublicPoolSet: (enabled) =>
+    request('/api/p2p/public-pool', {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled: !!enabled }),
+    }),
 }

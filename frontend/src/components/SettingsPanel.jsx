@@ -16,6 +16,7 @@ import {
   Sparkles,
   BookOpen,
   Server,
+  Network,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -35,6 +36,7 @@ import SecretsSection from './SecretsPanel'
 import UserToolsSection from './UserToolsPanel'
 import DocsSection from './DocsPanel'
 import ComputePoolSection from './ComputePoolPanel'
+import P2PSection from './P2PPanel'
 
 /**
  * SettingsPanel — consolidated settings drawer.
@@ -64,6 +66,7 @@ import ComputePoolSection from './ComputePoolPanel'
 const TABS = [
   { id: 'general', label: 'General', Icon: Sliders },
   { id: 'compute', label: 'Compute', Icon: Server },
+  { id: 'network', label: 'Network', Icon: Network },
   { id: 'memories', label: 'Memories', Icon: Brain },
   { id: 'secrets', label: 'Secrets', Icon: KeyRound },
   { id: 'schedules', label: 'Schedules', Icon: CalendarClock },
@@ -141,6 +144,7 @@ export default function SettingsPanel({ open, onClose }) {
           <div className="flex-1 overflow-y-auto px-6 py-4">
             {tab === 'general' && <GeneralSection />}
             {tab === 'compute' && <ComputePoolSection />}
+            {tab === 'network' && <P2PSection />}
             {tab === 'memories' && <MemoriesSection />}
             {tab === 'secrets' && <SecretsSection />}
             {tab === 'schedules' && <SchedulesSection />}
