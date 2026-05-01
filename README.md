@@ -222,9 +222,18 @@ Defence in depth:
 - **No key cache for v2** — caching the derived AEAD key per (eph_pub, recipient_pub) would defeat FS by leaving key material in memory after the ephemeral private key is destroyed; v2 derivation runs every envelope. Legacy v1 inbound still uses a per-pair cache with FIFO eviction (will disappear once v1 is removed).
 - **Cache wipe on unpair** — revoking trust drops cached legacy key material immediately
 
+**At-rest encryption (sensitive SQLite columns)**
+
+- **What's encrypted** — `messages.content` (every chat message body), `global_memories.content` (your saved memos), `project_memories.content` (per-cwd memos). All wrapped with ChaCha20-Poly1305 AEAD before INSERT/UPDATE; decrypted transparently in the row hydrators.
+- **Master key** — derived via HKDF-SHA256 from your X25519 identity private key (`identity.json`). Held in memory only; re-derived on each app start. No user passphrase prompt — chat app stays "just works".
+- **Threat model**: defends against backups / disk thefts that leak only `app.db` without `identity.json`. Does NOT defend against an attacker with both files (they can run our key derivation). For full-disk protection, a future opt-in passphrase wraps the master key.
+- **Migration** — wrapping is opportunistic on writes. Existing legacy rows (plaintext) remain readable through the same `decrypt()` path which is a pass-through for unwrapped values. A bulk `encrypt_legacy_rows()` helper is available for callers that want to convert in one pass.
+- **Search fallback** — substring search across encrypted bodies (`search_conversations`, `delete_*_memories_matching`) decrypts in Python and filters; SQL `LIKE` only matches plaintext columns (titles, tags, etc.).
+
 What's NOT yet protected (deliberate, documented):
 
 - **Full forward secrecy on the recipient side** — recipient-side compromise of the long-term X25519 priv still reveals past traffic to that recipient. The TLS-with-pinning migration (next phase) closes this on streaming paths.
+- **At-rest passphrase wrap** — master key is derived directly from `identity.json`. An attacker with both files can decrypt. Opt-in passphrase wrap is on the roadmap.
 - **Sender/recipient anonymity** — the envelope header carries plaintext device_ids (needed for routing). An observer with rendezvous logs can see who's talking to whom; only the contents are hidden.
 
 **Public pool & internet rendezvous**

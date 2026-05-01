@@ -1026,28 +1026,71 @@ def search_conversations(query: str, limit: int = 50) -> list[dict]:
     `query` is escaped with `?` parameter binding to prevent SQL injection.
     Empty/whitespace-only queries return an empty list rather than
     everything (avoids accidentally pulling thousands of rows on a typo).
+
+    At-rest encryption note — message content is stored as ciphertext
+    so the LIKE match below ONLY matches legacy (unencrypted) rows.
+    For freshly-written content, callers should use semantic search
+    (vector embeddings, separate API endpoint) — that pipeline reads
+    plaintext via `_row_to_message`-style decryption. Title and tags
+    remain plaintext so a typed query still surfaces the right
+    conversation by name even when the body is locked.
     """
+    from . import db_encryption as _enc
     q = (query or "").strip()
     if not q:
         return []
     pattern = f"%{q}%"
+    q_lower = q.lower()
     with _conn() as c:
-        rows = c.execute(
-            """
-            SELECT c.* FROM conversations AS c
-            WHERE c.id IN (
-                SELECT id FROM conversations
-                  WHERE title LIKE ? OR (tags IS NOT NULL AND tags LIKE ?)
-                UNION
-                SELECT conversation_id FROM messages
-                  WHERE content LIKE ?
-            )
-            ORDER BY c.pinned DESC, c.updated_at DESC
-            LIMIT ?
-            """,
-            (pattern, pattern, pattern, int(limit)),
+        # Pass 1: title / tags match — cheap SQL LIKE since both
+        # remain plaintext.
+        title_rows = c.execute(
+            "SELECT * FROM conversations "
+            "WHERE title LIKE ? OR (tags IS NOT NULL AND tags LIKE ?) "
+            "ORDER BY pinned DESC, updated_at DESC LIMIT ?",
+            (pattern, pattern, int(limit)),
         ).fetchall()
-    return [_row_to_conversation(r) for r in rows]
+        title_hits: dict[str, sqlite3.Row] = {r["id"]: r for r in title_rows}
+
+        # Pass 2: content match. Encrypted ciphertext won't match a
+        # plaintext LIKE, so we have to scan in Python after
+        # decryption. Pull conversation_id + content for every
+        # row, decrypt, filter. Cheap on the few-hundred-conversation
+        # corpus this app targets; if it ever feels slow, swap in a
+        # searchable encrypted index (e.g. blind-index hashes).
+        msg_rows = c.execute(
+            "SELECT conversation_id, content FROM messages "
+            "WHERE content IS NOT NULL"
+        ).fetchall()
+        body_hit_cids: set[str] = set()
+        for r in msg_rows:
+            cid_local = r["conversation_id"]
+            if cid_local in title_hits or cid_local in body_hit_cids:
+                continue
+            text = _enc.decrypt(r["content"]) or ""
+            if isinstance(text, str) and q_lower in text.lower():
+                body_hit_cids.add(cid_local)
+
+        # Hydrate body-hit conversations.
+        if body_hit_cids:
+            placeholders = ",".join("?" for _ in body_hit_cids)
+            extra = c.execute(
+                f"SELECT * FROM conversations WHERE id IN ({placeholders})",
+                tuple(body_hit_cids),
+            ).fetchall()
+            for r in extra:
+                title_hits.setdefault(r["id"], r)
+
+    # Apply the same pinned-DESC, updated_at-DESC ordering that the
+    # original SQL produced, then cap at limit.
+    merged = sorted(
+        title_hits.values(),
+        key=lambda r: (
+            -1 if r["pinned"] else 0,
+            -float(r["updated_at"] or 0),
+        ),
+    )[:int(limit)]
+    return [_row_to_conversation(r) for r in merged]
 
 
 def get_conversation(cid: str) -> dict | None:
@@ -1369,7 +1412,12 @@ def add_message(
     `images` is stored as a JSON-encoded array of filenames (under
     tools.UPLOAD_DIR). Only user-role rows typically carry images today, but
     the column accepts them on any role for forward-compat.
+
+    Content is encrypted at rest (see backend/db_encryption.py); the
+    returned dict carries the original plaintext so callers don't see
+    the wrapped form.
     """
+    from . import db_encryption as _enc
     mid = str(uuid.uuid4())
     now = time.time()
     tc = _json_dumps(tool_calls) if tool_calls else None
@@ -1377,7 +1425,7 @@ def add_message(
     with _conn() as c:
         c.execute(
             "INSERT INTO messages (id, conversation_id, role, content, tool_calls, images, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (mid, cid, role, content, tc, imgs, now),
+            (mid, cid, role, _enc.encrypt(content), tc, imgs, now),
         )
         # Always bump updated_at — keeps the existing crash-resilience
         # / staleness signals correct. Bump last_user_message_at ONLY
@@ -1510,6 +1558,7 @@ def compress_tool_outputs(ids: list[str]) -> int:
     """
     if not ids:
         return 0
+    from . import db_encryption as _enc
     placeholders = ",".join("?" for _ in ids)
     with _conn() as c:
         # Pull the originals so we can build per-row head+tail payloads.
@@ -1519,10 +1568,14 @@ def compress_tool_outputs(ids: list[str]) -> int:
         ).fetchall()
         touched = 0
         for r in rows:
-            new_content = _build_compressed_payload(r["content"] or "")
+            # Decrypt before building the compressed payload so the
+            # head/tail snippets are real text, not ciphertext. The
+            # rewritten payload is then re-encrypted before write.
+            existing_plain = _enc.decrypt(r["content"]) or ""
+            new_content = _build_compressed_payload(existing_plain)
             cur = c.execute(
                 "UPDATE messages SET content = ? WHERE id = ?",
-                (new_content, r["id"]),
+                (_enc.encrypt(new_content), r["id"]),
             )
             touched += cur.rowcount or 0
         return touched
@@ -1552,10 +1605,11 @@ def update_message_content(mid: str, content: str) -> dict | None:
     role before invoking. We do NOT bump `last_user_message_at` here
     because a self-refine is bookkeeping, not a fresh user action.
     """
+    from . import db_encryption as _enc
     with _conn() as c:
         cur = c.execute(
             "UPDATE messages SET content = ? WHERE id = ?",
-            (content or "", mid),
+            (_enc.encrypt(content or ""), mid),
         )
         if cur.rowcount == 0:
             return None
@@ -1571,10 +1625,11 @@ def update_user_message_content(mid: str, content: str) -> dict | None:
     the model's view of history. Returns the updated row, or None if no
     user-role row matched.
     """
+    from . import db_encryption as _enc
     with _conn() as c:
         cur = c.execute(
             "UPDATE messages SET content = ? WHERE id = ? AND role = 'user'",
-            (content or "", mid),
+            (_enc.encrypt(content or ""), mid),
         )
         if cur.rowcount == 0:
             return None
@@ -1792,12 +1847,16 @@ def list_unembedded_messages(limit: int = 500) -> list[dict]:
             """,
             (int(limit),),
         ).fetchall()
+    # Caller (the embedding pipeline) needs plaintext to feed into
+    # the vectoriser — decrypt the content column, same as the row
+    # hydrator does.
+    from . import db_encryption as _enc
     return [
         {
             "id": r["id"],
             "conversation_id": r["conversation_id"],
             "role": r["role"],
-            "content": r["content"],
+            "content": _enc.decrypt(r["content"]),
         }
         for r in rows
     ]
@@ -2933,7 +2992,10 @@ def add_global_memory(content: str, topic: str | None = None) -> dict:
 
     Empty / whitespace-only `content` raises ValueError so callers (API
     handler, agent tool) can surface a clean 400 / error to the user.
+
+    Content is encrypted at rest (see backend/db_encryption.py).
     """
+    from . import db_encryption as _enc
     cleaned = (content or "").strip()
     if not cleaned:
         raise ValueError("content is required")
@@ -2945,7 +3007,7 @@ def add_global_memory(content: str, topic: str | None = None) -> dict:
     with _conn() as c:
         c.execute(
             "INSERT INTO global_memories (id, content, topic, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (mid, cleaned, t, now, now),
+            (mid, _enc.encrypt(cleaned), t, now, now),
         )
     return get_global_memory(mid)  # type: ignore[return-value]
 
@@ -2961,6 +3023,7 @@ def update_global_memory(
     None if no row matched. Mirrors update_conversation's "None-means-skip"
     convention so the API handler can pass body.dict() without filtering.
     """
+    from . import db_encryption as _enc
     sets: list[str] = []
     values: list[Any] = []
     if content is not None:
@@ -2970,7 +3033,7 @@ def update_global_memory(
         if len(cleaned) > GLOBAL_MEMORY_CONTENT_MAX:
             cleaned = cleaned[:GLOBAL_MEMORY_CONTENT_MAX]
         sets.append("content = ?")
-        values.append(cleaned)
+        values.append(_enc.encrypt(cleaned))
     if topic is not None:
         t = topic.strip()[:GLOBAL_MEMORY_TOPIC_MAX] or None
         sets.append("topic = ?")
@@ -3004,32 +3067,41 @@ def delete_global_memories_matching(pattern: str) -> int:
     Returns the number of rows deleted. An empty / whitespace pattern is
     refused (ValueError) so a typo can't accidentally wipe the table.
 
-    SQL `LIKE` treats `%` and `_` as wildcards by default. The user (or the
-    agent calling `forget(scope="global", pattern=...)`) thinks of the
-    pattern as a literal substring, so we escape those metachars and use
-    `ESCAPE` to match the per-conv `forget` semantics. Without this, a
-    pattern like `100%` would match every row instead of just rows
-    containing the literal text "100%".
+    Memories are stored encrypted at rest, so SQL LIKE can't match
+    plaintext substrings against ciphertext. We pull every row,
+    decrypt + match in Python, and DELETE the survivors by id.
+    Cheap on the few-hundred-rows-per-user this table holds; if it
+    ever grows, swap to a blind-index approach.
     """
+    from . import db_encryption as _enc
     needle = (pattern or "").strip()
     if not needle:
         raise ValueError("pattern is required")
-    # Escape SQL LIKE metachars so the pattern stays literal. We pick `\` as
-    # the escape char and announce it via ESCAPE.
-    escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    like = f"%{escaped}%"
+    needle_lower = needle.lower()
     with _conn() as c:
+        rows = c.execute(
+            "SELECT id, content FROM global_memories"
+        ).fetchall()
+        to_delete: list[str] = []
+        for r in rows:
+            text = _enc.decrypt(r["content"]) or ""
+            if isinstance(text, str) and needle_lower in text.lower():
+                to_delete.append(r["id"])
+        if not to_delete:
+            return 0
+        placeholders = ",".join("?" for _ in to_delete)
         cur = c.execute(
-            "DELETE FROM global_memories WHERE LOWER(content) LIKE LOWER(?) ESCAPE '\\'",
-            (like,),
+            f"DELETE FROM global_memories WHERE id IN ({placeholders})",
+            tuple(to_delete),
         )
         return cur.rowcount or 0
 
 
 def _row_to_global_memory(row: sqlite3.Row) -> dict:
+    from . import db_encryption as _enc
     return {
         "id": row["id"],
-        "content": row["content"],
+        "content": _enc.decrypt(row["content"]),
         "topic": row["topic"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -3085,7 +3157,11 @@ def add_project_memory(
     cwd: str, content: str, topic: str | None = None,
 ) -> dict:
     """Insert a project memory and return the row. Same length caps as
-    global memory so a runaway agent can't blow up the prompt."""
+    global memory so a runaway agent can't blow up the prompt.
+
+    Content is encrypted at rest (see backend/db_encryption.py).
+    """
+    from . import db_encryption as _enc
     key = _normalize_project_cwd(cwd)
     if not key:
         raise ValueError("cwd is required")
@@ -3105,7 +3181,7 @@ def add_project_memory(
         c.execute(
             "INSERT INTO project_memories (id, cwd, content, topic, "
             "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (mid, key, body, t, now, now),
+            (mid, key, _enc.encrypt(body), t, now, now),
         )
         row = c.execute(
             "SELECT * FROM project_memories WHERE id = ?", (mid,),
@@ -3115,30 +3191,43 @@ def add_project_memory(
 
 def delete_project_memories_matching(cwd: str, pattern: str) -> int:
     """Delete every project memory whose content contains `pattern`
-    (case-insensitive substring), scoped to the given cwd. Same SQL-
-    LIKE-metachar escaping as `delete_global_memories_matching`."""
+    (case-insensitive substring), scoped to the given cwd. Same
+    decrypt-and-scan trick `delete_global_memories_matching` uses
+    since project_memories.content is also encrypted at rest."""
+    from . import db_encryption as _enc
     key = _normalize_project_cwd(cwd)
     if not key:
         raise ValueError("cwd is required")
     needle = (pattern or "").strip()
     if not needle:
         raise ValueError("pattern is required")
-    escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    like = f"%{escaped}%"
+    needle_lower = needle.lower()
     with _conn() as c:
+        rows = c.execute(
+            "SELECT id, content FROM project_memories WHERE cwd = ?",
+            (key,),
+        ).fetchall()
+        to_delete: list[str] = []
+        for r in rows:
+            text = _enc.decrypt(r["content"]) or ""
+            if isinstance(text, str) and needle_lower in text.lower():
+                to_delete.append(r["id"])
+        if not to_delete:
+            return 0
+        placeholders = ",".join("?" for _ in to_delete)
         cur = c.execute(
-            "DELETE FROM project_memories "
-            "WHERE cwd = ? AND LOWER(content) LIKE LOWER(?) ESCAPE '\\'",
-            (key, like),
+            f"DELETE FROM project_memories WHERE id IN ({placeholders})",
+            tuple(to_delete),
         )
         return cur.rowcount or 0
 
 
 def _row_to_project_memory(row: sqlite3.Row) -> dict:
+    from . import db_encryption as _enc
     return {
         "id": row["id"],
         "cwd": row["cwd"],
-        "content": row["content"],
+        "content": _enc.decrypt(row["content"]),
         "topic": row["topic"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -3512,11 +3601,15 @@ def _row_to_message(row: sqlite3.Row) -> dict:
         pinned = bool(row["pinned"])
     except (IndexError, KeyError):
         pinned = False
+    # Transparent at-rest decryption — `decrypt()` is a pass-through
+    # for legacy / never-encrypted rows, so this is safe to call
+    # unconditionally.
+    from . import db_encryption as _enc
     return {
         "id": row["id"],
         "conversation_id": row["conversation_id"],
         "role": row["role"],
-        "content": row["content"],
+        "content": _enc.decrypt(row["content"]),
         "tool_calls": _json_loads(row["tool_calls"]) if row["tool_calls"] else [],
         "images": _json_loads(raw_images) if raw_images else [],
         "pinned": pinned,
