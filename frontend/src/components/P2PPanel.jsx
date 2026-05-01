@@ -53,6 +53,7 @@ export default function P2PSection() {
   const [paired, setPaired] = useState([])
 
   const [publicPool, setPublicPool] = useState(true)
+  const [rendezvous, setRendezvous] = useState(null)
 
   // Pending pair offer (host side). When set, the panel renders the
   // "Show this PIN to the other device" card. PIN expires after 5 min;
@@ -81,11 +82,12 @@ export default function P2PSection() {
     let cancelled = false
     ;(async () => {
       try {
-        const [id, disc, pair, pp] = await Promise.all([
+        const [id, disc, pair, pp, rdv] = await Promise.all([
           api.p2pIdentity(),
           api.p2pDiscover(),
           api.p2pListPaired(),
           api.p2pPublicPoolStatus(),
+          api.p2pRendezvousStatus().catch(() => null),
         ])
         if (cancelled) return
         setIdentity(id)
@@ -94,6 +96,7 @@ export default function P2PSection() {
         setDiscoveryRunning(!!disc?.running)
         setPaired(pair?.paired || [])
         setPublicPool(!!pp?.enabled)
+        setRendezvous(rdv)
       } catch (e) {
         if (!cancelled) {
           toast.error('Could not load P2P state', {
@@ -272,6 +275,11 @@ export default function P2PSection() {
           consequential decision on this panel and the user comes here
           expecting to see it. */}
       <PublicPoolCard enabled={publicPool} onChange={togglePublicPool} />
+
+      {/* Rendezvous status — only render when public pool is on (no
+          status to show otherwise). Tells the user whether their
+          install is actually discoverable across the internet. */}
+      {publicPool && rendezvous ? <RendezvousStatusCard status={rendezvous} /> : null}
 
       {/* My identity */}
       <section className="rounded-lg border border-border bg-card p-4">
@@ -472,6 +480,96 @@ export default function P2PSection() {
 }
 
 /* ----------------------- Sub-components ----------------------- */
+
+function RendezvousStatusCard({ status }) {
+  if (!status?.configured) {
+    return (
+      <section className="rounded-lg border border-border bg-card p-4">
+        <h3 className="mb-2 flex items-center gap-2 text-sm font-medium">
+          <Globe className="size-4 text-muted-foreground" />
+          Internet rendezvous
+        </h3>
+        <p className="text-xs leading-snug text-muted-foreground">
+          Public Pool is on, but no rendezvous URL is configured on this
+          install. Set <code>GIGACHAT_RENDEZVOUS_URL</code> to the public
+          URL of your <code>gigachat-rendezvous</code> Cloud Run service
+          (see <code>rendezvous/README.md</code>) so peers across the
+          internet can find this device. LAN pairing keeps working
+          regardless.
+        </p>
+      </section>
+    )
+  }
+  const running = !!status.running
+  const lastReg = status.last_register_at || 0
+  const lastRegPretty = lastReg
+    ? formatMessageTime(lastReg)
+    : 'never'
+  const cands = Array.isArray(status.candidates) ? status.candidates : []
+  return (
+    <section
+      className={cn(
+        'rounded-lg border p-4',
+        running && lastReg
+          ? 'border-emerald-500/30 bg-emerald-500/5'
+          : 'border-amber-500/30 bg-amber-500/5',
+      )}
+    >
+      <h3 className="mb-2 flex items-center gap-2 text-sm font-medium">
+        <Globe
+          className={cn(
+            'size-4',
+            running && lastReg ? 'text-emerald-500' : 'text-amber-500',
+          )}
+        />
+        Internet rendezvous
+        <span
+          className={cn(
+            'ml-auto rounded px-1.5 py-0.5 text-[10px]',
+            running && lastReg
+              ? 'bg-emerald-500/15 text-emerald-500'
+              : 'bg-amber-500/15 text-amber-500',
+          )}
+        >
+          {running && lastReg ? 'Connected' : running ? 'Connecting…' : 'Disconnected'}
+        </span>
+      </h3>
+      <div className="space-y-1 text-xs text-muted-foreground">
+        <div>
+          <span className="font-medium text-foreground">Server:</span>{' '}
+          <code className="break-all">{status.url}</code>
+        </div>
+        {cands.length > 0 ? (
+          <div>
+            <span className="font-medium text-foreground">Candidates:</span>{' '}
+            {cands.map((c, i) => (
+              <span key={i} className="mr-2">
+                <code>{c.ip}:{c.port}</code>
+                <span className="ml-1 opacity-70">({c.source})</span>
+              </span>
+            ))}
+          </div>
+        ) : (
+          <div>
+            <span className="font-medium text-foreground">Candidates:</span>{' '}
+            none yet
+          </div>
+        )}
+        <div>
+          <span className="font-medium text-foreground">Last registered:</span>{' '}
+          <span title={status.last_register_at ? formatFullTimestamp(status.last_register_at) : ''}>
+            {lastRegPretty}
+          </span>
+        </div>
+        {status.last_error ? (
+          <div className="text-red-400">
+            <span className="font-medium">Last error:</span> {status.last_error}
+          </div>
+        ) : null}
+      </div>
+    </section>
+  )
+}
 
 function PublicPoolCard({ enabled, onChange }) {
   return (

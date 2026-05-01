@@ -191,6 +191,16 @@ async def lifespan(_app: FastAPI):
         await _p2pd.start(advertise_port=adv_port)
     except Exception as e:
         log.warning("p2p_discovery startup failed: %s", e)
+    # Rendezvous client — registers this install with the GCP Cloud
+    # Run rendezvous so other peers across the internet can find us.
+    # No-op when GIGACHAT_RENDEZVOUS_URL is unset OR when the user
+    # has Public Pool toggled off. Privacy: rendezvous only sees
+    # identity + STUN endpoints, NEVER prompts.
+    try:
+        from . import p2p_rendezvous as _rdv
+        await _rdv.start()
+    except Exception as e:
+        log.warning("p2p_rendezvous startup failed: %s", e)
 
     yield
 
@@ -199,6 +209,11 @@ async def lifespan(_app: FastAPI):
     # processes first, then the daemons. Each handler is independently
     # robust — failures during shutdown are swallowed inside each helper so
     # uvicorn always exits cleanly.
+    try:
+        from . import p2p_rendezvous as _rdv
+        await _rdv.stop()
+    except Exception as e:
+        log.warning("p2p_rendezvous shutdown failed: %s", e)
     try:
         from . import p2p_discovery as _p2pd
         await _p2pd.stop()
@@ -4206,18 +4221,44 @@ def api_p2p_public_pool_status() -> dict:
 
 
 @app.patch("/api/p2p/public-pool")
-def api_p2p_public_pool_set(body: P2PPublicPoolBody) -> dict:
+async def api_p2p_public_pool_set(body: P2PPublicPoolBody) -> dict:
     """Toggle the public-pool flag. Effect:
-      * ON  — donate spare compute to the swarm; benefit from
-              cooperative model-weight distribution. Prompts STILL
-              never leave the local pool.
-      * OFF — fully isolated to local pool only; no rendezvous
-              registration, no swarm sockets.
+      * ON  — register with the rendezvous, become discoverable
+              across the internet, donate spare compute to the
+              swarm. Prompts STILL never leave the local pool.
+      * OFF — unregister from the rendezvous, close the heartbeat
+              loop, fully isolate to local pool only.
+
+    The toggle is applied IMMEDIATELY: turning ON kicks off the
+    rendezvous loop and the user can be discovered within a few
+    seconds; turning OFF stops the loop and the entry expires from
+    the rendezvous within 60 seconds.
     """
     db.set_setting(
         "p2p_public_pool_enabled", "1" if body.enabled else "0",
     )
+    # Fire-and-forget the lifecycle change so the HTTP response
+    # doesn't block on a slow STUN round-trip. Errors logged inside
+    # the rendezvous module.
+    try:
+        from . import p2p_rendezvous as _rdv
+        if body.enabled:
+            await _rdv.start()
+        else:
+            await _rdv.stop()
+    except Exception as e:
+        log.warning("p2p_rendezvous toggle failed: %s", e)
     return {"enabled": bool(body.enabled)}
+
+
+@app.get("/api/p2p/rendezvous/status")
+def api_p2p_rendezvous_status() -> dict:
+    """Read live rendezvous loop state — used by the Settings UI to
+    show "Connected to swarm" / "STUN failed" / "Configured but off"
+    badges. Cheap, pure read of in-memory state.
+    """
+    from . import p2p_rendezvous as _rdv
+    return _rdv.status()
 
 
 # ----------------------------------------------------------------------

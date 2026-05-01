@@ -877,4 +877,7 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ enabled: !!enabled }),
     }),
+
+  /** Live rendezvous loop status — STUN candidates + last register/heartbeat. */
+  p2pRendezvousStatus: () => request('/api/p2p/rendezvous/status'),
 }
