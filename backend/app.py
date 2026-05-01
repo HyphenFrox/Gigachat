@@ -51,6 +51,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
+import os
 import secrets
 import sys
 import time
@@ -59,6 +61,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+# Module-level logger used by the lifespan hooks + the P2P toggle
+# endpoints to surface non-fatal startup / shutdown errors. Named after
+# the package so structured-log filters group it with sibling modules
+# (gigachat.agent, gigachat.compute_pool, etc.).
+log = logging.getLogger("gigachat.app")
 
 # ---------------------------------------------------------------------------
 # Force the Windows Proactor event loop BEFORE anything else imports asyncio.
