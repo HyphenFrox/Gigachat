@@ -13,7 +13,6 @@ import {
   Tag,
   Bell,
   RefreshCw,
-  LogOut,
   FolderOpen,
   Settings as SettingsIcon,
 } from 'lucide-react'
@@ -67,8 +66,6 @@ export default function Sidebar({
   onJumpToMessage,
   onReload,
   onClose,
-  authRequired,
-  onLogout,
 }) {
   const [pendingDelete, setPendingDelete] = useState(null) // conv or null
   const [renaming, setRenaming] = useState(null) // {id, value}
@@ -692,17 +689,6 @@ export default function Sidebar({
           <Bell className="h-4 w-4" />
           Notifications
         </Button>
-        {authRequired && onLogout && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={onLogout}
-            className="w-full justify-start gap-2 text-xs text-muted-foreground"
-          >
-            <LogOut className="h-4 w-4" />
-            Sign out
-          </Button>
-        )}
       </div>
 
       <Dialog

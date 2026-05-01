@@ -146,34 +146,17 @@ Deep dive: [docs/P2P.md](./docs/P2P.md) (encryption, rendezvous, TURN relay, TLS
 
 ---
 
-## LAN access (other devices on your home network)
+## Network model (LAN, P2P, public)
 
-Two bind modes — pick by who needs to reach the web UI:
+Default: backend binds `0.0.0.0`. Two layers of access control then filter every request:
 
-| Mode | Reachable from | Use case |
-| --- | --- | --- |
-| **loopback** *(default)* | Host machine only | Day-to-day solo. Zero config. |
-| **`lan`** | Loopback + any device on the same Wi-Fi/Ethernet (RFC1918 ranges) | Phone / tablet / second laptop on your home network. |
+- **Loopback** (the local browser on the same machine) — full access.
+- **LAN clients** (RFC1918 / IPv6-ULA / link-local) — **only** the P2P endpoints (encrypted compute proxy + pair handshake). The chat UI returns a clear 403 with "loopback only — install Gigachat on the other device and pair via Compute pool". P2P endpoints carry their own X25519 + Ed25519 envelope crypto, so no password layer is needed on top.
+- **Public IPs / Tailscale CGNAT** — flat 403. The app stays on the user's own physical network.
 
-Public-internet exposure and Tailscale-overlay access for the web UI are intentionally unsupported. The app is designed to live on a single physical network.
+There is **no password feature**. Two devices on the same Wi-Fi see each other via mDNS, pair with a 6-digit PIN (Bluetooth-style), and from then on share compute over an end-to-end encrypted channel — no shared secret to set up, no auth.json to write. Each device's chat UI runs on its own loopback.
 
-### Enabling LAN mode
-
-Hash a password (PBKDF2-SHA256, 200 000 iterations, 16-byte salt):
-
-```powershell
-python -c "from backend.auth import hash_password; print(hash_password('your-password-here'))"
-```
-
-Write `data/auth.json`:
-
-```json
-{ "host": "lan", "password": "a1b2c3…:d4e5f6…" }
-```
-
-Or use env vars (they win over the file): `GIGACHAT_HOST=lan` and `GIGACHAT_PASSWORD=…`. Then `.\start.bat`.
-
-The launcher binds to `0.0.0.0` but the access-control middleware admits only loopback and **private (RFC1918) LAN sources**. Public IPs and Tailscale CGNAT (`100.64.0.0/10`) get a flat 403. Login stores an HMAC-signed session cookie (httponly, SameSite=Lax, 30-day TTL).
+If you want hard isolation (no P2P discovery, no compute-pool participation — e.g. on an untrusted public Wi-Fi), set `GIGACHAT_HOST=127.0.0.1` and the backend binds loopback-only.
 
 ---
 
@@ -227,7 +210,8 @@ The `isolated_db` fixture rewires `db.DB_PATH` to a tmp file per test, so the su
 | Settings → Compute pool: rendezvous "Disconnected" / "Not configured" | Confirm Public Pool toggle is on. The default Cloud Run URL ships with the app; override or self-host via the URL editor. |
 | `PermissionError: [Errno 13] Permission denied: '...\\AppData\\Roaming\\Python\\Python3xx\\site-packages\\typing_extensions.py'` on backend startup | Mixed system + user site-packages install. Cleanest fix: `.\setup.bat` (creates `.venv\` and installs every dep there; `dev.bat` / `start.bat` auto-detect it). Quick patch without venv: `del "%APPDATA%\Python\Python3xx\site-packages\typing_extensions.py"` then `python -m pip install --user typing_extensions`. |
 | `pip uninstall typing-extensions` fails with `uninstall-no-record-file` | The existing copy was put there manually / by a partial install — pip can't safely remove it. Either delete the file by hand (`del "%APPDATA%\Python\Python3xx\site-packages\typing_extensions.py"`) or just run `.\setup.bat` and use the venv-aware launchers, which bypass the global install entirely. |
-| LAN mode: another device gets a 403 | Its source IP isn't in an RFC1918 range. Confirm both devices are on the same physical network. Tailscale CGNAT (`100.64.0.0/10`) is intentionally refused. |
+| Browser on another LAN device gets a "loopback only" 403 | By design — the chat UI is loopback-only on every install. Use Gigachat from the same machine it's running on; for cross-device compute, install Gigachat on both and pair via Settings → Compute pool. |
+| Another device on the LAN can't pair with mine (mDNS / direct connect fails) | Confirm Windows Defender has the OpenSSH SSH Server / Gigachat firewall rule enabled for the **Private** profile and that the Ethernet/Wi-Fi adapter is classified Private (not Public). Tailscale CGNAT (`100.64.0.0/10`) is intentionally refused; both devices must be on the same physical network. |
 
 More: see [docs/SECURITY.md](./docs/SECURITY.md) for risk-specific knobs and [docs/COMPUTE_POOL.md](./docs/COMPUTE_POOL.md) for pool-routing diagnostics.
 

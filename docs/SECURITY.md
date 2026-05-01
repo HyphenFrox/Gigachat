@@ -6,14 +6,13 @@ For the P2P-specific crypto + envelope protocol see [P2P.md](./P2P.md).
 
 ---
 
-## Network exposure & auth
+## Network exposure
 
-- **Default bind is 127.0.0.1.** Nothing on your LAN reaches it until you opt in via `GIGACHAT_HOST=lan` / `data/auth.json`.
-- **No public-internet exposure.** The bind layer refuses anything other than loopback or LAN. Tailscale CGNAT (`100.64.0.0/10`) is explicitly rejected by the middleware so the app can't be reached over the overlay either.
-- **Password gate on every LAN request.** In LAN mode non-loopback requests need a session cookie or `Bearer` token. Loopback callers (curl on the host, the desktop browser) skip the gate by design — anyone who can already execute code on the box has full access.
-- **PBKDF2-SHA256 password hashes** (200 000 iterations, 16-byte salt). Plaintext is accepted for dev convenience; `hash_password()` is canonical. Session tokens are HMAC-SHA256 signed against `data/auth_secret.key` (0600, auto-generated). 30-day TTL. Rotating the secret file invalidates every existing session — a one-step "log everyone out" lever.
-- **Login rate limit.** 10 failed attempts in 60 seconds locks out further logins for the next 60 seconds, regardless of source. Belt-and-braces against a misbehaving script on the LAN.
-- **Use a strong random password** (`python -c "import secrets; print(secrets.token_urlsafe(24))"`).
+- **Default bind is `0.0.0.0`** so other devices on the same physical network can reach the **P2P endpoints** (`/api/p2p/secure/*`, pair handshake, identity / discover). Their X25519 + Ed25519 envelope crypto IS the auth — no password layer is needed.
+- **Chat UI is loopback-only.** The `AuthMiddleware` in `app.py` returns a 403 with a clear "loopback only — install Gigachat on the other device and pair via Compute pool" for any non-loopback request that isn't a P2P endpoint or static asset. Each device runs its own local UI; cross-device chat from another device's browser isn't a supported use case.
+- **Public IPs / Tailscale CGNAT** (`100.64.0.0/10`) — flat 403. The app stays on the user's own physical network.
+- **Hard isolation** — set `GIGACHAT_HOST=127.0.0.1` and the backend binds loopback-only. Nothing on the LAN reaches anything, not even the P2P endpoints. Use on untrusted public Wi-Fi.
+- **No password feature.** Earlier versions had an opt-in LAN-web-UI mode with a PBKDF2 password gate; that was removed. The only reason to access the chat UI from another device on your LAN was historical, and the cleaner answer is "install Gigachat there too and pair the two via Compute pool."
 
 ## Data storage
 

@@ -41,9 +41,6 @@ Routes:
   GET  /api/conversations/{cid}/pinned   - list pinned messages in a conversation
   GET  /api/conversations/{cid}/usage    - cumulative-usage breakdown + budget
   DELETE /api/conversations/{cid}/messages/{mid} - delete one message
-  GET  /api/auth/status                  - is a password required / am I logged in
-  POST /api/auth/login                   - exchange password for a session cookie
-  POST /api/auth/logout                  - clear the session cookie
 """
 
 from __future__ import annotations
@@ -298,25 +295,22 @@ db.init()
 # ---------------------------------------------------------------------------
 # Access-control middleware
 #
-# In LAN mode the server binds to 0.0.0.0 so the host machine can hit itself
-# via ``localhost`` *and* other devices on the same Wi-Fi/Ethernet can hit it
-# via the LAN IP. That's a wider listener than we want to trust unconditionally
-# — a public IP could reach the port if the user is on a network with a
-# misconfigured firewall, and we never want Tailscale CGNAT clients to drain
-# the LLM either. This middleware closes both gaps: it inspects
-# ``request.client.host`` and admits only loopback (this machine) or RFC1918
-# LAN sources. Everything else — public IPs, Tailscale CGNAT, anything weird —
-# gets a flat 403.
+# The backend binds to 0.0.0.0 by default so other devices on the same
+# Wi-Fi/Ethernet can reach the **P2P endpoints** (encrypted compute proxy
+# + PIN pair handshake). Those endpoints have their own X25519 + Ed25519
+# envelope crypto — that IS the auth, no password layer is needed. Other
+# paths (chat UI, settings, conversations, etc.) are loopback-only:
+# each device is expected to run its own Gigachat install for chat;
+# cross-device chat from another device's browser isn't a supported use
+# case, so the simplest answer is to refuse.
 #
-# On top of that, every non-loopback request must carry a valid session cookie
-# (or Bearer token). Loopback is implicitly trusted because if someone can
-# already execute code on the box, there's no boundary left to enforce.
-#
-# The login endpoint and static assets are public so the frontend can render
-# its password form before authenticating.
+# Public IPs / Tailscale CGNAT clients always get a flat 403 — this app
+# stays on the user's own physical network.
 # ---------------------------------------------------------------------------
-_AUTH_EXEMPT_PREFIXES = (
-    "/api/auth/",
+
+# Static-asset prefixes any client can reach (browser bootstraps these
+# regardless of where the request originates).
+_STATIC_PREFIXES = (
     "/static/",
     "/assets/",
     "/favicon",
@@ -325,57 +319,65 @@ _AUTH_EXEMPT_PREFIXES = (
     "/sw.js",
 )
 
+# P2P endpoints reachable from any RFC1918 LAN IP. Their envelope
+# crypto is the actual auth — every payload is X25519+ChaCha20-Poly1305
+# sealed and Ed25519-signed, with the receiver verifying against the
+# sender's pinned public key. The middleware just needs to NOT block
+# the request before the crypto verify runs.
+_P2P_LAN_PREFIXES = (
+    "/api/p2p/secure/",        # encrypted compute proxy (one-shot + stream)
+    "/api/p2p/pair/accept",    # host accepts a claimant's PIN claim
+    "/api/p2p/pair/notify",    # symmetric-pair notify from the other side
+    "/api/p2p/pair/unpair-notify",
+    "/api/p2p/discover",       # mDNS browser snapshot (public info)
+    "/api/p2p/identity",       # device_id + label + pubkeys (public info)
+)
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        cfg = auth.get_config()
-        # Pure loopback deployment — no auth, no IP filtering. The OS
-        # already ensured only local processes can reach the socket.
-        if not auth.requires_password(cfg):
-            return await call_next(request)
-
         client_host = request.client.host if request.client else None
         is_loopback = auth.is_loopback(client_host)
         is_lan = auth.is_lan_client(client_host)
 
-        # LAN mode: reject anything that didn't come in over the loopback
-        # interface or a private RFC1918 / IPv6 ULA range. This is defence
-        # in depth — the port is physically listening on 0.0.0.0 so a
-        # public client *could* TCP-connect if the firewall is wide open,
-        # but they'll get a 403 before any handler runs. Tailscale CGNAT
-        # (100.64.0.0/10) is intentionally NOT in the allowlist: this app
-        # stays on the user's own LAN.
+        # Public IPs / Tailscale CGNAT / anything not loopback-or-LAN
+        # → 403. This app stays on the user's own physical network.
         if not (is_loopback or is_lan):
-            return JSONResponse(
-                {"error": "forbidden"},
-                status_code=403,
-            )
+            return JSONResponse({"error": "forbidden"}, status_code=403)
 
-        path = request.url.path
-        # The login page itself plus the static assets needed to render it
-        # are always public for allowed clients. Everything else under
-        # /api/* is gated, and so is the SPA entrypoint (the entrypoint is
-        # ``/``, and that's also the login page in the unauthenticated
-        # case, so we let it through — the frontend does the redirect).
-        if path == "/" or any(path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES):
-            return await call_next(request)
-        # Loopback on-host is trusted (the operator themselves or a local
-        # script). Other LAN clients still need to authenticate.
+        # Loopback (the local browser on the same machine) → unrestricted.
         if is_loopback:
             return await call_next(request)
-        token = request.cookies.get(auth.SESSION_COOKIE)
-        if not token:
-            # Also accept Bearer header for programmatic clients (curl,
-            # mobile app, scripted automation). Keeps the cookie path as
-            # the primary flow but doesn't force it.
-            header = request.headers.get("authorization", "")
-            if header.lower().startswith("bearer "):
-                token = header[7:].strip()
-        if auth.verify_token(token):
+
+        # LAN client. Allow:
+        #   * static assets (so a browser on this LAN can at least load
+        #     the SPA shell — the SPA itself will then 403 on its API
+        #     calls, which the user sees as a clear "loopback only"
+        #     message rather than a blank page).
+        #   * P2P inbound endpoints — envelope crypto handles auth.
+        #   * the SPA entrypoint "/" so the LAN browser can fetch the
+        #     loopback-only error message instead of a hard reject.
+        # Everything else → 403 with a hint.
+        path = request.url.path
+        if (
+            path == "/"
+            or any(path.startswith(p) for p in _STATIC_PREFIXES)
+            or any(path.startswith(p) for p in _P2P_LAN_PREFIXES)
+        ):
             return await call_next(request)
+
         return JSONResponse(
-            {"error": "authentication required", "requires_password": True},
-            status_code=401,
+            {
+                "error": "loopback only",
+                "message": (
+                    "Gigachat's chat UI is only accessible from the "
+                    "same machine it's running on. To use Gigachat from "
+                    "another device on this network, install Gigachat "
+                    "there too and pair the two via Settings → Compute "
+                    "pool — chat traffic stays local on each install."
+                ),
+            },
+            status_code=403,
         )
 
 
@@ -1217,117 +1219,6 @@ class SpawnTaskOpen(BaseModel):
     cwd: str | None = None
     model: str | None = None
 
-
-class LoginBody(BaseModel):
-    """Body for POST /api/auth/login. The frontend sends the typed password."""
-
-    password: str
-
-
-@app.get("/api/auth/status")
-def api_auth_status(request: Request) -> dict:
-    """Tell the frontend whether it needs to show the login page.
-
-    Returns ``{requires_password, authenticated, host}``. ``host`` is the
-    *configured* bind mode (``127.0.0.1`` or ``lan``) so the UI can
-    surface a "you're reachable from other LAN devices" indicator
-    without probing the network from the client.
-
-    Loopback clients are implicitly authenticated — the middleware waives
-    the gate for them, and reporting ``authenticated: false`` here would
-    make the frontend show a login page the user can never need (every
-    subsequent API call would pass without the cookie anyway).
-    """
-    cfg = auth.get_config()
-    requires = auth.requires_password(cfg)
-    host_str = cfg.get("host", "127.0.0.1")
-    if not requires:
-        return {"requires_password": False, "authenticated": True, "host": host_str}
-    client_host = request.client.host if request.client else None
-    # Loopback callers (curl on the host, the desktop browser) are always
-    # trusted — they're already on the box. LAN clients still have to
-    # present a valid session cookie or Bearer token.
-    if auth.is_loopback(client_host):
-        return {"requires_password": True, "authenticated": True, "host": host_str}
-    token = request.cookies.get(auth.SESSION_COOKIE)
-    header = request.headers.get("authorization", "")
-    if not token and header.lower().startswith("bearer "):
-        token = header[7:].strip()
-    authed = auth.verify_token(token)
-    return {
-        "requires_password": True,
-        "authenticated": authed,
-        "host": host_str,
-    }
-
-
-# Simple in-memory login rate limiter — one global counter (we don't bother
-# keying per-IP because LAN mode admits at most a handful of devices and a
-# brute-force attempt from any of them is equally interesting). At PBKDF2-
-# 200k's ~100 ms per attempt the password check itself already caps
-# throughput; this is belt-and-braces against a misbehaving script. The
-# count resets on a successful login so the common "wrong password, retype"
-# case doesn't lock the real user out.
-_LOGIN_FAIL_COUNT = 0
-_LOGIN_LOCKED_UNTIL = 0.0
-_LOGIN_MAX_FAILS = 10
-_LOGIN_LOCKOUT_SEC = 60
-
-
-@app.post("/api/auth/login")
-def api_auth_login(body: LoginBody, response: Response) -> dict:
-    """Exchange a password for a signed session cookie.
-
-    A tiny rate limit guards the endpoint: after 10 consecutive failed
-    attempts further logins are refused for 60 seconds. The window is
-    deliberately short — the threat model is a typo or a curious LAN
-    neighbour, not a sustained credential-stuffing campaign.
-    """
-    global _LOGIN_FAIL_COUNT, _LOGIN_LOCKED_UNTIL
-    cfg = auth.get_config()
-    if not auth.requires_password(cfg):
-        # Server isn't running in auth mode — login is a no-op success so
-        # the frontend flow stays uniform.
-        return {"ok": True, "authenticated": True}
-    now = time.time()
-    if now < _LOGIN_LOCKED_UNTIL:
-        retry_in = int(_LOGIN_LOCKED_UNTIL - now) + 1
-        raise HTTPException(
-            429,
-            f"too many failed logins; retry in {retry_in}s",
-        )
-    if not auth.check_password(body.password or ""):
-        _LOGIN_FAIL_COUNT += 1
-        if _LOGIN_FAIL_COUNT >= _LOGIN_MAX_FAILS:
-            _LOGIN_LOCKED_UNTIL = time.time() + _LOGIN_LOCKOUT_SEC
-            _LOGIN_FAIL_COUNT = 0
-        raise HTTPException(401, "invalid password")
-    # Success: reset the counter so a user who typo'd doesn't stay locked.
-    _LOGIN_FAIL_COUNT = 0
-    _LOGIN_LOCKED_UNTIL = 0.0
-    token = auth.make_token()
-    # HttpOnly + SameSite=Lax: the cookie is not JS-readable (no XSS to
-    # cookie-exfiltration path) and isn't sent on cross-site POSTs (no
-    # trivial CSRF). The Secure flag is omitted because LAN mode serves
-    # plain HTTP on the local network — the cookie never traverses a
-    # public network where it could be sniffed in transit.
-    response.set_cookie(
-        auth.SESSION_COOKIE,
-        token,
-        max_age=auth.SESSION_TTL_SECONDS,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-        path="/",
-    )
-    return {"ok": True, "authenticated": True, "token": token}
-
-
-@app.post("/api/auth/logout")
-def api_auth_logout(response: Response) -> dict:
-    """Clear the session cookie. Always succeeds — idempotent."""
-    response.delete_cookie(auth.SESSION_COOKIE, path="/")
-    return {"ok": True}
 
 
 # In-memory cache of "does this model support tool calling?" — keyed by

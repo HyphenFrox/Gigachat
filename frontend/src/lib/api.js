@@ -33,18 +33,6 @@ async function request(path, options = {}) {
     } catch {
       detail = await res.text().catch(() => '')
     }
-    // Late 401: our session cookie expired (30-day TTL) or the admin
-    // rotated the secret. Notify the top-level app so it can flip back
-    // to the login screen instead of the surface-level toast the caller
-    // would otherwise show. Login/status endpoints are exempted — they
-    // legitimately 401 on a bad password and the caller handles that.
-    if (
-      res.status === 401 &&
-      typeof window !== 'undefined' &&
-      !path.startsWith('/api/auth/')
-    ) {
-      window.dispatchEvent(new CustomEvent('gigachat:unauthorized'))
-    }
     throw new Error(`${res.status} ${res.statusText}${detail ? ` — ${detail}` : ''}`)
   }
   if (res.status === 204) return null
@@ -52,28 +40,6 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  /**
-   * Auth status check — returns `{requires_password, authenticated, host}`.
-   * When `requires_password` is false the server is bound to loopback and
-   * the login flow is skipped entirely. Callers use the `authenticated`
-   * flag to decide whether to render LoginView or the main app.
-   */
-  getAuthStatus: () => request('/api/auth/status'),
-
-  /**
-   * Exchange a typed password for a session cookie. The server sets an
-   * httponly cookie so subsequent requests authenticate automatically —
-   * the caller doesn't need to hold onto the returned token field.
-   */
-  login: (password) =>
-    request('/api/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ password }),
-    }),
-
-  /** Clear the session cookie. */
-  logout: () => request('/api/auth/logout', { method: 'POST' }),
-
   /**
    * List installed Ollama models. By default the backend filters the result to
    * models whose `capabilities` include `tools` — the agent loop 400s on

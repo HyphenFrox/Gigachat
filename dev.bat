@@ -30,13 +30,12 @@ REM file existence check — no `where` invocation, no shell-out cost.
 set PY=python
 if exist "%ROOT%.venv\Scripts\python.exe" set PY="%ROOT%.venv\Scripts\python.exe"
 
-REM Force loopback mode for dev regardless of what data/auth.json says. The
-REM env var wins over the file, so running dev.bat skips the password prompt
-REM even if auth.json is configured for "lan". The production launcher
-REM (start.bat) still honors auth.json.
-set GIGACHAT_HOST=127.0.0.1
+REM Backend binds to 0.0.0.0 by default — the AuthMiddleware in app.py
+REM keeps the chat UI loopback-only while letting the P2P endpoints
+REM (encrypted compute proxy + pair handshake) reach across the LAN.
+REM No password setup needed.
 
-start "Gigachat - backend" cmd /k "cd /d %ROOT% && set GIGACHAT_HOST=127.0.0.1&& %PY% -m uvicorn backend.app:app --host 127.0.0.1 --port 8000 --reload"
+start "Gigachat - backend" cmd /k "cd /d %ROOT% && %PY% -m uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload"
 start "Gigachat - frontend" cmd /k "cd /d %ROOT%frontend && npm run dev"
 
 echo.

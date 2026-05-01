@@ -1,21 +1,26 @@
 """Entry point that resolves the bind host before launching uvicorn.
 
-Run this instead of calling ``uvicorn backend.app:app`` directly — it reads
-``backend.auth.get_config()`` so the host configured via env var or
-``data/auth.json`` takes effect.
+Run this instead of calling ``uvicorn backend.app:app`` directly — it
+reads ``GIGACHAT_HOST`` so the bind mode picked by the user takes effect.
 
-Two hosts are supported:
+Two bind modes:
 
-  - loopback (default): no auth, binds to 127.0.0.1. Only same-machine
-    processes can connect.
-  - ``lan``: binds to 0.0.0.0 with a source-IP allowlist (loopback + RFC1918
-    LAN ranges). Other devices on the same physical network can reach the
-    app once they enter the password. Public IPs and Tailscale CGNAT
-    clients are refused — the app is intentionally not exposed over the
-    internet or over the Tailscale overlay.
+  - **default (unset)** → ``0.0.0.0``. P2P endpoints are reachable from
+    any RFC1918 LAN IP (envelope crypto handles auth); the chat UI is
+    loopback-only (the AuthMiddleware in ``app.py`` rejects non-loopback
+    requests for non-P2P paths). Compute-pool sharing between two
+    devices on the same Wi-Fi works without any per-install
+    configuration.
+  - **explicit loopback** (``GIGACHAT_HOST=127.0.0.1``) → ``127.0.0.1``.
+    Hard isolation — nothing on the LAN reaches anything, not even the
+    P2P endpoints. Use when this device shouldn't participate in any
+    cross-device compute pool.
 
-A misconfigured host aborts startup with a clear error rather than
-silently binding to an unexpected interface.
+Anything else aborts startup with a clear error.
+
+Optional: ``GIGACHAT_TLS_PORT=<port>`` spins up a SECOND uvicorn on a
+TLS-enabled port for forward-secret streaming P2P traffic. Default
+deployments don't need this.
 """
 
 from __future__ import annotations
@@ -39,9 +44,7 @@ def _detect_lan_ipv4() -> str | None:
     if it returns the wrong NIC the app still works.
 
     Strategy: open a UDP socket "to" a public address (no packet is
-    actually sent) and read the kernel's chosen source IP. This picks
-    whichever interface the OS would route an outbound packet through,
-    which on a typical home setup is the active Wi-Fi or Ethernet NIC.
+    actually sent) and read the kernel's chosen source IP.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -61,10 +64,8 @@ def _detect_lan_ipv4() -> str | None:
 
 
 def main() -> None:
-    cfg = auth.get_config()
-    configured_host = (cfg.get("host") or "").strip()
     try:
-        host = auth.resolve_bind_host(configured_host)
+        host = auth.resolve_bind_host()
     except ValueError as e:
         print(f"\n  [!] config error: {e}\n", file=sys.stderr)
         sys.exit(1)
@@ -74,45 +75,31 @@ def main() -> None:
     except ValueError:
         port = 8000
 
-    auth_required = auth.requires_password(cfg)
     print()
-
     if host == "0.0.0.0":
-        # LAN mode: listening on every interface but the middleware only
-        # admits loopback + RFC1918 LAN clients. Show both URLs so the
-        # user knows how to reach the app from this machine and from
-        # another device on the same Wi-Fi/Ethernet.
-        print(f"  Gigachat listening on http://localhost:{port}  (this machine)")
+        # Default mode: bind everywhere; AuthMiddleware filters per-path
+        # so the chat UI stays loopback-only while P2P endpoints are
+        # reachable from RFC1918 LAN clients.
+        print(f"  Gigachat chat UI:  http://localhost:{port}  (this machine)")
         lan_ip = _detect_lan_ipv4()
         if lan_ip:
-            print(f"  Gigachat listening on http://{lan_ip}:{port}  (LAN)")
+            print(
+                f"  P2P endpoints:     reachable on the LAN at "
+                f"{lan_ip}:{port}  (compute pool pairing + encrypted proxy)"
+            )
         else:
-            # Couldn't auto-detect — give the user a hint without printing
-            # anything that might be wrong.
-            print("  (use this machine's LAN IPv4 from another device on the same network)")
+            print(
+                "  P2P endpoints:     reachable on every interface "
+                "(LAN IP not auto-detected)"
+            )
     else:
-        print(f"  Gigachat listening on http://{host}:{port}")
+        print(f"  Gigachat listening on http://{host}:{port}  (loopback-only)")
 
-    if auth_required and not (cfg.get("password") or "").strip():
-        print(
-            "  [!] host is 'lan' but no password is configured.\n"
-            "      All non-loopback requests will be rejected with 401 until you set\n"
-            "      GIGACHAT_PASSWORD=... or write a password into data/auth.json.",
-            file=sys.stderr,
-        )
-    elif auth_required:
-        print("  password required for LAN clients — localhost is free")
-    else:
-        print("  loopback-only (no password required)")
-
-    # P2P TLS streaming port — opt-in via env var. When set, a second
-    # uvicorn binds the same FastAPI app on the TLS port using our
-    # self-signed identity cert (peers pin the cert pubkey, so no CA
-    # required). The TLS port is intended for streaming P2P traffic
-    # only — chat NDJSON streams ride a single TLS handshake and get
-    # full forward secrecy via TLS 1.3 ECDHE in BOTH directions, vs.
-    # the envelope path's sender-only ephemeral. The HTTP port keeps
-    # serving the browser UI + non-streaming endpoints unchanged.
+    # Optional TLS streaming port — opt-in via env var. When set, a
+    # second uvicorn binds the same FastAPI app on the TLS port using
+    # our self-signed identity cert (peers pin the cert pubkey, so no
+    # CA required). Useful for full forward secrecy on streaming chat
+    # paths via TLS 1.3 ECDHE.
     tls_port_env = (os.environ.get("GIGACHAT_TLS_PORT") or "").strip()
     tls_port: int | None = None
     if tls_port_env:
@@ -129,15 +116,13 @@ def main() -> None:
     print()
 
     if tls_port is None:
-        # Single uvicorn — preserves the legacy launch path so default
-        # deployments are byte-identical to before.
+        # Single uvicorn — the common default deployment.
         uvicorn.run("backend.app:app", host=host, port=port, log_level="info")
         return
 
     # Dual-server: HTTP (browser + non-stream P2P) + HTTPS (streaming
-    # P2P). Both serve the same FastAPI app. Run them under a single
-    # asyncio loop so they share startup/shutdown lifecycle and the
-    # same in-process state (db, identity, inventory cache, etc.).
+    # P2P). Both serve the same FastAPI app under one asyncio loop so
+    # they share startup/shutdown lifecycle and in-process state.
     from . import p2p_tls
     cert_path, key_path = p2p_tls.ensure_identity_cert()
 
@@ -160,8 +145,6 @@ def main() -> None:
     try:
         asyncio.run(_run_both())
     except KeyboardInterrupt:
-        # Graceful shutdown: signal both servers to exit. asyncio.run
-        # will then return as their tasks complete.
         http_server.should_exit = True
         tls_server.should_exit = True
 

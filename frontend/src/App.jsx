@@ -3,7 +3,6 @@ import { toast } from 'sonner'
 import { Toaster } from '@/components/ui/sonner'
 import Sidebar from './components/Sidebar'
 import ChatView from './components/ChatView'
-import LoginView from './components/LoginView'
 import { api } from '@/lib/api'
 import { onPushClick } from '@/lib/pwa'
 
@@ -15,14 +14,14 @@ import { onPushClick } from '@/lib/pwa'
  *   - Mobile (<md): ChatView full-width; Sidebar slides in from the left as
  *     a drawer when the hamburger is tapped. This gives the "native mobile
  *     app" feel CLAUDE.md asks for.
+ *
+ * No auth flow: the chat UI is loopback-only at the backend (the
+ * AuthMiddleware in app.py rejects non-loopback requests for non-P2P
+ * paths with a clear "loopback only" 403). Cross-device chat from
+ * another laptop's browser isn't a supported use case — install
+ * Gigachat on the other device too and pair them via Compute pool.
  */
 export default function App() {
-  // Auth state. `null` = still checking; {requires_password, authenticated, host}
-  // once the initial /api/auth/status call returns. We render the login page
-  // when requires_password && !authenticated, and the main app otherwise.
-  // A mid-session expiry (via the `gigachat:unauthorized` window event from
-  // api.js) flips authenticated back to false so the login gate reappears.
-  const [authState, setAuthState] = useState(null)
   const [conversations, setConversations] = useState([])
   const [activeId, setActiveId] = useState(null)
   const [models, setModels] = useState([])
@@ -33,33 +32,6 @@ export default function App() {
   const [showAllModels, setShowAllModels] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
 
-  const refreshAuth = useCallback(async () => {
-    try {
-      const s = await api.getAuthStatus()
-      setAuthState(s)
-    } catch {
-      // If the status call itself fails, assume we need a login rather than
-      // rendering a blank screen — the user can retry from the form.
-      setAuthState({ requires_password: true, authenticated: false, host: '' })
-    }
-  }, [])
-
-  useEffect(() => {
-    refreshAuth()
-  }, [refreshAuth])
-
-  // Any API call returning 401 flips back to the login screen. This covers
-  // the session-expired case (the cookie outlives 30 days) and the
-  // secret-rotated case (admin wiped data/auth_secret.key).
-  useEffect(() => {
-    function handler() {
-      setAuthState((prev) =>
-        prev ? { ...prev, authenticated: false } : prev,
-      )
-    }
-    window.addEventListener('gigachat:unauthorized', handler)
-    return () => window.removeEventListener('gigachat:unauthorized', handler)
-  }, [])
   // When the user clicks a semantic-search hit, the sidebar sets both a
   // conversation id and a target message id. ChatView scrolls to the message
   // after it finishes loading the conversation and clears the target via
@@ -93,19 +65,15 @@ export default function App() {
     }
   }, [showAllModels])
 
-  // Initial load — runs once the user is past the auth gate so we don't
-  // fire a wall of requests that would all 401 on a fresh remote visit.
+  // Initial load — fires on mount.
   useEffect(() => {
-    if (!authState?.authenticated) return
     reloadConversations()
     reloadModels()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authState?.authenticated])
+  }, [])
 
-  // Re-fetch the model list when the tool-capable filter flips. Skipped until
-  // the user is authenticated — same rationale as the initial load effect.
+  // Re-fetch the model list when the tool-capable filter flips.
   useEffect(() => {
-    if (!authState?.authenticated) return
     reloadModels()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showAllModels])
@@ -144,39 +112,6 @@ export default function App() {
     reloadConversations()
   }, [reloadConversations])
 
-  const handleLogout = useCallback(async () => {
-    try {
-      await api.logout()
-    } catch {
-      /* already signed out — proceed to the login screen anyway */
-    }
-    setAuthState((prev) =>
-      prev ? { ...prev, authenticated: false } : prev,
-    )
-    setActiveId(null)
-    setConversations([])
-  }, [])
-
-  // Still probing the server for its auth posture — render a neutral
-  // skeleton (just the toaster) rather than a misleading login prompt.
-  if (authState === null) {
-    return (
-      <div className="flex h-full w-full items-center justify-center bg-background">
-        <Toaster />
-      </div>
-    )
-  }
-
-  // Remote install + no cookie → gate.
-  if (authState.requires_password && !authState.authenticated) {
-    return (
-      <>
-        <LoginView host={authState.host} onAuthenticated={refreshAuth} />
-        <Toaster />
-      </>
-    )
-  }
-
   return (
     <div className="flex h-full w-full">
       {/* Mobile overlay drawer */}
@@ -208,8 +143,6 @@ export default function App() {
           }}
           onReload={reloadConversations}
           onClose={() => setSidebarOpen(false)}
-          authRequired={!!authState?.requires_password}
-          onLogout={handleLogout}
         />
       </div>
 
