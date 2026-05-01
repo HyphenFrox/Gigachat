@@ -4267,6 +4267,38 @@ class P2PRendezvousUrlBody(BaseModel):
     url: str = ""
 
 
+class P2PFairnessConfigBody(BaseModel):
+    """Body for PATCH /api/p2p/fairness/config. All fields optional."""
+    donation_fraction: float | None = None
+    max_concurrent_donations: int | None = None
+    per_peer_rate_per_min: int | None = None
+
+
+@app.get("/api/p2p/fairness/status")
+def api_p2p_fairness_status() -> dict:
+    """Real-time view of the fairness scheduler.
+
+    Surfaced in Settings → Network so the user sees how their
+    donation slice is being used right now: active jobs, per-peer
+    slice (auto-balanced by `total_donations / active_consumers`),
+    and the configured tunables.
+    """
+    from . import p2p_fairness as _fair
+    return _fair.status()
+
+
+@app.patch("/api/p2p/fairness/config")
+def api_p2p_fairness_set_config(body: P2PFairnessConfigBody) -> dict:
+    """Update donation tunables. Each takes effect immediately on
+    the next admission decision (no process restart needed)."""
+    from . import p2p_fairness as _fair
+    return _fair.set_config(
+        donation_fraction=body.donation_fraction,
+        max_concurrent_donations=body.max_concurrent_donations,
+        per_peer_rate_per_min=body.per_peer_rate_per_min,
+    )
+
+
 @app.patch("/api/p2p/rendezvous/url")
 async def api_p2p_rendezvous_set_url(body: P2PRendezvousUrlBody) -> dict:
     """Set (or clear) the rendezvous URL.

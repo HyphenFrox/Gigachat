@@ -1205,7 +1205,13 @@ async def _embed_via(base_url: str, auth_token: str | None, text: str) -> list[f
     Pulled out of `_embed_text` so we can hit either the host's local
     Ollama or a registered compute worker through the same code path.
     Returns None on any failure — the caller decides whether to fall back.
+
+    Privacy guard: the input text is part of a user's prompt / query —
+    embeddings reveal semantic content even without raw text. Refuse
+    any non-local-pool destination via PrivacyViolation.
     """
+    from . import p2p_privacy as _privacy
+    _privacy.assert_outbound_is_local(base_url, kind="embed")
     headers: dict[str, str] = {}
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
@@ -2465,6 +2471,15 @@ async def _stream_ollama_chat(
     base_url: str = OLLAMA_URL,
     auth_token: str | None = None,
 ) -> AsyncGenerator[dict, None]:
+    # Privacy guard — fail-closed before any prompt bytes hit the wire.
+    # The chat path carries the user's full prompt history; sending
+    # that to a destination outside the local pool would violate the
+    # explicit privacy contract. PrivacyViolation is raised as
+    # `RuntimeError` so the agent's existing exception handlers
+    # surface it as an `error` SSE event the UI can show.
+    from . import p2p_privacy as _privacy
+    _privacy.assert_outbound_is_local(base_url, kind="chat")
+
     """Yield raw chunks from Ollama /api/chat with stream=true.
 
     Automatically sets ``think: true`` when the model advertises the
@@ -2593,6 +2608,12 @@ async def _stream_llama_server_chat(
     is expected to be in adapter mode (system prompt has the tool
     block inlined) so we send only `messages`.
     """
+    # Privacy guard — same fail-closed contract as `_stream_ollama_chat`.
+    # Split-target llama-server URLs are typically host loopback; the
+    # check stays correct because loopback hostnames are always in
+    # the local-pool whitelist.
+    from . import p2p_privacy as _privacy
+    _privacy.assert_outbound_is_local(base_url, kind="chat")
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
