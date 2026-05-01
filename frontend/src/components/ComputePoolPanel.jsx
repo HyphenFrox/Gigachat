@@ -85,10 +85,16 @@ export default function ComputePoolSection() {
   // --- discovery + pairing flow ----------------------------------------
   const [discovered, setDiscovered] = useState([])
   const [discoveryRunning, setDiscoveryRunning] = useState(false)
+  // Local "I'm offering a PIN" state. Other devices type the PIN we
+  // display here into THEIR Pair dialog.
   const [pairOffer, setPairOffer] = useState(null)
   const [pairStarting, setPairStarting] = useState(false)
-  const [claimPin, setClaimPin] = useState('')
-  const [claimSubmitting, setClaimSubmitting] = useState(false)
+  // Cross-device pair dialog: when set, we render a modal asking for
+  // the PIN currently displayed on `pairingTarget`'s screen. The
+  // claim is then POSTed cross-device to that target's /pair/accept.
+  const [pairingTarget, setPairingTarget] = useState(null)
+  const [pairingPin, setPairingPin] = useState('')
+  const [pairingSubmitting, setPairingSubmitting] = useState(false)
 
   // --- pool: paired peers + matched workers ----------------------------
   const [paired, setPaired] = useState([])
@@ -221,35 +227,112 @@ export default function ComputePoolSection() {
     setPairOffer(null)
   }, [pairOffer])
 
-  const submitClaim = useCallback(async () => {
-    if (!pairOffer || !claimPin) return
-    setClaimSubmitting(true)
+  // Cross-device pair: claimant fetches the host's pending offers
+  // (via the host's /api/p2p/pair/handshake on its LAN IP), builds a
+  // signed claim against each offer's nonce + the host's pubkey (we
+  // have that from mDNS), and POSTs each candidate claim to the
+  // host's /api/p2p/pair/accept until one matches the PIN. Stops on
+  // the first 200 (success) or the last 400 (incorrect PIN — every
+  // offer rejected).
+  //
+  // Why try every offer: the host might have multiple pending PINs
+  // open (user clicked "Pair new device" twice). Only one matches,
+  // and the host returns "incorrect PIN" for the rest — that's
+  // expected and not worth surfacing.
+  const submitClaimToPeer = useCallback(async () => {
+    if (!pairingTarget || !pairingPin) return
+    const peer = pairingTarget
+    if (!peer.ip || !peer.port) {
+      toast.error('Pairing failed', {
+        description: 'Discovered peer has no LAN address. Wait for the next mDNS tick and retry.',
+      })
+      return
+    }
+    if (!peer.public_key_b64) {
+      toast.error('Pairing failed', {
+        description: 'Discovered peer is missing its public key (legacy mDNS record). Restart Gigachat on that device and retry.',
+      })
+      return
+    }
+    setPairingSubmitting(true)
+    const baseUrl = `http://${peer.ip}:${peer.port}`
     try {
-      const claim = await api.p2pPairBuildClaim(
-        claimPin, pairOffer.nonce, pairOffer.host_public_key_b64,
-      )
-      const result = await api.p2pPairAccept({
-        pairing_id: pairOffer.pairing_id,
-        pin: claimPin,
-        claimant_device_id: claim.claimant_device_id,
-        claimant_label: claim.claimant_label,
-        claimant_public_key_b64: claim.claimant_public_key_b64,
-        signature_b64: claim.signature_b64,
-      })
-      toast.success('Device paired', {
-        description: result?.paired?.label || claim.claimant_device_id,
-      })
-      setPairOffer(null)
-      setClaimPin('')
-      setTick((n) => n + 1)
+      // 1. Fetch the host's pending offers (pairing_id + nonce, NO PIN).
+      const handshakeRes = await fetch(`${baseUrl}/api/p2p/pair/handshake`)
+      if (!handshakeRes.ok) {
+        throw new Error(
+          `host returned HTTP ${handshakeRes.status} for /pair/handshake. ` +
+          `Make sure they clicked "Pair new device" within the last 5 minutes.`
+        )
+      }
+      const { offers } = await handshakeRes.json()
+      if (!Array.isArray(offers) || offers.length === 0) {
+        throw new Error(
+          `${peer.label || peer.device_id} has no pending pair offer. ` +
+          `Click "Pair new device" on that machine first.`
+        )
+      }
+
+      // 2. Try each offer with our typed PIN. The host accepts the one
+      //    whose PIN matches and rejects the rest with "incorrect PIN".
+      let lastErr = null
+      let paired = null
+      for (const offer of offers) {
+        try {
+          // Build the signed claim on OUR backend (loopback), bound to
+          // the host's nonce + pubkey.
+          const claim = await api.p2pPairBuildClaim(
+            pairingPin, offer.nonce, peer.public_key_b64,
+          )
+          // POST claim to the HOST'S /pair/accept (cross-device).
+          const acceptRes = await fetch(`${baseUrl}/api/p2p/pair/accept`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              pairing_id: offer.pairing_id,
+              pin: pairingPin,
+              claimant_device_id: claim.claimant_device_id,
+              claimant_label: claim.claimant_label,
+              claimant_public_key_b64: claim.claimant_public_key_b64,
+              claimant_x25519_public_b64: claim.claimant_x25519_public_b64,
+              signature_b64: claim.signature_b64,
+            }),
+          })
+          if (acceptRes.ok) {
+            paired = await acceptRes.json()
+            break
+          }
+          // Try to extract the host's error message for the toast.
+          let detail = ''
+          try {
+            const j = await acceptRes.json()
+            detail = j?.error || j?.detail || ''
+          } catch {
+            detail = await acceptRes.text()
+          }
+          lastErr = `HTTP ${acceptRes.status}${detail ? ` — ${detail}` : ''}`
+        } catch (perOfferErr) {
+          lastErr = perOfferErr?.message || String(perOfferErr)
+        }
+      }
+      if (paired) {
+        toast.success('Device paired', {
+          description: peer.label || peer.device_id,
+        })
+        setPairingTarget(null)
+        setPairingPin('')
+        setTick((n) => n + 1)
+      } else {
+        throw new Error(lastErr || 'host rejected every pending offer')
+      }
     } catch (e) {
       toast.error('Pairing failed', {
         description: e?.message || String(e),
       })
     } finally {
-      setClaimSubmitting(false)
+      setPairingSubmitting(false)
     }
-  }, [pairOffer, claimPin])
+  }, [pairingTarget, pairingPin])
 
   const togglePublicPool = useCallback(async (next) => {
     try {
@@ -500,10 +583,6 @@ export default function ComputePoolSection() {
         {pairOffer && (
           <PairOfferCard
             offer={pairOffer}
-            claimPin={claimPin}
-            setClaimPin={setClaimPin}
-            submitting={claimSubmitting}
-            onSubmitClaim={submitClaim}
             onCancel={cancelPair}
           />
         )}
@@ -523,16 +602,28 @@ export default function ComputePoolSection() {
             <p className="text-xs text-muted-foreground">
               No other Gigachat devices found on the network. Open Gigachat on
               another laptop / desktop on the same Wi-Fi to see it here, then
-              click <em>Pair new device</em> to start.
+              click <em>Pair</em> next to it.
             </p>
           ) : (
             <ul className="space-y-1.5">
               {freshDiscovered.map((d) => (
-                <DiscoveredRow key={d.device_id} device={d} />
+                <DiscoveredRow
+                  key={d.device_id}
+                  device={d}
+                  onPair={() => {
+                    setPairingTarget(d)
+                    setPairingPin('')
+                  }}
+                />
               ))}
             </ul>
           )}
-          <div className="mt-4">
+          <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-[11px] leading-snug text-muted-foreground">
+              To pair, click <em>Pair</em> on the device above and type the PIN it shows.
+              <br />
+              Or generate a PIN here for the OTHER device to pair with us:
+            </p>
             <Button
               onClick={startPair}
               disabled={pairStarting || !!pairOffer}
@@ -541,7 +632,7 @@ export default function ComputePoolSection() {
               {pairStarting ? (
                 <Loader2 className="size-4 animate-spin" />
               ) : (
-                'Pair new device'
+                'Show our PIN'
               )}
             </Button>
           </div>
@@ -678,6 +769,23 @@ export default function ComputePoolSection() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Cross-device pair dialog (rendered when user clicks "Pair" on
+          a discovered peer). Asks for the PIN displayed on that peer
+          and dispatches the cross-device claim flow via
+          submitClaimToPeer. */}
+      <PairWithPeerDialog
+        peer={pairingTarget}
+        pin={pairingPin}
+        setPin={setPairingPin}
+        submitting={pairingSubmitting}
+        onConfirm={submitClaimToPeer}
+        onCancel={() => {
+          if (pairingSubmitting) return
+          setPairingTarget(null)
+          setPairingPin('')
+        }}
+      />
     </>
   )
 }
@@ -937,7 +1045,16 @@ function RendezvousStatusCard({ status }) {
   )
 }
 
-function PairOfferCard({ offer, claimPin, setClaimPin, submitting, onSubmitClaim, onCancel }) {
+/** Local-side "we generated a PIN; the OTHER device should type it" card.
+ *
+ *  No inline PIN-typing field anymore. The cross-device flow now lives
+ *  on the discovered-peer rows: each row has a "Pair" button that
+ *  opens a dialog asking for the PIN displayed on THAT peer. So this
+ *  card just shows OUR PIN to the user (so they can read it off
+ *  the screen and type it on the other device's Pair dialog) +
+ *  a Cancel button.
+ */
+function PairOfferCard({ offer, onCancel }) {
   const expiresAt = offer?.expires_at || 0
   const [now, setNow] = useState(Date.now() / 1000)
   useEffect(() => {
@@ -954,10 +1071,11 @@ function PairOfferCard({ offer, claimPin, setClaimPin, submitting, onSubmitClaim
         <KeyRound className="mt-0.5 size-5 text-primary" />
         <div className="min-w-0 flex-1 space-y-3">
           <div>
-            <h3 className="text-sm font-semibold">Pair a device</h3>
+            <h3 className="text-sm font-semibold">Show this PIN on the other device</h3>
             <p className="mt-0.5 text-xs leading-snug text-muted-foreground">
-              Open Gigachat on the other device, choose <strong>Pair to existing host</strong>,
-              and enter the PIN below. The PIN expires in{' '}
+              Open Gigachat on the other device, find this device in its
+              <strong> Devices on this network</strong> list, click <strong>Pair</strong>,
+              and type the PIN below. Expires in{' '}
               <span className="font-mono font-semibold text-foreground">
                 {mm}:{ss}
               </span>
@@ -971,38 +1089,10 @@ function PairOfferCard({ offer, claimPin, setClaimPin, submitting, onSubmitClaim
             </span>
           </div>
 
-          <div className="border-t border-border/50 pt-3">
-            <p className="mb-2 text-xs text-muted-foreground">
-              Pairing FROM this device? Type the PIN that's displayed on the
-              <em> other </em>screen here:
-            </p>
-            <div className="flex items-center gap-2">
-              <Input
-                value={claimPin}
-                onChange={(e) =>
-                  setClaimPin(e.target.value.replace(/\D/g, '').slice(0, 6))
-                }
-                placeholder="6-digit PIN"
-                maxLength={6}
-                className="h-8 max-w-[160px] font-mono tracking-widest"
-                disabled={submitting}
-              />
-              <Button
-                size="sm"
-                onClick={onSubmitClaim}
-                disabled={submitting || claimPin.length !== 6}
-              >
-                {submitting ? <Loader2 className="size-4 animate-spin" /> : 'Confirm'}
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={onCancel}
-                disabled={submitting}
-              >
-                Cancel
-              </Button>
-            </div>
+          <div className="flex justify-end">
+            <Button size="sm" variant="ghost" onClick={onCancel}>
+              Cancel
+            </Button>
           </div>
         </div>
       </div>
@@ -1010,7 +1100,7 @@ function PairOfferCard({ offer, claimPin, setClaimPin, submitting, onSubmitClaim
   )
 }
 
-function DiscoveredRow({ device }) {
+function DiscoveredRow({ device, onPair }) {
   const lastSeenAt = device.last_seen_at || 0
   return (
     <li className="flex items-center gap-3 rounded border border-border/50 bg-background/50 px-3 py-2">
@@ -1035,10 +1125,78 @@ function DiscoveredRow({ device }) {
           ) : null}
         </div>
       </div>
-      <p className="text-[11px] text-muted-foreground">
-        Open Gigachat on this device to pair from there.
-      </p>
+      <Button
+        size="sm"
+        onClick={onPair}
+        disabled={!device.ip || !device.public_key_b64}
+        title={
+          !device.ip
+            ? 'Waiting for mDNS to surface this peer\'s LAN address.'
+            : !device.public_key_b64
+            ? 'Peer\'s mDNS record is missing its public key (legacy install). Restart Gigachat on that device.'
+            : 'Type the PIN displayed on this peer to pair with it.'
+        }
+      >
+        Pair
+      </Button>
     </li>
+  )
+}
+
+/** Cross-device pair dialog. The user picked a discovered peer; this
+ *  asks for the PIN currently displayed on that peer's screen. On
+ *  submit, ComputePoolSection.submitClaimToPeer() does the cross-device
+ *  HTTP exchange (fetch host's pending offers → build claim → POST
+ *  claim to host's /pair/accept). */
+function PairWithPeerDialog({ peer, pin, setPin, submitting, onConfirm, onCancel }) {
+  return (
+    <Dialog open={!!peer} onOpenChange={(o) => !o && onCancel?.()}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <KeyRound className="size-4 text-primary" />
+            Pair with {peer?.label || peer?.device_id}
+          </DialogTitle>
+          <DialogDescription>
+            On the OTHER device ({peer?.label || 'that device'}), open
+            Settings → Compute pool → click <strong>Show our PIN</strong>.
+            Type the 6-digit PIN that appears below.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <Input
+            autoFocus
+            value={pin}
+            onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && pin.length === 6 && !submitting) {
+                onConfirm()
+              }
+            }}
+            placeholder="6-digit PIN"
+            maxLength={6}
+            className="h-10 text-center font-mono text-lg tracking-[0.4em]"
+            disabled={submitting}
+          />
+          <p className="text-[11px] leading-snug text-muted-foreground">
+            <code>{peer?.ip}:{peer?.port}</code>
+            {' · '}
+            device <code>{peer?.device_id}</code>
+          </p>
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onCancel} disabled={submitting}>
+            Cancel
+          </Button>
+          <Button
+            onClick={onConfirm}
+            disabled={submitting || pin.length !== 6}
+          >
+            {submitting ? <Loader2 className="size-4 animate-spin" /> : 'Pair'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 

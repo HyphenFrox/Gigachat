@@ -183,6 +183,12 @@ class _GigachatListener:
         port = int(getattr(info, "port", 0) or 0)
         label = txt.get("label") or device_id
         version = txt.get("version") or ""
+        # Pubkey is in the TXT record under "public_key" — propagate it
+        # under the canonical name "public_key_b64" so the frontend can
+        # use it for the cross-device pair-claim signature without an
+        # extra round-trip to /api/p2p/identity. Falls back to empty
+        # string when an older peer's mDNS record omits it.
+        public_key_b64 = txt.get("public_key") or ""
 
         record = {
             "device_id": device_id,
@@ -190,6 +196,7 @@ class _GigachatListener:
             "ip": ip,
             "port": port,
             "version": version,
+            "public_key_b64": public_key_b64,
             "last_seen_at": time.time(),
             "_service_name": name,
         }

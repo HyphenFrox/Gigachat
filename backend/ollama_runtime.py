@@ -394,21 +394,29 @@ def get_recommendation() -> dict:
     return dict(_RECOMMENDED)
 
 
-async def auto_tune_models(disable_pull: bool = False) -> dict:
-    """Pick optimal models for this hardware and pull any that are missing.
+async def auto_tune_models() -> dict:
+    """Pick optimal models for this hardware. Records the recommendation
+    in `_RECOMMENDED` but does NOT auto-pull anything.
 
-    Called during FastAPI startup after `ensure_running()` succeeds. Mutates
-    the module-level `_RECOMMENDED` dict so the rest of the app can read
-    "what should we default to" without re-probing the host.
+    Earlier versions of this function pulled the recommended chat +
+    embed models on backend startup if they were missing. That was
+    surprising — opening Settings would show a download in progress
+    that the user never asked for, and a fresh install on a metered
+    connection could rack up gigabytes of background traffic before
+    the user had picked anything.
 
-    Pulls run in-band here: they can take several minutes but the rest of
-    the server is already up (uvicorn treats startup hooks as concurrent),
-    so the UI stays responsive. Progress is logged but the frontend also
-    polls /api/system/config to surface a "pulling…" toast.
+    The user now triggers pulls explicitly:
 
-    If `disable_pull=True` (respects the GIGACHAT_NO_AUTO_PULL env var), we
-    only record the recommendation; the user pulls manually. This is an
-    escape hatch for metered connections.
+      * Pick a model from the chat header's model picker. If it isn't
+        installed locally, `compute_pool.route_chat_for` calls
+        `auto_pull_on_host` for the executing turn — progress streams
+        to the UI as a Sonner toast (see the `model_download_progress`
+        SSE event in agent.py).
+      * Or pull from a terminal with `ollama pull <name>`.
+
+    This function still RECORDS the hardware-tuned recommendation so
+    `/api/system/config` can surface "for your hardware we'd recommend
+    gemma4:e4b" — useful guidance, no surprise downloads.
     """
     # Late import — avoids a sysdetect → ollama_runtime cycle at module load.
     from . import sysdetect
@@ -421,59 +429,30 @@ async def auto_tune_models(disable_pull: bool = False) -> dict:
 
     _RECOMMENDED["chat_model"] = chat["model"]
     _RECOMMENDED["embed_model"] = embed["model"]
+    _RECOMMENDED["pulling"] = False
     _RECOMMENDED["pull_error"] = ""
 
-    if disable_pull or os.environ.get("GIGACHAT_NO_AUTO_PULL", "").strip() in ("1", "true", "yes"):
-        _RECOMMENDED["pulling"] = False
-        _RECOMMENDED["pull_status"] = "skipped (GIGACHAT_NO_AUTO_PULL set)"
-        log.info(
-            "ollama: auto-pull disabled via GIGACHAT_NO_AUTO_PULL. "
-            "Recommended: chat=%s embed=%s",
-            chat["model"],
-            embed["model"],
-        )
-        return _RECOMMENDED
-
-    # Figure out what actually needs to be fetched.
-    to_pull: list[str] = []
+    needs = []
     if chat["needs_pull"]:
-        to_pull.append(chat["model"])
+        needs.append(chat["model"])
     if embed["needs_pull"]:
-        to_pull.append(embed["model"])
-
-    if not to_pull:
-        _RECOMMENDED["pulling"] = False
-        _RECOMMENDED["pull_status"] = "all models already installed"
-        log.info(
-            "ollama: auto-tune done. chat=%s embed=%s (no pulls needed)",
-            chat["model"],
-            embed["model"],
+        needs.append(embed["model"])
+    if needs:
+        _RECOMMENDED["pull_status"] = (
+            f"recommended (not installed): {', '.join(needs)}"
         )
-        return _RECOMMENDED
-
-    _RECOMMENDED["pulling"] = True
-    _RECOMMENDED["pull_status"] = f"pulling {', '.join(to_pull)}"
-    log.info(
-        "ollama: auto-tune picked chat=%s embed=%s — pulling %s",
-        chat["model"],
-        embed["model"],
-        to_pull,
-    )
-
-    errors: list[str] = []
-    for m in to_pull:
-        _RECOMMENDED["pull_status"] = f"pulling {m}"
-        res = await pull_model(m)
-        if not res.get("ok"):
-            errors.append(f"{m}: {res.get('error', 'unknown error')}")
-
-    _RECOMMENDED["pulling"] = False
-    if errors:
-        _RECOMMENDED["pull_status"] = "partial failure"
-        _RECOMMENDED["pull_error"] = "; ".join(errors)
-        log.warning("ollama: auto-pull errors: %s", errors)
+        log.info(
+            "ollama: auto-tune done. Recommended chat=%s embed=%s — "
+            "%s not installed; user-driven pull when picked.",
+            chat["model"], embed["model"], ", ".join(needs),
+        )
     else:
-        _RECOMMENDED["pull_status"] = "ready"
+        _RECOMMENDED["pull_status"] = "all recommended models installed"
+        log.info(
+            "ollama: auto-tune done. Recommended chat=%s embed=%s "
+            "(both already installed).",
+            chat["model"], embed["model"],
+        )
 
     return _RECOMMENDED
 
@@ -481,10 +460,7 @@ async def auto_tune_models(disable_pull: bool = False) -> dict:
 async def startup_autotune_background() -> None:
     """Fire-and-forget entry point for FastAPI's startup hook.
 
-    We spawn the auto-tune as a background task rather than awaiting it
-    synchronously so uvicorn finishes startup (serves /api/*) while a first-
-    time user's multi-GB model pull runs. The UI reads the rolling status
-    from /api/system/config.
+    Records the recommendation but does NOT pull. See `auto_tune_models`.
     """
     try:
         await auto_tune_models()

@@ -157,15 +157,42 @@ def cancel_pairing(pairing_id: str) -> bool:
 
 
 def list_pending() -> list[dict]:
-    """Snapshot of currently-active offers — used by the UI to
+    """Snapshot of currently-active offers — used by the LOCAL UI to
     render the "PIN is X, waiting for the other side…" panel even
-    after a refresh."""
+    after a refresh.
+
+    Includes the PIN so the local UI can re-display it to the user.
+    Loopback-only via the auth middleware; never reachable from
+    other LAN clients (which would expose the PIN as a secret).
+    """
     _purge_expired()
     with _lock:
         return [
             {
                 "pairing_id": r.id,
                 "pin": r.pin,
+                "expires_at": r.expires_at,
+            }
+            for r in _pending.values()
+            if not r.consumed
+        ]
+
+
+def list_pending_handshake() -> list[dict]:
+    """Same shape as `list_pending` but with the PIN OMITTED.
+
+    Public on the LAN via /api/p2p/pair/handshake — a claimant device
+    GETs this from the host to learn the host's pairing_id + nonce so
+    it can build a signed claim. The PIN stays loopback-only because
+    it's the shared-secret half of the handshake; the rest is fine to
+    expose (useless without the PIN).
+    """
+    _purge_expired()
+    with _lock:
+        return [
+            {
+                "pairing_id": r.id,
+                "nonce": r.nonce_b64,
                 "expires_at": r.expires_at,
             }
             for r in _pending.values()

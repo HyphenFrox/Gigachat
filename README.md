@@ -114,7 +114,7 @@ A second header dropdown picks a per-conversation quality mode. Every mode uses 
 
 One sidebar footer button (⚙ Settings) hosts eight tabs:
 
-- **General** — default chat model, hardware summary, auto-pull status.
+- **General** — default chat model, hardware summary, recommended-but-not-installed model hint (no automatic background download — pulls happen only when you pick a model that isn't local).
 - **Compute pool** — identity, public-pool toggle, LAN discovery, paired devices with live status + per-workload routing toggles. Single source of truth for "other devices doing work for me."
 - **Memories** — global memory CRUD (one entry per row, optional `topic` for grouping; edits propagate immediately, no save button).
 - **Secrets** — named API tokens / credentials referenced via `{{secret:NAME}}`. Values hidden by default; click reveal to show one.

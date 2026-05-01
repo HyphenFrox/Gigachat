@@ -325,12 +325,16 @@ _STATIC_PREFIXES = (
 # sender's pinned public key. The middleware just needs to NOT block
 # the request before the crypto verify runs.
 _P2P_LAN_PREFIXES = (
-    "/api/p2p/secure/",        # encrypted compute proxy (one-shot + stream)
-    "/api/p2p/pair/accept",    # host accepts a claimant's PIN claim
-    "/api/p2p/pair/notify",    # symmetric-pair notify from the other side
+    "/api/p2p/secure/",         # encrypted compute proxy (one-shot + stream)
+    "/api/p2p/pair/accept",     # host accepts a claimant's PIN claim
+    "/api/p2p/pair/notify",     # symmetric-pair notify from the other side
     "/api/p2p/pair/unpair-notify",
-    "/api/p2p/discover",       # mDNS browser snapshot (public info)
-    "/api/p2p/identity",       # device_id + label + pubkeys (public info)
+    "/api/p2p/pair/handshake",  # claimant fetches host's pending offer
+                                #   (pairing_id + nonce, NO PIN) so it can
+                                #   build a signed claim against the host's
+                                #   actual challenge.
+    "/api/p2p/discover",        # mDNS browser snapshot (public info)
+    "/api/p2p/identity",        # device_id + label + pubkeys (public info)
 )
 
 
@@ -4192,6 +4196,35 @@ def api_p2p_pair_pending() -> dict:
     "PIN displayed, waiting…" panel after a refresh."""
     from . import p2p_pairing as _pair
     return {"pending": _pair.list_pending()}
+
+
+@app.get("/api/p2p/pair/handshake")
+def api_p2p_pair_handshake() -> dict:
+    """Public-on-LAN: list pending pairing offers WITHOUT the PIN.
+
+    Used by the cross-device pair flow: after the user types the PIN
+    on the claimant device, the claimant's frontend GETs this from the
+    HOST'S backend (via the LAN IP it discovered through mDNS) so it
+    can build a signed claim against the host's actual nonce. The PIN
+    is the only secret in the handshake; ``pairing_id`` and ``nonce``
+    are safe to expose because they're useless without the PIN to
+    sign over them.
+
+    Reachable from any RFC1918 LAN IP via _P2P_LAN_PREFIXES (no
+    password gate). The same trust profile as /api/p2p/identity —
+    public info that helps a peer initiate a pairing handshake.
+    """
+    from . import p2p_pairing as _pair
+    return {
+        "offers": [
+            {
+                "pairing_id": entry["pairing_id"],
+                "nonce": entry["nonce"],
+                "expires_at": entry["expires_at"],
+            }
+            for entry in _pair.list_pending_handshake()
+        ],
+    }
 
 
 @app.post("/api/p2p/pair/accept")
