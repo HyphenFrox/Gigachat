@@ -216,13 +216,33 @@ async def ensure_public_peer_worker(model_name: str) -> dict | None:
 # Auto-pull from the OFFICIAL Ollama registry (NOT peer-to-peer transfer)
 # ---------------------------------------------------------------------------
 
-async def auto_pull_on_host(model_name: str, *, timeout_sec: float = 600.0) -> bool:
+async def auto_pull_on_host(
+    model_name: str,
+    *,
+    timeout_sec: float = 600.0,
+    on_progress: Any = None,
+) -> bool:
     """Trigger ``ollama pull`` against the local Ollama instance.
 
     Used when the user picks a model and the host doesn't have it.
     Uses Ollama's HTTP API (the same /api/pull endpoint the CLI
-    drives) rather than spawning a subprocess so we get progress
-    streaming if needed in a future commit.
+    drives) so we can stream progress to the UI.
+
+    ``on_progress`` is an optional async callable that receives a
+    progress dict every time Ollama emits a status line. Shape:
+
+      {
+        "status": "downloading|verifying|writing|success|...",
+        "digest": "sha256:...",            # only for layer-level events
+        "completed": <int bytes>,          # only when downloading
+        "total": <int bytes>,              # only when downloading
+        "percent": <float 0-100>,          # derived helper
+      }
+
+    The agent provides one that bridges to the SSE turn so the user
+    sees a "Downloading model… 23% (1.2/5.4 GB)" indicator instead of
+    a silent multi-minute hang. Errors in ``on_progress`` are
+    swallowed — surfacing progress is best-effort.
 
     Returns True on success, False otherwise. Failure is logged at
     INFO; the caller surfaces a user-friendly error.
@@ -235,6 +255,7 @@ async def auto_pull_on_host(model_name: str, *, timeout_sec: float = 600.0) -> b
         return False
     url = "http://127.0.0.1:11434/api/pull"
     body = {"name": model_name, "stream": True}
+    import json as _json
     try:
         timeout = httpx.Timeout(connect=10.0, read=timeout_sec, write=30.0, pool=10.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -247,13 +268,44 @@ async def auto_pull_on_host(model_name: str, *, timeout_sec: float = 600.0) -> b
                         body_bytes[:200].decode("utf-8", errors="replace"),
                     )
                     return False
-                # Drain the NDJSON stream so the pull actually
-                # completes; we don't surface progress here yet.
                 async for line in r.aiter_lines():
                     if not line:
                         continue
-                    # Last line should look like {"status":"success"}
-                    # — anything else means in-progress chunk.
+                    # Parse the NDJSON status line so we can surface
+                    # progress to the caller. Tolerate malformed
+                    # lines silently — Ollama occasionally emits
+                    # blank or partial chunks during reconnect.
+                    if on_progress is None:
+                        continue
+                    try:
+                        evt = _json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(evt, dict):
+                        continue
+                    completed = evt.get("completed")
+                    total = evt.get("total")
+                    pct = None
+                    if (
+                        isinstance(completed, (int, float))
+                        and isinstance(total, (int, float))
+                        and total > 0
+                    ):
+                        pct = max(0.0, min(100.0, (completed / total) * 100.0))
+                    payload = {
+                        "model": model_name,
+                        "status": evt.get("status") or "",
+                        "digest": evt.get("digest") or "",
+                        "completed": completed,
+                        "total": total,
+                        "percent": pct,
+                    }
+                    try:
+                        await on_progress(payload)
+                    except Exception:
+                        # Best-effort callback — never block the
+                        # actual download on a UI-side failure.
+                        pass
         log.info("auto-pull: completed pull of %r on host", model_name)
         return True
     except Exception as e:

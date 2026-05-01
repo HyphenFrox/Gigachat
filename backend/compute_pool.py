@@ -2163,16 +2163,54 @@ def pick_chat_target(
 
     if not cands:
         return None
-    # Tie-aware selection: among workers whose capability score equals
-    # the leader's, pick the least-busy. Concurrent turns from
-    # different conversations spread across the pool.
+    # Near-tie-aware selection. The original tie-breaker only kicked
+    # in on EXACT capability-score equality, which almost never
+    # happens in practice (one worker has measured 4.2 tok/s, another
+    # 4.1 — different scores → no tie). We now widen "tied" to the
+    # near-tie band (top_score scaled by ~0.85) so the load and
+    # locality factors get a real say when N workers all have the
+    # same model installed.
     top_score = _capability_score(cands[0])
-    tied = [c for c in cands if _capability_score(c) == top_score]
-    if len(tied) > 1:
-        tied.sort(
-            key=lambda c: _ACTIVE_TURNS_PER_NODE.get(f"worker:{c['id']}", 0),
+    near_band = _scaled_score_threshold(top_score)
+    near_tied = [c for c in cands if _capability_score(c) >= near_band]
+
+    if len(near_tied) > 1:
+        # Multi-criteria sort, lowest-key-wins:
+        #   1. LOCALITY — LAN-paired peers (and host) before public-
+        #      pool peers. A LAN peer's RTT is sub-millisecond; a
+        #      public-pool peer crosses the internet, often hundreds
+        #      of ms. Only let a public peer win on locality when
+        #      it's measurably more capable AND no LAN option is
+        #      eligible.
+        #   2. LOAD — fewer in-flight turns wins. Concurrent
+        #      conversations spread across the pool instead of
+        #      stacking on the strongest single node.
+        #   3. CAPABILITY — within the near-tie band, but still a
+        #      tie-breaker when locality + load are equal.
+        def _locality_rank(w: dict) -> int:
+            # 0 = LAN paired, 1 = public, 2 = unknown / manually-added
+            did = w.get("gigachat_device_id") or ""
+            if not did:
+                return 2
+            try:
+                paired = db.get_paired_device(did)
+            except Exception:
+                paired = None
+            role = (paired or {}).get("role") or ""
+            if role == "local":
+                return 0
+            if role == "public":
+                return 1
+            return 2
+        near_tied.sort(
+            key=lambda c: (
+                _locality_rank(c),
+                _ACTIVE_TURNS_PER_NODE.get(f"worker:{c['id']}", 0),
+                # Negate capability so higher beats lower in ascending sort.
+                tuple(-x for x in _capability_score(c)),
+            ),
         )
-        w = tied[0]
+        w = near_tied[0]
     else:
         w = cands[0]
     # Schedule a background bench of the host on this exact model so
@@ -5039,6 +5077,64 @@ def _pool_model_inventory() -> list[dict]:
     return [m for m in out if m["name"] and "embed" not in m["name"].lower()]
 
 
+def find_smaller_variants_in_family(
+    model_name: str, *, max_size_bytes: int,
+) -> list[dict]:
+    """Suggest smaller-but-same-family alternatives that would fit.
+
+    Used by the mega-model warning path: when the user picks a model
+    too big to run usefully on the pool, we surface a short list of
+    same-family models that ARE small enough — Llama-3-70B doesn't
+    fit, here are llama3:8b and llama3:13b that do.
+
+    Quality preservation: the returned list is filtered to models the
+    user (or someone in the swarm) ALREADY HAS, NOT freshly-quantized
+    versions. We never silently degrade Q4 → Q3 to fit; the user
+    keeps their quality bar by picking from real same-family
+    variants designed at smaller sizes.
+
+    Returns up to 6 entries sorted largest-fitting first (closer to
+    user's original quality intent). Empty list when no same-family
+    variant exists in the pool.
+    """
+    if not model_name:
+        return []
+    info = resolve_ollama_model(model_name)
+    target_family = ((info or {}).get("family") or "").lower()
+    if not target_family:
+        return []
+    inventory = _pool_model_inventory()
+    candidates: list[dict] = []
+    seen_names: set[str] = set()
+    target_size = int((info or {}).get("size_bytes") or 0)
+    for entry in inventory:
+        name = entry.get("name") or ""
+        family = (entry.get("family") or "").lower()
+        size = int(entry.get("size_bytes") or 0)
+        if not name or family != target_family:
+            continue
+        if name == model_name or name in seen_names:
+            continue
+        # Only suggest models smaller than the original AND that fit
+        # within the pool's available memory.
+        if target_size > 0 and size >= target_size:
+            continue
+        if max_size_bytes > 0 and size > max_size_bytes:
+            continue
+        seen_names.add(name)
+        candidates.append({
+            "name": name,
+            "family": family,
+            "size_bytes": size,
+            "size_gb": round(size / (1024 ** 3), 1),
+            "source": entry.get("source") or "host",
+        })
+    # Largest-fitting first — closer to the user's original quality
+    # intent than the smallest variant in the family.
+    candidates.sort(key=lambda c: c["size_bytes"], reverse=True)
+    return candidates[:6]
+
+
 def _list_host_installed_models() -> list[dict]:
     """Read every `manifests/registry.ollama.ai/library/<model>/<tag>`
     JSON file under the host's Ollama models dir, return per-tag
@@ -5554,6 +5650,26 @@ async def ensure_worker_chat_server(
             f"draft={draft_on_worker}"
         )
 
+    # Pick a continuous-batching slot count tuned to the worker's
+    # observed VRAM. Mirrors split_lifecycle._compute_optimal_parallel
+    # without needing GGUF-metadata round-trips back to the worker —
+    # we use the same tier table ollama_runtime uses for host. A
+    # worker servicing one chat at a time pays nothing for unused
+    # slots; adding 2-8 slots lets concurrent dispatches (parallel
+    # subagents, two browser tabs against the same worker) share
+    # the warm engine instead of serializing.
+    worker_vram_gb = float(
+        (worker.get("capabilities") or {}).get("max_vram_seen_bytes") or 0,
+    ) / (1024 ** 3)
+    if worker_vram_gb >= 20:
+        worker_parallel = 8
+    elif worker_vram_gb >= 12:
+        worker_parallel = 4
+    elif worker_vram_gb >= 6:
+        worker_parallel = 2
+    else:
+        worker_parallel = 1
+
     # Build the spawn command. Worker-side llama-server runs the same
     # CLI as host's, just with target + draft both local. The flags
     # mirror split_lifecycle._build_command's defaults so the chat
@@ -5566,6 +5682,8 @@ async def ensure_worker_chat_server(
     #     loss — frees room for the draft model on the worker.
     #   * `--cache-reuse 256` makes follow-up turns reuse the previous
     #     prompt's prefix via KV-shift; big win on multi-turn chat.
+    #   * `--parallel N` enables continuous batching on the worker so
+    #     concurrent requests share the same warm engine.
     spawn_cmd = (
         f'"{llama_server_path}" '
         f'--model "{target_on_worker}" '
@@ -5573,6 +5691,7 @@ async def ensure_worker_chat_server(
         f'--port {_WORKER_LLAMA_PORT} '
         '--flash-attn on -ctk q8_0 -ctv q8_0 --cache-reuse 256 '
         '--jinja -ngl 99 -c 4096 --no-warmup '
+        f'--parallel {worker_parallel} '
         f'-md "{draft_on_worker}" --draft-max 8 --draft-min 1 -ngld 99'
     )
     # Win32_Process.Create makes the spawned llama-server outlive the
@@ -5763,7 +5882,11 @@ class RouteChatError(RuntimeError):
         self.status = status or {}
 
 
-async def route_chat_for(model_name: str) -> dict:
+async def route_chat_for(
+    model_name: str,
+    *,
+    on_pull_progress: Any = None,
+) -> dict:
     """Pick the right inference engine for this model + drive any
     needed lifecycle changes.
 
@@ -5829,7 +5952,12 @@ async def route_chat_for(model_name: str) -> dict:
                 # "model not found" downstream. Triggered as a
                 # blocking call so the very next chat turn benefits;
                 # caller can hit Ctrl+C if they don't want to wait.
-                pulled = await _ppr.auto_pull_on_host(model_name)
+                # Progress callback bridges to the agent's SSE stream
+                # so the user sees download % instead of a silent
+                # multi-minute hang.
+                pulled = await _ppr.auto_pull_on_host(
+                    model_name, on_progress=on_pull_progress,
+                )
                 if pulled:
                     log.info(
                         "compute_pool: auto-pulled %r on host before "
@@ -6203,6 +6331,15 @@ async def route_chat_for(model_name: str) -> dict:
                     rpc_pool_total / (1024 ** 3), 1,
                 )
                 result["model_size_gb"] = round(size_bytes / (1024 ** 3), 1)
+                # Suggest smaller same-family variants the user already
+                # has — quality-preserving alternatives instead of
+                # silent quantization. Empty list when nothing fits;
+                # UI just shows the mega warning without suggestions.
+                result["suggested_smaller_models"] = (
+                    find_smaller_variants_in_family(
+                        model_name, max_size_bytes=rpc_pool_total,
+                    )
+                )
                 # Mark host's disk subsystem busy so subsequent parallel
                 # work (subagents / embeddings / side chats) is biased
                 # toward workers — keeps the host disk dedicated to the
@@ -6232,6 +6369,11 @@ async def route_chat_for(model_name: str) -> dict:
         result["mega_model"] = True
         result["pool_memory_gb"] = round(host_total / (1024 ** 3), 1)
         result["model_size_gb"] = round(size_bytes / (1024 ** 3), 1)
+        result["suggested_smaller_models"] = (
+            find_smaller_variants_in_family(
+                model_name, max_size_bytes=host_total,
+            )
+        )
         # Same reasoning as the Tier-2 mega path above: bias parallel
         # work to workers while the host disk is busy mmapping.
         _mark_host_mega_busy()

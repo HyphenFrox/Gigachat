@@ -2560,6 +2560,23 @@ async def _stream_ollama_chat_via_secure_proxy(
                 # the direct path applies.
                 continue
     except _secure.SecureProxyError as e:
+        # Mark the worker as transiently unavailable so the next
+        # routing call skips it. The probe loop will reset the
+        # last_error after the next successful probe; until then,
+        # the user's retry routes to a healthy peer instead of
+        # repeating the failed dispatch. This is "KV-cache resume"
+        # at the routing layer: we lose the KV cache on the dead
+        # worker, but the resume happens against a different node
+        # without manual intervention.
+        try:
+            from . import db as _db
+            wid = worker.get("id")
+            if wid:
+                _db.update_compute_worker_capabilities(
+                    wid, last_error=f"stream interrupted: {type(e).__name__}",
+                )
+        except Exception:
+            pass
         # Surface as a normal stream error so the agent's existing
         # error handler renders it to the UI.
         raise httpx.HTTPError(f"secure proxy: {e}")
@@ -3224,8 +3241,47 @@ async def _run_turn_impl(
         # auto-stops it when it doesn't. Everything is invisible to the
         # user — they just pick a model from the picker.
         split_target: tuple[str, str] | None = None
+        # Pull-progress bridge: the agent owns an asyncio.Queue that
+        # the routing layer pushes pull-progress events into; we
+        # drain it concurrently with the route_chat_for await so the
+        # user sees a live "downloading model… 23%" indicator
+        # instead of a silent multi-minute hang during auto-pull.
+        _pull_progress_q: asyncio.Queue = asyncio.Queue()
+
+        async def _on_pull_progress(payload: dict) -> None:
+            try:
+                _pull_progress_q.put_nowait({
+                    "type": "model_download_progress",
+                    **payload,
+                })
+            except asyncio.QueueFull:
+                # Best-effort: drop progress chips when the consumer
+                # is slow rather than block the download.
+                pass
+
         try:
-            decision = await compute_pool.route_chat_for(conv["model"])
+            # Run route_chat_for as a task so we can drain the
+            # progress queue concurrently. Each event drained gets
+            # yielded immediately to the SSE stream.
+            route_task = asyncio.create_task(
+                compute_pool.route_chat_for(
+                    conv["model"], on_pull_progress=_on_pull_progress,
+                ),
+            )
+            while not route_task.done():
+                try:
+                    evt = await asyncio.wait_for(
+                        _pull_progress_q.get(), timeout=0.25,
+                    )
+                    yield evt
+                except asyncio.TimeoutError:
+                    continue
+            # Drain any final events the routing layer queued just
+            # before completing — we want the "100%" chip even if
+            # the task transitions to done before our next poll.
+            while not _pull_progress_q.empty():
+                yield _pull_progress_q.get_nowait()
+            decision = route_task.result()
         except compute_pool.RouteChatError as e:
             # Two failure modes:
             # 1. Acquisition in progress (Scope B): override / mmproj
@@ -3278,11 +3334,30 @@ async def _run_turn_impl(
         # the user accurate expectations instead of the appearance
         # of a hung backend.
         if decision.get("mega_model"):
+            suggestions = decision.get("suggested_smaller_models") or []
+            # Build a quality-preserving alternative blurb: same family,
+            # ALREADY in the pool, designed at smaller sizes (NOT
+            # auto-quantized — see compute_pool.find_smaller_variants_in_family).
+            if suggestions:
+                names_blurb = ", ".join(
+                    f"{m['name']} ({m['size_gb']} GB)"
+                    for m in suggestions[:3]
+                )
+                tail_msg = (
+                    f"Quality-preserving alternatives in your pool: {names_blurb}. "
+                    "Pick one in the model picker for normal-speed chat."
+                )
+            else:
+                tail_msg = (
+                    "Pull a smaller variant in the same family "
+                    "(e.g. an 8B / 13B / 30B model) for interactive-speed chat."
+                )
             yield {
                 "type": "mega_model_warning",
                 "model": conv["model"],
                 "model_size_gb": decision.get("model_size_gb"),
                 "pool_memory_gb": decision.get("pool_memory_gb"),
+                "suggested_smaller_models": suggestions,
                 "message": (
                     f"{conv['model']!r} is "
                     f"{decision.get('model_size_gb', '?')} GB but the "
@@ -3290,8 +3365,7 @@ async def _run_turn_impl(
                     "of available memory. Layers beyond capacity will "
                     "page from disk on each forward pass — expect "
                     "very slow per-token rates (typically 0.1-1 tok/s). "
-                    "Consider a smaller quant or a smaller model for "
-                    "interactive use."
+                    + tail_msg
                 ),
             }
 
@@ -3576,6 +3650,49 @@ async def _run_turn_impl(
                 if tail_delta:
                     yield {"type": "delta", "text": tail_delta}
             except httpx.HTTPError as e:
+                # Mid-stream worker failure: mark the routed worker
+                # transiently unhealthy so the user's retry / next
+                # turn routes to a different node. The probe loop
+                # clears `last_error` when the worker comes back up
+                # — until then, `_is_fresh` excludes it from
+                # eligibility. This is the "KV-cache resume across
+                # worker restarts" hook: we lose the warm KV on the
+                # dead worker, but the failover is automatic.
+                try:
+                    target_meta = _LAST_CHAT_TARGET.get(conversation_id) or {}
+                    base = target_meta.get("base_url") or ""
+                    if base and base != OLLAMA_URL:
+                        for w in db.list_compute_workers(enabled_only=True):
+                            wbu = (
+                                f"http://{w.get('address')}:"
+                                f"{int(w.get('ollama_port') or 11434)}"
+                            )
+                            if wbu == base:
+                                db.update_compute_worker_capabilities(
+                                    w["id"],
+                                    last_error=(
+                                        f"chat stream interrupted: "
+                                        f"{type(e).__name__}"
+                                    ),
+                                )
+                                break
+                except Exception:
+                    pass
+                # Persist whatever the stream produced so the user
+                # doesn't lose the partial response. The next user
+                # message will route to a different worker (because
+                # we just marked this one unhealthy) and continue
+                # the conversation from history.
+                _persist_partial(partial=True)
+                yield {
+                    "type": "stream_interrupted",
+                    "message": (
+                        f"Worker became unreachable mid-response "
+                        f"({type(e).__name__}). Partial reply saved. "
+                        "Send another message to continue — the next "
+                        "turn will route to a different node."
+                    ),
+                }
                 yield {"type": "error", "message": f"ollama error: {e}"}
                 return
             except asyncio.CancelledError:

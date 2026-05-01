@@ -1270,6 +1270,49 @@ export default function ChatView({
           })
         }
         break
+      case 'stream_interrupted':
+        // A worker dropped mid-response. The agent already marked
+        // the offending worker as transiently unhealthy and saved
+        // whatever was streamed so far as a partial response. Surface
+        // a clear toast so the user knows their next message will
+        // resume the conversation on a different node — no manual
+        // retry-routing required.
+        toast.warning('Worker dropped mid-response', {
+          description:
+            evt.message ||
+            'Partial reply saved. Next message will route to a different node.',
+          duration: 7000,
+        })
+        break
+      case 'model_download_progress': {
+        // Auto-pull from the OFFICIAL Ollama registry is in flight
+        // because no peer in the swarm offered the model. We surface
+        // a single Sonner toast keyed by `model-download:<name>` so
+        // repeated progress events update the SAME toast in place
+        // instead of stacking. The toast disappears on `success`.
+        const name = evt.model || 'model'
+        const status = (evt.status || '').toLowerCase()
+        const id = `model-download:${name}`
+        if (status.includes('success') || status === 'done') {
+          toast.success(`Downloaded ${name}`, { id, duration: 4000 })
+          break
+        }
+        const completed = typeof evt.completed === 'number' ? evt.completed : null
+        const total = typeof evt.total === 'number' ? evt.total : null
+        const pct =
+          typeof evt.percent === 'number' ? `${evt.percent.toFixed(1)}%` : ''
+        const sizeStr =
+          completed && total
+            ? `${(completed / 1e9).toFixed(2)} / ${(total / 1e9).toFixed(2)} GB`
+            : ''
+        toast.loading(`Downloading ${name}`, {
+          id,
+          description: [evt.status || 'pulling', pct, sizeStr]
+            .filter(Boolean)
+            .join(' · '),
+        })
+        break
+      }
       default:
         break
     }
