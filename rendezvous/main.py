@@ -125,21 +125,49 @@ class Candidate(BaseModel):
     source: str = Field(default="stun", max_length=16)
 
 
+class ModelEntry(BaseModel):
+    """One Ollama-installed model the peer is willing to serve.
+
+    Trimmed shape compared to Ollama's /api/tags — we only carry the
+    fields the model picker uses (name + size + a couple of details
+    for sorting / display). Larger pieces (capabilities array,
+    template, modelfile) are NOT exchanged via rendezvous to keep
+    the peer registration small.
+    """
+    name: str = Field(..., min_length=1, max_length=128)
+    family: str | None = Field(default=None, max_length=32)
+    parameter_size: str | None = Field(default=None, max_length=16)
+    quantization_level: str | None = Field(default=None, max_length=16)
+    size_bytes: int = Field(default=0, ge=0)
+
+
 class RegisterBody(BaseModel):
     """Body for POST /register.
 
     The signature proves the peer holds the Ed25519 private key
     matching `public_key_b64`. The signed message is the JSON-encoded
-    payload of (device_id, public_key_b64, candidates, timestamp) in
-    that order, separated by '|' to prevent ambiguity.
+    payload of (device_id, public_key_b64, candidates, models,
+    timestamp) in that order, separated by '|' to prevent ambiguity.
 
     Replay protection: `timestamp` must be fresh
     (within REGISTER_TIMESTAMP_SKEW_SEC of server time). The same
     signature can't be reused after the window closes.
+
+    `x25519_public_b64` is the peer's encryption pubkey (separate
+    from Ed25519 signing pubkey). Other peers use it to seal
+    envelopes addressed to this peer — they look it up via
+    /lookup/{device_id} or /models when picking a route.
+
+    `models` is the list of Ollama models this peer is willing to
+    serve. Empty list is fine — peer can join the swarm purely as a
+    consumer. The list is whatever the peer's local /api/tags
+    returned, trimmed to the picker-relevant fields.
     """
     device_id: str = Field(..., min_length=4, max_length=64)
     public_key_b64: str = Field(..., min_length=8, max_length=128)
+    x25519_public_b64: str | None = Field(default=None, max_length=128)
     candidates: list[Candidate] = Field(default_factory=list, max_length=8)
+    models: list[ModelEntry] = Field(default_factory=list, max_length=200)
     timestamp: float = Field(..., gt=0)
     signature_b64: str = Field(..., min_length=8, max_length=256)
 
@@ -157,7 +185,9 @@ class LookupResponse(BaseModel):
     """Response shape for /lookup/{device_id}."""
     device_id: str
     public_key_b64: str
+    x25519_public_b64: str | None = None
     candidates: list[Candidate]
+    models: list[ModelEntry] = Field(default_factory=list)
     last_seen_at: float
     ttl_remaining_sec: float
 
@@ -239,18 +269,27 @@ def _check_rate_limit(ip: str) -> None:
 def _build_register_message(body: RegisterBody) -> bytes:
     """Canonical bytes that body.signature must verify against.
 
-    Same shape on the client; mismatched serialization would break
-    the signature even when the actual data is identical, so we
-    nail down the format here. Pipe-separated, lexicographic order.
+    v2 added x25519_public_b64 + models to the signed payload so a
+    captured v1 signature can't be replayed against a v2 peer record.
+    Pipe-separated, lexicographic, deterministic — both client and
+    server must agree byte-for-byte.
     """
     cand_repr = ",".join(
         f"{c.ip}:{c.port}:{c.source}" for c in body.candidates
     )
+    # Models serialised as `name|size_bytes` joined by `;`. Stable
+    # because the client sends them in the same order it gets from
+    # /api/tags.
+    models_repr = ";".join(
+        f"{m.name}|{m.size_bytes}" for m in body.models
+    )
     parts = [
-        b"gigachat-rdv-register-v1",
+        b"gigachat-rdv-register-v2",
         body.device_id.encode("ascii"),
         body.public_key_b64.encode("ascii"),
+        (body.x25519_public_b64 or "").encode("ascii"),
         cand_repr.encode("ascii"),
+        models_repr.encode("ascii"),
         f"{body.timestamp:.6f}".encode("ascii"),
     ]
     return b"|".join(parts)
@@ -316,7 +355,9 @@ async def register(body: RegisterBody, request: Request) -> dict:
         _peers[body.device_id] = {
             "device_id": body.device_id,
             "public_key_b64": body.public_key_b64,
+            "x25519_public_b64": body.x25519_public_b64,
             "candidates": [c.model_dump() for c in body.candidates],
+            "models": [m.model_dump() for m in body.models],
             "last_seen_at": time.time(),
         }
     return {
@@ -369,10 +410,70 @@ async def lookup(device_id: str) -> LookupResponse:
         return LookupResponse(
             device_id=rec["device_id"],
             public_key_b64=rec["public_key_b64"],
+            x25519_public_b64=rec.get("x25519_public_b64"),
             candidates=[Candidate(**c) for c in rec["candidates"]],
+            models=[ModelEntry(**m) for m in (rec.get("models") or [])],
             last_seen_at=rec["last_seen_at"],
             ttl_remaining_sec=ttl_remaining,
         )
+
+
+@app.get("/models")
+async def models_index() -> dict:
+    """Aggregated model index across every currently-registered peer.
+
+    Returns ``{"models": [<entry>, ...]}`` where each entry carries
+    the model name + size + the source peer's identity. Callers (the
+    Gigachat backend's `/api/models/all-sources` endpoint) merge this
+    into their model-picker payload so users can see which models are
+    available on the public swarm right now.
+
+    Cheap: it's a single dict scan over registered peers, capped at
+    a few hundred entries. No persistence, no fanout.
+    """
+    async with _state_lock:
+        _purge_expired()
+        out: list[dict] = []
+        for rec in _peers.values():
+            for m in rec.get("models") or []:
+                out.append({
+                    "name": m.get("name"),
+                    "family": m.get("family"),
+                    "parameter_size": m.get("parameter_size"),
+                    "quantization_level": m.get("quantization_level"),
+                    "size_bytes": m.get("size_bytes") or 0,
+                    "source_device_id": rec["device_id"],
+                    "source_label": (rec.get("device_id") or "")[:16],
+                })
+    return {
+        "models": out,
+        "peer_count": len(_peers),
+    }
+
+
+@app.get("/peers_with_model")
+async def peers_with_model(name: str) -> dict:
+    """Return every registered peer offering a specific model.
+
+    Used by the routing layer when a user picks a public-pool model
+    and we need to know which peers can serve it. Each peer entry
+    includes the candidate endpoints + their X25519 pubkey so the
+    caller can immediately seal an envelope to one of them.
+    """
+    if not name:
+        raise HTTPException(400, "name query param is required")
+    async with _state_lock:
+        _purge_expired()
+        peers = []
+        for rec in _peers.values():
+            if any(m.get("name") == name for m in rec.get("models") or []):
+                peers.append({
+                    "device_id": rec["device_id"],
+                    "public_key_b64": rec["public_key_b64"],
+                    "x25519_public_b64": rec.get("x25519_public_b64"),
+                    "candidates": rec.get("candidates", []),
+                })
+    return {"name": name, "peers": peers, "count": len(peers)}
 
 
 @app.get("/")
@@ -385,6 +486,8 @@ async def index() -> dict:
             "POST /register",
             "POST /heartbeat",
             "GET /lookup/{device_id}",
+            "GET /models",
+            "GET /peers_with_model?name=<model>",
             "GET /health",
         ],
         "peers_registered": len(_peers),

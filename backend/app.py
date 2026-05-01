@@ -1386,6 +1386,123 @@ async def list_models(all: bool = False) -> dict:
         return {"models": [], "error": str(e)}
 
 
+@app.get("/api/models/all-sources")
+async def list_models_all_sources(tools_only: bool = True) -> dict:
+    """Aggregated model inventory across local + LAN + public pool.
+
+    Response shape:
+      {
+        "local":  [{"name", "family", "size_bytes"}, ...],
+        "lan":    [{"name", "source_device_id", "source_label",
+                    "size_bytes", "family"}, ...],
+        "public": [{"name", "source_device_id", "source_label", ...}, ...],
+        "public_pool_enabled": bool,
+      }
+
+    LAN models come from each paired peer's last probe (cached in
+    `compute_workers.capabilities_json.models` — populated by the
+    periodic /api/tags probe). No live network calls here, so the
+    endpoint is fast.
+
+    Public-pool models come from the rendezvous lookup when the
+    Public Pool toggle is on. If the rendezvous is unreachable or
+    not configured, the `public` array is empty + `error` set.
+
+    `tools_only` (default True) filters local models to just those
+    whose Ollama template declares tool-calling support — same logic
+    as `/api/models`. LAN/Public models aren't filtered because we
+    don't have probe data on their templates yet.
+    """
+    out: dict[str, Any] = {
+        "local": [],
+        "lan": [],
+        "public": [],
+        "public_pool_enabled": False,
+    }
+    # Local
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get("http://localhost:11434/api/tags")
+            r.raise_for_status()
+            data = r.json()
+            local_raw = [m for m in (data.get("models") or [])]
+            if tools_only:
+                results = await asyncio.gather(
+                    *[_model_supports_tools(c, m["name"]) for m in local_raw],
+                    return_exceptions=True,
+                )
+                local_raw = [
+                    m for m, ok in zip(local_raw, results)
+                    if isinstance(ok, bool) and ok
+                ]
+            for m in local_raw:
+                details = m.get("details") or {}
+                out["local"].append({
+                    "name": m.get("name"),
+                    "family": details.get("family"),
+                    "parameter_size": details.get("parameter_size"),
+                    "quantization_level": details.get("quantization_level"),
+                    "size_bytes": m.get("size") or 0,
+                })
+    except Exception as e:
+        out["local_error"] = str(e)
+
+    # LAN — read from paired-peer capabilities_json (already
+    # populated by the periodic worker probe). No network call here.
+    try:
+        for w in db.list_compute_workers(enabled_only=True):
+            if not w.get("gigachat_device_id"):
+                continue  # manually-added (non-paired) worker, skip
+            caps = w.get("capabilities") or {}
+            for m in caps.get("models") or []:
+                if not m.get("name"):
+                    continue
+                out["lan"].append({
+                    "name": m["name"],
+                    "source_device_id": w.get("gigachat_device_id"),
+                    "source_label": w.get("label"),
+                    "family": m.get("family"),
+                    "parameter_size": m.get("parameter_size"),
+                    "quantization_level": m.get("quantization_level"),
+                    "size_bytes": m.get("size") or 0,
+                    "encrypted": bool(w.get("use_encrypted_proxy")),
+                })
+    except Exception as e:
+        out["lan_error"] = str(e)
+
+    # Public pool — only when toggled on. Looks up the rendezvous
+    # for an aggregated peer-model index. The rendezvous endpoint
+    # this calls is added in the follow-up commit; for now we
+    # gracefully no-op when the rendezvous returns 404 on /models.
+    pp_val = db.get_setting("p2p_public_pool_enabled")
+    public_enabled = (
+        pp_val is None
+        or str(pp_val).lower() in ("1", "true", "yes", "on")
+    )
+    out["public_pool_enabled"] = public_enabled
+    if public_enabled:
+        try:
+            from . import p2p_rendezvous as _rdv
+            url = _rdv._current_rendezvous_url()
+            if url:
+                async with httpx.AsyncClient(timeout=8.0) as c:
+                    r = await c.get(f"{url.rstrip('/')}/models")
+                    if r.status_code == 200:
+                        data = r.json() or {}
+                        for entry in data.get("models") or []:
+                            out["public"].append(entry)
+                    elif r.status_code == 404:
+                        # Rendezvous predates the /models endpoint —
+                        # skip without surfacing as an error.
+                        pass
+                    else:
+                        out["public_error"] = f"HTTP {r.status_code}"
+        except Exception as e:
+            out["public_error"] = str(e)
+
+    return out
+
+
 @app.get("/api/models/{name:path}/capabilities")
 async def api_model_capabilities(name: str) -> dict:
     """Return the Ollama capabilities list for one installed model.

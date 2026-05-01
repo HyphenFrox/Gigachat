@@ -84,6 +84,17 @@ export const api = {
     request(`/api/models${all ? '?all=1' : ''}`),
 
   /**
+   * Aggregated model inventory across local, paired-LAN peers, and
+   * (when public pool is on) the public rendezvous index. Returns
+   *   { local: [...], lan: [...], public: [...], public_pool_enabled }.
+   * Each entry has at least `name`; LAN/public entries also carry
+   * `source_device_id` + `source_label` so the UI can show which
+   * peer is offering the model.
+   */
+  listModelsAllSources: ({ toolsOnly = true } = {}) =>
+    request(`/api/models/all-sources?tools_only=${toolsOnly ? 1 : 0}`),
+
+  /**
    * Fetch the capabilities list for a single installed model. Used by the
    * composer to warn the user before attaching images to a non-vision
    * chat model (the attachment would be stripped by the agent layer).
