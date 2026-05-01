@@ -726,22 +726,26 @@ function PublicPoolCard({ enabled, onChange }) {
             <h3 className="text-sm font-semibold">Public pool</h3>
             <Switch checked={enabled} onCheckedChange={onChange} />
           </div>
+          {/* Two-line accuracy contract: tells the user the swarm is
+              bidirectional (donate AND consume) and that consumption
+              crosses the internet (encrypted). The previous copy
+              claimed prompts "never leave this network", which became
+              wrong once the public-pool consumer path shipped — chat
+              CAN dispatch to a peer's GPU when no local device has
+              the model. End-to-end encryption is the protection;
+              local-network-only is not. */}
           <p className="mt-1 text-xs leading-snug text-muted-foreground">
             {enabled ? (
               <>
-                <strong className="text-foreground">On — donating idle compute.</strong>{' '}
-                Your spare GPU/CPU cycles run other peers' public workloads
-                when you aren't using them, and you benefit from cooperative
-                model-weight distribution.{' '}
-                <strong className="text-foreground">
-                  Your prompts still run only on your local pool — they never leave this network.
-                </strong>
+                <strong className="text-foreground">On.</strong>{' '}
+                Donates idle compute; uses peers' GPUs when a model isn't
+                local. Traffic is end-to-end encrypted; local pool wins routing.
               </>
             ) : (
               <>
-                <strong className="text-foreground">Off — local pool only.</strong>{' '}
-                You're disconnected from the global swarm. Inference and any
-                background workloads run exclusively on your paired LAN devices.
+                <strong className="text-foreground">Off.</strong>{' '}
+                Local devices only. New models auto-pull from the OFFICIAL
+                Ollama registry — never from peers.
               </>
             )}
           </p>
