@@ -4577,8 +4577,30 @@ def api_p2p_list_paired() -> dict:
 
 @app.delete("/api/p2p/paired/{device_id}")
 def api_p2p_unpair(device_id: str) -> dict:
-    """Drop a pairing record. The other side keeps theirs until
-    they unpair on their own device."""
+    """Drop a pairing record AND the auto-created compute_worker that
+    rode along with it. The other side keeps their pairing until they
+    unpair on their own device.
+
+    The compute_worker cleanup mirrors the symmetric-unpair path
+    (`api_p2p_pair_unpair_notify`) so both directions are consistent
+    — without it, a unilateral unpair from the UI left an orphaned
+    compute_worker row that the routing layer would still try to
+    dispatch to (and fail) until the next periodic probe sweep
+    auto-disabled it.
+    """
+    try:
+        worker = db.get_compute_worker_by_device_id(device_id)
+        if worker:
+            db.delete_compute_worker(worker["id"])
+    except Exception as e:
+        log.info("unpair: compute_worker cleanup failed: %s", e)
+    # Also forget any cached crypto material for this peer so a
+    # re-pair starts from a clean slate.
+    try:
+        from . import p2p_crypto as _pc
+        _pc.clear_key_cache()
+    except Exception:
+        pass
     if not db.delete_paired_device(device_id):
         raise HTTPException(404, "device not paired")
     return {"unpaired": True}

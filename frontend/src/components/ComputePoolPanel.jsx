@@ -1,16 +1,27 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus,
-  Trash2,
-  Pencil,
+  Loader2,
   RefreshCw,
-  Server,
+  Trash2,
   Wifi,
+  WifiOff,
+  ShieldCheck,
+  Globe,
+  Pencil,
+  Check,
+  X,
+  KeyRound,
+  Lock,
+  Unlock,
+  Server,
+  Smartphone,
+  Laptop,
+  Monitor,
+  Cpu,
   CircleCheck,
   CircleX,
   CircleHelp,
-  Cpu,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -23,188 +34,277 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { cn } from '@/lib/utils'
+import { cn, formatMessageTime, formatFullTimestamp } from '@/lib/utils'
 import { api } from '@/lib/api'
 import AutoSplitInstallSection from './SplitModelsPanel'
 
 /**
- * ComputePoolSection — body for the "Compute Pool" tab inside SettingsPanel.
+ * ComputePoolSection — single Settings tab that owns the entire
+ * "other devices doing work for me" UX.
  *
- * The compute pool lets the user register other PCs (laptops, spare desktops)
- * as Ollama workers. The host then routes a slice of its workload to those
- * machines so big models / parallel subagents finish faster, and cross-LAN
- * fanout doesn't fight a single GPU.
+ * Replaces the pre-merge split between Settings → Compute (manual IP /
+ * SSH workers) and Settings → Network (PIN-paired Gigachat peers).
+ * Both surfaces backed the same routing layer, so the user saw a
+ * paired device twice — once in each tab — and could edit it from
+ * either side, which was confusing.
  *
- * All ongoing traffic — chat, embeddings, subagent calls — flows over the
- * LAN address. An optional Tailscale identifier is stored alongside it
- * purely as a self-repair handle: when the worker rejoins the LAN and DHCP
- * gives it a different IP, the backend reaches it over Tailscale just long
- * enough to rediscover the new LAN address. Tailscale is never used for
- * regular traffic, so the user's metered internet bandwidth is preserved.
+ * Layout (top → bottom):
+ *   1. Public-pool toggle — most consequential decision, gets the
+ *      visual weight.
+ *   2. Internet rendezvous status — only when public pool is on.
+ *   3. This device — identity card with rename.
+ *   4. Active pair offer — renders when a pairing is in flight.
+ *   5. Devices on this network — mDNS-discovered, ready to pair.
+ *   6. Paired devices — the actual compute pool, joined view of
+ *      `paired_devices` + `compute_workers` (same physical machine,
+ *      one row each in the underlying schema). Shows live status,
+ *      capabilities (Ollama version, GPU, model count), workload
+ *      routing toggles, test-connection + unpair affordances.
+ *   7. Legacy workers — manually-added rows from the pre-merge UI.
+ *      Delete-only; new manual entries aren't accepted because
+ *      paired devices cover every supported case.
+ *   8. End-to-end encryption summary — pinned info card.
+ *   9. AutoSplit install banner — one-time llama.cpp install for
+ *      the big-model split path.
  *
- * Each row shows the live probe status (online / unreachable / never seen),
- * the worker's Ollama version, and how many models it has installed. The
- * "Test connection" action triggers an out-of-band probe so the user
- * doesn't have to wait for the 5-min sweep to confirm a freshly-edited row.
+ * Polling: discovery + paired + worker lists tick every 2 s. Cheap
+ * because all three endpoints read in-memory snapshots / cached DB
+ * rows (no probe fan-out per tick).
  */
 export default function ComputePoolSection() {
+  // --- identity / labels ------------------------------------------------
+  const [identity, setIdentity] = useState(null)
+  const [labelDraft, setLabelDraft] = useState('')
+  const [editingLabel, setEditingLabel] = useState(false)
+  const [savingLabel, setSavingLabel] = useState(false)
+
+  // --- public pool / rendezvous ----------------------------------------
+  const [publicPool, setPublicPool] = useState(true)
+  const [rendezvous, setRendezvous] = useState(null)
+
+  // --- discovery + pairing flow ----------------------------------------
+  const [discovered, setDiscovered] = useState([])
+  const [discoveryRunning, setDiscoveryRunning] = useState(false)
+  const [pairOffer, setPairOffer] = useState(null)
+  const [pairStarting, setPairStarting] = useState(false)
+  const [claimPin, setClaimPin] = useState('')
+  const [claimSubmitting, setClaimSubmitting] = useState(false)
+
+  // --- pool: paired peers + matched workers ----------------------------
+  const [paired, setPaired] = useState([])
   const [workers, setWorkers] = useState([])
-  const [loading, setLoading] = useState(false)
-  // Form state for the add/edit dialog. `null` = dialog closed.
-  const [editing, setEditing] = useState(null)
-  const [pendingDelete, setPendingDelete] = useState(null)
-  // Worker IDs currently being probed — used to spin the per-row icon.
   const [probing, setProbing] = useState(() => new Set())
   const [refreshingAll, setRefreshingAll] = useState(false)
+  const [pendingDelete, setPendingDelete] = useState(null)
 
-  const refresh = useCallback(async () => {
-    setLoading(true)
-    try {
-      const res = await api.listComputeWorkers()
-      setWorkers(res.workers || [])
-    } catch (e) {
-      toast.error('Failed to load compute workers', { description: e.message })
-    } finally {
-      setLoading(false)
-    }
+  // 2s polling tick. Discovery + paired + workers all share it so the
+  // panel stays internally consistent (you don't see a paired device
+  // appear before its worker row catches up, etc.).
+  const [tick, setTick] = useState(0)
+  useEffect(() => {
+    const t = setInterval(() => setTick((n) => n + 1), 2000)
+    return () => clearInterval(t)
   }, [])
 
   useEffect(() => {
-    refresh()
-  }, [refresh])
-
-  /** Default form state for "Add device". */
-  function blankForm() {
-    return {
-      label: '',
-      address: '',
-      ollama_port: 11434,
-      auth_token: '',
-      ssh_host: '',
-      tailscale_host: '',
-      enabled: true,
-      use_for_chat: true,
-      use_for_embeddings: true,
-      use_for_subagents: true,
-    }
-  }
-
-  function startAdd() {
-    setEditing({ ...blankForm(), _mode: 'create' })
-  }
-
-  function startEdit(w) {
-    setEditing({
-      _mode: 'edit',
-      id: w.id,
-      label: w.label || '',
-      address: w.address || '',
-      ollama_port: w.ollama_port ?? 11434,
-      // Empty string means "leave token alone" on save (the placeholder
-      // "••••••" is rendered when the row already has one).
-      auth_token: '',
-      auth_token_was_set: !!w.auth_token_set,
-      ssh_host: w.ssh_host || '',
-      tailscale_host: w.tailscale_host || '',
-      enabled: !!w.enabled,
-      use_for_chat: !!w.use_for_chat,
-      use_for_embeddings: !!w.use_for_embeddings,
-      use_for_subagents: !!w.use_for_subagents,
-    })
-  }
-
-  async function saveEditing() {
-    if (!editing) return
-    const label = (editing.label || '').trim()
-    const address = (editing.address || '').trim()
-    if (!label) return toast.error('Label is required')
-    if (!address) return toast.error('Address is required')
-
-    const port = Number(editing.ollama_port)
-    if (!Number.isFinite(port) || port < 1 || port > 65535) {
-      return toast.error('Port must be 1–65535')
-    }
-
-    try {
-      if (editing._mode === 'edit') {
-        const patch = {
-          label,
-          address,
-          ollama_port: port,
-          ssh_host: editing.ssh_host || '',
-          tailscale_host: editing.tailscale_host || '',
-          enabled: editing.enabled,
-          use_for_chat: editing.use_for_chat,
-          use_for_embeddings: editing.use_for_embeddings,
-          use_for_subagents: editing.use_for_subagents,
+    let cancelled = false
+    ;(async () => {
+      try {
+        const [id, disc, pair, pp, rdv, ws] = await Promise.all([
+          api.p2pIdentity(),
+          api.p2pDiscover(),
+          api.p2pListPaired(),
+          api.p2pPublicPoolStatus(),
+          api.p2pRendezvousStatus().catch(() => null),
+          api.listComputeWorkers(),
+        ])
+        if (cancelled) return
+        setIdentity(id)
+        setLabelDraft(id?.label || '')
+        setDiscovered(disc?.devices || [])
+        setDiscoveryRunning(!!disc?.running)
+        setPaired(pair?.paired || [])
+        setPublicPool(!!pp?.enabled)
+        setRendezvous(rdv)
+        setWorkers(ws?.workers || [])
+      } catch (e) {
+        if (!cancelled) {
+          toast.error('Could not load compute pool', {
+            description: e?.message || String(e),
+          })
         }
-        // Only patch the token if the user typed something; an empty
-        // textbox means "no change". Backend treats "" as a clear, but we
-        // never actually send "" from this UI — there's a separate "Clear
-        // token" affordance to cover that intent explicitly.
-        if (editing.auth_token) patch.auth_token = editing.auth_token
-        await api.updateComputeWorker(editing.id, patch)
-        toast.success('Worker updated')
-      } else {
-        await api.createComputeWorker({
-          label,
-          address,
-          ollama_port: port,
-          auth_token: editing.auth_token || null,
-          ssh_host: editing.ssh_host || null,
-          tailscale_host: editing.tailscale_host || null,
-          enabled: editing.enabled,
-          use_for_chat: editing.use_for_chat,
-          use_for_embeddings: editing.use_for_embeddings,
-          use_for_subagents: editing.use_for_subagents,
-        })
-        toast.success('Worker added', {
-          description: `${label} registered. A capability probe will fire shortly — or use "Test connection" now.`,
-        })
       }
-      setEditing(null)
-      refresh()
-    } catch (e) {
-      toast.error('Save failed', { description: e.message })
-    }
-  }
+    })()
+    return () => { cancelled = true }
+  }, [tick])
 
-  async function clearToken() {
-    if (!editing?.id) return
-    try {
-      await api.updateComputeWorker(editing.id, { auth_token: '' })
-      toast.success('Auth token cleared')
-      setEditing({ ...editing, auth_token: '', auth_token_was_set: false })
-      refresh()
-    } catch (e) {
-      toast.error('Clear failed', { description: e.message })
-    }
-  }
+  // Pending pair offer poller — survives accidental modal-close.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const { pending } = await api.p2pPairPending()
+        if (cancelled) return
+        if (Array.isArray(pending) && pending.length) {
+          setPairOffer((cur) => cur || pending[0])
+        } else {
+          setPairOffer(null)
+        }
+      } catch {
+        // Silent — a single failed poll shouldn't spam the user.
+      }
+    })()
+    return () => { cancelled = true }
+  }, [tick])
 
-  async function confirmDelete() {
-    if (!pendingDelete) return
-    try {
-      await api.deleteComputeWorker(pendingDelete.id)
-      toast.success('Worker removed')
-      setPendingDelete(null)
-      refresh()
-    } catch (e) {
-      toast.error('Delete failed', { description: e.message })
-    }
-  }
+  // --- joined view -----------------------------------------------------
+  // Each physical paired device has TWO underlying DB rows:
+  //   * paired_devices  — identity + crypto (label, pubkeys, role)
+  //   * compute_workers — routing target + capabilities (auto-created
+  //                        by the pair flow, keyed by gigachat_device_id)
+  // We join them client-side so the UI shows ONE row per device with
+  // all the relevant info (online status, Ollama version, model count,
+  // workload toggles).
+  const pairedView = useMemo(() => {
+    return (paired || []).map((p) => {
+      const worker = (workers || []).find(
+        (w) => w.gigachat_device_id === p.device_id,
+      ) || null
+      return { paired: p, worker }
+    })
+  }, [paired, workers])
 
-  async function probeOne(w) {
-    setProbing((s) => new Set(s).add(w.id))
+  // Workers that have no matching paired_device — these are the
+  // legacy manually-added rows from the pre-merge UI. New manual
+  // entries aren't accepted; existing ones can be deleted.
+  const legacyWorkers = useMemo(
+    () => (workers || []).filter((w) => !w.gigachat_device_id),
+    [workers],
+  )
+
+  // Drop already-paired devices from the discovered list so they
+  // don't show up twice ("ready to pair" + "paired").
+  const pairedIds = new Set(paired.map((p) => p.device_id))
+  const freshDiscovered = discovered.filter((d) => !pairedIds.has(d.device_id))
+
+  // --- summary line at top --------------------------------------------
+  const summary = useMemo(() => {
+    const total = pairedView.length + legacyWorkers.length
+    if (total === 0) return 'No devices in your pool yet'
+    const online = pairedView.filter((row) => isPairedOnline(row)).length
+      + legacyWorkers.filter((w) => isWorkerOnline(w)).length
+    return `${total} device${total === 1 ? '' : 's'} · ${online} online`
+  }, [pairedView, legacyWorkers])
+
+  // --- actions ---------------------------------------------------------
+  const startPair = useCallback(async () => {
+    setPairStarting(true)
     try {
-      const res = await api.probeComputeWorker(w.id)
+      const offer = await api.p2pPairStart()
+      setPairOffer(offer)
+    } catch (e) {
+      toast.error('Could not start pairing', {
+        description: e?.message || String(e),
+      })
+    } finally {
+      setPairStarting(false)
+    }
+  }, [])
+
+  const cancelPair = useCallback(async () => {
+    if (!pairOffer?.pairing_id) return
+    try {
+      await api.p2pPairCancel(pairOffer.pairing_id)
+    } catch {
+      // Silent — purpose is to clear the UI.
+    }
+    setPairOffer(null)
+  }, [pairOffer])
+
+  const submitClaim = useCallback(async () => {
+    if (!pairOffer || !claimPin) return
+    setClaimSubmitting(true)
+    try {
+      const claim = await api.p2pPairBuildClaim(
+        claimPin, pairOffer.nonce, pairOffer.host_public_key_b64,
+      )
+      const result = await api.p2pPairAccept({
+        pairing_id: pairOffer.pairing_id,
+        pin: claimPin,
+        claimant_device_id: claim.claimant_device_id,
+        claimant_label: claim.claimant_label,
+        claimant_public_key_b64: claim.claimant_public_key_b64,
+        signature_b64: claim.signature_b64,
+      })
+      toast.success('Device paired', {
+        description: result?.paired?.label || claim.claimant_device_id,
+      })
+      setPairOffer(null)
+      setClaimPin('')
+      setTick((n) => n + 1)
+    } catch (e) {
+      toast.error('Pairing failed', {
+        description: e?.message || String(e),
+      })
+    } finally {
+      setClaimSubmitting(false)
+    }
+  }, [pairOffer, claimPin])
+
+  const togglePublicPool = useCallback(async (next) => {
+    try {
+      const { enabled } = await api.p2pPublicPoolSet(next)
+      setPublicPool(!!enabled)
+      toast.success(
+        enabled ? 'Joined public pool' : 'Left public pool',
+        {
+          description: enabled
+            ? 'Donating spare compute to peers. Your prompts still run only on your local pool.'
+            : 'Fully isolated to your local pool.',
+        },
+      )
+    } catch (e) {
+      toast.error('Could not change public pool state', {
+        description: e?.message || String(e),
+      })
+    }
+  }, [])
+
+  const saveLabel = useCallback(async () => {
+    const next = labelDraft.trim()
+    if (!next || next === identity?.label) {
+      setEditingLabel(false)
+      return
+    }
+    setSavingLabel(true)
+    try {
+      const updated = await api.p2pSetLabel(next)
+      setIdentity(updated)
+      setLabelDraft(updated.label)
+      setEditingLabel(false)
+      toast.success('Device label updated')
+    } catch (e) {
+      toast.error('Could not update label', {
+        description: e?.message || String(e),
+      })
+    } finally {
+      setSavingLabel(false)
+    }
+  }, [labelDraft, identity])
+
+  const probeOne = useCallback(async (worker) => {
+    if (!worker?.id) return
+    setProbing((s) => new Set(s).add(worker.id))
+    try {
+      const res = await api.probeComputeWorker(worker.id)
       if (res.ok) {
         const ver = res.capabilities?.version
         const n = res.capabilities?.models?.length || 0
-        toast.success(`${w.label} is online`, {
-          description: `Ollama ${ver || '?'} · ${n} model${n === 1 ? '' : 's'} installed`,
+        toast.success(`${worker.label} is online`, {
+          description: `Ollama ${ver || '?'} · ${n} model${n === 1 ? '' : 's'}`,
         })
       } else {
-        toast.error(`${w.label} probe failed`, {
+        toast.error(`${worker.label} probe failed`, {
           description: res.error || 'unknown error',
         })
       }
@@ -213,16 +313,14 @@ export default function ComputePoolSection() {
     } finally {
       setProbing((s) => {
         const copy = new Set(s)
-        copy.delete(w.id)
+        copy.delete(worker.id)
         return copy
       })
-      // Re-fetch the list so the row's last_seen / last_error reflects the
-      // probe outcome we just persisted server-side.
-      refresh()
+      setTick((n) => n + 1)
     }
-  }
+  }, [])
 
-  async function probeAll() {
+  const probeAll = useCallback(async () => {
     setRefreshingAll(true)
     try {
       const res = await api.probeAllComputeWorkers()
@@ -240,290 +338,330 @@ export default function ComputePoolSection() {
       toast.error('Refresh failed', { description: e.message })
     } finally {
       setRefreshingAll(false)
-      refresh()
+      setTick((n) => n + 1)
     }
-  }
+  }, [])
 
-  const summary = useMemo(() => {
-    if (loading) return 'Loading…'
-    if (!workers.length) return 'No workers yet'
-    const online = workers.filter((w) => isOnline(w)).length
-    return `${workers.length} worker${workers.length === 1 ? '' : 's'} · ${online} online`
-  }, [workers, loading])
+  const toggleWorkerFlag = useCallback(async (worker, key, value) => {
+    if (!worker?.id) return
+    try {
+      await api.updateComputeWorker(worker.id, { [key]: value })
+      setTick((n) => n + 1)
+    } catch (e) {
+      toast.error('Update failed', { description: e.message })
+    }
+  }, [])
 
+  const unpair = useCallback(async (deviceId, label) => {
+    if (!confirm(`Unpair ${label || deviceId}?`)) return
+    try {
+      // Backend's DELETE /api/p2p/paired/{id} now also drops the
+      // matching compute_worker row, so this single call cleans up
+      // both halves of the join.
+      await api.p2pUnpair(deviceId)
+      toast.success(`Unpaired ${label || deviceId}`)
+      setTick((n) => n + 1)
+    } catch (e) {
+      toast.error('Unpair failed', {
+        description: e?.message || String(e),
+      })
+    }
+  }, [])
+
+  const confirmDeleteLegacy = useCallback(async () => {
+    if (!pendingDelete) return
+    try {
+      await api.deleteComputeWorker(pendingDelete.id)
+      toast.success('Worker removed')
+      setPendingDelete(null)
+      setTick((n) => n + 1)
+    } catch (e) {
+      toast.error('Delete failed', { description: e.message })
+    }
+  }, [pendingDelete])
+
+  // --- render ----------------------------------------------------------
   return (
     <>
-      <div className="flex max-h-[60vh] flex-col overflow-hidden">
-        <div className="flex items-center justify-between pb-2">
-          <div className="text-xs text-muted-foreground">{summary}</div>
-          <div className="flex items-center gap-2">
+      <div className="space-y-6">
+        <header className="flex items-start justify-between gap-3">
+          <div>
+            <h2 className="flex items-center gap-2 text-base font-semibold">
+              <Server className="size-5 text-primary" />
+              Compute pool
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              {summary}. Pair other Gigachat devices on this network so they
+              share the workload — chat, embeddings, parallel subagents.
+            </p>
+          </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={probeAll}
+            disabled={refreshingAll || (!pairedView.length && !legacyWorkers.length)}
+            className="gap-1.5 text-xs"
+            title="Re-probe every device now"
+          >
+            <RefreshCw
+              className={cn('h-3.5 w-3.5', refreshingAll && 'animate-spin')}
+            />
+            Refresh
+          </Button>
+        </header>
+
+        <PublicPoolCard enabled={publicPool} onChange={togglePublicPool} />
+
+        {publicPool && rendezvous ? (
+          <RendezvousStatusCard status={rendezvous} />
+        ) : null}
+
+        {/* My identity card */}
+        <section className="rounded-lg border border-border bg-card p-4">
+          <h3 className="mb-3 flex items-center gap-2 text-sm font-medium">
+            <KeyRound className="size-4 text-muted-foreground" />
+            This device
+          </h3>
+          {identity ? (
+            <div className="space-y-2 text-sm">
+              <div className="flex items-center gap-2">
+                <span className="w-16 text-xs text-muted-foreground">Label</span>
+                {editingLabel ? (
+                  <>
+                    <Input
+                      value={labelDraft}
+                      onChange={(e) => setLabelDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') saveLabel()
+                        if (e.key === 'Escape') {
+                          setLabelDraft(identity.label)
+                          setEditingLabel(false)
+                        }
+                      }}
+                      className="h-7 max-w-[260px]"
+                      disabled={savingLabel}
+                      autoFocus
+                    />
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      onClick={saveLabel}
+                      disabled={savingLabel}
+                      className="size-7"
+                      title="Save"
+                    >
+                      {savingLabel ? (
+                        <Loader2 className="size-3.5 animate-spin" />
+                      ) : (
+                        <Check className="size-3.5" />
+                      )}
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      onClick={() => {
+                        setLabelDraft(identity.label)
+                        setEditingLabel(false)
+                      }}
+                      disabled={savingLabel}
+                      className="size-7"
+                      title="Cancel"
+                    >
+                      <X className="size-3.5" />
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <span className="font-medium">{identity.label}</span>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      onClick={() => setEditingLabel(true)}
+                      className="size-7 text-muted-foreground hover:text-foreground"
+                      title="Rename device"
+                    >
+                      <Pencil className="size-3.5" />
+                    </Button>
+                  </>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="w-16 text-xs text-muted-foreground">ID</span>
+                <code className="rounded bg-muted px-2 py-0.5 font-mono text-xs">
+                  {identity.device_id_pretty || identity.device_id}
+                </code>
+              </div>
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">Loading identity…</p>
+          )}
+        </section>
+
+        {pairOffer && (
+          <PairOfferCard
+            offer={pairOffer}
+            claimPin={claimPin}
+            setClaimPin={setClaimPin}
+            submitting={claimSubmitting}
+            onSubmitClaim={submitClaim}
+            onCancel={cancelPair}
+          />
+        )}
+
+        {/* Available LAN devices ready to pair */}
+        <section className="rounded-lg border border-border bg-card p-4">
+          <h3 className="mb-3 flex items-center gap-2 text-sm font-medium">
+            <Wifi className="size-4 text-muted-foreground" />
+            Devices on this network
+            {!discoveryRunning && (
+              <span className="ml-2 rounded bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-500">
+                mDNS unavailable — discovery disabled
+              </span>
+            )}
+          </h3>
+          {freshDiscovered.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No other Gigachat devices found on the network. Open Gigachat on
+              another laptop / desktop on the same Wi-Fi to see it here, then
+              click <em>Pair new device</em> to start.
+            </p>
+          ) : (
+            <ul className="space-y-1.5">
+              {freshDiscovered.map((d) => (
+                <DiscoveredRow key={d.device_id} device={d} />
+              ))}
+            </ul>
+          )}
+          <div className="mt-4">
             <Button
-              variant="ghost"
+              onClick={startPair}
+              disabled={pairStarting || !!pairOffer}
               size="sm"
-              onClick={probeAll}
-              disabled={refreshingAll || !workers.length}
-              className="gap-1.5 text-xs"
-              title="Re-probe every enabled worker now"
             >
-              <RefreshCw
-                className={cn('h-3.5 w-3.5', refreshingAll && 'animate-spin')}
-              />
-              Refresh all
-            </Button>
-            <Button size="sm" onClick={startAdd} className="gap-2">
-              <Plus className="h-4 w-4" /> Add device
+              {pairStarting ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                'Pair new device'
+              )}
             </Button>
           </div>
-        </div>
+        </section>
 
-        <p className="pb-2 text-xs text-muted-foreground">
-          Register other PCs running Ollama as compute workers. The host will
-          send a slice of chat / embedding / subagent traffic to them so
-          parallel work finishes faster.
-          <br />
-          All ongoing traffic stays on the <strong className="text-foreground">LAN</strong>.
-          A Tailscale identifier is optional — used only to rediscover the
-          worker's LAN IP after it changes (e.g. a fresh DHCP lease).
-        </p>
-
-        <div className="flex-1 space-y-2 overflow-y-auto pr-1">
-          {workers.length === 0 && !loading && (
-            <p className="py-8 text-center text-sm text-muted-foreground">
-              No compute workers yet. Click <em>Add device</em> to register a
-              laptop or spare desktop. The host probes it for Ollama version
-              and installed models, then starts routing work to it.
+        {/* Paired devices — the actual compute pool */}
+        <section className="rounded-lg border border-border bg-card p-4">
+          <h3 className="mb-3 flex items-center gap-2 text-sm font-medium">
+            <ShieldCheck className="size-4 text-emerald-500" />
+            Paired devices
+          </h3>
+          {pairedView.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No paired devices yet. Pair one above and it will appear here
+              with live status, capabilities, and per-workload routing
+              toggles. Reconnects after IP changes are automatic — same as
+              Bluetooth. All compute traffic is end-to-end encrypted
+              (X25519 + ChaCha20-Poly1305).
             </p>
+          ) : (
+            <ul className="space-y-2">
+              {pairedView.map((row) => (
+                <PairedDeviceRow
+                  key={row.paired.device_id}
+                  row={row}
+                  probing={row.worker ? probing.has(row.worker.id) : false}
+                  onProbe={() => row.worker && probeOne(row.worker)}
+                  onToggle={(key, value) =>
+                    row.worker && toggleWorkerFlag(row.worker, key, value)
+                  }
+                  onUnpair={() => unpair(row.paired.device_id, row.paired.label)}
+                />
+              ))}
+            </ul>
           )}
-          {workers.map((w) => (
-            <WorkerRow
-              key={w.id}
-              worker={w}
-              probing={probing.has(w.id)}
-              onProbe={() => probeOne(w)}
-              onEdit={() => startEdit(w)}
-              onDelete={() => setPendingDelete(w)}
-            />
-          ))}
-        </div>
+        </section>
 
-        {/* Phase 2 install banner only — actual split-model routing is
-            fully automatic. When the user picks a model in chat, the
-            backend's `compute_pool.route_chat_for` decides whether the
-            model fits the host's VRAM (→ Ollama) or needs to fan across
-            workers via llama.cpp RPC (→ llama-server auto-spawned).
-            The user never sees a "split models" registry — just this
-            small banner that asks for the one-time llama.cpp install
-            when they want to enable the big-model path. */}
+        {/* Legacy manually-added workers — delete-only */}
+        {legacyWorkers.length > 0 && (
+          <section className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
+            <h3 className="mb-2 flex items-center gap-2 text-sm font-medium">
+              <Cpu className="size-4 text-amber-500" />
+              Legacy workers ({legacyWorkers.length})
+            </h3>
+            <p className="mb-3 text-xs text-muted-foreground">
+              These workers were added by typed IP / SSH alias before the
+              Compute and Network panels were merged. Manual entry is no
+              longer supported — use <em>Pair new device</em> above for
+              new workers. Existing rows can be removed below; routing
+              still uses them until you do.
+            </p>
+            <ul className="space-y-2">
+              {legacyWorkers.map((w) => (
+                <LegacyWorkerRow
+                  key={w.id}
+                  worker={w}
+                  probing={probing.has(w.id)}
+                  onProbe={() => probeOne(w)}
+                  onToggle={(key, value) => toggleWorkerFlag(w, key, value)}
+                  onDelete={() => setPendingDelete(w)}
+                />
+              ))}
+            </ul>
+          </section>
+        )}
+
+        {/* End-to-end encryption summary */}
+        <section className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-4">
+          <h3 className="mb-2 flex items-center gap-2 text-sm font-medium">
+            <Lock className="size-4 text-emerald-500" />
+            End-to-end encryption
+          </h3>
+          <ul className="space-y-1 text-xs leading-snug text-muted-foreground">
+            <li>
+              <strong className="text-foreground">Identity:</strong>{' '}
+              Each device has an Ed25519 (signing) + X25519 (key
+              agreement) keypair generated on first launch and stored
+              in <code>data/identity.json</code> with mode 0600.
+            </li>
+            <li>
+              <strong className="text-foreground">Compute traffic:</strong>{' '}
+              Every chat, embedding, and probe call to a paired peer is
+              wrapped in an X25519+ChaCha20-Poly1305 envelope, signed
+              with Ed25519. Anyone observing the network sees only
+              ciphertext — prompts, model output, even peer metadata.
+            </li>
+            <li>
+              <strong className="text-foreground">Forward secrecy:</strong>{' '}
+              Each envelope generates a fresh ephemeral X25519 keypair on
+              the sender side. Captured envelopes can't be decrypted
+              later from sender-side compromise of long-term keys.
+            </li>
+            <li>
+              <strong className="text-foreground">Replay protection:</strong>{' '}
+              ±120 s timestamp window on every envelope.
+            </li>
+            <li>
+              <strong className="text-foreground">Path whitelist:</strong>{' '}
+              Even authenticated peers can only reach a strict set of
+              Ollama compute endpoints — no admin / model-delete paths.
+              Discovered-but-not-paired peers get an even tighter
+              read-only subset.
+            </li>
+          </ul>
+        </section>
+
+        {/* AutoSplit (llama.cpp) install banner — only relevant for the
+            big-model split-across-pool path. Leave it at the bottom so
+            the primary device-management workflows above stay focused. */}
         <AutoSplitInstallSection />
       </div>
 
-      {/* Add / edit drawer */}
-      <Dialog
-        open={!!editing}
-        onOpenChange={(o) => {
-          if (!o) setEditing(null)
-        }}
-      >
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle>
-              {editing?._mode === 'edit' ? 'Edit worker' : 'Add compute worker'}
-            </DialogTitle>
-            <DialogDescription>
-              {editing?._mode === 'edit'
-                ? 'Update the connection details. Capabilities re-probe automatically; click Save and then "Test connection" on the row.'
-                : 'Point to another PC running Ollama on the same LAN. Add a Tailscale identifier if you want the LAN IP to self-heal after a DHCP rebind.'}
-            </DialogDescription>
-          </DialogHeader>
-          {editing && (
-            <div className="space-y-3">
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  Label
-                </label>
-                <Input
-                  value={editing.label}
-                  onChange={(e) =>
-                    setEditing({ ...editing, label: e.target.value })
-                  }
-                  placeholder="e.g. office laptop, spare desktop"
-                  autoFocus={editing._mode !== 'edit'}
-                />
-              </div>
-
-              <div className="grid grid-cols-3 gap-2">
-                <div className="col-span-2">
-                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                    LAN address
-                  </label>
-                  <Input
-                    value={editing.address}
-                    onChange={(e) =>
-                      setEditing({ ...editing, address: e.target.value })
-                    }
-                    placeholder="worker.local or 192.168.x.x"
-                  />
-                  <p className="mt-1 text-[11px] text-muted-foreground">
-                    Hostname or private IPv4 on the same Wi-Fi/Ethernet.
-                    Public IPs and Tailscale CGNAT addresses are not
-                    accepted here — all ongoing traffic stays on the LAN.
-                  </p>
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                    Port
-                  </label>
-                  <Input
-                    type="number"
-                    inputMode="numeric"
-                    min={1}
-                    max={65535}
-                    value={editing.ollama_port}
-                    onChange={(e) =>
-                      setEditing({
-                        ...editing,
-                        ollama_port: e.target.value,
-                      })
-                    }
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  Auth token (optional)
-                </label>
-                <Input
-                  type="password"
-                  value={editing.auth_token}
-                  onChange={(e) =>
-                    setEditing({ ...editing, auth_token: e.target.value })
-                  }
-                  placeholder={
-                    editing.auth_token_was_set
-                      ? '••••••• (leave blank to keep current)'
-                      : 'Bearer token the worker validates'
-                  }
-                />
-                <div className="mt-1 flex items-center justify-between">
-                  <p className="text-[11px] text-muted-foreground">
-                    Sent as <code>Authorization: Bearer …</code> on every
-                    request to this worker. Required if its Ollama is exposed
-                    beyond loopback.
-                  </p>
-                  {editing._mode === 'edit' && editing.auth_token_was_set && (
-                    <button
-                      type="button"
-                      onClick={clearToken}
-                      className="ml-2 shrink-0 text-[11px] text-destructive hover:underline"
-                    >
-                      Clear token
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  SSH host (optional, for LAN model copy)
-                </label>
-                <Input
-                  value={editing.ssh_host}
-                  onChange={(e) =>
-                    setEditing({ ...editing, ssh_host: e.target.value })
-                  }
-                  placeholder="e.g. laptop (an alias from your ~/.ssh/config)"
-                />
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  When set, this host can scp Ollama model blobs to the
-                  worker over LAN instead of having the worker pull from
-                  the internet. Saves bandwidth on multi-GB models. Add
-                  the alias to <code className="rounded bg-muted px-1">~/.ssh/config</code>{' '}
-                  on this host first; the backend just reuses your existing SSH setup.
-                </p>
-              </div>
-
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  Tailscale host (optional, for auto-repair only)
-                </label>
-                <Input
-                  value={editing.tailscale_host}
-                  onChange={(e) =>
-                    setEditing({ ...editing, tailscale_host: e.target.value })
-                  }
-                  placeholder="e.g. worker.your-tailnet.ts.net or 100.x.x.x"
-                />
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  Stable Tailscale identifier (MagicDNS name or CGNAT IPv4).
-                  When the LAN address goes stale — typically because the
-                  worker rejoined the network and DHCP gave it a new lease —
-                  the host SSHes over Tailscale just long enough to rediscover
-                  the new LAN IP. Never used for ongoing chat / embedding
-                  traffic, so your metered internet bandwidth is preserved.
-                </p>
-              </div>
-
-              <div className="rounded-md border border-border bg-muted/30 p-3">
-                <div className="mb-2 text-xs font-medium text-foreground">
-                  Workload routing
-                </div>
-                <ToggleRow
-                  label="Use for chat"
-                  hint="Stream user-facing chat through this worker."
-                  value={editing.use_for_chat}
-                  onChange={(v) =>
-                    setEditing({ ...editing, use_for_chat: v })
-                  }
-                />
-                <ToggleRow
-                  label="Use for embeddings"
-                  hint="Run vector embedding requests here."
-                  value={editing.use_for_embeddings}
-                  onChange={(v) =>
-                    setEditing({ ...editing, use_for_embeddings: v })
-                  }
-                />
-                <ToggleRow
-                  label="Use for subagents"
-                  hint="Distribute parallel delegate_parallel calls."
-                  value={editing.use_for_subagents}
-                  onChange={(v) =>
-                    setEditing({ ...editing, use_for_subagents: v })
-                  }
-                />
-                <div className="mt-2 border-t border-border/60 pt-2">
-                  <ToggleRow
-                    label="Enabled"
-                    hint="Toggle off to skip this worker without deleting the row."
-                    value={editing.enabled}
-                    onChange={(v) =>
-                      setEditing({ ...editing, enabled: v })
-                    }
-                  />
-                </div>
-              </div>
-            </div>
-          )}
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setEditing(null)}>
-              Cancel
-            </Button>
-            <Button onClick={saveEditing}>
-              {editing?._mode === 'edit' ? 'Save changes' : 'Add worker'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* Delete confirm */}
+      {/* Legacy delete confirm */}
       <Dialog
         open={!!pendingDelete}
         onOpenChange={(o) => !o && setPendingDelete(null)}
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Remove this worker?</DialogTitle>
+            <DialogTitle>Remove this legacy worker?</DialogTitle>
             <DialogDescription>
               <strong>{pendingDelete?.label}</strong> will stop receiving any
               routed traffic. Capabilities and history are deleted; the worker
@@ -534,7 +672,7 @@ export default function ComputePoolSection() {
             <Button variant="outline" onClick={() => setPendingDelete(null)}>
               Cancel
             </Button>
-            <Button variant="destructive" onClick={confirmDelete}>
+            <Button variant="destructive" onClick={confirmDeleteLegacy}>
               <Trash2 className="mr-1 h-4 w-4" /> Remove
             </Button>
           </DialogFooter>
@@ -544,11 +682,21 @@ export default function ComputePoolSection() {
   )
 }
 
-/** Liveness rule: a worker counts as online when its last probe succeeded
- * (no `last_error`) and we have a `last_seen` timestamp from within the
- * last hour. The 1-hour window covers the 5-min sweep cadence with plenty
- * of buffer for intermittent network blips. */
-function isOnline(w) {
+/* ----------------------- Sub-components ----------------------- */
+
+/** Liveness rule: paired-row online iff the matched worker probed
+ *  recently OR the mDNS last_seen is fresh. We accept either signal
+ *  because the worker probe runs every 5 min while mDNS broadcasts
+ *  every ~10 s — fresh mDNS without a recent probe still means "the
+ *  device is on the network and we'll hear back from it shortly." */
+function isPairedOnline({ paired, worker }) {
+  if (worker && isWorkerOnline(worker)) return true
+  const mdnsAt = paired?.last_seen_at || 0
+  if (mdnsAt > 0 && Date.now() / 1000 - mdnsAt < 120) return true
+  return false
+}
+
+function isWorkerOnline(w) {
   if (!w?.enabled) return false
   if (!w.last_seen) return false
   if (w.last_error) return false
@@ -556,37 +704,503 @@ function isOnline(w) {
   return ageSec >= 0 && ageSec < 60 * 60
 }
 
-/** One row inside the "Workload routing" form section. */
-function ToggleRow({ label, hint, value, onChange }) {
+function PublicPoolCard({ enabled, onChange }) {
   return (
-    <div className="flex items-center justify-between gap-3 py-1">
-      <div className="min-w-0">
-        <div className="text-xs font-medium text-foreground">{label}</div>
-        <div className="text-[11px] text-muted-foreground">{hint}</div>
+    <section
+      className={cn(
+        'rounded-lg border-2 p-4 transition-colors',
+        enabled
+          ? 'border-emerald-500/40 bg-emerald-500/5'
+          : 'border-border bg-card',
+      )}
+    >
+      <div className="flex items-start gap-3">
+        <Globe
+          className={cn(
+            'mt-0.5 size-5',
+            enabled ? 'text-emerald-500' : 'text-muted-foreground',
+          )}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-3">
+            <h3 className="text-sm font-semibold">Public pool</h3>
+            <Switch checked={enabled} onCheckedChange={onChange} />
+          </div>
+          <p className="mt-1 text-xs leading-snug text-muted-foreground">
+            {enabled ? (
+              <>
+                <strong className="text-foreground">On — donating idle compute.</strong>{' '}
+                Your spare GPU/CPU cycles run other peers' public workloads
+                when you aren't using them, and you benefit from cooperative
+                model-weight distribution.{' '}
+                <strong className="text-foreground">
+                  Your prompts still run only on your local pool — they never leave this network.
+                </strong>
+              </>
+            ) : (
+              <>
+                <strong className="text-foreground">Off — local pool only.</strong>{' '}
+                You're disconnected from the global swarm. Inference and any
+                background workloads run exclusively on your paired LAN devices.
+              </>
+            )}
+          </p>
+        </div>
       </div>
-      <Switch checked={!!value} onCheckedChange={onChange} />
-    </div>
+    </section>
   )
 }
 
-/** One worker row — status pill, label/address, model count, action buttons. */
-function WorkerRow({ worker, probing, onProbe, onEdit, onDelete }) {
-  const online = isOnline(worker)
-  const neverSeen = !worker.last_seen
+function RendezvousStatusCard({ status }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(status?.url || '')
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    if (!editing) setDraft(status?.url || '')
+  }, [status?.url, editing])
+
+  const save = useCallback(async () => {
+    setSaving(true)
+    try {
+      await api.p2pRendezvousSetUrl(draft.trim())
+      toast.success(
+        draft.trim() ? 'Rendezvous URL updated' : 'Rendezvous URL cleared',
+      )
+      setEditing(false)
+    } catch (e) {
+      toast.error('Could not update rendezvous URL', {
+        description: e?.message || String(e),
+      })
+    } finally {
+      setSaving(false)
+    }
+  }, [draft])
+
+  const running = !!status?.running
+  const lastReg = status?.last_register_at || 0
+  const lastRegPretty = lastReg ? formatMessageTime(lastReg) : 'never'
+  const cands = Array.isArray(status?.candidates) ? status.candidates : []
+  const configured = !!status?.configured
+
+  return (
+    <section
+      className={cn(
+        'rounded-lg border p-4',
+        configured && running && lastReg
+          ? 'border-emerald-500/30 bg-emerald-500/5'
+          : configured
+            ? 'border-amber-500/30 bg-amber-500/5'
+            : 'border-border bg-card',
+      )}
+    >
+      <h3 className="mb-2 flex items-center gap-2 text-sm font-medium">
+        <Globe
+          className={cn(
+            'size-4',
+            configured && running && lastReg
+              ? 'text-emerald-500'
+              : configured
+                ? 'text-amber-500'
+                : 'text-muted-foreground',
+          )}
+        />
+        Internet rendezvous
+        <span
+          className={cn(
+            'ml-auto rounded px-1.5 py-0.5 text-[10px]',
+            configured && running && lastReg
+              ? 'bg-emerald-500/15 text-emerald-500'
+              : configured
+                ? 'bg-amber-500/15 text-amber-500'
+                : 'bg-muted text-muted-foreground',
+          )}
+        >
+          {!configured
+            ? 'Not configured'
+            : running && lastReg
+              ? 'Connected'
+              : running
+                ? 'Connecting…'
+                : 'Disconnected'}
+        </span>
+      </h3>
+
+      <div className="mb-2 flex items-center gap-2">
+        <span className="w-16 shrink-0 text-xs text-muted-foreground">URL</span>
+        {editing ? (
+          <>
+            <Input
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') save()
+                if (e.key === 'Escape') {
+                  setDraft(status?.url || '')
+                  setEditing(false)
+                }
+              }}
+              placeholder="https://gigachat-rendezvous-…run.app"
+              className="h-7 flex-1 font-mono text-xs"
+              disabled={saving}
+              autoFocus
+            />
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={save}
+              disabled={saving}
+              className="size-7"
+              title="Save"
+            >
+              {saving ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Check className="size-3.5" />
+              )}
+            </Button>
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => {
+                setDraft(status?.url || '')
+                setEditing(false)
+              }}
+              disabled={saving}
+              className="size-7"
+              title="Cancel"
+            >
+              <X className="size-3.5" />
+            </Button>
+          </>
+        ) : (
+          <>
+            <code className="flex-1 truncate text-xs text-muted-foreground">
+              {status?.url || '(not set)'}
+            </code>
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => setEditing(true)}
+              className="size-7 text-muted-foreground hover:text-foreground"
+              title="Edit"
+            >
+              <Pencil className="size-3.5" />
+            </Button>
+          </>
+        )}
+      </div>
+
+      {!configured ? (
+        <p className="text-xs leading-snug text-muted-foreground">
+          Public Pool is on, but no rendezvous URL is set. Deploy the
+          Cloud Run service (<code>rendezvous/README.md</code>) and paste
+          the URL above so peers across the internet can find this
+          device. LAN pairing keeps working without it.
+        </p>
+      ) : (
+        <div className="space-y-1 text-xs text-muted-foreground">
+          {cands.length > 0 ? (
+            <div>
+              <span className="font-medium text-foreground">Candidates:</span>{' '}
+              {cands.map((c, i) => (
+                <span key={i} className="mr-2">
+                  <code>{c.ip}:{c.port}</code>
+                  <span className="ml-1 opacity-70">({c.source})</span>
+                </span>
+              ))}
+            </div>
+          ) : (
+            <div>
+              <span className="font-medium text-foreground">Candidates:</span>{' '}
+              none yet
+            </div>
+          )}
+          <div>
+            <span className="font-medium text-foreground">Last registered:</span>{' '}
+            <span title={status.last_register_at ? formatFullTimestamp(status.last_register_at) : ''}>
+              {lastRegPretty}
+            </span>
+          </div>
+          {status.last_error ? (
+            <div className="text-red-400">
+              <span className="font-medium">Last error:</span> {status.last_error}
+            </div>
+          ) : null}
+        </div>
+      )}
+    </section>
+  )
+}
+
+function PairOfferCard({ offer, claimPin, setClaimPin, submitting, onSubmitClaim, onCancel }) {
+  const expiresAt = offer?.expires_at || 0
+  const [now, setNow] = useState(Date.now() / 1000)
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now() / 1000), 1000)
+    return () => clearInterval(t)
+  }, [])
+  const remaining = Math.max(0, Math.floor(expiresAt - now))
+  const mm = String(Math.floor(remaining / 60)).padStart(2, '0')
+  const ss = String(remaining % 60).padStart(2, '0')
+
+  return (
+    <section className="rounded-lg border-2 border-primary/40 bg-primary/5 p-4">
+      <div className="flex items-start gap-3">
+        <KeyRound className="mt-0.5 size-5 text-primary" />
+        <div className="min-w-0 flex-1 space-y-3">
+          <div>
+            <h3 className="text-sm font-semibold">Pair a device</h3>
+            <p className="mt-0.5 text-xs leading-snug text-muted-foreground">
+              Open Gigachat on the other device, choose <strong>Pair to existing host</strong>,
+              and enter the PIN below. The PIN expires in{' '}
+              <span className="font-mono font-semibold text-foreground">
+                {mm}:{ss}
+              </span>
+              .
+            </p>
+          </div>
+
+          <div className="flex items-center justify-center rounded-md border bg-background py-3">
+            <span className="font-mono text-3xl font-semibold tracking-[0.4em] text-primary">
+              {offer.pin}
+            </span>
+          </div>
+
+          <div className="border-t border-border/50 pt-3">
+            <p className="mb-2 text-xs text-muted-foreground">
+              Pairing FROM this device? Type the PIN that's displayed on the
+              <em> other </em>screen here:
+            </p>
+            <div className="flex items-center gap-2">
+              <Input
+                value={claimPin}
+                onChange={(e) =>
+                  setClaimPin(e.target.value.replace(/\D/g, '').slice(0, 6))
+                }
+                placeholder="6-digit PIN"
+                maxLength={6}
+                className="h-8 max-w-[160px] font-mono tracking-widest"
+                disabled={submitting}
+              />
+              <Button
+                size="sm"
+                onClick={onSubmitClaim}
+                disabled={submitting || claimPin.length !== 6}
+              >
+                {submitting ? <Loader2 className="size-4 animate-spin" /> : 'Confirm'}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={onCancel}
+                disabled={submitting}
+              >
+                Cancel
+              </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function DiscoveredRow({ device }) {
+  const lastSeenAt = device.last_seen_at || 0
+  return (
+    <li className="flex items-center gap-3 rounded border border-border/50 bg-background/50 px-3 py-2">
+      {iconForLabel(device.label, true)}
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 text-sm">
+          <span className="truncate font-medium">{device.label}</span>
+          <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+            v{device.version || '1'}
+          </span>
+        </div>
+        <div className="text-[11px] text-muted-foreground">
+          <code>{device.device_id}</code>
+          {device.ip ? <> · {device.ip}{device.port ? `:${device.port}` : ''}</> : null}
+          {lastSeenAt ? (
+            <>
+              {' · '}
+              <span title={formatFullTimestamp(lastSeenAt)}>
+                seen {formatMessageTime(lastSeenAt)}
+              </span>
+            </>
+          ) : null}
+        </div>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Open Gigachat on this device to pair from there.
+      </p>
+    </li>
+  )
+}
+
+/** Joined paired_device + compute_worker row. The merge gives us a single
+ *  visual line per physical device with online status, capabilities, and
+ *  per-workload routing toggles. Inline actions: probe, unpair. */
+function PairedDeviceRow({ row, probing, onProbe, onToggle, onUnpair }) {
+  const { paired, worker } = row
+  const online = isPairedOnline(row)
+  const e2e = !!paired.x25519_public_b64
+  const caps = (worker && worker.capabilities) || {}
+  const modelCount = Array.isArray(caps.models) ? caps.models.length : 0
+  const ver = caps.version
+  const lastSeenAt = paired.last_seen_at || 0
+
+  return (
+    <li className="rounded border border-border/50 bg-background/50 p-3">
+      <div className="flex items-start gap-3">
+        {iconForLabel(paired.label, online)}
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <span className="truncate font-medium">{paired.label}</span>
+            <span
+              className={cn(
+                'inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px]',
+                online
+                  ? 'bg-emerald-500/15 text-emerald-500'
+                  : 'bg-muted text-muted-foreground',
+              )}
+            >
+              {online ? <Wifi className="size-2.5" /> : <WifiOff className="size-2.5" />}
+              {online ? 'Online' : 'Offline'}
+            </span>
+            <span
+              className={cn(
+                'inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px]',
+                e2e
+                  ? 'bg-emerald-500/15 text-emerald-500'
+                  : 'bg-amber-500/15 text-amber-500',
+              )}
+              title={
+                e2e
+                  ? 'End-to-end encrypted via X25519+ChaCha20-Poly1305'
+                  : 'Re-pair to enable end-to-end encryption'
+              }
+            >
+              {e2e ? <Lock className="size-2.5" /> : <Unlock className="size-2.5" />}
+              {e2e ? 'E2E' : 'plaintext'}
+            </span>
+          </div>
+
+          <div className="mt-0.5 text-[11px] text-muted-foreground">
+            <code>{paired.device_id}</code>
+            {paired.ip ? <> · {paired.ip}{paired.port ? `:${paired.port}` : ''}</> : null}
+            {lastSeenAt ? (
+              <>
+                {' · '}
+                <span title={formatFullTimestamp(lastSeenAt)}>
+                  last seen {formatMessageTime(lastSeenAt)}
+                </span>
+              </>
+            ) : null}
+          </div>
+
+          {worker ? (
+            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-muted-foreground">
+              {ver && (
+                <span className="inline-flex items-center gap-1">
+                  <Cpu className="size-3" /> Ollama {ver}
+                </span>
+              )}
+              {modelCount > 0 && (
+                <span title={(caps.models || []).map((m) => m.name).join(', ')}>
+                  {modelCount} model{modelCount === 1 ? '' : 's'}
+                </span>
+              )}
+              {caps.gpu_present && <span>GPU</span>}
+              {caps.max_vram_seen_bytes ? (
+                <span>
+                  {(caps.max_vram_seen_bytes / 1e9).toFixed(1)} GB VRAM seen
+                </span>
+              ) : null}
+            </div>
+          ) : (
+            <div className="mt-1 text-[11px] text-amber-500">
+              No worker row yet — capability probe pending.
+            </div>
+          )}
+
+          {worker?.last_error && (
+            <div className="mt-1 truncate text-[11px] text-destructive">
+              {worker.last_error}
+            </div>
+          )}
+
+          {/* Inline workload-routing toggles. Showing them per-row on the
+              paired list means the user can shape the pool without
+              opening a separate edit dialog. */}
+          {worker && (
+            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px]">
+              <InlineToggle
+                label="chat"
+                checked={!!worker.use_for_chat}
+                onChange={(v) => onToggle('use_for_chat', v)}
+              />
+              <InlineToggle
+                label="embed"
+                checked={!!worker.use_for_embeddings}
+                onChange={(v) => onToggle('use_for_embeddings', v)}
+              />
+              <InlineToggle
+                label="subagents"
+                checked={!!worker.use_for_subagents}
+                onChange={(v) => onToggle('use_for_subagents', v)}
+              />
+              <InlineToggle
+                label="enabled"
+                checked={!!worker.enabled}
+                onChange={(v) => onToggle('enabled', v)}
+              />
+            </div>
+          )}
+        </div>
+
+        <div className="flex shrink-0 gap-1">
+          {worker && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={onProbe}
+              disabled={probing || !worker.enabled}
+              className="h-7 w-7 text-muted-foreground hover:text-foreground"
+              title="Test connection now"
+            >
+              <RefreshCw className={cn('h-4 w-4', probing && 'animate-spin')} />
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onUnpair}
+            className="h-7 w-7 text-muted-foreground hover:text-destructive"
+            title="Unpair (also removes the worker row)"
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+    </li>
+  )
+}
+
+/** Legacy worker row (manually-added, no paired peer). Slimmer than the
+ *  paired-row because there's no E2E badge and no identity to show.
+ *  Inline workload toggles + delete-only action. */
+function LegacyWorkerRow({ worker, probing, onProbe, onToggle, onDelete }) {
+  const online = isWorkerOnline(worker)
   const caps = worker.capabilities || {}
   const modelCount = Array.isArray(caps.models) ? caps.models.length : 0
 
-  // Status badge — three states cover the meaningful outcomes:
-  //   * green — last probe succeeded recently
-  //   * red   — probe failed or row is disabled
-  //   * gray  — never probed yet (just added)
   let StatusIcon = CircleHelp
   let statusLabel = 'Never seen'
   let statusClass = 'text-muted-foreground'
   if (!worker.enabled) {
     StatusIcon = CircleX
     statusLabel = 'Disabled'
-    statusClass = 'text-muted-foreground'
   } else if (online) {
     StatusIcon = CircleCheck
     statusLabel = 'Online'
@@ -595,99 +1209,118 @@ function WorkerRow({ worker, probing, onProbe, onEdit, onDelete }) {
     StatusIcon = CircleX
     statusLabel = 'Unreachable'
     statusClass = 'text-destructive'
-  } else if (neverSeen) {
-    StatusIcon = CircleHelp
-    statusLabel = 'Never probed'
-    statusClass = 'text-muted-foreground'
   }
 
-  // Build a compact "uses" pill string — chat / embed / subagents — so the
-  // user can see at a glance which workloads route here without opening the
-  // edit dialog. Order matches the form.
-  const uses = [
-    worker.use_for_chat && 'chat',
-    worker.use_for_embeddings && 'embed',
-    worker.use_for_subagents && 'subagents',
-  ].filter(Boolean)
-
   return (
-    <div className="flex items-start gap-3 rounded-md border border-border bg-card/40 p-3">
-      <Server className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-baseline gap-2">
-          <span className="text-sm font-semibold text-foreground">
-            {worker.label}
-          </span>
-          <span
-            className={cn('inline-flex items-center gap-1 text-[11px]', statusClass)}
-            title={worker.last_error || statusLabel}
-          >
-            <StatusIcon className="h-3 w-3" /> {statusLabel}
-          </span>
-          <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
-            <Wifi className="h-3 w-3" /> LAN
-          </span>
-        </div>
-
-        <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
-          {worker.address}:{worker.ollama_port}
-        </div>
-
-        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-muted-foreground">
-          {caps.version && (
-            <span className="inline-flex items-center gap-1">
-              <Cpu className="h-3 w-3" /> Ollama {caps.version}
+    <li className="rounded border border-border/50 bg-background/50 p-3">
+      <div className="flex items-start gap-3">
+        <Server className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-baseline gap-2 text-sm">
+            <span className="font-semibold">{worker.label}</span>
+            <span
+              className={cn(
+                'inline-flex items-center gap-1 text-[11px]',
+                statusClass,
+              )}
+              title={worker.last_error || statusLabel}
+            >
+              <StatusIcon className="h-3 w-3" /> {statusLabel}
             </span>
-          )}
-          {modelCount > 0 && (
-            <span title={(caps.models || []).map((m) => m.name).join(', ')}>
-              {modelCount} model{modelCount === 1 ? '' : 's'}
-            </span>
-          )}
-          {uses.length > 0 && (
-            <span>uses: {uses.join(', ')}</span>
-          )}
-          {worker.auth_token_set && <span>auth: set</span>}
-          {worker.tailscale_host && <span title={`auto-repair via ${worker.tailscale_host}`}>auto-repair: on</span>}
-        </div>
-
-        {worker.last_error && (
-          <div className="mt-1 truncate text-[11px] text-destructive">
-            {worker.last_error}
           </div>
-        )}
+          <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
+            {worker.address}:{worker.ollama_port}
+          </div>
+          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-muted-foreground">
+            {caps.version && (
+              <span className="inline-flex items-center gap-1">
+                <Cpu className="h-3 w-3" /> Ollama {caps.version}
+              </span>
+            )}
+            {modelCount > 0 && (
+              <span title={(caps.models || []).map((m) => m.name).join(', ')}>
+                {modelCount} model{modelCount === 1 ? '' : 's'}
+              </span>
+            )}
+          </div>
+          {worker.last_error && (
+            <div className="mt-1 truncate text-[11px] text-destructive">
+              {worker.last_error}
+            </div>
+          )}
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px]">
+            <InlineToggle
+              label="chat"
+              checked={!!worker.use_for_chat}
+              onChange={(v) => onToggle('use_for_chat', v)}
+            />
+            <InlineToggle
+              label="embed"
+              checked={!!worker.use_for_embeddings}
+              onChange={(v) => onToggle('use_for_embeddings', v)}
+            />
+            <InlineToggle
+              label="subagents"
+              checked={!!worker.use_for_subagents}
+              onChange={(v) => onToggle('use_for_subagents', v)}
+            />
+            <InlineToggle
+              label="enabled"
+              checked={!!worker.enabled}
+              onChange={(v) => onToggle('enabled', v)}
+            />
+          </div>
+        </div>
+        <div className="flex shrink-0 gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onProbe}
+            disabled={probing || !worker.enabled}
+            className="h-7 w-7 text-muted-foreground hover:text-foreground"
+            title="Test connection now"
+          >
+            <RefreshCw className={cn('h-4 w-4', probing && 'animate-spin')} />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onDelete}
+            className="h-7 w-7 text-destructive hover:text-destructive"
+            title="Remove worker"
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
       </div>
+    </li>
+  )
+}
 
-      <div className="flex shrink-0 gap-1">
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={onProbe}
-          disabled={probing || !worker.enabled}
-          className="h-7 w-7 text-muted-foreground hover:text-foreground"
-          title="Test connection now"
-        >
-          <RefreshCw className={cn('h-4 w-4', probing && 'animate-spin')} />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={onEdit}
-          className="h-7 w-7 text-muted-foreground hover:text-foreground"
-          title="Edit worker"
-        >
-          <Pencil className="h-4 w-4" />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={onDelete}
-          className="h-7 w-7 text-destructive hover:text-destructive"
-          title="Remove worker"
-        >
-          <Trash2 className="h-4 w-4" />
-        </Button>
-      </div>
-    </div>
+function InlineToggle({ label, checked, onChange }) {
+  return (
+    <label className="inline-flex cursor-pointer items-center gap-1.5 text-muted-foreground">
+      <Switch
+        checked={!!checked}
+        onCheckedChange={onChange}
+        className="scale-75"
+      />
+      <span>{label}</span>
+    </label>
+  )
+}
+
+function iconForLabel(label, online) {
+  const lower = (label || '').toLowerCase()
+  let Icon = Monitor
+  if (/(phone|mobile|android|ios|iphone)/.test(lower)) Icon = Smartphone
+  else if (/(laptop|book|surface|notebook)/.test(lower)) Icon = Laptop
+  return (
+    <Icon
+      className={cn(
+        'size-5 shrink-0',
+        online ? 'text-foreground' : 'text-muted-foreground',
+      )}
+    />
   )
 }
