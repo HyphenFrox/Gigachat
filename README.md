@@ -222,6 +222,15 @@ Defence in depth:
 - **No key cache for v2** — caching the derived AEAD key per (eph_pub, recipient_pub) would defeat FS by leaving key material in memory after the ephemeral private key is destroyed; v2 derivation runs every envelope. Legacy v1 inbound still uses a per-pair cache with FIFO eviction (will disappear once v1 is removed).
 - **Cache wipe on unpair** — revoking trust drops cached legacy key material immediately
 
+**TLS-with-pinning (streaming paths, opt-in)**
+
+- **Self-signed identity cert** — `backend/p2p_tls.ensure_identity_cert()` generates an X.509 cert whose Subject Pubkey is your Ed25519 identity pubkey (the same value that's already in `paired_devices.public_key_b64`). Stored alongside `identity.json` at `~/.gigachat/identity-cert.pem` (mode 0600 on POSIX). Auto-rotated when expiry is within 30 days OR identity has changed.
+- **Pin-based trust, no CA** — peer certs are self-signed. `verify_peer_cert(cert_bytes, expected_ed25519_pub_b64)` does a constant-time compare against the value we already have on file (paired_devices / inventory cache / rendezvous /peers). No certificate authority is involved; the trust anchor IS the identity pubkey we'd otherwise verify Ed25519 sigs against.
+- **Server SSL context** (`make_server_ssl_context`) — TLS 1.3-only, compression off, ready to plug into uvicorn's `ssl_certfile=` / `ssl_keyfile=`.
+- **Client SSL context** (`make_pinned_client_ssl_context`) — accepts ANY cert chain at handshake; the caller is required to invoke `verify_peer_cert(socket.getpeercert(binary_form=True), expected_pub)` before sending the request body. This is the pattern recommended by the cryptography lib for non-CA pinning.
+- **Why for streaming** — TLS 1.3 ECDHE gives FULL forward secrecy in both directions (both sides exchange ephemerals during the handshake). Replaces the per-NDJSON-chunk envelope wrapping with a single TLS handshake then bulk-encrypted stream. The custom envelope (sender-ephemeral X25519 + ChaCha20-Poly1305) stays in place for one-shot calls — its overhead amortises poorly across hundreds of small chunks.
+- **Migration status** — cert generation + pinning helpers shipped. The actual streaming-port enablement is opt-in (separate uvicorn TLS listener) and lands in a follow-up so existing peers stay compatible.
+
 **At-rest encryption (sensitive SQLite columns)**
 
 - **What's encrypted** — `messages.content` (every chat message body), `global_memories.content` (your saved memos), `project_memories.content` (per-cwd memos). All wrapped with ChaCha20-Poly1305 AEAD before INSERT/UPDATE; decrypted transparently in the row hydrators.
@@ -232,7 +241,7 @@ Defence in depth:
 
 What's NOT yet protected (deliberate, documented):
 
-- **Full forward secrecy on the recipient side** — recipient-side compromise of the long-term X25519 priv still reveals past traffic to that recipient. The TLS-with-pinning migration (next phase) closes this on streaming paths.
+- **TLS streaming port enablement** — cert + pinning infrastructure is in place; flipping the streaming endpoints over to a TLS-only port is opt-in via a follow-up that touches uvicorn launch topology. Until then, streaming uses sender-ephemeral envelopes (partial FS).
 - **At-rest passphrase wrap** — master key is derived directly from `identity.json`. An attacker with both files can decrypt. Opt-in passphrase wrap is on the roadmap.
 - **Sender/recipient anonymity** — the envelope header carries plaintext device_ids (needed for routing). An observer with rendezvous logs can see who's talking to whom; only the contents are hidden.
 
