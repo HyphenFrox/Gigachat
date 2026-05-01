@@ -332,18 +332,42 @@ def accept_pairing(
                 "until manually added",
                 e,
             )
+    # Symmetric pairing: tell the claimant that we accepted them so
+    # their side of the friendship is mirrored. Fire-and-forget — a
+    # failed notify only leaves the claimant without a symmetric
+    # record (they can re-pair to fix). Default Gigachat port is the
+    # FastAPI port we read from env.
+    try:
+        from . import p2p_lan_client as _lan
+        peer_port = int(claimant_port or 8000)
+        _lan.fire_and_forget(_lan.push_pair_notify(
+            peer_ip=claimant_ip or "",
+            peer_port=peer_port,
+            peer_device_id=claimant_device_id,
+        ))
+    except Exception as e:
+        log.info("p2p: pair-notify scheduling failed: %s", e)
     return paired
 
 
 def unpair(device_id: str) -> bool:
     """Drop a pairing record AND its auto-created compute_worker row.
 
-    The other side keeps their pairing record until they delete it on
-    their own device — there's no remote-revoke in v1 because that
-    would require a transport channel we haven't built yet. Removing
-    the worker too keeps the routing layer from trying to talk to a
-    peer the user has decided not to trust anymore.
+    Symmetric: also fires a signed unpair-notify to the peer's
+    Gigachat so they remove their record of us too. Fire-and-forget
+    — a failed notify (peer offline) leaves the friendship state
+    inconsistent (we forget them, they still remember us). The peer
+    can prune the orphan record manually or wait for the next
+    pair attempt to refresh it.
     """
+    # Capture the peer's address BEFORE we delete the rows so the
+    # notify has somewhere to go. The notify only succeeds when the
+    # peer's Gigachat is reachable on the LAN at this address; if it
+    # has hopped IPs since we last saw it the notify will fail and
+    # the friendship will end up one-sided.
+    paired = db.get_paired_device(device_id)
+    peer_ip = paired.get("ip") if paired else None
+    peer_port = paired.get("port") if paired else None
     # Order matters: delete the worker BEFORE the pairing so the
     # "find the worker by device_id" lookup still succeeds.
     try:
@@ -358,4 +382,17 @@ def unpair(device_id: str) -> bool:
         log.info(
             "p2p: compute_worker cleanup on unpair failed: %s", e,
         )
-    return db.delete_paired_device(device_id)
+    removed = db.delete_paired_device(device_id)
+    # Symmetric notify — fire after local removal so we don't roll
+    # the local action back if the peer is offline.
+    if removed and peer_ip:
+        try:
+            from . import p2p_lan_client as _lan
+            _lan.fire_and_forget(_lan.push_unpair_notify(
+                peer_ip=peer_ip,
+                peer_port=int(peer_port or 8000),
+                peer_device_id=device_id,
+            ))
+        except Exception as e:
+            log.info("p2p: unpair-notify scheduling failed: %s", e)
+    return removed

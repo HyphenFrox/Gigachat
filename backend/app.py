@@ -49,6 +49,7 @@ Routes:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import secrets
 import sys
@@ -4166,6 +4167,162 @@ def api_p2p_pair_accept(body: P2PPairAcceptBody) -> dict:
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"paired": rec}
+
+
+class P2PPairNotifyBody(BaseModel):
+    """Body for POST /api/p2p/pair/notify (claimant-side receiver).
+
+    The HOST sends this AFTER it accepts our PIN — it tells us "we
+    paired you, here's our identity, mirror the friendship on your
+    side." Same canonical-bytes signature as the outbound side so
+    a tampered or impersonated message is rejected.
+    """
+    host_device_id: str
+    host_label: str
+    host_public_key_b64: str
+    claimant_device_id: str
+    timestamp: float
+    signature_b64: str
+
+
+class P2PUnpairNotifyBody(BaseModel):
+    """Body for POST /api/p2p/pair/unpair-notify.
+
+    The friend sends this when their user removes the pairing on
+    their side. We verify the signature against the peer's stored
+    pubkey, then drop our matching record so the friendship is
+    symmetrically removed.
+    """
+    initiator_device_id: str
+    initiator_public_key_b64: str
+    peer_device_id: str
+    timestamp: float
+    signature_b64: str
+
+
+@app.post("/api/p2p/pair/notify")
+async def api_p2p_pair_notify(body: P2PPairNotifyBody, request: Request) -> dict:
+    """Receive a "we paired with you" notice from the host side.
+
+    Verifies:
+      * signature is valid against the claimed host public key
+      * `claimant_device_id` matches OUR own device_id (the
+        message is for us, not a misrouted ping)
+      * timestamp is fresh (replay protection)
+    On success: persist the host's identity as a paired peer so
+    the friendship is symmetric. Idempotent — repeat notifies
+    refresh the address but don't double-pair.
+    """
+    from . import identity as _ident
+    from . import p2p_lan_client as _lan
+    me = _ident.get_identity()
+    if body.claimant_device_id != me.device_id:
+        raise HTTPException(400, "this notify is for a different device")
+    if abs(time.time() - body.timestamp) > 120.0:
+        raise HTTPException(400, "notify timestamp out of window")
+    # Cross-check that the host's claimed device_id derives from
+    # their public key — same protection the rendezvous applies.
+    try:
+        derived = _ident._device_id_from_pubkey(
+            base64.b64decode(body.host_public_key_b64)
+        )
+    except Exception:
+        raise HTTPException(400, "host public key is malformed")
+    if derived != body.host_device_id:
+        raise HTTPException(400, "host device_id does not match host public key")
+    digest = _lan._sign_pair_notify(
+        host_device_id=body.host_device_id,
+        host_label=body.host_label,
+        host_public_key_b64=body.host_public_key_b64,
+        claimant_device_id=body.claimant_device_id,
+        timestamp=body.timestamp,
+    )
+    try:
+        sig = base64.b64decode(body.signature_b64)
+    except Exception:
+        raise HTTPException(400, "signature is not valid base64")
+    if not _ident.verify_signature(body.host_public_key_b64, digest, sig):
+        raise HTTPException(401, "signature verification failed")
+    # Trust verified — persist the host as a paired peer.
+    peer_ip = ""
+    if request.client:
+        peer_ip = request.client.host or ""
+    rec = db.upsert_paired_device(
+        device_id=body.host_device_id,
+        public_key_b64=body.host_public_key_b64,
+        label=body.host_label,
+        ip=peer_ip or None,
+        port=None,  # we don't know their FastAPI port — mDNS will fill in
+        role="local",
+    )
+    # Phase 2 mirror: also create a compute_worker row so the host
+    # appears in our routing pool too. Symmetric with what the host
+    # did when it accepted us.
+    try:
+        existing = db.get_compute_worker_by_device_id(body.host_device_id)
+        if not existing and peer_ip:
+            db.create_compute_worker(
+                label=body.host_label or body.host_device_id,
+                address=peer_ip,
+                ollama_port=11434,
+                enabled=True,
+                use_for_chat=True,
+                use_for_embeddings=True,
+                use_for_subagents=True,
+                gigachat_device_id=body.host_device_id,
+            )
+    except Exception as e:
+        log.info("symmetric pair: compute_worker mirror failed: %s", e)
+    return {"paired": rec}
+
+
+@app.post("/api/p2p/pair/unpair-notify")
+async def api_p2p_pair_unpair_notify(body: P2PUnpairNotifyBody) -> dict:
+    """Receive an unpair notice from a former friend.
+
+    Verifies the signature against the initiator's stored pubkey
+    (looked up from our paired_devices table — if we don't have a
+    record of them, we have nothing to unpair, return 200 quietly
+    so a stale retry doesn't error).
+
+    On success: drop our matching record + the auto-created
+    compute_worker row.
+    """
+    from . import identity as _ident
+    from . import p2p_lan_client as _lan
+    if abs(time.time() - body.timestamp) > 120.0:
+        raise HTTPException(400, "notify timestamp out of window")
+    me = _ident.get_identity()
+    if body.peer_device_id != me.device_id:
+        raise HTTPException(400, "this notify is for a different device")
+    # Use the stored pubkey if we have one — that way a peer can't
+    # use a fresh keypair to unpair under another peer's id. If we
+    # have no record at all, accept the message's claimed pubkey
+    # for verification but mark the unpair as a no-op (nothing to
+    # remove).
+    paired = db.get_paired_device(body.initiator_device_id)
+    pubkey = (paired or {}).get("public_key_b64") or body.initiator_public_key_b64
+    digest = _lan._sign_unpair_notify(
+        initiator_device_id=body.initiator_device_id,
+        initiator_public_key_b64=body.initiator_public_key_b64,
+        peer_device_id=body.peer_device_id,
+        timestamp=body.timestamp,
+    )
+    try:
+        sig = base64.b64decode(body.signature_b64)
+    except Exception:
+        raise HTTPException(400, "signature is not valid base64")
+    if not _ident.verify_signature(pubkey, digest, sig):
+        raise HTTPException(401, "signature verification failed")
+    # Verified — drop the worker first then the pairing.
+    try:
+        worker = db.get_compute_worker_by_device_id(body.initiator_device_id)
+        if worker:
+            db.delete_compute_worker(worker["id"])
+    except Exception as e:
+        log.info("symmetric unpair: compute_worker cleanup failed: %s", e)
+    removed = db.delete_paired_device(body.initiator_device_id)
+    return {"unpaired": removed}
 
 
 @app.post("/api/p2p/pair/build-claim")
