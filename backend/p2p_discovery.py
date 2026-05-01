@@ -94,6 +94,50 @@ class _DiscoveryState:
 _state: _DiscoveryState | None = None
 
 
+def merge_discovered_peers(peers: list[dict]) -> int:
+    """Merge externally-discovered peers (e.g. from the active LAN
+    scan in `p2p_lan_scan.py`) into the canonical `_state.discovered`
+    dict.
+
+    Each ``peer`` dict must carry at least ``device_id``, ``ip``,
+    ``port``, ``public_key_b64``. ``last_seen_at`` is set to now if
+    absent so the TTL tracking works.
+
+    Returns the count of peers merged.
+
+    Idempotent — calling with the same peer multiple times just
+    refreshes the ``last_seen_at`` timestamp, keeping it fresh in
+    the discovered list. Doesn't overwrite the trust anchor (the
+    public key) once set, so a malicious LAN-scan response with a
+    spoofed pubkey can't displace a real mDNS-learned one.
+    """
+    if not _state or not peers:
+        return 0
+    now = time.time()
+    merged = 0
+    with _state.lock:
+        for peer in peers:
+            did = (peer.get("device_id") or "").strip()
+            if not did:
+                continue
+            existing = _state.discovered.get(did)
+            if existing:
+                # Refresh address + last_seen, preserve the original
+                # public_key_b64 (trust anchor — first-write-wins).
+                existing["ip"] = peer.get("ip") or existing.get("ip")
+                existing["port"] = int(peer.get("port") or existing.get("port") or 0)
+                existing["label"] = peer.get("label") or existing.get("label")
+                existing["last_seen_at"] = peer.get("last_seen_at") or now
+                if not existing.get("public_key_b64"):
+                    existing["public_key_b64"] = peer.get("public_key_b64") or ""
+            else:
+                rec = dict(peer)
+                rec.setdefault("last_seen_at", now)
+                _state.discovered[did] = rec
+            merged += 1
+    return merged
+
+
 def _local_ip() -> str:
     """Best-effort guess at the host's primary LAN address.
 

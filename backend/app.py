@@ -197,6 +197,18 @@ async def lifespan(_app: FastAPI):
         await _p2pd.start(advertise_port=adv_port)
     except Exception as e:
         log.warning("p2p_discovery startup failed: %s", e)
+    # Active LAN-scan fallback. Some Wi-Fi setups (AP isolation, IGMP
+    # snooping with aggressive timeouts) silently drop multicast in
+    # one or both directions, leaving mDNS unable to discover peers.
+    # The scanner periodically GETs /api/p2p/identity on every host
+    # in our local /24 — slower than mDNS but always works on a
+    # routed LAN. Merges results into the same discovered dict the
+    # mDNS browser populates.
+    try:
+        from . import p2p_lan_scan as _scan
+        await _scan.start()
+    except Exception as e:
+        log.warning("p2p_lan_scan startup failed: %s", e)
     # Rendezvous client — registers this install with the GCP Cloud
     # Run rendezvous so other peers across the internet can find us.
     # No-op when GIGACHAT_RENDEZVOUS_URL is unset OR when the user
@@ -250,6 +262,11 @@ async def lifespan(_app: FastAPI):
         await _rdv.stop()
     except Exception as e:
         log.warning("p2p_rendezvous shutdown failed: %s", e)
+    try:
+        from . import p2p_lan_scan as _scan
+        await _scan.stop()
+    except Exception as e:
+        log.warning("p2p_lan_scan shutdown failed: %s", e)
     try:
         from . import p2p_discovery as _p2pd
         await _p2pd.stop()
@@ -4232,7 +4249,8 @@ class P2PPairInitiateBody(BaseModel):
 
     The claimant's frontend calls THIS endpoint on its OWN backend
     (loopback, no CORS). The backend looks up the target peer in its
-    mDNS discovery cache to get the IP / port / pubkey, then does the
+    discovery cache (which merges mDNS broadcasts with the active
+    TCP-scan fallback for routers that drop multicast), then does the
     cross-device HTTP exchange with the host:
 
       1. GET http://<host_ip>:<host_port>/api/p2p/pair/handshake
@@ -4268,10 +4286,9 @@ async def api_p2p_pair_initiate(body: P2PPairInitiateBody) -> dict:
     if not body.device_id:
         raise HTTPException(400, "device_id is required")
 
-    # Resolve the peer's IP / port / pubkey from our own mDNS discovery
-    # cache. The frontend just clicks "Pair" on a discovered row, so
-    # we already have the address — no need to plumb it back through
-    # the request body.
+    # Resolve from our local discovery cache (mDNS + active TCP scan
+    # merged into one list). Both mechanisms populate
+    # `p2p_discovery.list_discovered()`.
     from . import p2p_discovery as _disc
     peer = next(
         (d for d in _disc.list_discovered() if d.get("device_id") == body.device_id),
@@ -4280,8 +4297,8 @@ async def api_p2p_pair_initiate(body: P2PPairInitiateBody) -> dict:
     if not peer:
         raise HTTPException(
             400,
-            "That device is no longer in the discovered-peers list. "
-            "Wait a couple of seconds for mDNS to refresh and try again.",
+            "That device is no longer in the discovered list. Wait a "
+            "few seconds for the next discovery sweep and try again.",
         )
     host_ip = peer.get("ip") or ""
     host_port = int(peer.get("port") or 0)
@@ -4289,8 +4306,8 @@ async def api_p2p_pair_initiate(body: P2PPairInitiateBody) -> dict:
     if not (host_ip and host_port and host_public_key_b64):
         raise HTTPException(
             400,
-            "Discovered peer is missing IP / port / public key in the "
-            "mDNS record. Restart Gigachat on that device and retry.",
+            "Discovered peer is missing IP / port / public key. "
+            "Restart Gigachat on that device and retry.",
         )
     base_url = f"http://{host_ip}:{host_port}"
     # 1. Fetch the host's pending offers (pairing_id + nonce, NO PIN).
