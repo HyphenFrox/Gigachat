@@ -4310,6 +4310,31 @@ async def api_p2p_pair_initiate(body: P2PPairInitiateBody) -> dict:
             "Restart Gigachat on that device and retry.",
         )
     base_url = f"http://{host_ip}:{host_port}"
+
+    # Claimant address the host should record + push the symmetric
+    # pair-notify back to. Pick OUR LAN IP that's on the SAME /24 as
+    # the host (so the host can reach us at it). Without this the
+    # host stores `ip=null` and the push_pair_notify silently no-ops,
+    # leaving us with no record of the pairing on this side.
+    from . import p2p_discovery as _disc
+    import ipaddress as _ipaddr
+    my_advertised_ip = ""
+    try:
+        host_obj = _ipaddr.ip_address(host_ip)
+        for my_ip in _disc._local_lan_ips():
+            try:
+                if host_obj in _ipaddr.ip_interface(f"{my_ip}/24").network:
+                    my_advertised_ip = my_ip
+                    break
+            except ValueError:
+                continue
+    except ValueError:
+        pass
+    if not my_advertised_ip:
+        # No matching subnet — fall back to the first LAN IP.
+        ips = _disc._local_lan_ips()
+        my_advertised_ip = ips[0] if ips else ""
+    my_advertised_port = int(os.environ.get("PORT", "8000"))
     # 1. Fetch the host's pending offers (pairing_id + nonce, NO PIN).
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
@@ -4367,6 +4392,12 @@ async def api_p2p_pair_initiate(body: P2PPairInitiateBody) -> dict:
                         "claimant_public_key_b64": claim["claimant_public_key_b64"],
                         "claimant_x25519_public_b64": claim["claimant_x25519_public_b64"],
                         "signature_b64": claim["signature_b64"],
+                        # Tell the host where to push the pair-notify
+                        # back so the symmetric record lands on our
+                        # side too. Without these the host stores us
+                        # with `ip=null` and silently skips the notify.
+                        "claimant_ip": my_advertised_ip,
+                        "claimant_port": my_advertised_port,
                     },
                 )
         except Exception as e:
@@ -4397,14 +4428,32 @@ async def api_p2p_pair_initiate(body: P2PPairInitiateBody) -> dict:
 
 
 @app.post("/api/p2p/pair/accept")
-def api_p2p_pair_accept(body: P2PPairAcceptBody) -> dict:
+def api_p2p_pair_accept(body: P2PPairAcceptBody, request: Request) -> dict:
     """Verify a pairing claim and persist the trust anchor.
 
     Called by the OTHER device (the claimant) — the device whose
     user just typed the PIN. Body carries the claimant's
     Ed25519-signed proof of PIN knowledge.
+
+    Defence in depth on `claimant_ip` / `claimant_port`: when the
+    body doesn't carry them (older client, manual curl, etc.), fall
+    back to the request's source IP and the standard Gigachat port.
+    Without an ip we can't push the symmetric pair-notify, leaving
+    the claimant without a record on their side.
     """
     from . import p2p_pairing as _pair
+    claimant_ip = body.claimant_ip
+    if not claimant_ip and request.client:
+        candidate = request.client.host or ""
+        # Strip an IPv4-mapped IPv6 prefix that some proxies emit.
+        if candidate.startswith("::ffff:"):
+            candidate = candidate[len("::ffff:"):]
+        # Only use it when it's actually a private LAN address —
+        # if a proxy somewhere put a public IP in there we'd silently
+        # store garbage.
+        if auth.is_lan_client(candidate):
+            claimant_ip = candidate
+    claimant_port = body.claimant_port or 8000
     try:
         rec = _pair.accept_pairing(
             pairing_id=body.pairing_id,
@@ -4413,8 +4462,8 @@ def api_p2p_pair_accept(body: P2PPairAcceptBody) -> dict:
             claimant_label=body.claimant_label,
             claimant_public_key_b64=body.claimant_public_key_b64,
             signature_b64=body.signature_b64,
-            claimant_ip=body.claimant_ip,
-            claimant_port=body.claimant_port,
+            claimant_ip=claimant_ip,
+            claimant_port=claimant_port,
             claimant_x25519_public_b64=body.claimant_x25519_public_b64,
         )
     except ValueError as e:
