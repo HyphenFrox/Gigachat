@@ -229,7 +229,15 @@ Defence in depth:
 - **Server SSL context** (`make_server_ssl_context`) — TLS 1.3-only, compression off, ready to plug into uvicorn's `ssl_certfile=` / `ssl_keyfile=`.
 - **Client SSL context** (`make_pinned_client_ssl_context`) — accepts ANY cert chain at handshake; the caller is required to invoke `verify_peer_cert(socket.getpeercert(binary_form=True), expected_pub)` before sending the request body. This is the pattern recommended by the cryptography lib for non-CA pinning.
 - **Why for streaming** — TLS 1.3 ECDHE gives FULL forward secrecy in both directions (both sides exchange ephemerals during the handshake). Replaces the per-NDJSON-chunk envelope wrapping with a single TLS handshake then bulk-encrypted stream. The custom envelope (sender-ephemeral X25519 + ChaCha20-Poly1305) stays in place for one-shot calls — its overhead amortises poorly across hundreds of small chunks.
-- **Migration status** — cert generation + pinning helpers shipped. The actual streaming-port enablement is opt-in (separate uvicorn TLS listener) and lands in a follow-up so existing peers stay compatible.
+- **Streaming port enablement** — opt-in via `GIGACHAT_TLS_PORT=<port>` env var. When set, `backend/server.py` spins up a second uvicorn instance bound to that port, sharing the same FastAPI app + identity cert. The HTTP port keeps serving the browser UI + non-streaming endpoints unchanged. Peers who connect to the TLS port pin the cert against the value already in `paired_devices` / inventory cache (no CA required). Default deployments are byte-identical to before — TLS adoption is gradual.
+
+**TURN-style relay (symmetric-NAT fallback)**
+
+- **Why** — direct STUN-discovered candidates fail when both peers are behind symmetric-NAT routers (most home networks without UPnP). The relay shuttles encrypted envelopes through the rendezvous so symmetric-NAT pairs stay reachable.
+- **Server** (`rendezvous/main.py`) — `POST /relay/send` drops an envelope into the recipient's queue; `GET /relay/inbox/{device_id}` long-polls (up to 25 s) for queued envelopes. Per-IP rate limit (60 sends/min), per-recipient queue cap (200 envelopes), payload cap (256 KB), 60 s TTL.
+- **Privacy** — the relay sees ONLY ciphertext. Confidentiality is end-to-end via the existing `p2p_crypto` envelope (X25519 ECDH + ChaCha20-Poly1305 AEAD), so adding the relay doesn't widen the rendezvous's trust profile.
+- **Client** (`backend/p2p_relay.py`) — `forward_via_relay(...)` is a drop-in replacement for `p2p_secure_client.forward()`, generating a `_relay_req_id` for request/response correlation and parking an asyncio Future until the matching response envelope arrives via the inbox poll loop. `p2p_secure_client.forward()` falls back to the relay automatically when the direct HTTP POST fails.
+- **Latency** — ~100-300 ms relay roundtrip on Cloud Run, vs. sub-millisecond direct LAN. Acceptable for one-shot calls (chat completions, embeddings); too slow for streaming chat where each NDJSON chunk would pay the relay tax. Streaming over relay needs WebSocket transport — deferred to a follow-up.
 
 **At-rest encryption (sensitive SQLite columns)**
 

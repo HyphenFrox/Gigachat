@@ -20,6 +20,7 @@ silently binding to an unexpected interface.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import sys
@@ -103,9 +104,66 @@ def main() -> None:
         print("  password required for LAN clients — localhost is free")
     else:
         print("  loopback-only (no password required)")
+
+    # P2P TLS streaming port — opt-in via env var. When set, a second
+    # uvicorn binds the same FastAPI app on the TLS port using our
+    # self-signed identity cert (peers pin the cert pubkey, so no CA
+    # required). The TLS port is intended for streaming P2P traffic
+    # only — chat NDJSON streams ride a single TLS handshake and get
+    # full forward secrecy via TLS 1.3 ECDHE in BOTH directions, vs.
+    # the envelope path's sender-only ephemeral. The HTTP port keeps
+    # serving the browser UI + non-streaming endpoints unchanged.
+    tls_port_env = (os.environ.get("GIGACHAT_TLS_PORT") or "").strip()
+    tls_port: int | None = None
+    if tls_port_env:
+        try:
+            tls_port = int(tls_port_env)
+        except ValueError:
+            print(
+                f"  [!] GIGACHAT_TLS_PORT={tls_port_env!r} is not a valid "
+                "integer — TLS port disabled.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  P2P TLS streaming port: https://{host}:{tls_port}")
     print()
 
-    uvicorn.run("backend.app:app", host=host, port=port, log_level="info")
+    if tls_port is None:
+        # Single uvicorn — preserves the legacy launch path so default
+        # deployments are byte-identical to before.
+        uvicorn.run("backend.app:app", host=host, port=port, log_level="info")
+        return
+
+    # Dual-server: HTTP (browser + non-stream P2P) + HTTPS (streaming
+    # P2P). Both serve the same FastAPI app. Run them under a single
+    # asyncio loop so they share startup/shutdown lifecycle and the
+    # same in-process state (db, identity, inventory cache, etc.).
+    from . import p2p_tls
+    cert_path, key_path = p2p_tls.ensure_identity_cert()
+
+    http_config = uvicorn.Config(
+        "backend.app:app", host=host, port=port,
+        log_level="info", lifespan="on",
+    )
+    tls_config = uvicorn.Config(
+        "backend.app:app", host=host, port=tls_port,
+        log_level="info", lifespan="off",  # share lifespan with HTTP server
+        ssl_certfile=str(cert_path),
+        ssl_keyfile=str(key_path),
+    )
+    http_server = uvicorn.Server(http_config)
+    tls_server = uvicorn.Server(tls_config)
+
+    async def _run_both() -> None:
+        await asyncio.gather(http_server.serve(), tls_server.serve())
+
+    try:
+        asyncio.run(_run_both())
+    except KeyboardInterrupt:
+        # Graceful shutdown: signal both servers to exit. asyncio.run
+        # will then return as their tasks complete.
+        http_server.should_exit = True
+        tls_server.should_exit = True
 
 
 if __name__ == "__main__":
