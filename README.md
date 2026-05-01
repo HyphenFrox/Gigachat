@@ -24,27 +24,20 @@ A self-hosted web app that turns **any locally-running Ollama model** (Gemma, Ll
 # 1. Install Ollama and a function-calling model.
 ollama pull gemma4:e4b
 
-# 2. One-shot setup (creates an isolated .venv\ and installs every dep).
-.\setup.bat
-
-# 3. Run the dev servers (two console windows). Visit http://localhost:5173.
-.\dev.bat
+# 2. One-shot install (asks for Administrator via UAC, then sets
+#    everything up: virtualenv, deps, frontend build, firewall rule
+#    for the LAN compute pool, and a scheduled task that auto-starts
+#    the backend at logon and restarts it on crash).
+.\install.bat
 ```
 
-That's it for solo loopback use. **Production** build is `.\build.bat` then `.\start.bat` (FastAPI serves both the API + the built frontend on http://localhost:8000). All three launchers auto-detect `.venv\` and use it when present.
+That's it. The backend is now running and reachable at **http://localhost:8000** in your browser; it'll come back automatically after every reboot, no manual launching needed. Other Gigachat installs on the same Wi-Fi can pair with it via Settings → Compute pool.
 
-**Optional one-shot for permanent setup** (Windows): run `.\install-service.bat` as Administrator to (a) add an inbound firewall rule for port 8000 on the Private profile so other Gigachat installs on the same Wi-Fi can reach this device's P2P endpoints, and (b) register a Scheduled Task that auto-starts the backend at logon (survives reboots, no need to manually run `start.bat` after that). `.\uninstall-service.bat` undoes both. The app itself is unchanged — these only set up the OS-level integration.
+**Re-running `install.bat`** is safe + idempotent — every step replaces existing state cleanly. Run it again after `git pull` to refresh deps + rebuild the frontend bundle.
 
-**Manual setup** (if you'd rather not use `setup.bat`):
+**To remove**: `.\uninstall.bat` undoes everything (scheduled task, firewall rule, .venv, node_modules, frontend build). Asks before deleting `data\` so a re-install picks up your chat history and P2P identity. Source tree is untouched.
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\activate
-python -m pip install -r backend\requirements.txt
-cd frontend && npm install && cd ..
-```
-
-The venv is strongly recommended on Windows — installing into the system + user site-packages dirs mixes locations and runs into `PermissionError` issues when antivirus / OneDrive / file ACLs touch one of the half-installed files. See the [Troubleshooting](#troubleshooting) row for that error if you hit it.
+**Dev mode** (hot-reload Vite + uvicorn `--reload`): `.\dev.bat` starts both servers in two console windows; visit http://localhost:5173. No admin required, no scheduled task, no firewall rule (loopback only).
 
 **Requirements**: Windows 10/11 (for the launcher `.bat` scripts; Python/Node code is cross-platform), Python 3.12+, Node 20+, Ollama running locally on `http://localhost:11434`, at least one function-calling Ollama model.
 
@@ -210,8 +203,8 @@ The `isolated_db` fixture rewires `db.DB_PATH` to a tmp file per test, so the su
 | `web_search` rate-limited | DuckDuckGo occasionally rate-limits. Wait a minute; persistent? `pip install -U ddgs`. |
 | `doc_index` / `doc_search`: "no vector" | `ollama pull nomic-embed-text`. |
 | Settings → Compute pool: rendezvous "Disconnected" / "Not configured" | Confirm Public Pool toggle is on. The default Cloud Run URL ships with the app; override or self-host via the URL editor. |
-| `PermissionError: [Errno 13] Permission denied: '...\\AppData\\Roaming\\Python\\Python3xx\\site-packages\\typing_extensions.py'` on backend startup | Mixed system + user site-packages install. Cleanest fix: `.\setup.bat` (creates `.venv\` and installs every dep there; `dev.bat` / `start.bat` auto-detect it). Quick patch without venv: `del "%APPDATA%\Python\Python3xx\site-packages\typing_extensions.py"` then `python -m pip install --user typing_extensions`. |
-| `pip uninstall typing-extensions` fails with `uninstall-no-record-file` | The existing copy was put there manually / by a partial install — pip can't safely remove it. Either delete the file by hand (`del "%APPDATA%\Python\Python3xx\site-packages\typing_extensions.py"`) or just run `.\setup.bat` and use the venv-aware launchers, which bypass the global install entirely. |
+| `PermissionError: [Errno 13] Permission denied: '...\\AppData\\Roaming\\Python\\Python3xx\\site-packages\\typing_extensions.py'` on backend startup | Mixed system + user site-packages install. Cleanest fix: `.\install.bat` (creates `.venv\` and installs every dep there; the scheduled task uses that venv exclusively). Quick patch without venv: `del "%APPDATA%\Python\Python3xx\site-packages\typing_extensions.py"` then re-run `install.bat`. |
+| `pip uninstall typing-extensions` fails with `uninstall-no-record-file` | The existing copy was put there manually / by a partial install — pip can't safely remove it. Run `.\install.bat` to use the venv path, which bypasses the global install entirely. |
 | Browser on another LAN device gets a "loopback only" 403 | By design — the chat UI is loopback-only on every install. Use Gigachat from the same machine it's running on; for cross-device compute, install Gigachat on both and pair via Settings → Compute pool. |
 | Another device on the LAN can't pair with mine (mDNS / direct connect fails) | Confirm Windows Defender has the OpenSSH SSH Server / Gigachat firewall rule enabled for the **Private** profile and that the Ethernet/Wi-Fi adapter is classified Private (not Public). Tailscale CGNAT (`100.64.0.0/10`) is intentionally refused; both devices must be on the same physical network. |
 
