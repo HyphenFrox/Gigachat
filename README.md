@@ -33,6 +33,8 @@ ollama pull gemma4:e4b
 
 That's it for solo loopback use. **Production** build is `.\build.bat` then `.\start.bat` (FastAPI serves both the API + the built frontend on http://localhost:8000). All three launchers auto-detect `.venv\` and use it when present.
 
+**Optional one-shot for permanent setup** (Windows): run `.\install-service.bat` as Administrator to (a) add an inbound firewall rule for port 8000 on the Private profile so other Gigachat installs on the same Wi-Fi can reach this device's P2P endpoints, and (b) register a Scheduled Task that auto-starts the backend at logon (survives reboots, no need to manually run `start.bat` after that). `.\uninstall-service.bat` undoes both. The app itself is unchanged — these only set up the OS-level integration.
+
 **Manual setup** (if you'd rather not use `setup.bat`):
 
 ```powershell
