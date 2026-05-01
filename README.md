@@ -25,19 +25,21 @@ A self-hosted web app that turns **any locally-running Ollama model** (Gemma, Ll
 ollama pull gemma4:e4b
 
 # 2. One-shot install (asks for Administrator via UAC, then sets
-#    everything up: virtualenv, deps, frontend build, firewall rule
-#    for the LAN compute pool, and a scheduled task that auto-starts
-#    the backend at logon and restarts it on crash).
+#    everything up: virtualenv, backend deps, frontend build, and the
+#    inbound firewall rule for the LAN compute pool).
 .\install.bat
+
+# 3. Start the backend whenever you want to use the app:
+.\start.bat                 # production (single port, http://localhost:8000)
+# OR
+.\dev.bat                   # dev mode with hot reload (http://localhost:5173)
 ```
 
-That's it. The backend is now running and reachable at **http://localhost:8000** in your browser; it'll come back automatically after every reboot, no manual launching needed. Other Gigachat installs on the same Wi-Fi can pair with it via Settings → Compute pool.
+`install.bat` is a one-time setup. After it finishes you launch the backend explicitly with `start.bat` or `dev.bat` — nothing runs in the background you didn't ask for. Other Gigachat installs on the same Wi-Fi can pair with this device via Settings → Compute pool while the backend is up.
 
 **Re-running `install.bat`** is safe + idempotent — every step replaces existing state cleanly. Run it again after `git pull` to refresh deps + rebuild the frontend bundle.
 
-**To remove**: `.\uninstall.bat` undoes everything (scheduled task, firewall rule, .venv, node_modules, frontend build). Asks before deleting `data\` so a re-install picks up your chat history and P2P identity. Source tree is untouched.
-
-**Dev mode** (hot-reload Vite + uvicorn `--reload`): `.\dev.bat` starts both servers in two console windows; visit http://localhost:5173. No admin required, no scheduled task, no firewall rule (loopback only).
+**To remove**: `.\uninstall.bat` undoes everything (firewall rule, `.venv\`, `node_modules\`, frontend build). Asks before deleting `data\` so a re-install picks up your chat history and P2P identity. Source tree is untouched.
 
 **Requirements**: Windows 10/11 (for the launcher `.bat` scripts; Python/Node code is cross-platform), Python 3.12+, Node 20+, Ollama running locally on `http://localhost:11434`, at least one function-calling Ollama model.
 
