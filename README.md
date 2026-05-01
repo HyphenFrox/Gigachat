@@ -167,48 +167,105 @@ Register any REST API by its OpenAPI spec, then call any of its endpoints withou
 
 Every tool call across every conversation is recorded in the `audit_log` table — tool name, category, args, result summary (capped at 2 KB), ok/duration. `GET /api/audit-log` exposes a filterable read-only view: by conversation, by tool name, since-timestamp. Useful for "what did the agent do today" reviews and for post-mortem of long-running tasks.
 
-### P2P pool — LAN pairing + public pool toggle (Phase 1)
+### P2P pool — encrypted LAN pairing + global rendezvous + public pool
 
-Settings → **Network** lets you pair other Gigachat installs on the same Wi-Fi the way phones pair Bluetooth devices: click, show a 6-digit PIN, type it on the other side, done. After pairing, the trust anchor is the device's Ed25519 public key — IP changes (Wi-Fi networks, DHCP leases) don't break pairing because mDNS rediscovery refreshes the address automatically.
+Settings → **Network** lets you pair other Gigachat installs the way phones pair Bluetooth devices: click, show a 6-digit PIN, type it on the other side, done. Once paired, all compute traffic between the two devices is **end-to-end encrypted** — anyone observing the network sees only ciphertext.
 
-**How it works:**
+**Identity & encryption keys**
 
-- **Identity** — every install generates an Ed25519 keypair on first launch and stores it under `data/identity.json` (mode 0600 on POSIX). The public key, base32-truncated, is the device's `device_id` (e.g. `PBJ4-GCBV-5NH3-PGXH`). Identity persists across restarts; reinstalls regenerate.
-- **Discovery** — each install advertises itself as `_gigachat._tcp.local.` via mDNS (zero-conf / Bonjour / Avahi). Cross-platform: Windows mDNS service, macOS Bonjour, Linux Avahi all interoperate. The TXT record carries `{device_id, label, version, public_key}` so peers can verify identity at pair-time without an extra round-trip.
-- **PIN-based pairing** — host generates a 6-digit PIN with a 5-minute TTL and a 16-byte nonce. The claimant signs `H("gigachat-p2p-pair-v1" || pin || nonce || claimant_pubkey || host_pubkey)` with their identity key. Host verifies the signature, sanity-checks that the claimant's claimed `device_id` matches their public key, and persists the pairing record. PIN is consumed atomically (single-use). Replay-proof because the signature is bound to the host's per-offer nonce.
-- **Auto-reconnect** — the mDNS browser stays running. When a paired device's advertisement reappears with the same `device_id` (different IP), the backend updates the address in place. The user does nothing.
+Every install generates two keypairs on first launch and stores them in `data/identity.json` (mode 0600 on POSIX):
 
-**Public pool toggle** (Settings → Network → "Public pool", default ON):
+- **Ed25519** — for signing. The public key, base32-truncated to 16 chars, is the device's `device_id` (e.g. `PBJ4-GCBV-5NH3-PGXH`). The trust anchor across IP changes, re-pairings, and reinstalls.
+- **X25519** — for ECDH key agreement. Used to derive a per-pair AEAD key (HKDF-SHA256 over the ECDH output) for ChaCha20-Poly1305 envelope encryption.
 
-- **ON** — your install donates idle compute to the wider Gigachat swarm and benefits from cooperative model-weight distribution. **Your prompts still run only on your local pool — they never leave this network**, regardless of the toggle's state. The public-pool path is donate-only for prompt-bearing inference; the privacy boundary is enforced at the routing layer, not just by policy.
-- **OFF** — fully isolated to your local pool. No rendezvous registration, no swarm sockets.
+Same primitives Signal and WhatsApp use; no homemade algorithms.
 
-**v1 scope (this commit):**
+**Discovery & pairing**
 
-- ✅ mDNS discovery + advertisement
-- ✅ PIN-based pairing handshake (Ed25519-signed)
-- ✅ Auto-reconnect on IP change via identity-keyed lookup
-- ✅ Public-pool opt-in toggle (default ON), persisted in `user_settings`
-- ⏳ P2P transport over QUIC (next phase) — actual cross-LAN inference, friend pool
-- ⏳ Rendezvous service (GCP Cloud Run) — peer discovery beyond LAN
-- ⏳ Real-time fairness scheduler — credit-based with per-user min/max bounds
+- **mDNS** — each install advertises `_gigachat._tcp.local.` (zero-conf / Bonjour / Avahi). The TXT record carries `device_id`, `label`, `version`, and the Ed25519 public key. Cross-platform: Windows mDNS service, macOS Bonjour, Linux Avahi all interoperate.
+- **PIN-based pair handshake** — host generates a 6-digit PIN with a 5-minute TTL and a 16-byte nonce. The claimant signs `H("gigachat-p2p-pair-v1" || pin || nonce || claimant_pubkey || host_pubkey)` with their Ed25519 key, AND ships their X25519 pubkey alongside. Host verifies signature + cross-checks `device_id` derives from the public key, then stores the trust anchors. PIN is single-use (atomic consume) and replay-proof (signature binds to the host's per-offer nonce).
+- **Symmetric friendship** — after the host accepts, an Ed25519-signed pair-notify is pushed to the claimant so both sides have a record. Either side's unpair triggers a signed unpair-notify so the friendship is removed symmetrically. The notify itself is wrapped in the encrypted envelope when both sides have each other's X25519 keys.
+- **Auto-reconnect** — the mDNS browser stays running. When a paired device's advertisement reappears with the same `device_id` (different IP), the backend updates the address + the corresponding `compute_workers` row in place. The user does nothing.
+
+**End-to-end encryption — every byte on the wire**
+
+After pairing, all peer-to-peer traffic flows through the encrypted compute proxy (`/api/p2p/secure/forward` and `/forward-stream`). Each payload is wrapped in a `p2p_crypto` envelope:
+
+```
+{ "v":1, "sender":<id>, "sender_x25519_pub":<b64>, "recipient":<id>,
+  "nonce_b64":<12 random bytes>, "timestamp":<float>,
+  "ciphertext_b64":<ChaCha20-Poly1305 output>,
+  "signature_b64":<Ed25519 over (sender|recipient|nonce|timestamp|sender_x25519_pub|sha256(plaintext))> }
+```
+
+What's protected:
+
+| Data path | Mechanism |
+|---|---|
+| Embed request/response (carries query text + vector) | per-request envelope |
+| Chat completion (carries full prompt history + token-by-token output) | per-NDJSON-chunk envelope |
+| Worker probe (`/api/version`, `/api/tags`, `/api/ps`) | per-request envelope |
+| Subagent fan-out to paired peers | per-NDJSON-chunk envelope |
+| Pair-notify and unpair-notify metadata | wrapped envelope |
+
+Defence in depth:
+
+- **Sender authenticity** pinned to the receiver's stored `paired_devices.public_key_b64` — substituting a different pubkey in the envelope fails the signature check
+- **AEAD tag** detects any byte tamper before plaintext is extracted
+- **Replay window** ±120 s — captured envelopes can't be replayed later
+- **Per-peer rate limit** 60 req/min on inbound — defends against compromised friend keypair flooding
+- **Envelope size cap** 256 KB inbound — memory-DoS defence
+- **Upstream response cap** 4 MB — one-way amplification defence
+- **Path whitelist** — even authenticated peers can only reach 7 specific Ollama endpoints (no admin / model-delete)
+- **Refuses peers without X25519 on file** — would mean we can't seal the response back; refuse cleanly
+- **Per-pair derived key cache** with FIFO eviction — streaming chat re-uses the AEAD key across chunks; ECDH+HKDF runs once per pair-session
+- **Cache wipe on unpair** — revoking trust drops cached key material immediately
+
+What's NOT yet protected (deliberate, documented):
+
+- **Forward secrecy** — long-term X25519 keys can decrypt all prior captured messages. A future Noise-IK / Signal-style ratchet is the next planned phase.
+- **Sender/recipient anonymity** — the envelope header carries plaintext device_ids (needed for routing). An observer with rendezvous logs can see who's talking to whom; only the contents are hidden.
+
+**Public pool & internet rendezvous**
+
+- **Rendezvous service** — a tiny stateless FastAPI app deployable to GCP Cloud Run (`rendezvous/`). Holds only `(device_id, public_key, [STUN candidates], last_seen_at)`; never sees prompts, model weights, or chat data. Peers register every 30 s with an Ed25519-signed registration; lookup is by device_id. Same protocol Signal and BitTorrent use for peer discovery.
+- **STUN endpoint discovery** — pure-stdlib STUN client (`backend/p2p_rendezvous.py`) discovers our public IP/port via Google / Cloudflare / Nextcloud STUN servers. Re-discovers every 5 minutes to catch NAT mapping drift.
+- **Public pool toggle** (Settings → Network → "Public pool", default ON):
+  - **ON** — registers with the rendezvous so other peers can find us. Donates idle compute to the wider Gigachat swarm.
+  - **OFF** — fully isolated to local pool. No rendezvous registration, no swarm sockets.
+
+**Real-time fairness scheduler**
+
+When public pool is on and inbound requests arrive, `backend/p2p_fairness.py` enforces:
+
+- **Minimum entitlement**: your full local pool, always available (no quota).
+- **Maximum entitlement** (per-consumer slice, real-time): `total_donations / active_consumers`. Recomputed on EVERY admission decision — a surge of new consumers immediately tightens existing slices; departures widen them.
+- **Per-peer rate cap** + **hard concurrency cap** as belt-and-braces.
 
 **API surface:**
 
 | Endpoint | Use |
 |---|---|
-| `GET /api/p2p/identity` | This install's identity (device_id, label, public key) |
+| `GET /api/p2p/identity` | This install's identity (device_id, label, Ed25519 + X25519 pubkeys) |
 | `PATCH /api/p2p/identity` | Rename the local device |
 | `GET /api/p2p/discover` | Snapshot of LAN peers from mDNS browser |
 | `POST /api/p2p/pair/start` | Generate a pairing PIN |
 | `POST /api/p2p/pair/build-claim` | Build a signed pairing claim from this device's identity |
 | `POST /api/p2p/pair/accept` | Accept a pairing claim (host side) |
+| `POST /api/p2p/pair/notify` | Receive symmetric pair record from peer (encrypted envelope) |
+| `POST /api/p2p/pair/unpair-notify` | Receive symmetric unpair from peer (encrypted envelope) |
 | `DELETE /api/p2p/pair/{id}` | Cancel a pending pairing offer |
 | `GET /api/p2p/pair/pending` | List active pairing offers |
 | `GET /api/p2p/paired` | List paired devices |
-| `DELETE /api/p2p/paired/{device_id}` | Unpair |
+| `DELETE /api/p2p/paired/{device_id}` | Unpair (signed notify pushed to peer) |
+| `POST /api/p2p/secure/forward` | Inbound encrypted compute proxy (one-shot) |
+| `POST /api/p2p/secure/forward-stream` | Inbound encrypted compute proxy (streaming) |
 | `GET /api/p2p/public-pool` | Read public-pool toggle |
 | `PATCH /api/p2p/public-pool` | Toggle public-pool on/off |
+| `GET /api/p2p/rendezvous/status` | STUN candidates + last register/heartbeat |
+| `PATCH /api/p2p/rendezvous/url` | Set the rendezvous server URL |
+| `GET /api/p2p/fairness/status` | Real-time fairness scheduler view |
+| `PATCH /api/p2p/fairness/config` | Tune donation fraction + concurrency caps |
 
 ---
 

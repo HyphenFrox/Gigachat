@@ -16,6 +16,8 @@ import {
   Check,
   X,
   KeyRound,
+  Lock,
+  Unlock,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -420,12 +422,15 @@ export default function P2PSection() {
           <p className="text-xs text-muted-foreground">
             No paired devices yet. After pairing, devices reconnect
             automatically when their IP changes — same as Bluetooth.
+            All compute traffic to paired devices is end-to-end
+            encrypted (X25519 + ChaCha20-Poly1305).
           </p>
         ) : (
           <ul className="space-y-1.5">
             {paired.map((d) => {
               const lastSeenAt = d.last_seen_at || 0
               const online = lastSeenAt > 0 && (Date.now() / 1000 - lastSeenAt) < 120
+              const e2e = !!d.x25519_public_b64
               return (
                 <li
                   key={d.device_id}
@@ -433,7 +438,7 @@ export default function P2PSection() {
                 >
                   {iconForLabel(d.label, online)}
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 text-sm">
+                    <div className="flex flex-wrap items-center gap-2 text-sm">
                       <span className="truncate font-medium">{d.label}</span>
                       <span
                         className={cn(
@@ -445,6 +450,27 @@ export default function P2PSection() {
                       >
                         {online ? <Wifi className="size-2.5" /> : <WifiOff className="size-2.5" />}
                         {online ? 'Online' : 'Offline'}
+                      </span>
+                      {/* Encryption status badge — green lock when
+                          we have the peer's X25519 key on file
+                          (auto-exchanged at pair time); amber unlock
+                          for legacy peers paired before E2E shipped
+                          who need to re-pair to enable encryption. */}
+                      <span
+                        className={cn(
+                          'inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px]',
+                          e2e
+                            ? 'bg-emerald-500/15 text-emerald-500'
+                            : 'bg-amber-500/15 text-amber-500',
+                        )}
+                        title={
+                          e2e
+                            ? 'End-to-end encrypted: all compute traffic to this peer is wrapped in X25519+ChaCha20-Poly1305 envelopes; nothing on the wire is plaintext.'
+                            : 'No encryption key on file — peer was paired before E2E shipped. Re-pair to enable end-to-end encryption.'
+                        }
+                      >
+                        {e2e ? <Lock className="size-2.5" /> : <Unlock className="size-2.5" />}
+                        {e2e ? 'E2E' : 'plaintext'}
                       </span>
                     </div>
                     <div className="text-[11px] text-muted-foreground">
@@ -474,6 +500,47 @@ export default function P2PSection() {
             })}
           </ul>
         )}
+      </section>
+
+      {/* Security model summary — explicit so users can see what's
+          protected and what isn't, without trawling through code. */}
+      <section className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-4">
+        <h3 className="mb-2 flex items-center gap-2 text-sm font-medium">
+          <Lock className="size-4 text-emerald-500" />
+          End-to-end encryption
+        </h3>
+        <ul className="space-y-1 text-xs leading-snug text-muted-foreground">
+          <li>
+            <strong className="text-foreground">Identity:</strong>{' '}
+            Each device has an Ed25519 (signing) + X25519 (key
+            agreement) keypair generated on first launch and stored
+            in <code>data/identity.json</code> with mode 0600.
+          </li>
+          <li>
+            <strong className="text-foreground">Compute traffic:</strong>{' '}
+            Every chat, embedding, and probe call to a paired peer is
+            wrapped in an X25519+ChaCha20-Poly1305 envelope, signed
+            with Ed25519. Anyone observing the network sees only
+            ciphertext — prompts, model output, even peer metadata.
+          </li>
+          <li>
+            <strong className="text-foreground">Replay protection:</strong>{' '}
+            ±120 s timestamp window enforced on every envelope. Captured
+            traffic can't be replayed later.
+          </li>
+          <li>
+            <strong className="text-foreground">Sender authenticity:</strong>{' '}
+            Receiver verifies the signature against the SENDER's pinned
+            public key from the pair record. Identity substitution by a
+            MITM is rejected before decryption is attempted.
+          </li>
+          <li>
+            <strong className="text-foreground">Path whitelist:</strong>{' '}
+            Even authenticated peers can only reach Ollama compute
+            endpoints through the secure proxy — no admin/model-delete
+            paths exposed.
+          </li>
+        </ul>
       </section>
     </div>
   )

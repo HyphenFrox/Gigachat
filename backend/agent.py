@@ -4384,6 +4384,7 @@ async def run_subagent(
     *,
     base_url: str = OLLAMA_URL,
     auth_token: str | None = None,
+    secure_proxy_worker: dict | None = None,
 ) -> dict:
     """Execute `task` in an isolated agent loop. Returns the same
     {ok, output, error} shape as a normal tool result.
@@ -4518,6 +4519,12 @@ async def run_subagent(
             async for chunk in _stream_ollama_chat(
                 model, messages, schemas,
                 base_url=base_url, auth_token=auth_token,
+                # Encrypted-proxy dispatch when this subagent is
+                # routed to a paired peer. The caller in
+                # `run_subagents_parallel` resolves the worker dict
+                # alongside the URL/token; passing it through here
+                # keeps subagent traffic encrypted on the wire too.
+                secure_proxy_worker=secure_proxy_worker,
             ):
                 msg = chunk.get("message") or {}
                 if msg.get("content"):
@@ -4705,9 +4712,19 @@ async def run_subagents_parallel(
     # smallest fan-outs (1-2 tasks) since its loopback Ollama is the
     # cheapest hop and we don't want to wake up a sleeping laptop for a
     # single subagent task.
-    targets: list[tuple[str, str | None]] = [(OLLAMA_URL, None)]
+    # Each target tuple: (base_url, auth_token, worker_dict_or_None).
+    # The worker dict is needed downstream so encrypted-proxy peers
+    # get their traffic wrapped in envelopes; host gets None.
+    targets: list[tuple[str, str | None, dict | None]] = [
+        (OLLAMA_URL, None, None),
+    ]
     try:
-        targets.extend(compute_pool.list_subagent_workers(model))
+        for w in compute_pool.list_subagent_workers_full(model):
+            base = (
+                f"http://{w['address']}:{w['ollama_port']}"
+            )
+            token = db.get_compute_worker_auth_token(w["id"])
+            targets.append((base, token, w))
     except Exception:
         # compute_pool can't fail here in practice (pure DB read), but
         # belt-and-braces: a routing layer hiccup must never break the
@@ -4729,7 +4746,15 @@ async def run_subagents_parallel(
     # value in the results list rather than aborting the gather.
     coros = []
     for i, (t, bid) in enumerate(zip(cleaned, branch_ids)):
-        base_url, token = targets[i % len(targets)]
+        base_url, token, worker_dict = targets[i % len(targets)]
+        # Encrypted-proxy worker → pass the dict; loopback host →
+        # None. The subagent's _stream_ollama_chat reads the flag
+        # and dispatches through the encrypted proxy when set.
+        secure_worker = (
+            worker_dict
+            if worker_dict and worker_dict.get("use_encrypted_proxy")
+            else None
+        )
         coros.append(
             run_subagent(
                 t, cwd, model, max_iterations,
@@ -4739,6 +4764,7 @@ async def run_subagents_parallel(
                 branch_id=bid,
                 base_url=base_url,
                 auth_token=token,
+                secure_proxy_worker=secure_worker,
             )
         )
     results = await asyncio.gather(*coros, return_exceptions=True)

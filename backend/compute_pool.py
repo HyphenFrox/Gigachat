@@ -975,6 +975,84 @@ async def _attempt_lan_address_repair(worker: dict) -> dict | None:
     return updated
 
 
+async def _probe_one_via_secure_proxy(worker: dict) -> dict:
+    """Mirror of `_probe_one` that routes the three Ollama probe
+    GETs through a paired peer's encrypted Gigachat proxy.
+
+    Builds the same probe payload `_probe_one` does — version + tags
+    + ps + probe_latency_ms — so the existing capability-merge
+    logic upstream sees an identical shape regardless of transport.
+
+    All three GETs go through `p2p_secure_client.forward()` which
+    wraps each request in a `p2p_crypto` envelope addressed to the
+    peer. The wire bytes are ciphertext; the peer's secure proxy
+    decrypts, forwards to its loopback Ollama, encrypts the
+    response back. Anyone observing the LAN sees no probe data.
+    """
+    from . import p2p_secure_client as _secure
+    out: dict[str, Any] = {}
+
+    async def _via(path: str) -> dict | Exception:
+        try:
+            status, body_text = await _secure.forward(
+                worker, method="GET", path=path, body=None,
+            )
+            if status >= 400:
+                raise RuntimeError(f"HTTP {status}")
+            try:
+                return json.loads(body_text)
+            except Exception as je:
+                raise RuntimeError(f"non-JSON body: {je}")
+        except Exception as e:
+            return e
+
+    _t0 = time.perf_counter()
+    ver_res, tags_res, ps_res = await asyncio.gather(
+        _via("/api/version"), _via("/api/tags"), _via("/api/ps"),
+    )
+    out["probe_latency_ms"] = int((time.perf_counter() - _t0) * 1000)
+
+    if isinstance(ver_res, Exception):
+        out["version_error"] = f"{type(ver_res).__name__}: {ver_res}"
+    else:
+        out["version"] = (ver_res or {}).get("version") or "unknown"
+    if isinstance(tags_res, Exception):
+        out["tags_error"] = f"{type(tags_res).__name__}: {tags_res}"
+    else:
+        models = []
+        for m in (tags_res or {}).get("models", []) or []:
+            details = (m.get("details") or {}) if isinstance(m, dict) else {}
+            models.append({
+                "name": m.get("name") if isinstance(m, dict) else None,
+                "size": m.get("size") if isinstance(m, dict) else None,
+                "family": details.get("family"),
+                "parameter_size": details.get("parameter_size"),
+                "quantization_level": details.get("quantization_level"),
+            })
+        out["models"] = [m for m in models if m.get("name")]
+    if isinstance(ps_res, Exception):
+        out["gpu_present"] = False
+        out["max_vram_seen_bytes"] = 0
+        out["loaded_count"] = 0
+    else:
+        loaded = (ps_res or {}).get("models") or []
+        gpu_present = False
+        max_vram = 0
+        for m in loaded:
+            if not isinstance(m, dict):
+                continue
+            v = int(m.get("size_vram") or 0)
+            if v > 0:
+                gpu_present = True
+            if v > max_vram:
+                max_vram = v
+        out["gpu_present"] = gpu_present
+        out["max_vram_seen_bytes"] = max_vram
+        out["loaded_count"] = len(loaded)
+    out["transport"] = "encrypted-proxy"
+    return out
+
+
 async def probe_worker(wid: str) -> dict:
     """Probe one worker now and persist the result.
 
@@ -1001,11 +1079,23 @@ async def probe_worker(wid: str) -> dict:
 
     payload: dict | None = None
     last_exc: Exception | None = None
-    try:
-        async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_SEC) as client:
-            payload = await _probe_one(client, base, token)
-    except Exception as e:
-        last_exc = e
+    # Encrypted-proxy mode: paired peers' compute_workers rows
+    # point at the peer's Gigachat port (not Ollama), so the
+    # plaintext /api/version etc. GETs would 404. Route the same
+    # three Ollama probes through the encrypted proxy instead —
+    # the wire stays ciphertext and the data shape coming back
+    # is identical to a direct Ollama probe.
+    if worker.get("use_encrypted_proxy"):
+        try:
+            payload = await _probe_one_via_secure_proxy(worker)
+        except Exception as e:
+            last_exc = e
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_SEC) as client:
+                payload = await _probe_one(client, base, token)
+        except Exception as e:
+            last_exc = e
 
     if payload is None:
         # Network-level failure — connection refused, DNS miss, etc.
@@ -6095,6 +6185,45 @@ async def route_chat_for(model_name: str) -> dict:
         # work to workers while the host disk is busy mmapping.
         _mark_host_mega_busy()
     return result
+
+
+def list_subagent_workers_full(model: str) -> list[dict]:
+    """Same selection logic as `list_subagent_workers` but returns
+    the FULL worker dicts so callers can read `use_encrypted_proxy`
+    and dispatch subagent traffic through the encrypted proxy when
+    set. Existing tuple-returning helper kept for back-compat with
+    older test fixtures."""
+    cands = _eligible_workers("use_for_subagents", model=model)
+    if not cands:
+        return []
+
+    host_score = _host_capability_score(model)
+    host_tps = host_score[0]
+    mega_busy = is_host_mega_busy()
+
+    if host_tps > 0 and not mega_busy:
+        min_tps = host_tps * _SUBAGENT_MIN_PERF_RATIO
+        gated = []
+        for w in cands:
+            w_tps = float((w.get("capabilities") or {}).get("tokens_per_second") or 0.0)
+            if w_tps <= 0:
+                gated.append(w)
+            elif w_tps >= min_tps:
+                gated.append(w)
+            else:
+                log.info(
+                    "subagent fan-out: skipping %r (tps=%.1f) — below %.0f%% of host's %.1f tps",
+                    w.get("label"), w_tps,
+                    _SUBAGENT_MIN_PERF_RATIO * 100, host_tps,
+                )
+        cands = gated
+    elif mega_busy:
+        log.info(
+            "subagent fan-out: host mega-busy, skipping perf-ratio gate "
+            "to push all %d worker(s) into the rotation",
+            len(cands),
+        )
+    return cands
 
 
 def list_subagent_workers(model: str) -> list[tuple[str, str | None]]:

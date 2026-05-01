@@ -411,6 +411,16 @@ def unpair(device_id: str) -> bool:
             "p2p: compute_worker cleanup on unpair failed: %s", e,
         )
     removed = db.delete_paired_device(device_id)
+    # Drop any cached per-pair derived key so a revoked peer's
+    # session keys aren't left sitting in memory. The long-term
+    # X25519 keypair is per-install and stays; only the derived
+    # symmetric key for this specific peer pair is purged.
+    if removed:
+        try:
+            from . import p2p_crypto as _pc
+            _pc.clear_key_cache()
+        except Exception:
+            pass
     # Symmetric notify — fire after local removal so we don't roll
     # the local action back if the peer is offline.
     if removed and peer_ip:

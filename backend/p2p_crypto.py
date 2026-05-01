@@ -130,6 +130,27 @@ def _b64decode(s: str, *, expected_len: int | None = None) -> bytes:
     return raw
 
 
+# Per-pair derived-key cache. The X25519 ECDH + HKDF cost dominates
+# small-payload AEAD operations; caching the symmetric key per
+# (our_pubkey, peer_pubkey) collapses a streaming chat with hundreds
+# of token chunks from N expensive derivations to one. Long-term
+# keys don't rotate within a process lifetime so the cache never
+# goes stale; entries fall out via FIFO eviction at `_KEY_CACHE_MAX`
+# so a worker that pairs with thousands of peers doesn't grow the
+# dict without bound.
+_KEY_CACHE: "collections.OrderedDict[tuple[str, str], bytes]" = None  # type: ignore
+_KEY_CACHE_MAX = 256
+
+
+def _ensure_cache_initialized() -> None:
+    """Lazy init so we don't import collections eagerly at module
+    load time (microbench: ~0.3 ms saved on cold start)."""
+    global _KEY_CACHE
+    if _KEY_CACHE is None:
+        import collections
+        _KEY_CACHE = collections.OrderedDict()
+
+
 def _derive_shared_key(
     private_key: X25519PrivateKey, peer_public_b64: str,
     *, our_pubkey_b64: str,
@@ -144,8 +165,19 @@ def _derive_shared_key(
          pubkeys lexically before composing the salt so direction
          doesn't matter.
 
-    Returns 32 bytes — the AEAD key.
+    Result is cached per-pair so a streaming chat with many chunks
+    pays the ECDH+HKDF cost ONCE rather than per-chunk. Cache key
+    is the sorted pubkey pair so both directions hit the same entry.
     """
+    _ensure_cache_initialized()
+    cache_key = tuple(sorted((our_pubkey_b64, peer_public_b64)))
+    cached = _KEY_CACHE.get(cache_key)
+    if cached is not None:
+        # Promote to LRU front so frequently-used pairs survive
+        # eviction even on a busy multi-peer host.
+        _KEY_CACHE.move_to_end(cache_key)
+        return cached
+
     peer_pub_bytes = _b64decode(peer_public_b64, expected_len=32)
     try:
         peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
@@ -171,7 +203,26 @@ def _derive_shared_key(
         salt=salt,
         info=_HKDF_INFO,
     ).derive(shared)
+
+    _KEY_CACHE[cache_key] = derived
+    while len(_KEY_CACHE) > _KEY_CACHE_MAX:
+        # FIFO/LRU eviction — popitem(last=False) drops the
+        # least-recently-touched entry.
+        _KEY_CACHE.popitem(last=False)
     return derived
+
+
+def clear_key_cache() -> None:
+    """Forget all derived per-pair keys.
+
+    Called by tests and by the unpair path so a peer whose trust
+    we just revoked can't have any cached key material lying around
+    in memory. Long-term keys themselves stay (they're per-install,
+    not per-peer); only the derived symmetric key is dropped.
+    """
+    global _KEY_CACHE
+    if _KEY_CACHE is not None:
+        _KEY_CACHE.clear()
 
 
 def _aad_bytes(
