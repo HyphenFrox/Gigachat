@@ -216,14 +216,15 @@ Defence in depth:
 - **Per-peer rate limit** 60 req/min on inbound — defends against compromised friend keypair flooding
 - **Envelope size cap** 256 KB inbound — memory-DoS defence
 - **Upstream response cap** 4 MB — one-way amplification defence
-- **Path whitelist** — even authenticated peers can only reach 7 specific Ollama endpoints (no admin / model-delete)
+- **Path whitelist** — even authenticated peers can only reach a strict set of Ollama endpoints (no admin / model-delete); discovered-but-not-paired peers get a tighter read-only subset
 - **Refuses peers without X25519 on file** — would mean we can't seal the response back; refuse cleanly
-- **Per-pair derived key cache** with FIFO eviction — streaming chat re-uses the AEAD key across chunks; ECDH+HKDF runs once per pair-session
-- **Cache wipe on unpair** — revoking trust drops cached key material immediately
+- **Forward secrecy (sender-ephemeral)** — every v2 envelope generates a fresh X25519 ephemeral keypair on the sender side. The AEAD key is derived from `ECDH(eph_priv, recipient_long_term_pub)`; once `seal()` returns, the ephemeral private key is dropped. Captured envelopes can NOT be decrypted later from sender-side compromise. Recipient-side compromise still reveals past traffic addressed to that recipient — full FS in both directions arrives with the TLS-with-pinning migration on the streaming paths (TLS 1.3's ECDHE handshake gives full FS by exchanging ephemerals on both ends). v1 (long-term ECDH) envelopes still verify on the receive path during the rolling upgrade.
+- **No key cache for v2** — caching the derived AEAD key per (eph_pub, recipient_pub) would defeat FS by leaving key material in memory after the ephemeral private key is destroyed; v2 derivation runs every envelope. Legacy v1 inbound still uses a per-pair cache with FIFO eviction (will disappear once v1 is removed).
+- **Cache wipe on unpair** — revoking trust drops cached legacy key material immediately
 
 What's NOT yet protected (deliberate, documented):
 
-- **Forward secrecy** — long-term X25519 keys can decrypt all prior captured messages. A future Noise-IK / Signal-style ratchet is the next planned phase.
+- **Full forward secrecy on the recipient side** — recipient-side compromise of the long-term X25519 priv still reveals past traffic to that recipient. The TLS-with-pinning migration (next phase) closes this on streaming paths.
 - **Sender/recipient anonymity** — the envelope header carries plaintext device_ids (needed for routing). An observer with rendezvous logs can see who's talking to whom; only the contents are hidden.
 
 **Public pool & internet rendezvous**
