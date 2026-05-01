@@ -212,6 +212,16 @@ async def lifespan(_app: FastAPI):
         await _inv.start()
     except Exception as e:
         log.warning("p2p_pool_inventory startup failed: %s", e)
+    # Relay inbox poll loop — TURN-style fallback for symmetric-NAT
+    # peers that can't be reached directly. The loop long-polls the
+    # rendezvous's /relay/inbox/{device_id} for envelopes addressed
+    # to us, dispatching each through the secure-proxy verify+forward
+    # path. Relay sees only ciphertext.
+    try:
+        from . import p2p_relay as _relay
+        await _relay.start()
+    except Exception as e:
+        log.warning("p2p_relay startup failed: %s", e)
 
     yield
 
@@ -220,6 +230,11 @@ async def lifespan(_app: FastAPI):
     # processes first, then the daemons. Each handler is independently
     # robust — failures during shutdown are swallowed inside each helper so
     # uvicorn always exits cleanly.
+    try:
+        from . import p2p_relay as _relay
+        await _relay.stop()
+    except Exception as e:
+        log.warning("p2p_relay shutdown failed: %s", e)
     try:
         from . import p2p_pool_inventory as _inv
         await _inv.stop()
@@ -4618,6 +4633,18 @@ async def api_p2p_public_pool_set(body: P2PPublicPoolBody) -> dict:
             _inv.clear_cache()
     except Exception as e:
         log.warning("p2p_pool_inventory toggle failed: %s", e)
+    # Relay inbox loop tracks the same toggle so we don't keep
+    # long-polling the rendezvous when Public Pool is off (and so
+    # peers can't reach us via relay either, mirroring the cache
+    # wipe above).
+    try:
+        from . import p2p_relay as _relay
+        if body.enabled:
+            await _relay.start()
+        else:
+            await _relay.stop()
+    except Exception as e:
+        log.warning("p2p_relay toggle failed: %s", e)
     return {"enabled": bool(body.enabled)}
 
 

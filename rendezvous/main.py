@@ -108,6 +108,50 @@ _register_history: dict[str, Deque[float]] = defaultdict(deque)
 _state_lock = asyncio.Lock()
 
 
+# ---------- TURN-style relay state ----------
+#
+# Symmetric-NAT peers (most home routers without UPnP) can't be reached
+# at any STUN-discovered candidate from a peer behind a different NAT.
+# The relay shuttles encrypted envelopes between such peers. The
+# relay sees ONLY ciphertext (envelopes are X25519+ChaCha20 sealed
+# end-to-end before they hit the queue), so the rendezvous server's
+# trust profile doesn't widen — losing the relay = losing message
+# routing only, not confidentiality.
+#
+# Per-recipient queue: {device_id: [(timestamp, envelope_dict), ...]}
+_relay_inbox: dict[str, list[tuple[float, dict]]] = defaultdict(list)
+_relay_lock = asyncio.Lock()
+
+# How long a queued envelope sits before being purged. 60 s lets a
+# slow recipient catch up after a brief network blip; longer just
+# wastes memory on undelivered envelopes.
+RELAY_TTL_SEC = 60.0
+
+# Per-recipient cap on queued envelopes. Defends against an attacker
+# flooding a target's inbox with junk to crowd out real envelopes.
+# 200 is well above any realistic burst — chat at 5 msg/sec for 40 s.
+RELAY_QUEUE_MAX = 200
+
+# Per-IP rate limit on POST /relay/send. Defends against a malicious
+# sender flooding the relay with traffic to drive up bandwidth costs.
+# 60 req/min per source IP — a normal chat doesn't come close.
+RELAY_SEND_RATE_PER_MIN = 60
+_relay_send_history: dict[str, Deque[float]] = defaultdict(deque)
+
+# Hard cap on individual relay-payload size. Envelope schema with a
+# small chat body fits in <8 KB; we set 256 KB to match the secure-
+# proxy's inbound envelope cap so the same legitimate request can
+# go either direct or via relay without surgery.
+RELAY_PAYLOAD_MAX_BYTES = 256_000
+
+# Maximum long-poll wait. Recipients GET /relay/inbox and the server
+# holds the connection up to this long for new envelopes to arrive
+# before returning empty (so the client just polls again). 25 s is
+# under most proxy / Cloud Run idle timeouts (60 s default) with
+# safety margin.
+RELAY_POLL_MAX_WAIT_SEC = 25.0
+
+
 # ---------- Request / response models ----------
 
 
@@ -509,6 +553,138 @@ async def peers_index() -> dict:
     return {"peers": out, "count": len(out)}
 
 
+# ---------- Relay endpoints ----------
+
+
+class RelaySendBody(BaseModel):
+    """Body for POST /relay/send.
+
+    `recipient` identifies the target peer. `envelope` is the
+    OPAQUE encrypted-envelope dict the recipient will decrypt. The
+    rendezvous never inspects envelope contents — fields beyond a
+    few bookkeeping ones (size, sender hint for rate-limiting) are
+    treated as opaque.
+    """
+    recipient: str = Field(..., min_length=4, max_length=64)
+    envelope: dict = Field(...)
+
+
+def _purge_relay_expired(now: float | None = None) -> None:
+    """Drop relay entries past RELAY_TTL_SEC. Called at the top of
+    each relay endpoint so the dict stays bounded even if
+    recipients never come back to fetch."""
+    cutoff = (now if now is not None else time.time()) - RELAY_TTL_SEC
+    for did in list(_relay_inbox.keys()):
+        keep = [(ts, env) for ts, env in _relay_inbox[did] if ts >= cutoff]
+        if keep:
+            _relay_inbox[did] = keep
+        else:
+            _relay_inbox.pop(did, None)
+
+
+def _check_relay_send_rate(ip: str) -> None:
+    """Sliding-window per-IP rate limit on POST /relay/send."""
+    now = time.time()
+    cutoff = now - 60.0
+    history = _relay_send_history[ip]
+    while history and history[0] < cutoff:
+        history.popleft()
+    if len(history) >= RELAY_SEND_RATE_PER_MIN:
+        raise HTTPException(
+            429,
+            f"rate limit: {RELAY_SEND_RATE_PER_MIN} relay sends/min per IP",
+        )
+    history.append(now)
+
+
+@app.post("/relay/send")
+async def relay_send(body: RelaySendBody, request: Request) -> dict:
+    """Drop an encrypted envelope into the recipient's inbox.
+
+    The relay shuttles ciphertext between symmetric-NAT peers that
+    can't reach each other directly. The rendezvous never inspects
+    the envelope — confidentiality is end-to-end via the existing
+    p2p_crypto envelope (X25519 ECDH + ChaCha20-Poly1305 AEAD).
+
+    Caps applied:
+      * Per-IP rate limit (RELAY_SEND_RATE_PER_MIN req/min) so a
+        malicious sender can't flood the relay with junk.
+      * Per-payload size cap (RELAY_PAYLOAD_MAX_BYTES) so memory
+        usage stays bounded.
+      * Per-recipient queue depth (RELAY_QUEUE_MAX) so an attacker
+        can't crowd out a target's real envelopes.
+
+    Authentication: NONE at the relay. The envelope's own Ed25519
+    signature is the recipient's verification mechanism. The relay
+    is dumb infrastructure — losing it = losing routing, NOT
+    losing confidentiality.
+    """
+    ip = _client_ip(request)
+    _check_relay_send_rate(ip)
+
+    # Reject oversize envelopes BEFORE entering the lock so a flood
+    # of large payloads can't stall legitimate traffic.
+    try:
+        approx_size = len(__import__("json").dumps(body.envelope))
+    except Exception:
+        raise HTTPException(400, "envelope is not JSON-serialisable")
+    if approx_size > RELAY_PAYLOAD_MAX_BYTES:
+        raise HTTPException(
+            413,
+            f"envelope exceeds size cap ({approx_size} > "
+            f"{RELAY_PAYLOAD_MAX_BYTES} bytes)",
+        )
+
+    async with _relay_lock:
+        _purge_relay_expired()
+        queue = _relay_inbox[body.recipient]
+        if len(queue) >= RELAY_QUEUE_MAX:
+            # Drop the OLDEST entry rather than refusing the new
+            # one — gives senders priority over stale undelivered
+            # mail. Refusing would let an offline-target's stale
+            # queue lock out new senders entirely.
+            queue.pop(0)
+        queue.append((time.time(), body.envelope))
+    return {"ok": True, "queued": True}
+
+
+@app.get("/relay/inbox/{device_id}")
+async def relay_inbox(device_id: str) -> dict:
+    """Long-poll for queued envelopes addressed to ``device_id``.
+
+    Returns up to all currently-queued envelopes for the recipient,
+    blocking up to RELAY_POLL_MAX_WAIT_SEC if the inbox is empty so
+    a freshly-arrived envelope returns immediately rather than
+    waiting for the next poll cycle. This keeps interactive
+    latency under one round-trip even on cold inboxes.
+
+    No authentication — anyone who knows the device_id can drain
+    it. Privacy is not lost: device_ids are public identifiers
+    (visible in pairing UIs, signed receipts, etc.) and the
+    envelopes inside are end-to-end encrypted to the recipient's
+    keypair. An attacker can drain the queue but can't read the
+    contents OR forge new envelopes.
+    """
+    deadline = time.time() + RELAY_POLL_MAX_WAIT_SEC
+    while True:
+        async with _relay_lock:
+            _purge_relay_expired()
+            queue = _relay_inbox.pop(device_id, [])
+        if queue:
+            return {
+                "envelopes": [env for _, env in queue],
+                "count": len(queue),
+                "as_of": time.time(),
+            }
+        # Empty inbox — sleep briefly then re-check until deadline.
+        if time.time() >= deadline:
+            return {"envelopes": [], "count": 0, "as_of": time.time()}
+        # 250 ms is short enough that a freshly-queued envelope is
+        # picked up within a quarter-second; long enough that the
+        # poll loop doesn't burn CPU on idle inboxes.
+        await asyncio.sleep(0.25)
+
+
 @app.get("/")
 async def index() -> dict:
     """Tiny landing page for humans poking at the URL."""
@@ -520,6 +696,8 @@ async def index() -> dict:
             "POST /heartbeat",
             "GET /lookup/{device_id}",
             "GET /peers",
+            "POST /relay/send",
+            "GET /relay/inbox/{device_id}",
             "GET /health",
         ],
         "deprecated_endpoints": [
@@ -527,11 +705,15 @@ async def index() -> dict:
             "GET /peers_with_model?name=<model>",
         ],
         "peers_registered": len(_peers),
+        "relay_queues": len(_relay_inbox),
         "ttl_sec": TTL_SEC,
+        "relay_ttl_sec": RELAY_TTL_SEC,
         "note": (
-            "This service stores ONLY peer locations for NAT traversal. "
-            "Prompts, models, and chat content never pass through here. "
-            "Model inventory is queried peer-to-peer, not via this server."
+            "This service stores ONLY peer locations for NAT traversal "
+            "and shuttles ciphertext envelopes between symmetric-NAT "
+            "peers. Prompts, models, and chat content never pass through "
+            "here in the clear. Model inventory is queried peer-to-peer, "
+            "not via this server."
         ),
     }
 

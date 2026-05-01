@@ -281,6 +281,15 @@ async def serve_forward_one_shot(envelope: dict) -> dict:
         "content_type": r.headers.get("content-type", "application/json"),
         "body": r.text,  # plaintext-of-Ollama-response, will be encrypted in seal
     }
+    # Relay-mode correlation id: when the request arrived via the
+    # rendezvous's relay (as opposed to a direct HTTP POST), the
+    # client embedded `_relay_req_id` in the request payload so it
+    # could match the eventual response envelope back to the
+    # awaiting future. Echo it verbatim. Cheap; the field is
+    # ignored by direct-HTTP callers.
+    rid = payload.get("_relay_req_id")
+    if isinstance(rid, str) and rid:
+        response_payload["_relay_req_id"] = rid
     return p2p_crypto.seal_json(
         recipient_x25519_pub_b64=peer.get("x25519_public_b64") or "",
         recipient_device_id=peer["device_id"],

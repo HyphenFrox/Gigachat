@@ -105,16 +105,44 @@ async def forward(
         f"http://{worker.get('address')}:"
         f"{int(worker.get('ollama_port') or 8000)}/api/p2p/secure/forward"
     )
+    direct_failed: Exception | None = None
+    response_envelope: dict | None = None
     try:
         async with httpx.AsyncClient(timeout=_ONE_SHOT_TIMEOUT_SEC) as client:
             r = await client.post(url, json=envelope)
             r.raise_for_status()
             response_envelope = r.json()
     except Exception as e:
-        raise SecureProxyError(
-            f"secure proxy request to {peer.get('label')!r} failed: "
-            f"{type(e).__name__}: {e}"
-        )
+        direct_failed = e
+
+    if direct_failed is not None:
+        # Direct path failed — typical cause for a public-pool peer
+        # is symmetric NAT on either end. Fall back to the rendezvous
+        # relay if it's available + the peer's role suggests
+        # internet-routing (LAN-paired peers stay direct because
+        # relay can't beat sub-ms LAN RTT). The relay sees only
+        # ciphertext: confidentiality is preserved.
+        try:
+            from . import p2p_relay as _relay
+            log.info(
+                "p2p_secure_client: direct forward to %s failed (%s); "
+                "falling back to relay",
+                peer.get("label"), type(direct_failed).__name__,
+            )
+            status, body_text = await _relay.forward_via_relay(
+                recipient_device_id=peer["device_id"],
+                recipient_x25519_pub_b64=peer_x25519,
+                recipient_ed25519_pub_b64=peer.get("public_key_b64") or "",
+                method=method, path=path, body=body, headers=headers,
+            )
+            return status, body_text
+        except Exception as relay_err:
+            raise SecureProxyError(
+                f"both direct and relay paths to {peer.get('label')!r} "
+                f"failed: direct={type(direct_failed).__name__}: "
+                f"{direct_failed}; relay={type(relay_err).__name__}: "
+                f"{relay_err}"
+            )
     try:
         # Verify the response was sealed BY THE PEER (signature
         # pinned to their Ed25519 pubkey). Substitution attacks
