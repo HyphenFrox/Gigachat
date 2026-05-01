@@ -24,15 +24,25 @@ A self-hosted web app that turns **any locally-running Ollama model** (Gemma, Ll
 # 1. Install Ollama and a function-calling model.
 ollama pull gemma4:e4b
 
-# 2. Install Python + frontend deps. From the project root (Gigachat/):
-python -m pip install -r backend/requirements.txt
-cd frontend && npm install && cd ..
+# 2. One-shot setup (creates an isolated .venv\ and installs every dep).
+.\setup.bat
 
 # 3. Run the dev servers (two console windows). Visit http://localhost:5173.
 .\dev.bat
 ```
 
-That's it for solo loopback use. **Production** build is `.\build.bat` then `.\start.bat` (FastAPI serves both the API + the built frontend on http://localhost:8000).
+That's it for solo loopback use. **Production** build is `.\build.bat` then `.\start.bat` (FastAPI serves both the API + the built frontend on http://localhost:8000). All three launchers auto-detect `.venv\` and use it when present.
+
+**Manual setup** (if you'd rather not use `setup.bat`):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install -r backend\requirements.txt
+cd frontend && npm install && cd ..
+```
+
+The venv is strongly recommended on Windows — installing into the system + user site-packages dirs mixes locations and runs into `PermissionError` issues when antivirus / OneDrive / file ACLs touch one of the half-installed files. See the [Troubleshooting](#troubleshooting) row for that error if you hit it.
 
 **Requirements**: Windows 10/11 (for the launcher `.bat` scripts; Python/Node code is cross-platform), Python 3.12+, Node 20+, Ollama running locally on `http://localhost:11434`, at least one function-calling Ollama model.
 
@@ -215,6 +225,8 @@ The `isolated_db` fixture rewires `db.DB_PATH` to a tmp file per test, so the su
 | `web_search` rate-limited | DuckDuckGo occasionally rate-limits. Wait a minute; persistent? `pip install -U ddgs`. |
 | `doc_index` / `doc_search`: "no vector" | `ollama pull nomic-embed-text`. |
 | Settings → Compute pool: rendezvous "Disconnected" / "Not configured" | Confirm Public Pool toggle is on. The default Cloud Run URL ships with the app; override or self-host via the URL editor. |
+| `PermissionError: [Errno 13] Permission denied: '...\\AppData\\Roaming\\Python\\Python3xx\\site-packages\\typing_extensions.py'` on backend startup | Mixed system + user site-packages install. Cleanest fix: `.\setup.bat` (creates `.venv\` and installs every dep there; `dev.bat` / `start.bat` auto-detect it). Quick patch without venv: `del "%APPDATA%\Python\Python3xx\site-packages\typing_extensions.py"` then `python -m pip install --user typing_extensions`. |
+| `pip uninstall typing-extensions` fails with `uninstall-no-record-file` | The existing copy was put there manually / by a partial install — pip can't safely remove it. Either delete the file by hand (`del "%APPDATA%\Python\Python3xx\site-packages\typing_extensions.py"`) or just run `.\setup.bat` and use the venv-aware launchers, which bypass the global install entirely. |
 | LAN mode: another device gets a 403 | Its source IP isn't in an RFC1918 range. Confirm both devices are on the same physical network. Tailscale CGNAT (`100.64.0.0/10`) is intentionally refused. |
 
 More: see [docs/SECURITY.md](./docs/SECURITY.md) for risk-specific knobs and [docs/COMPUTE_POOL.md](./docs/COMPUTE_POOL.md) for pool-routing diagnostics.

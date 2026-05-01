@@ -20,11 +20,18 @@ setlocal
 set ROOT=%~dp0
 cd /d %ROOT%
 
+REM Pick the right Python: prefer the project's local venv at .venv\,
+REM fall back to whatever `python` resolves to on PATH. Avoids the
+REM mixed-system+user-site PermissionError class that hits Windows
+REM users on fresh installs.
+set PY=python
+if exist "%ROOT%.venv\Scripts\python.exe" set PY="%ROOT%.venv\Scripts\python.exe"
+
 if not exist "%ROOT%frontend\dist\index.html" (
   echo [!] Frontend not built. Running build first...
   call "%ROOT%build.bat"
 )
 
-python -m backend.server
+%PY% -m backend.server
 
 endlocal
