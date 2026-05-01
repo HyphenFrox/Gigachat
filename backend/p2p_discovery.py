@@ -393,7 +393,26 @@ async def start(advertise_port: int | None = None) -> None:
         return
 
     state = _DiscoveryState()
-    state.zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
+    # Explicitly bind zeroconf to every routable LAN IPv4 instead of
+    # the default `InterfaceChoice.All`. The default has known issues
+    # on multi-NIC Windows where it claims to bind every interface but
+    # silently picks one for outbound multicast, breaking discovery in
+    # one direction (peers receive our broadcasts on some subnets
+    # but not others). Passing the explicit list forces zeroconf to
+    # join the multicast group on each named interface, so our
+    # outbound queries + announcements actually reach every LAN we're
+    # plugged into.
+    bind_ips = _local_lan_ips()
+    if bind_ips:
+        state.zeroconf = Zeroconf(
+            interfaces=bind_ips,
+            ip_version=IPVersion.V4Only,
+        )
+    else:
+        # No LAN-private addresses (offline laptop, every interface a
+        # VPN tunnel). Fall back to default behaviour so the rest of
+        # the app still boots; discovery just won't find anyone.
+        state.zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
     state.started_at = time.time()
 
     me = identity.get_identity()
