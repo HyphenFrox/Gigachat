@@ -5799,11 +5799,62 @@ async def route_chat_for(model_name: str) -> dict:
         base, label = legacy
         return {"engine": "llama_server", "base_url": base, "label": label}
 
+    # Public-pool fallback. Before any local-routing logic, check
+    # whether (a) the host has the model, (b) any already-registered
+    # worker (LAN or public) has it. If neither, look for a peer in
+    # the public swarm that's offering it AND register them as a
+    # compute_worker so the rest of this function picks them up
+    # naturally. If even the public swarm has nobody, fall back to
+    # auto-pulling from the OFFICIAL Ollama registry on the host.
+    #
+    # All of this is best-effort: if the public-pool query / pull
+    # fails, we continue to the existing flow which surfaces a clear
+    # "model not found" error to the user instead of hanging.
+    try:
+        host_has = resolve_ollama_model(model_name) is not None
+        existing_workers = db.list_compute_workers(enabled_only=True)
+        pool_has = any(
+            _worker_has_model(w, model_name)
+            for w in existing_workers
+            if w.get("use_for_chat")
+        )
+        if not host_has and not pool_has:
+            # Step 1 — try the public swarm.
+            from . import p2p_pool_routing as _ppr
+            public_worker = await _ppr.ensure_public_peer_worker(model_name)
+            if public_worker is None:
+                # Step 2 — nobody in the swarm has it either. Auto-pull
+                # from the OFFICIAL registry on host. Best-effort: a
+                # failure here means the user just sees the standard
+                # "model not found" downstream. Triggered as a
+                # blocking call so the very next chat turn benefits;
+                # caller can hit Ctrl+C if they don't want to wait.
+                pulled = await _ppr.auto_pull_on_host(model_name)
+                if pulled:
+                    log.info(
+                        "compute_pool: auto-pulled %r on host before "
+                        "route_chat_for resumed", model_name,
+                    )
+            else:
+                log.info(
+                    "compute_pool: public-pool peer registered as "
+                    "worker for %r, routing will pick it up",
+                    model_name,
+                )
+    except Exception as e:
+        log.info(
+            "compute_pool: public-pool fallback for %r failed: %s",
+            model_name, e,
+        )
+
     info = resolve_ollama_model(model_name)
     if info is None:
         # Not an Ollama-managed model. Could be a custom name the user
-        # set up another way. Stay on the Ollama path — Ollama will
-        # surface its own error if the model truly doesn't exist.
+        # set up another way, OR a public-pool peer is hosting it (we
+        # registered them above; pick_chat_target will route to them).
+        # Stay on the Ollama path — `pick_chat_target` will pick the
+        # right node, and if no eligible target exists Ollama on host
+        # surfaces its own error.
         await stop_all_running_splits()
         return {"engine": "ollama"}
 

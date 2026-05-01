@@ -228,11 +228,14 @@ What's NOT yet protected (deliberate, documented):
 
 **Public pool & internet rendezvous**
 
-- **Rendezvous service** — a tiny stateless FastAPI app deployable to GCP Cloud Run (`rendezvous/`). Holds only `(device_id, public_key, [STUN candidates], last_seen_at)`; never sees prompts, model weights, or chat data. Peers register every 30 s with an Ed25519-signed registration; lookup is by device_id. Same protocol Signal and BitTorrent use for peer discovery.
+- **Rendezvous service — bootstrap discovery ONLY** — a tiny stateless FastAPI app deployable to GCP Cloud Run (`rendezvous/`). Holds only `(device_id, public_key, x25519_pubkey, [STUN candidates], last_seen_at)`; never sees prompts, model weights, chat data, OR what models each peer offers. Peers register every 30 s with an Ed25519-signed registration; lookup is by device_id. Same role Signal and BitTorrent give their trackers — pure peer index.
+- **Local pool inventory** (`backend/p2p_pool_inventory.py`) — once we know who's online (from the rendezvous `/peers` list), each install queries every other peer DIRECTLY via the encrypted proxy (`/api/p2p/secure/forward` with `path=/api/tags`) to build a local cache of "who has what model". The model graph stays peer-to-peer; the rendezvous never sees it. Cross-checks `device_id == base32(pubkey)[:16]` on every peer record so a malicious rendezvous can't substitute identities.
+- **Discovered-peer trust gate** — peers we know about via the rendezvous bootstrap but haven't accepted into our pool can ONLY call read-only metadata endpoints (`/api/tags`, `/api/show`, `/api/ps`) via the secure proxy. They cannot drive `/api/chat`, `/api/embed`, or `/api/pull` until the user explicitly picks one of their models, which promotes them to `role='public'` in `paired_devices`.
 - **STUN endpoint discovery** — pure-stdlib STUN client (`backend/p2p_rendezvous.py`) discovers our public IP/port via Google / Cloudflare / Nextcloud STUN servers. Re-discovers every 5 minutes to catch NAT mapping drift.
 - **Public pool toggle** (Settings → Network → "Public pool", default ON):
-  - **ON** — registers with the rendezvous so other peers can find us. Donates idle compute to the wider Gigachat swarm.
-  - **OFF** — fully isolated to local pool. No rendezvous registration, no swarm sockets.
+  - **ON** — registers with the rendezvous so other peers can find us. Local inventory loop polls peers' `/api/tags` over the encrypted proxy. Donates idle compute to the wider Gigachat swarm.
+  - **OFF** — fully isolated to local pool. No rendezvous registration, no inventory polling, discovered-peer cache wiped (revokes other peers' tighter-whitelist access to our `/api/tags`).
+- **Auto-pull from official source** — when the user picks a model that no peer in the swarm offers, the executing machine pulls it from the OFFICIAL Ollama registry (`registry.ollama.ai`), NOT peer-to-peer. Model bytes never traverse another user's home internet — the swarm doesn't bottleneck on the slowest uploader.
 
 **Real-time fairness scheduler**
 

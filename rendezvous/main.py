@@ -453,12 +453,16 @@ async def models_index() -> dict:
 
 @app.get("/peers_with_model")
 async def peers_with_model(name: str) -> dict:
-    """Return every registered peer offering a specific model.
+    """DEPRECATED — kept only for back-compat with old clients still
+    polling here. New clients (Gigachat ≥ this commit) never call
+    this endpoint; they pull the peer list from /peers and query each
+    peer's own /api/tags directly via the encrypted proxy. Putting
+    model search on the rendezvous makes it a centralised index of
+    "who has what" — that's not the P2P architecture we want.
 
-    Used by the routing layer when a user picks a public-pool model
-    and we need to know which peers can serve it. Each peer entry
-    includes the candidate endpoints + their X25519 pubkey so the
-    caller can immediately seal an envelope to one of them.
+    Still functional today only because peer registrations may carry
+    a `models` field (also deprecated). Will return an empty list as
+    soon as everyone's upgraded.
     """
     if not name:
         raise HTTPException(400, "name query param is required")
@@ -476,6 +480,35 @@ async def peers_with_model(name: str) -> dict:
     return {"name": name, "peers": peers, "count": len(peers)}
 
 
+@app.get("/peers")
+async def peers_index() -> dict:
+    """List of every currently-registered peer — IDENTITY ONLY.
+
+    Returns ``{"peers": [{device_id, public_key_b64, x25519_public_b64,
+    candidates: [...]}, ...]}``. Deliberately omits any model /
+    capability / activity info: the rendezvous's job is "where can I
+    reach this peer", not "what does this peer offer". Model
+    inventory is queried directly peer-to-peer over the encrypted
+    proxy after the bootstrap.
+
+    Cheap O(N) scan over registered peers. The cap built into TTL
+    + per-IP rate-limit keeps N bounded in practice.
+    """
+    async with _state_lock:
+        _purge_expired()
+        out = [
+            {
+                "device_id": rec["device_id"],
+                "public_key_b64": rec["public_key_b64"],
+                "x25519_public_b64": rec.get("x25519_public_b64"),
+                "candidates": rec.get("candidates", []),
+                "last_seen_at": rec["last_seen_at"],
+            }
+            for rec in _peers.values()
+        ]
+    return {"peers": out, "count": len(out)}
+
+
 @app.get("/")
 async def index() -> dict:
     """Tiny landing page for humans poking at the URL."""
@@ -486,15 +519,19 @@ async def index() -> dict:
             "POST /register",
             "POST /heartbeat",
             "GET /lookup/{device_id}",
+            "GET /peers",
+            "GET /health",
+        ],
+        "deprecated_endpoints": [
             "GET /models",
             "GET /peers_with_model?name=<model>",
-            "GET /health",
         ],
         "peers_registered": len(_peers),
         "ttl_sec": TTL_SEC,
         "note": (
             "This service stores ONLY peer locations for NAT traversal. "
-            "Prompts, models, and chat content never pass through here."
+            "Prompts, models, and chat content never pass through here. "
+            "Model inventory is queried peer-to-peer, not via this server."
         ),
     }
 

@@ -276,21 +276,28 @@ async def _gather_candidates() -> list[_StunCandidate]:
 def _build_register_message(
     device_id: str, public_key_b64: str,
     x25519_public_b64: str,
-    candidates: list[_StunCandidate], models: list[dict],
+    candidates: list[_StunCandidate],
     timestamp: float,
 ) -> bytes:
-    """Match `rendezvous/main.py::_build_register_message` v2 byte-for-byte."""
+    """Match `rendezvous/main.py::_build_register_message` v2 byte-for-byte.
+
+    The empty-models slot is preserved in the signed payload so already-
+    deployed rendezvous servers (which still expect v2 with a models
+    field in the signature) keep verifying our signatures. We just
+    always send empty — the rendezvous's role is now NAT-traversal /
+    identity only; model inventory lives entirely on the peers
+    themselves and is fetched directly via the encrypted proxy. This
+    keeps the swarm truly P2P: the rendezvous is dumb infrastructure,
+    not a centralised "who has what" index.
+    """
     cand_repr = ",".join(f"{c.ip}:{c.port}:{c.source}" for c in candidates)
-    models_repr = ";".join(
-        f"{m.get('name','')}|{int(m.get('size_bytes', 0))}" for m in models
-    )
     parts = [
         b"gigachat-rdv-register-v2",
         device_id.encode("ascii"),
         public_key_b64.encode("ascii"),
         (x25519_public_b64 or "").encode("ascii"),
         cand_repr.encode("ascii"),
-        models_repr.encode("ascii"),
+        b"",  # models field — always empty by design (see docstring).
         f"{timestamp:.6f}".encode("ascii"),
     ]
     return b"|".join(parts)
@@ -305,50 +312,12 @@ def _build_heartbeat_message(device_id: str, timestamp: float) -> bytes:
     return b"|".join(parts)
 
 
-async def _list_local_models() -> list[dict]:
-    """Fetch local Ollama's model list and trim to the rendezvous schema.
-
-    Returns ``[{name, family, parameter_size, quantization_level,
-    size_bytes}, ...]`` — exactly the shape `ModelEntry` on the
-    rendezvous accepts. Empty list on any failure (Ollama down, no
-    models installed) so an absent local Ollama doesn't break
-    registration.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get("http://127.0.0.1:11434/api/tags")
-            r.raise_for_status()
-            data = r.json() or {}
-    except Exception:
-        return []
-    out: list[dict] = []
-    for m in data.get("models") or []:
-        if not isinstance(m, dict):
-            continue
-        name = m.get("name") or ""
-        if not name:
-            continue
-        details = m.get("details") or {}
-        out.append({
-            "name": name,
-            "family": details.get("family"),
-            "parameter_size": details.get("parameter_size"),
-            "quantization_level": details.get("quantization_level"),
-            "size_bytes": int(m.get("size") or 0),
-        })
-    # Cap at 200 to match the rendezvous validator. Most users have
-    # well under that; the cap is just defensive against a runaway
-    # Ollama install with hundreds of test models.
-    return out[:200]
-
-
 async def _post_register(state: _RendezvousState) -> None:
     me = identity.get_identity()
     ts = time.time()
-    models = await _list_local_models()
     msg = _build_register_message(
         me.device_id, me.public_key_b64, me.x25519_public_b64,
-        state.candidates, models, ts,
+        state.candidates, ts,
     )
     sig = base64.b64encode(me.sign(msg)).decode("ascii")
     body = {
@@ -359,7 +328,9 @@ async def _post_register(state: _RendezvousState) -> None:
             {"ip": c.ip, "port": c.port, "source": c.source}
             for c in state.candidates
         ],
-        "models": models,
+        # Empty models list — see _build_register_message docstring.
+        # Rendezvous accepts the field but new peers never populate it.
+        "models": [],
         "timestamp": ts,
         "signature_b64": sig,
     }
@@ -567,6 +538,79 @@ def status() -> dict:
         "last_register_at": _state.last_register_at if _state else 0.0,
         "last_error": _state.last_error if _state else "",
     }
+
+
+async def lookup_peers() -> list[dict]:
+    """Bootstrap discovery — fetch the list of currently-online peers
+    from the rendezvous. IDENTITY ONLY — no model / capability info.
+
+    Returns ``[{device_id, public_key_b64, x25519_public_b64,
+    candidates: [{ip, port, source}, ...], last_seen_at}, ...]``.
+
+    The local pool-inventory cache (`p2p_pool_inventory.py`) is the
+    sole caller of this function. It periodically refreshes the peer
+    list from here, then queries each peer's own `/api/tags` directly
+    via the encrypted proxy to learn what models they have. The
+    rendezvous never sees the model graph — that stays peer-to-peer.
+
+    Each returned peer has `device_id` cross-checked against
+    `public_key_b64` so a malicious rendezvous can't substitute a
+    peer's identity. Verification is cheap: base32(pubkey)[:16] must
+    equal the device_id, same rule the rendezvous applies at
+    registration.
+
+    Returns empty list on any error (rendezvous unreachable, no URL
+    configured). Treated as "no public peers right now" by callers —
+    they continue working with host + LAN.
+    """
+    url = _current_rendezvous_url()
+    if not url:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+            r = await client.get(f"{url.rstrip('/')}/peers")
+            if r.status_code == 404:
+                # Old rendezvous deployment without /peers — degrade
+                # gracefully so the swarm still works for installs
+                # talking to a stale server.
+                log.debug("p2p: rendezvous lacks /peers endpoint")
+                return []
+            r.raise_for_status()
+            data = r.json() or {}
+            raw = data.get("peers") or []
+            if not isinstance(raw, list):
+                return []
+            verified: list[dict] = []
+            for entry in raw:
+                if not isinstance(entry, dict):
+                    continue
+                device_id = entry.get("device_id") or ""
+                pub = entry.get("public_key_b64") or ""
+                if not device_id or not pub:
+                    continue
+                # Cross-check device_id ↔ pubkey binding so the
+                # rendezvous can't lie about identity. Mirrors
+                # `identity._device_id_from_pubkey`.
+                try:
+                    pub_bytes = base64.b64decode(pub)
+                    expected = (
+                        base64.b32encode(pub_bytes)
+                        .decode("ascii").rstrip("=")[:16].upper()
+                    )
+                except Exception:
+                    continue
+                if expected != device_id:
+                    log.warning(
+                        "p2p: rejecting peer with mismatched "
+                        "device_id/pubkey: %s",
+                        device_id,
+                    )
+                    continue
+                verified.append(entry)
+            return verified
+    except Exception as e:
+        log.debug("p2p: rendezvous /peers lookup failed: %s", e)
+        return []
 
 
 async def lookup_peer(device_id: str) -> dict | None:

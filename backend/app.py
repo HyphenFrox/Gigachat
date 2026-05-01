@@ -196,12 +196,22 @@ async def lifespan(_app: FastAPI):
     # Run rendezvous so other peers across the internet can find us.
     # No-op when GIGACHAT_RENDEZVOUS_URL is unset OR when the user
     # has Public Pool toggled off. Privacy: rendezvous only sees
-    # identity + STUN endpoints, NEVER prompts.
+    # identity + STUN endpoints, NEVER prompts and (per the new P2P
+    # architecture) NEVER our model inventory either.
     try:
         from . import p2p_rendezvous as _rdv
         await _rdv.start()
     except Exception as e:
         log.warning("p2p_rendezvous startup failed: %s", e)
+    # Pool inventory loop — keeps a local cache of "what models does
+    # each peer in the swarm have" by directly querying each peer's
+    # encrypted /api/tags endpoint. The model picker + smart routing
+    # read from this cache; the rendezvous never sees model data.
+    try:
+        from . import p2p_pool_inventory as _inv
+        await _inv.start()
+    except Exception as e:
+        log.warning("p2p_pool_inventory startup failed: %s", e)
 
     yield
 
@@ -210,6 +220,11 @@ async def lifespan(_app: FastAPI):
     # processes first, then the daemons. Each handler is independently
     # robust — failures during shutdown are swallowed inside each helper so
     # uvicorn always exits cleanly.
+    try:
+        from . import p2p_pool_inventory as _inv
+        await _inv.stop()
+    except Exception as e:
+        log.warning("p2p_pool_inventory shutdown failed: %s", e)
     try:
         from . import p2p_rendezvous as _rdv
         await _rdv.stop()
@@ -1470,10 +1485,13 @@ async def list_models_all_sources(tools_only: bool = True) -> dict:
     except Exception as e:
         out["lan_error"] = str(e)
 
-    # Public pool — only when toggled on. Looks up the rendezvous
-    # for an aggregated peer-model index. The rendezvous endpoint
-    # this calls is added in the follow-up commit; for now we
-    # gracefully no-op when the rendezvous returns 404 on /models.
+    # Public pool — only when toggled on. Reads from the LOCAL
+    # inventory cache (`p2p_pool_inventory`) which is populated by
+    # direct peer-to-peer queries of each peer's /api/tags via the
+    # encrypted secure proxy. We do NOT call the rendezvous from
+    # here — model inventory is fully P2P. The rendezvous's only
+    # job is the bootstrap "who's online" list, polled by the
+    # inventory loop on its own cadence.
     pp_val = db.get_setting("p2p_public_pool_enabled")
     public_enabled = (
         pp_val is None
@@ -1482,21 +1500,15 @@ async def list_models_all_sources(tools_only: bool = True) -> dict:
     out["public_pool_enabled"] = public_enabled
     if public_enabled:
         try:
-            from . import p2p_rendezvous as _rdv
-            url = _rdv._current_rendezvous_url()
-            if url:
-                async with httpx.AsyncClient(timeout=8.0) as c:
-                    r = await c.get(f"{url.rstrip('/')}/models")
-                    if r.status_code == 200:
-                        data = r.json() or {}
-                        for entry in data.get("models") or []:
-                            out["public"].append(entry)
-                    elif r.status_code == 404:
-                        # Rendezvous predates the /models endpoint —
-                        # skip without surfacing as an error.
-                        pass
-                    else:
-                        out["public_error"] = f"HTTP {r.status_code}"
+            from . import p2p_pool_inventory as _inv
+            # Force a refresh if the cache is stale — opening the
+            # picker should show fresh data even when the periodic
+            # loop hasn't fired in a while. ensure_fresh is a no-op
+            # when the cache is already current, so this is cheap
+            # in the common case.
+            await _inv.ensure_fresh(max_age_sec=120.0)
+            for entry in _inv.list_all_models():
+                out["public"].append(entry)
         except Exception as e:
             out["public_error"] = str(e)
 
@@ -4593,6 +4605,19 @@ async def api_p2p_public_pool_set(body: P2PPublicPoolBody) -> dict:
             await _rdv.stop()
     except Exception as e:
         log.warning("p2p_rendezvous toggle failed: %s", e)
+    # Pool-inventory loop tracks the same toggle. When the user
+    # turns Public Pool OFF we also wipe the discovered-peer cache
+    # — both to stop pinging peers AND to revoke their tighter-
+    # whitelist access to our /api/tags via the secure proxy.
+    try:
+        from . import p2p_pool_inventory as _inv
+        if body.enabled:
+            await _inv.start()
+        else:
+            await _inv.stop()
+            _inv.clear_cache()
+    except Exception as e:
+        log.warning("p2p_pool_inventory toggle failed: %s", e)
     return {"enabled": bool(body.enabled)}
 
 

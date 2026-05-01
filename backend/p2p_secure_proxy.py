@@ -79,8 +79,10 @@ _MAX_UPSTREAM_RESPONSE_BYTES = 4_000_000
 # from holding our resources indefinitely.
 _STREAM_IDLE_TIMEOUT_SEC = 60.0
 
-# Whitelist of upstream Ollama paths the secure proxy will forward.
-# Tighter than `not /api/p2p/* and not /api/conversations` because
+# Whitelist of upstream Ollama paths the secure proxy will forward
+# for PAIRED peers (LAN pair or role='public' — i.e. a peer the user
+# has accepted into their compute pool, directly or transitively).
+# Tighter than "not /api/p2p/* and not /api/conversations" because
 # even an authenticated peer should not be able to call into
 # arbitrary Ollama admin endpoints (model deletion, etc.) through
 # our proxy. Anything outside this set is refused at the verify
@@ -93,6 +95,20 @@ _FORWARDABLE_PATHS = frozenset({
     "/api/tags",        # model list — read-only metadata
     "/api/show",        # model info — read-only metadata
     "/api/ps",          # which models are currently loaded — read-only
+    "/api/pull",        # auto-pull from official source on the executor
+})
+
+# Whitelist for DISCOVERED peers — peers we know about via the
+# rendezvous bootstrap but haven't accepted into our compute pool
+# yet. They can ask "what models do you have" but they cannot
+# consume our compute (no /api/chat, no /api/embed, no /api/pull).
+# This is the trust gate that lets the model-picker show "model X is
+# on peer Y" across the whole swarm without giving every swarm peer
+# a free ride on our GPU.
+_DISCOVERED_PEER_PATHS = frozenset({
+    "/api/tags",
+    "/api/show",
+    "/api/ps",
 })
 
 
@@ -126,15 +142,29 @@ def _check_inbound_rate_limit(peer_device_id: str) -> None:
 
 
 def _peer_record_for(sender_device_id: str) -> dict | None:
-    """Look up the paired-device record for an inbound request's sender.
+    """Look up the trust record for an inbound request's sender.
 
-    Returns the row when the sender is paired with us; None otherwise.
-    The router refuses unpaired senders before we even get here, but
-    this is the canonical lookup used by the verify path.
+    Two-tier lookup:
+      1. ``paired_devices`` (DB, persistent) — the canonical store
+         for peers the user has explicitly accepted (LAN pair or
+         role='public' from the model picker).
+      2. ``p2p_pool_inventory`` (in-memory, populated from the
+         rendezvous /peers list) — peers we know about but haven't
+         accepted. They get a TIGHTER whitelist via the role
+         dispatch in ``_verify_inbound``.
+
+    Returns the canonical-shape dict (with `role` set) or None when
+    the sender is wholly unknown.
     """
     if not sender_device_id:
         return None
-    return db.get_paired_device(sender_device_id)
+    paired = db.get_paired_device(sender_device_id)
+    if paired:
+        return paired
+    # Lazy import to avoid a hard dependency cycle (pool_inventory
+    # imports p2p_crypto which imports identity which imports db…).
+    from . import p2p_pool_inventory
+    return p2p_pool_inventory.get_discovered_peer(sender_device_id)
 
 
 def _verify_inbound(envelope: dict) -> tuple[dict, dict]:
@@ -193,9 +223,19 @@ def _verify_inbound(envelope: dict) -> tuple[dict, dict]:
             "envelope sender mismatch after verify"
         )
     path = payload.get("path") or ""
-    if path not in _FORWARDABLE_PATHS:
+    # Per-role whitelist dispatch — paired peers (full set) vs.
+    # discovered peers (read-only metadata only). See whitelist
+    # docstrings above for the rationale.
+    role = peer.get("role") or ""
+    allowed = (
+        _DISCOVERED_PEER_PATHS
+        if role == "discovered"
+        else _FORWARDABLE_PATHS
+    )
+    if path not in allowed:
         raise p2p_crypto.CryptoError(
-            f"path {path!r} is not on the secure-proxy whitelist"
+            f"path {path!r} is not on the secure-proxy whitelist "
+            f"for role {role!r}"
         )
     return payload, peer
 
