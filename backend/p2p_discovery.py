@@ -101,6 +101,13 @@ def _local_ip() -> str:
     socket's local address — the OS routing table picks the right
     interface for us. No packet is actually sent (UDP, connect()
     only). Falls back to 127.0.0.1 when offline / no route exists.
+
+    Note: this picks the interface that routes to the PUBLIC internet,
+    which on multi-NIC hosts (corporate Ethernet + home Wi-Fi)
+    is typically NOT the LAN-private interface that peers with other
+    Gigachat installs. Use `_local_lan_ips()` instead when advertising
+    over mDNS — it returns every RFC1918 / IPv6-ULA address so peers
+    on any local subnet can reach us.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -113,6 +120,93 @@ def _local_ip() -> str:
     finally:
         s.close()
     return ip
+
+
+# Interface-name substrings that indicate a VPN tunnel / virtual
+# adapter we should NEVER advertise as a LAN interface. Matched
+# case-insensitively against psutil's `net_if_addrs()` keys.
+# Order doesn't matter; any match → skip the whole interface.
+_NON_LAN_IFACE_HINTS = (
+    "tailscale",
+    "nordlynx",
+    "openvpn",
+    "wireguard",
+    "tap-",
+    "tun-",
+    "vethernet",     # Hyper-V virtual switch (host side, often loopback-only)
+    "loopback",
+    "isatap",
+    "teredo",
+    "bluetooth",
+)
+
+
+def _local_lan_ips() -> list[str]:
+    """Enumerate every routable RFC1918 IPv4 address on the host.
+
+    Multi-NIC reality: a typical Windows laptop has Wi-Fi (home LAN),
+    Ethernet (corporate / wired), one or more VPN tunnels (NordVPN,
+    Tailscale), Hyper-V virtual switches, and several APIPA
+    `169.254.x.x` interfaces. The kernel's "default route" picks ONE
+    for outbound internet traffic; that one is rarely the LAN-private
+    interface you'd want to advertise to other Gigachat installs.
+
+    Filtering rules:
+      * RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) — kept.
+      * Link-local `169.254.0.0/16` (APIPA, no DHCP) — DROPPED. mDNS
+        on these works on a wire-direct link but never reaches another
+        regular LAN; advertising them just confuses receivers.
+      * Tailscale CGNAT `100.64.0.0/10` — DROPPED (not LAN; see
+        SECURITY.md).
+      * Any address on an interface whose name contains a VPN /
+        virtual-adapter hint (`tailscale`, `nordlynx`, `openvpn`,
+        `wireguard`, `tap-`, `tun-`, `vethernet`, etc.) — DROPPED.
+        These tunnels carry the address through a different routing
+        domain than the physical LAN, and a peer trying to reach them
+        from the LAN will time out.
+
+    mDNS broadcasts go out on every interface zeroconf is bound to,
+    but a `ServiceInfo` only advertises the addresses we tell it to.
+    Returning every routable LAN IPv4 here means peers on any local
+    subnet pick the one that routes to them.
+
+    Falls back to `[<routed_ip>]` if psutil isn't importable.
+    """
+    import ipaddress
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        import psutil  # type: ignore
+        for iface, addrs in psutil.net_if_addrs().items():
+            iface_lower = (iface or "").lower()
+            if any(hint in iface_lower for hint in _NON_LAN_IFACE_HINTS):
+                continue
+            for snic in addrs:
+                if getattr(snic, "family", None) != socket.AF_INET:
+                    continue
+                addr = (snic.address or "").strip()
+                if not addr or addr in seen:
+                    continue
+                if addr.startswith(("127.", "0.", "169.254.")):
+                    continue
+                try:
+                    ip_obj = ipaddress.ip_address(addr)
+                except ValueError:
+                    continue
+                if not ip_obj.is_private:
+                    continue
+                # Tailscale CGNAT — explicitly excluded.
+                if addr.startswith("100.") and 64 <= int(addr.split(".")[1]) <= 127:
+                    continue
+                seen.add(addr)
+                out.append(addr)
+    except Exception:
+        pass
+    if not out:
+        fallback = _local_ip()
+        if fallback and fallback != "127.0.0.1":
+            out.append(fallback)
+    return out
 
 
 class _GigachatListener:
@@ -168,25 +262,51 @@ class _GigachatListener:
         if not device_id or device_id == self_id:
             return
 
-        # Pick the first IPv4 address that's actually routable. The
-        # `addresses_by_version` API is the v0.146+ shape; we
-        # fall back to the legacy `addresses` attribute on older
-        # zeroconf versions.
+        # Pick the routable IPv4 address. mDNS records can carry
+        # MULTIPLE addresses (we advertise every LAN-private NIC we
+        # have on this side too). Prefer the one that's on the SAME
+        # subnet as one of OUR own LAN interfaces — that's the one
+        # we can actually reach. Falls back to the first IPv4 if no
+        # subnet match (e.g. peer is on a different subnet we still
+        # somehow route to).
         ip = ""
         try:
-            addrs = info.parsed_addresses() or []
-            for a in addrs:
-                if "." in a:  # naive but correct for v4 vs v6
-                    ip = a
-                    break
-            if not ip and addrs:
-                ip = addrs[0]
+            v4_addrs = [a for a in (info.parsed_addresses() or []) if "." in a]
         except Exception:
+            v4_addrs = []
             try:
                 if info.addresses:
-                    ip = ".".join(str(b) for b in info.addresses[0])
+                    v4_addrs = [
+                        ".".join(str(b) for b in raw) for raw in info.addresses
+                    ]
             except Exception:
-                ip = ""
+                v4_addrs = []
+        if v4_addrs:
+            try:
+                import ipaddress as _ipaddr
+                my_v4_networks = []
+                for my_ip in _local_lan_ips():
+                    try:
+                        my_v4_networks.append(
+                            _ipaddr.ip_interface(f"{my_ip}/24").network,
+                        )
+                    except ValueError:
+                        continue
+                for cand in v4_addrs:
+                    try:
+                        cand_obj = _ipaddr.ip_address(cand)
+                    except ValueError:
+                        continue
+                    for net in my_v4_networks:
+                        if cand_obj in net:
+                            ip = cand
+                            break
+                    if ip:
+                        break
+            except Exception:
+                pass
+            if not ip:
+                ip = v4_addrs[0]
 
         port = int(getattr(info, "port", 0) or 0)
         label = txt.get("label") or device_id
@@ -278,7 +398,27 @@ async def start(advertise_port: int | None = None) -> None:
 
     me = identity.get_identity()
     port = int(advertise_port or _DEFAULT_ADVERTISE_PORT)
-    ip = _local_ip()
+    # Advertise on EVERY RFC1918 / link-local IPv4 we have. On a
+    # multi-NIC laptop (Wi-Fi + Ethernet + virtual switches), peers
+    # on any of those subnets pick the address that routes to them.
+    # See `_local_lan_ips()` for the rationale.
+    ips = _local_lan_ips() or [_local_ip()]
+    addresses = []
+    for ip in ips:
+        try:
+            addresses.append(socket.inet_aton(ip))
+        except OSError:
+            # Malformed IP for some reason — skip silently.
+            pass
+    if not addresses:
+        # Last-ditch: advertise loopback so the test path on a
+        # disconnected box still works.
+        addresses = [socket.inet_aton("127.0.0.1")]
+        ips = ["127.0.0.1"]
+    log.info(
+        "p2p_discovery: advertising on %d LAN address(es): %s",
+        len(addresses), ", ".join(ips),
+    )
     # mDNS service name needs to be unique on the LAN. Suffixing with
     # the device_id guarantees uniqueness even when two installs use
     # the same hostname (the more common case than you'd think — two
@@ -293,7 +433,7 @@ async def start(advertise_port: int | None = None) -> None:
     state.service_info = ServiceInfo(
         _SERVICE_TYPE,
         instance_name,
-        addresses=[socket.inet_aton(ip)],
+        addresses=addresses,
         port=port,
         properties=txt,
         server=f"gigachat-{me.device_id.lower()}.local.",
