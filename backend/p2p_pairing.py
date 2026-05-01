@@ -313,29 +313,40 @@ def accept_pairing(
     # Phase 2: paired devices become routable compute workers
     # automatically. We materialise a row in compute_workers keyed
     # by the device_id so the existing routing / probe / scoring
-    # code transparently includes the paired peer. Default
-    # `ollama_port=11434` matches the Ollama install convention;
-    # callers can override via the worker's edit form. Failure is
-    # non-fatal — the pairing record itself is the trust anchor;
-    # compute integration is a convenience.
+    # code transparently includes the paired peer.
+    #
+    # Encrypted-proxy mode (use_encrypted_proxy=True): outbound
+    # routing goes via the peer's Gigachat /api/p2p/secure/forward
+    # endpoint, NOT direct Ollama. The address+port we store is
+    # the peer's Gigachat port (claimant_port from mDNS), not 11434.
+    # All compute traffic is then E2E-encrypted via X25519+ChaCha20
+    # — prompts, embeddings, model outputs, all of it. The peer's
+    # Gigachat decrypts each request and forwards to its own local
+    # Ollama on loopback.
     if claimant_ip:
         try:
             existing = db.get_compute_worker_by_device_id(claimant_device_id)
             if not existing:
+                # Use the peer's Gigachat port (FastAPI), NOT Ollama.
+                # The encrypted-proxy endpoint lives on the Gigachat
+                # backend; routing through Ollama directly would be
+                # unencrypted.
+                gigachat_port = int(claimant_port or 8000)
                 db.create_compute_worker(
                     label=claimant_label or claimant_device_id,
                     address=claimant_ip,
-                    ollama_port=11434,
+                    ollama_port=gigachat_port,
                     enabled=True,
                     use_for_chat=True,
                     use_for_embeddings=True,
                     use_for_subagents=True,
                     gigachat_device_id=claimant_device_id,
+                    use_encrypted_proxy=True,
                 )
                 log.info(
-                    "p2p: auto-created compute_worker for paired device %s "
-                    "at %s:11434",
-                    claimant_device_id, claimant_ip,
+                    "p2p: auto-created encrypted compute_worker for "
+                    "paired device %s at %s:%d (E2E via X25519+ChaCha20)",
+                    claimant_device_id, claimant_ip, gigachat_port,
                 )
         except Exception as e:
             log.info(
@@ -349,6 +360,9 @@ def accept_pairing(
     # failed notify only leaves the claimant without a symmetric
     # record (they can re-pair to fix). Default Gigachat port is the
     # FastAPI port we read from env.
+    #
+    # The claimant's X25519 pubkey was just exchanged in the pair
+    # handshake — pass it through so the notify is encrypted.
     try:
         from . import p2p_lan_client as _lan
         peer_port = int(claimant_port or 8000)
@@ -356,6 +370,7 @@ def accept_pairing(
             peer_ip=claimant_ip or "",
             peer_port=peer_port,
             peer_device_id=claimant_device_id,
+            peer_x25519_public_b64=claimant_x25519_public_b64,
         ))
     except Exception as e:
         log.info("p2p: pair-notify scheduling failed: %s", e)
@@ -380,6 +395,7 @@ def unpair(device_id: str) -> bool:
     paired = db.get_paired_device(device_id)
     peer_ip = paired.get("ip") if paired else None
     peer_port = paired.get("port") if paired else None
+    peer_x25519 = paired.get("x25519_public_b64") if paired else None
     # Order matters: delete the worker BEFORE the pairing so the
     # "find the worker by device_id" lookup still succeeds.
     try:
@@ -404,6 +420,7 @@ def unpair(device_id: str) -> bool:
                 peer_ip=peer_ip,
                 peer_port=int(peer_port or 8000),
                 peer_device_id=device_id,
+                peer_x25519_public_b64=peer_x25519,
             ))
         except Exception as e:
             log.info("p2p: unpair-notify scheduling failed: %s", e)

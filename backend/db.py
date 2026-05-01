@@ -458,6 +458,7 @@ def init() -> None:
                 last_seen REAL,
                 last_error TEXT,
                 gigachat_device_id TEXT,
+                use_encrypted_proxy INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
@@ -677,6 +678,17 @@ def init() -> None:
             # DB or a migrated one.
             "CREATE INDEX IF NOT EXISTS idx_compute_workers_device_id "
             "ON compute_workers(gigachat_device_id)",
+            # Encrypted-proxy mode: when 1, outbound traffic to this
+            # worker goes via the peer's Gigachat /api/p2p/secure/*
+            # endpoints (envelope-wrapped). When 0 (default for
+            # manually-added workers), outbound talks directly to
+            # the worker's Ollama port in plaintext — preserves
+            # behaviour for existing user-configured raw-Ollama
+            # workers. Pair-flow auto-creates rows with this flag
+            # set so paired LAN peers get encrypted compute by
+            # default; the user doesn't have to opt in.
+            "ALTER TABLE compute_workers ADD COLUMN "
+            "use_encrypted_proxy INTEGER NOT NULL DEFAULT 0",
             # Per-peer X25519 public key for end-to-end encryption.
             # Captured at pair time alongside the existing Ed25519
             # signing key. NULL means a peer paired before E2E
@@ -4113,6 +4125,7 @@ def create_compute_worker(
     use_for_embeddings: bool = True,
     use_for_subagents: bool = True,
     gigachat_device_id: str | None = None,
+    use_encrypted_proxy: bool = False,
 ) -> str:
     """Insert a new compute worker and return its id.
 
@@ -4153,8 +4166,9 @@ def create_compute_worker(
             "INSERT INTO compute_workers ("
             "id, label, address, ollama_port, auth_token, ssh_host, "
             "tailscale_host, enabled, use_for_chat, use_for_embeddings, "
-            "use_for_subagents, gigachat_device_id, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "use_for_subagents, gigachat_device_id, use_encrypted_proxy, "
+            "created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 wid, lbl, addr, port, auth_token,
                 ssh_host_clean, tailscale_clean,
@@ -4163,6 +4177,7 @@ def create_compute_worker(
                 1 if use_for_embeddings else 0,
                 1 if use_for_subagents else 0,
                 (gigachat_device_id or None),
+                1 if use_encrypted_proxy else 0,
                 now, now,
             ),
         )
@@ -4413,11 +4428,16 @@ def _row_to_compute_worker(row: sqlite3.Row) -> dict:
         gigachat_device_id = row["gigachat_device_id"]
     except IndexError:
         gigachat_device_id = None
+    try:
+        use_encrypted_proxy = bool(row["use_encrypted_proxy"])
+    except IndexError:
+        use_encrypted_proxy = False
     return {
         "id": row["id"],
         "label": row["label"],
         "address": row["address"],
         "ollama_port": row["ollama_port"],
+        "use_encrypted_proxy": use_encrypted_proxy,
         # auth_token is NEVER returned to the API/UI — the column exists
         # for outbound requests only. Surfacing it would be a credential
         # exfiltration vector. Use `get_compute_worker_auth_token(wid)`

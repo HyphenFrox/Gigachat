@@ -1848,6 +1848,84 @@ def embed_concurrency_limit(model: str) -> int:
     return max(2, min(16, backend_count * 2))
 
 
+def pick_chat_worker(
+    model: str, conv_id: str | None = None,
+) -> dict | None:
+    """Return the FULL worker dict the chat picker would route to,
+    or None when host wins.
+
+    Same selection logic as `pick_chat_target` (affinity, capability
+    score, mega-busy bias) — just exposes the row instead of the
+    pre-formatted (url, token) tuple. Callers that need the worker's
+    `use_encrypted_proxy` flag use this; callers that just want the
+    URL can stay on `pick_chat_target`.
+    """
+    cands = _eligible_workers("use_for_chat", model=model)
+    sticky = _CONV_AFFINITY.get(conv_id) if conv_id else None
+    if sticky and sticky != "host":
+        wid = sticky.split(":", 1)[1] if ":" in sticky else ""
+        sticky_w = next((w for w in cands if w["id"] == wid), None)
+        if sticky_w is not None:
+            sticky_load = _ACTIVE_TURNS_PER_NODE.get(sticky, 0)
+            better = next(
+                (
+                    w for w in cands
+                    if w["id"] != wid
+                    and _ACTIVE_TURNS_PER_NODE.get(f"worker:{w['id']}", 0)
+                        <= sticky_load - 2
+                ),
+                None,
+            )
+            if better is None:
+                return sticky_w
+    if not cands:
+        return None
+    top_score = _capability_score(cands[0])
+    tied = [c for c in cands if _capability_score(c) == top_score]
+    if len(tied) > 1:
+        tied.sort(
+            key=lambda c: _ACTIVE_TURNS_PER_NODE.get(f"worker:{c['id']}", 0),
+        )
+        w = tied[0]
+    else:
+        w = cands[0]
+    worker_score = _capability_score(w)
+    host_score = _host_capability_score(model)
+    if worker_score[0] <= 0 or host_score[0] <= 0:
+        worker_score = (0.0,) + worker_score[1:]
+        host_score = (0.0,) + host_score[1:]
+    if worker_score <= host_score and not is_host_mega_busy():
+        return None
+    return w
+
+
+def pick_embed_worker(model: str) -> dict | None:
+    """Return the FULL worker dict (or None for host) the next embed
+    request should route to.
+
+    Wraps the same picker `pick_embed_target` uses but returns the
+    full row so callers can read `use_encrypted_proxy` and dispatch
+    through the secure proxy when needed. Behaviour-equivalent for
+    callers that only need the URL/token.
+    """
+    cands = _eligible_workers("use_for_embeddings", model=model)
+    if not cands:
+        return None
+    if len(cands) > 1:
+        top_score = _capability_score(cands[0])
+        threshold_score = top_score
+        usable = [
+            c for c in cands
+            if _capability_score(c) >= _scaled_score_threshold(threshold_score)
+        ]
+    else:
+        usable = cands
+    idx = _EMBED_TARGET_INDEX.get(model, 0)
+    w = usable[idx % len(usable)]
+    _EMBED_TARGET_INDEX[model] = (idx + 1) % max(len(usable), 1)
+    return w
+
+
 def pick_embed_target(model: str) -> tuple[str, str | None] | None:
     """Choose a worker to run an embed request against, or None for host.
 

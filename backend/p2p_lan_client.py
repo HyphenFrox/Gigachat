@@ -87,6 +87,7 @@ async def push_pair_notify(
     peer_ip: str,
     peer_port: int,
     peer_device_id: str,
+    peer_x25519_public_b64: str | None = None,
 ) -> bool:
     """Tell the freshly-paired claimant that the host accepted them.
 
@@ -95,9 +96,13 @@ async def push_pair_notify(
     signature, stores the host's identity, and the friendship is
     symmetric.
 
-    Returns True on success, False on any error. Failure is non-fatal:
-    the host's record is intact, only the claimant's side is missing
-    its symmetric copy. The user can re-pair to repair.
+    Encryption: when `peer_x25519_public_b64` is supplied the body
+    is wrapped in a `p2p_crypto` envelope addressed to the peer.
+    For backwards compatibility with peers paired before E2E shipped
+    (no X25519 key on file), we fall back to plaintext + signed
+    body — the receiver accepts both shapes.
+
+    Returns True on success, False on any error.
     """
     if not peer_ip:
         log.info("pair-notify skipped — no peer ip yet")
@@ -113,7 +118,7 @@ async def push_pair_notify(
         timestamp=ts,
     )
     sig = base64.b64encode(me.sign(digest)).decode("ascii")
-    body = {
+    inner_body = {
         "host_device_id": me.device_id,
         "host_label": me.label,
         "host_public_key_b64": me.public_key_b64,
@@ -122,12 +127,35 @@ async def push_pair_notify(
         "timestamp": ts,
         "signature_b64": sig,
     }
+    if peer_x25519_public_b64:
+        # Encrypted envelope wraps the (already-signed) inner body.
+        # The envelope's own signature pins the SENDER (us) — the
+        # inner signature pins the PAIR-NOTIFY ACTION's authenticity.
+        # Two layers means a tampered envelope fails AEAD before we
+        # spend cycles on the inner verify.
+        from . import p2p_crypto as _pc
+        outer = _pc.seal_json(
+            recipient_x25519_pub_b64=peer_x25519_public_b64,
+            recipient_device_id=peer_device_id,
+            payload=inner_body,
+        )
+        post_body = {"encrypted": outer}
+    else:
+        # Legacy / first-pair path — peer doesn't have our X25519
+        # key yet, so we can't address an envelope to them. The
+        # signed inner body still proves authenticity.
+        post_body = inner_body
+
     url = f"http://{peer_ip}:{peer_port}/api/p2p/pair/notify"
     try:
         async with httpx.AsyncClient(timeout=_NOTIFY_TIMEOUT_SEC) as client:
-            r = await client.post(url, json=body)
+            r = await client.post(url, json=post_body)
             r.raise_for_status()
-        log.info("pair-notify delivered to %s:%d", peer_ip, peer_port)
+        log.info(
+            "pair-notify delivered to %s:%d (%s)",
+            peer_ip, peer_port,
+            "encrypted" if peer_x25519_public_b64 else "plaintext",
+        )
         return True
     except Exception as e:
         log.info(
@@ -143,6 +171,7 @@ async def push_unpair_notify(
     peer_ip: str,
     peer_port: int,
     peer_device_id: str,
+    peer_x25519_public_b64: str | None = None,
 ) -> bool:
     """Tell the friend that we unpaired so they drop their record too.
 
@@ -150,6 +179,11 @@ async def push_unpair_notify(
     OTHER side gets removed too. The signed message proves the
     request really came from the claimed initiator (an attacker
     can't drop someone else's pairing without their private key).
+
+    Encryption: same treatment as `push_pair_notify` — body is
+    wrapped in a `p2p_crypto` envelope when we have the peer's
+    X25519 key on file; falls back to plaintext+signed for legacy
+    peers paired before E2E shipped.
 
     Failure non-fatal: the local-side removal already succeeded.
     Worst case the peer's record stays orphaned until they prune
@@ -166,19 +200,34 @@ async def push_unpair_notify(
         timestamp=ts,
     )
     sig = base64.b64encode(me.sign(digest)).decode("ascii")
-    body = {
+    inner_body = {
         "initiator_device_id": me.device_id,
         "initiator_public_key_b64": me.public_key_b64,
         "peer_device_id": peer_device_id,
         "timestamp": ts,
         "signature_b64": sig,
     }
+    if peer_x25519_public_b64:
+        from . import p2p_crypto as _pc
+        outer = _pc.seal_json(
+            recipient_x25519_pub_b64=peer_x25519_public_b64,
+            recipient_device_id=peer_device_id,
+            payload=inner_body,
+        )
+        post_body = {"encrypted": outer}
+    else:
+        post_body = inner_body
+
     url = f"http://{peer_ip}:{peer_port}/api/p2p/pair/unpair-notify"
     try:
         async with httpx.AsyncClient(timeout=_NOTIFY_TIMEOUT_SEC) as client:
-            r = await client.post(url, json=body)
+            r = await client.post(url, json=post_body)
             r.raise_for_status()
-        log.info("unpair-notify delivered to %s:%d", peer_ip, peer_port)
+        log.info(
+            "unpair-notify delivered to %s:%d (%s)",
+            peer_ip, peer_port,
+            "encrypted" if peer_x25519_public_b64 else "plaintext",
+        )
         return True
     except Exception as e:
         log.info(

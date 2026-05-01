@@ -31,6 +31,7 @@ import asyncio
 import base64
 import difflib
 import json
+import logging
 import math
 import re
 import uuid
@@ -40,6 +41,13 @@ from typing import Any, AsyncGenerator
 import httpx
 
 from . import compute_pool, db, jsonutil, mcp, sysdetect, tool_prompt_adapter, tools
+
+# Module logger. Existing code throughout agent.py uses `log.info`/
+# `log.warning` etc.; without this module-level binding those calls
+# would NameError at runtime (silently swallowed inside their
+# enclosing try/except blocks but invisible at debug time). Adding
+# the logger makes the existing log statements actually fire.
+log = logging.getLogger("gigachat.agent")
 from .prompts import TOOL_SCHEMAS, build_system_prompt
 
 OLLAMA_URL = "http://localhost:11434"
@@ -1243,31 +1251,69 @@ async def _embed_text(text: str) -> list[float] | None:
     if not text or not text.strip():
         return None
 
-    target = None
+    worker = None
     try:
-        target = compute_pool.pick_embed_target(EMBED_MODEL)
+        worker = compute_pool.pick_embed_worker(EMBED_MODEL)
     except Exception:
         # Picker can't fail in practice (read-only DB query) but if the
         # compute_pool module ever raises here we don't want to break
         # the embedding path — silently route to host.
-        target = None
+        worker = None
 
-    if target is not None:
-        base, token = target
+    if worker is not None:
         try:
-            vec = await _embed_via(base, token, text)
+            if worker.get("use_encrypted_proxy"):
+                # Route via the peer's E2E-encrypted Gigachat proxy.
+                # The peer's secure proxy decrypts our envelope, calls
+                # its own loopback Ollama, encrypts the response back.
+                # Anyone on the wire sees only ciphertext.
+                vec = await _embed_via_secure_proxy(worker, text)
+            else:
+                base = f"http://{worker['address']}:{worker['ollama_port']}"
+                token = db.get_compute_worker_auth_token(worker["id"])
+                vec = await _embed_via(base, token, text)
             if vec:
                 return vec
             # Empty payload from worker — fall through to host.
-        except Exception:
-            # Worker unreachable / 5xx — fall through.
-            pass
+        except Exception as e:
+            # Worker unreachable / 5xx / crypto fail — fall through
+            # to host. Logged at debug; the periodic probe will mark
+            # `last_error` so the picker skips a broken worker.
+            log.debug("embed via worker %s failed: %s", worker.get("label"), e)
 
     # Host fallback. Same code path; auth_token is None on loopback Ollama.
     try:
         return await _embed_via(OLLAMA_URL, None, text)
     except Exception:
         return None
+
+
+async def _embed_via_secure_proxy(worker: dict, text: str) -> list[float] | None:
+    """Embed via the peer's encrypted Gigachat proxy.
+
+    Builds the same /api/embeddings request body Ollama expects,
+    wraps it in a `p2p_crypto` envelope, POSTs to the peer's
+    `/api/p2p/secure/forward`, parses the decrypted Ollama JSON
+    response, returns the normalised embedding vector. The wire
+    format between us and the peer is ciphertext only — prompts
+    NEVER leave this device in plaintext.
+    """
+    from . import p2p_secure_client as _secure
+    body = {"model": EMBED_MODEL, "prompt": text[:8000]}
+    status, response_text = await _secure.forward(
+        worker, method="POST", path="/api/embeddings", body=body,
+    )
+    if status >= 400:
+        return None
+    try:
+        data = jsonutil.loads(response_text)
+    except Exception:
+        return None
+    vec = data.get("embedding") or []
+    if not vec:
+        return None
+    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+    return [x / norm for x in vec]
 
 
 def _dot(a: list[float], b: list[float]) -> float:
@@ -2461,6 +2507,64 @@ async def _apply_quality_mode(
         }
 
 
+async def _stream_ollama_chat_via_secure_proxy(
+    model: str,
+    messages: list[dict],
+    tool_schemas: list[dict],
+    *,
+    adapter_mode: bool,
+    disable_thinking: bool,
+    worker: dict,
+) -> AsyncGenerator[dict, None]:
+    """Stream a chat completion over the E2E-encrypted Gigachat proxy.
+
+    Builds the same Ollama /api/chat request body the direct path
+    would, wraps it in a `p2p_crypto.seal_json` envelope, POSTs to
+    the peer's `/api/p2p/secure/forward-stream`, and yields each
+    decrypted Ollama NDJSON chunk back to the caller as if it had
+    come direct.
+
+    The privacy guarantee is enforced by `p2p_secure_client`:
+    every byte on the wire between us and the peer is ciphertext.
+    Anyone observing the LAN or internet path sees nonces +
+    ciphertext, not the prompt.
+    """
+    from . import p2p_secure_client as _secure
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "options": {
+            "temperature": 0.3,
+            "num_ctx": NUM_CTX,
+            "num_predict": -1,
+        },
+    }
+    if not adapter_mode:
+        body["tools"] = tool_schemas
+    # Thinking-mode opt-in mirrors the direct path's logic. The
+    # capability probe lives on the peer's Ollama; we hint via the
+    # `think` field and let the peer's runner accept-or-ignore.
+    if disable_thinking:
+        body["think"] = False
+    try:
+        async for line in _secure.forward_stream(
+            worker, method="POST", path="/api/chat", body=body,
+        ):
+            try:
+                yield jsonutil.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                # Malformed NDJSON line from the peer — skip rather
+                # than crash the stream. The peer's Ollama might
+                # have emitted a stray empty token; same recovery
+                # the direct path applies.
+                continue
+    except _secure.SecureProxyError as e:
+        # Surface as a normal stream error so the agent's existing
+        # error handler renders it to the UI.
+        raise httpx.HTTPError(f"secure proxy: {e}")
+
+
 async def _stream_ollama_chat(
     model: str,
     messages: list[dict],
@@ -2470,15 +2574,33 @@ async def _stream_ollama_chat(
     disable_thinking: bool = False,
     base_url: str = OLLAMA_URL,
     auth_token: str | None = None,
+    secure_proxy_worker: dict | None = None,
 ) -> AsyncGenerator[dict, None]:
-    # Privacy guard — fail-closed before any prompt bytes hit the wire.
-    # The chat path carries the user's full prompt history; sending
-    # that to a destination outside the local pool would violate the
-    # explicit privacy contract. PrivacyViolation is raised as
-    # `RuntimeError` so the agent's existing exception handlers
-    # surface it as an `error` SSE event the UI can show.
+    # E2E-encrypted dispatch path: when the target worker is a
+    # paired peer with `use_encrypted_proxy=True`, route the chat
+    # stream through the peer's `/api/p2p/secure/forward-stream`
+    # endpoint. The wire carries only ciphertext envelopes —
+    # prompts, model output, everything is X25519+ChaCha20 sealed
+    # for the recipient's identity. The receive side decrypts each
+    # NDJSON envelope back into the original Ollama line and yields
+    # the plaintext dict, so the rest of this function (the rAF
+    # batching, tool-call parsing, etc.) sees identical input
+    # whether we're talking direct or via the encrypted proxy.
+    if secure_proxy_worker and secure_proxy_worker.get("use_encrypted_proxy"):
+        async for chunk in _stream_ollama_chat_via_secure_proxy(
+            model, messages, tool_schemas,
+            adapter_mode=adapter_mode,
+            disable_thinking=disable_thinking,
+            worker=secure_proxy_worker,
+        ):
+            yield chunk
+        return
+    # Privacy guard — when NOT going through the encrypted proxy,
+    # fail closed if the destination is anything other than loopback
+    # or a paired-LAN peer. Stops a future regression that points
+    # the chat path at a remote URL without enabling encryption.
     from . import p2p_privacy as _privacy
-    _privacy.assert_outbound_is_local(base_url, kind="chat")
+    _privacy.assert_plaintext_allowed(base_url, kind="chat")
 
     """Yield raw chunks from Ollama /api/chat with stream=true.
 
@@ -3183,6 +3305,10 @@ async def _run_turn_impl(
         # warmth survives across streamed tool-call iterations.
         chat_base_url = OLLAMA_URL
         chat_auth_token: str | None = None
+        # Set when routing to a paired peer with use_encrypted_proxy=True.
+        # _stream_ollama_chat reads it and dispatches the streaming
+        # call through the E2E-encrypted proxy instead of plain HTTP.
+        chat_worker_dict: dict | None = None
         if split_target is None:
             try:
                 # Pass conv_id so the picker honors per-conversation
@@ -3199,6 +3325,17 @@ async def _run_turn_impl(
                 chat_target = None
             if chat_target is not None:
                 chat_base_url, chat_auth_token = chat_target
+            # Resolve the FULL worker dict alongside so we can route
+            # through the E2E encrypted proxy when the worker has
+            # `use_encrypted_proxy=True` (the default for paired
+            # peers). The picker is deterministic so the dict
+            # corresponds to the same worker as `chat_target`.
+            try:
+                chat_worker_dict = compute_pool.pick_chat_worker(
+                    conv["model"], conv_id=conversation_id,
+                )
+            except Exception:
+                chat_worker_dict = None
             # Register this turn against the chosen node so future
             # picks see accurate load. The matching `register_turn_end`
             # runs in `run_turn`'s finally block — we read the node id
@@ -3371,6 +3508,11 @@ async def _run_turn_impl(
                     disable_thinking=empty_retries > 0,
                     base_url=chat_base_url,
                     auth_token=chat_auth_token,
+                    # When non-None, the chat-stream gets routed via
+                    # the peer's E2E-encrypted proxy instead of the
+                    # plaintext base_url. Enabled automatically for
+                    # paired peers (use_encrypted_proxy=True).
+                    secure_proxy_worker=chat_worker_dict,
                 )
             try:
                 async for chunk in stream_iter:

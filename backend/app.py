@@ -4211,21 +4211,54 @@ class P2PUnpairNotifyBody(BaseModel):
 
 
 @app.post("/api/p2p/pair/notify")
-async def api_p2p_pair_notify(body: P2PPairNotifyBody, request: Request) -> dict:
+async def api_p2p_pair_notify(request: Request) -> dict:
     """Receive a "we paired with you" notice from the host side.
 
-    Verifies:
-      * signature is valid against the claimed host public key
-      * `claimant_device_id` matches OUR own device_id (the
-        message is for us, not a misrouted ping)
+    Two acceptable body shapes:
+      * Encrypted envelope:  ``{"encrypted": <p2p_crypto envelope>}``
+        — preferred when the sender has our X25519 key. Decrypts to
+        the same fields the legacy plaintext shape carries.
+      * Legacy plaintext:    ``{<host_device_id, host_label, ...>}``
+        — first-pair / pre-E2E peers that don't have our X25519 key.
+        Still signed (Ed25519) so the host's identity is verified.
+
+    Verifies (after decrypt if needed):
+      * signature against claimed host public key
+      * claimant_device_id matches us (not a misrouted ping)
       * timestamp is fresh (replay protection)
-    On success: persist the host's identity as a paired peer so
-    the friendship is symmetric. Idempotent — repeat notifies
-    refresh the address but don't double-pair.
+      * claimed device_id matches the host's own pubkey
+
+    On success: persist the host as a paired peer (X25519 key
+    captured when supplied) and mirror the compute_worker row.
     """
     from . import identity as _ident
     from . import p2p_lan_client as _lan
+    from . import p2p_crypto as _pc
     me = _ident.get_identity()
+    raw = await request.json()
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "body must be a JSON object")
+    if "encrypted" in raw:
+        # Encrypted shape — open envelope addressed to us.
+        try:
+            payload, _verified_sender = _pc.open_envelope_json(
+                raw["encrypted"],
+                # First-touch: the envelope's claimed sender is the
+                # one we'll trust here because we don't yet have
+                # them in paired_devices. The signature still binds
+                # the envelope to whatever pubkey it claims, which
+                # we cross-check against the inner host_public_key.
+                expected_sender_ed25519_pub_b64=None,
+            )
+        except _pc.CryptoError as e:
+            raise HTTPException(400, f"envelope decrypt failed: {e}")
+        body_dict = payload
+    else:
+        body_dict = raw
+    try:
+        body = P2PPairNotifyBody(**body_dict)
+    except Exception as e:
+        raise HTTPException(400, f"malformed pair-notify body: {e}")
     if body.claimant_device_id != me.device_id:
         raise HTTPException(400, "this notify is for a different device")
     if abs(time.time() - body.timestamp) > 120.0:
@@ -4269,19 +4302,25 @@ async def api_p2p_pair_notify(body: P2PPairNotifyBody, request: Request) -> dict
     )
     # Phase 2 mirror: also create a compute_worker row so the host
     # appears in our routing pool too. Symmetric with what the host
-    # did when it accepted us.
+    # did when it accepted us. Encrypted-proxy mode by default —
+    # all compute traffic to the host's machine flows via their
+    # Gigachat secure proxy (X25519+ChaCha20), never plaintext.
+    # We don't know the host's Gigachat port from this notify
+    # (mDNS will fill it in later); fall back to the standard 8000
+    # which the host's mDNS ad will refresh on the next sweep.
     try:
         existing = db.get_compute_worker_by_device_id(body.host_device_id)
         if not existing and peer_ip:
             db.create_compute_worker(
                 label=body.host_label or body.host_device_id,
                 address=peer_ip,
-                ollama_port=11434,
+                ollama_port=8000,
                 enabled=True,
                 use_for_chat=True,
                 use_for_embeddings=True,
                 use_for_subagents=True,
                 gigachat_device_id=body.host_device_id,
+                use_encrypted_proxy=True,
             )
     except Exception as e:
         log.info("symmetric pair: compute_worker mirror failed: %s", e)
@@ -4289,19 +4328,36 @@ async def api_p2p_pair_notify(body: P2PPairNotifyBody, request: Request) -> dict
 
 
 @app.post("/api/p2p/pair/unpair-notify")
-async def api_p2p_pair_unpair_notify(body: P2PUnpairNotifyBody) -> dict:
+async def api_p2p_pair_unpair_notify(request: Request) -> dict:
     """Receive an unpair notice from a former friend.
 
-    Verifies the signature against the initiator's stored pubkey
-    (looked up from our paired_devices table — if we don't have a
-    record of them, we have nothing to unpair, return 200 quietly
-    so a stale retry doesn't error).
-
-    On success: drop our matching record + the auto-created
-    compute_worker row.
+    Same dual body shape as `pair_notify`: encrypted envelope OR
+    legacy plaintext (for peers without our X25519 key on file).
+    Verifies the inner signature against the initiator's stored
+    pubkey; falls back to the message's claimed pubkey when we
+    have no record (in which case the unpair is a no-op anyway).
     """
     from . import identity as _ident
     from . import p2p_lan_client as _lan
+    from . import p2p_crypto as _pc
+    raw = await request.json()
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "body must be a JSON object")
+    if "encrypted" in raw:
+        try:
+            payload, _verified = _pc.open_envelope_json(
+                raw["encrypted"],
+                expected_sender_ed25519_pub_b64=None,
+            )
+        except _pc.CryptoError as e:
+            raise HTTPException(400, f"envelope decrypt failed: {e}")
+        body_dict = payload
+    else:
+        body_dict = raw
+    try:
+        body = P2PUnpairNotifyBody(**body_dict)
+    except Exception as e:
+        raise HTTPException(400, f"malformed unpair-notify body: {e}")
     if abs(time.time() - body.timestamp) > 120.0:
         raise HTTPException(400, "notify timestamp out of window")
     me = _ident.get_identity()
@@ -4334,6 +4390,9 @@ async def api_p2p_pair_unpair_notify(body: P2PUnpairNotifyBody) -> dict:
     except Exception as e:
         log.info("symmetric unpair: compute_worker cleanup failed: %s", e)
     removed = db.delete_paired_device(body.initiator_device_id)
+    # Use the local request IP defensively — we don't actually
+    # send anything back, just used for logging.
+    _ = request.client.host if request.client else "unknown"
     return {"unpaired": removed}
 
 
@@ -4418,6 +4477,62 @@ async def api_p2p_public_pool_set(body: P2PPublicPoolBody) -> dict:
     except Exception as e:
         log.warning("p2p_rendezvous toggle failed: %s", e)
     return {"enabled": bool(body.enabled)}
+
+
+@app.post("/api/p2p/secure/forward")
+async def api_p2p_secure_forward(envelope: dict) -> dict:
+    """Inbound encrypted-proxy endpoint (one-shot variant).
+
+    The peer's secure-client wrapped a (method, path, body) tuple in
+    a `p2p_crypto` envelope addressed to us; we decrypt + verify
+    + forward to local Ollama + encrypt the response back. Errors
+    in any of those steps surface as HTTP 400 (envelope problem)
+    or HTTP 502 (upstream Ollama problem) so the caller can
+    distinguish a security failure from a compute failure.
+    """
+    from . import p2p_secure_proxy as _sp
+    from . import p2p_crypto as _pc
+    try:
+        return await _sp.serve_forward_one_shot(envelope)
+    except _pc.CryptoError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        log.warning("secure_forward upstream error: %s", e)
+        raise HTTPException(502, f"upstream error: {type(e).__name__}")
+
+
+@app.post("/api/p2p/secure/forward-stream")
+async def api_p2p_secure_forward_stream(envelope: dict):
+    """Inbound encrypted-proxy endpoint (streaming variant).
+
+    Same trust + verify pipeline as the one-shot endpoint, but the
+    response body is NDJSON of envelope-wrapped Ollama chunks.
+    Caller reads line-by-line, decrypts each, feeds to its existing
+    NDJSON parser. The stream terminator + error markers are
+    encoded as separate envelopes with `_stream` keys.
+    """
+    from . import p2p_secure_proxy as _sp
+    from . import p2p_crypto as _pc
+
+    # Verify upfront (synchronously) so a CryptoError surfaces as
+    # HTTP 400 rather than mid-stream. The verify path is repeated
+    # inside `serve_forward_stream` for the actual decrypt — cheap
+    # double-check.
+    try:
+        _sp._verify_inbound(envelope)
+    except _pc.CryptoError as e:
+        raise HTTPException(400, str(e))
+
+    async def _gen():
+        try:
+            async for chunk in _sp.serve_forward_stream(envelope):
+                yield chunk
+        except Exception as e:
+            log.warning("secure_forward_stream error: %s", e)
+
+    return StreamingResponse(
+        _gen(), media_type="application/x-ndjson",
+    )
 
 
 @app.get("/api/p2p/rendezvous/status")
