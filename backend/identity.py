@@ -26,6 +26,9 @@ from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey, Ed25519PublicKey,
 )
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey, X25519PublicKey,
+)
 from cryptography.hazmat.primitives.serialization import (
     Encoding, NoEncryption, PrivateFormat, PublicFormat,
 )
@@ -39,19 +42,37 @@ _IDENTITY_PATH = Path(os.environ.get("GIGACHAT_DATA_DIR", "data")) / "identity.j
 
 @dataclass(frozen=True)
 class Identity:
-    """The four pieces of state a peer needs to act in the P2P network.
+    """The state a peer needs to act in the P2P network.
 
-    `device_id` is short (16 chars, base32) and human-quotable — what the
-    user reads off the screen when verifying a friend's identity.
-    `public_key_b64` is the full 32-byte Ed25519 public key (base64), the
-    canonical wire-format identifier used in pairing / receipts / handshakes.
-    `label` is a friendly name (defaults to the OS hostname) shown next to
-    the id in pairing UIs so users can tell their devices apart.
+    Two distinct keypairs because Ed25519 (signatures) and X25519
+    (key-agreement / ECDH) are different primitives — same curve
+    arithmetic underneath, but different operations and reusing one
+    key for both is non-standard and risky. NaCl / libsodium follow
+    the same separation (`crypto_sign` vs `crypto_box`).
+
+      * Ed25519 (`private_key`, `public_key_b64`) — signs the
+        pairing handshake, receipts, and any peer-to-peer
+        authenticated messages so a receiver can verify the sender.
+      * X25519 (`x25519_private`, `x25519_public_b64`) — derives a
+        shared secret with each peer via ECDH; the secret is used
+        to seed an AEAD (ChaCha20-Poly1305) so all peer-to-peer
+        message bodies — prompts, chat content, anything — are
+        end-to-end encrypted.
+
+    `device_id` is short (16 chars, base32) and human-quotable —
+    derived from the Ed25519 public key, NOT the X25519 one. The
+    Ed25519 key is the canonical identity; the X25519 key is
+    treated as an attribute of that identity.
+    `label` is a friendly name (defaults to the OS hostname) shown
+    next to the id in pairing UIs so users can tell their devices
+    apart.
     """
     device_id: str
     label: str
     public_key_b64: str
     private_key: Ed25519PrivateKey
+    x25519_private: X25519PrivateKey
+    x25519_public_b64: str
 
     @property
     def public_key(self) -> Ed25519PublicKey:
@@ -108,18 +129,28 @@ def format_device_id(device_id: str) -> str:
     return "-".join(s[i:i + 4] for i in range(0, len(s), 4)) if s else ""
 
 
-def _save_identity(priv: Ed25519PrivateKey, label: str) -> None:
+def _save_identity(
+    priv: Ed25519PrivateKey,
+    x25519_priv: X25519PrivateKey,
+    label: str,
+) -> None:
     """Write identity to disk with conservative file permissions.
 
-    Format is plain JSON (private key DER-base64) so a future tool
-    that needs to read it without importing cryptography can do so.
-    On POSIX we chmod the file to 0600. On Windows the equivalent is
-    "current user only" via ACLs — we don't try to set those (would
-    require pywin32) but the data dir itself is in the user's home,
-    so multi-user disclosure is unlikely.
+    Format is plain JSON (PEM-encoded private keys, base64-encoded
+    public keys) so a future tool that needs to read it without
+    importing cryptography can do so. On POSIX we chmod the file
+    to 0600. On Windows the equivalent is "current user only" via
+    ACLs — we don't try to set those (would require pywin32) but
+    the data dir itself is in the user's home, so multi-user
+    disclosure is unlikely.
+
+    Schema version 2 added the X25519 keypair. v1 files are migrated
+    on read by generating a fresh X25519 keypair (the user has to
+    re-pair existing peers to exchange the new pubkey, but the
+    Ed25519 identity is preserved).
     """
     _IDENTITY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    der = priv.private_bytes(
+    ed_pem = priv.private_bytes(
         encoding=Encoding.PEM,
         format=PrivateFormat.PKCS8,
         encryption_algorithm=NoEncryption(),
@@ -127,12 +158,22 @@ def _save_identity(priv: Ed25519PrivateKey, label: str) -> None:
     pub_bytes = priv.public_key().public_bytes(
         encoding=Encoding.Raw, format=PublicFormat.Raw,
     )
+    x25519_pem = x25519_priv.private_bytes(
+        encoding=Encoding.PEM,
+        format=PrivateFormat.PKCS8,
+        encryption_algorithm=NoEncryption(),
+    ).decode("ascii")
+    x25519_pub_bytes = x25519_priv.public_key().public_bytes(
+        encoding=Encoding.Raw, format=PublicFormat.Raw,
+    )
     payload = {
-        "version": 1,
+        "version": 2,
         "label": label,
         "device_id": _device_id_from_pubkey(pub_bytes),
         "public_key_b64": base64.b64encode(pub_bytes).decode("ascii"),
-        "private_key_pem": der,
+        "private_key_pem": ed_pem,
+        "x25519_public_b64": base64.b64encode(x25519_pub_bytes).decode("ascii"),
+        "x25519_private_pem": x25519_pem,
     }
     tmp = _IDENTITY_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -169,11 +210,36 @@ def get_identity() -> Identity:
             if not isinstance(priv, Ed25519PrivateKey):
                 raise ValueError("identity.json holds a non-Ed25519 key")
             label = str(payload.get("label") or _default_label())
+            # X25519 keypair was added in schema v2. v1 files keep
+            # their Ed25519 identity but get a fresh X25519 keypair
+            # generated on the spot — saved back to disk so subsequent
+            # loads are stable. Existing peers paired before v2 don't
+            # have our new X25519 pubkey; re-pairing exchanges it.
+            x_pem = payload.get("x25519_private_pem")
+            if x_pem:
+                x_priv = load_pem_private_key(
+                    x_pem.encode("ascii"), password=None,
+                )
+                if not isinstance(x_priv, X25519PrivateKey):
+                    raise ValueError(
+                        "identity.json holds a non-X25519 encryption key"
+                    )
+            else:
+                log.info(
+                    "identity: upgrading v1 → v2 (adding X25519 keypair)"
+                )
+                x_priv = X25519PrivateKey.generate()
+                _save_identity(priv, x_priv, label)
+            x_pub_bytes = x_priv.public_key().public_bytes(
+                encoding=Encoding.Raw, format=PublicFormat.Raw,
+            )
             _CACHED = Identity(
                 device_id=str(payload["device_id"]),
                 label=label,
                 public_key_b64=str(payload["public_key_b64"]),
                 private_key=priv,
+                x25519_private=x_priv,
+                x25519_public_b64=base64.b64encode(x_pub_bytes).decode("ascii"),
             )
             return _CACHED
         except Exception as e:
@@ -191,11 +257,15 @@ def get_identity() -> Identity:
             except OSError:
                 pass
 
-    # First launch: generate + persist.
+    # First launch: generate + persist both keypairs.
     priv = Ed25519PrivateKey.generate()
+    x_priv = X25519PrivateKey.generate()
     label = _default_label()
-    _save_identity(priv, label)
+    _save_identity(priv, x_priv, label)
     pub_bytes = priv.public_key().public_bytes(
+        encoding=Encoding.Raw, format=PublicFormat.Raw,
+    )
+    x_pub_bytes = x_priv.public_key().public_bytes(
         encoding=Encoding.Raw, format=PublicFormat.Raw,
     )
     _CACHED = Identity(
@@ -203,9 +273,11 @@ def get_identity() -> Identity:
         label=label,
         public_key_b64=base64.b64encode(pub_bytes).decode("ascii"),
         private_key=priv,
+        x25519_private=x_priv,
+        x25519_public_b64=base64.b64encode(x_pub_bytes).decode("ascii"),
     )
     log.info(
-        "identity: generated new Ed25519 identity %s (%s)",
+        "identity: generated new Ed25519 + X25519 identity %s (%s)",
         _CACHED.device_id, _CACHED.label,
     )
     return _CACHED
@@ -224,13 +296,15 @@ def set_label(new_label: str) -> Identity:
     cur = get_identity()
     if label == cur.label:
         return cur
-    _save_identity(cur.private_key, label)
+    _save_identity(cur.private_key, cur.x25519_private, label)
     global _CACHED
     _CACHED = Identity(
         device_id=cur.device_id,
         label=label,
         public_key_b64=cur.public_key_b64,
         private_key=cur.private_key,
+        x25519_private=cur.x25519_private,
+        x25519_public_b64=cur.x25519_public_b64,
     )
     log.info("identity: label updated to %r", label)
     return _CACHED

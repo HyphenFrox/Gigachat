@@ -4051,6 +4051,12 @@ class P2PPairAcceptBody(BaseModel):
     The HOST receives this from the claimant device — usually a
     direct LAN POST from the device the user is pairing. Same shape
     is used by the simulated same-host pair flow in tests.
+
+    `claimant_x25519_public_b64` is the new X25519 (encryption)
+    pubkey the claimant ships alongside its Ed25519 (signing)
+    pubkey. Stored in `paired_devices.x25519_public_b64` and used
+    by the encrypted-envelope module for all subsequent peer-to-peer
+    traffic to this peer.
     """
     pairing_id: str
     pin: str
@@ -4060,6 +4066,7 @@ class P2PPairAcceptBody(BaseModel):
     signature_b64: str
     claimant_ip: str | None = None
     claimant_port: int | None = None
+    claimant_x25519_public_b64: str | None = None
 
 
 class P2PIdentityLabelBody(BaseModel):
@@ -4163,6 +4170,7 @@ def api_p2p_pair_accept(body: P2PPairAcceptBody) -> dict:
             signature_b64=body.signature_b64,
             claimant_ip=body.claimant_ip,
             claimant_port=body.claimant_port,
+            claimant_x25519_public_b64=body.claimant_x25519_public_b64,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -4173,13 +4181,15 @@ class P2PPairNotifyBody(BaseModel):
     """Body for POST /api/p2p/pair/notify (claimant-side receiver).
 
     The HOST sends this AFTER it accepts our PIN — it tells us "we
-    paired you, here's our identity, mirror the friendship on your
-    side." Same canonical-bytes signature as the outbound side so
-    a tampered or impersonated message is rejected.
+    paired you, here's our identity (signing + encryption keys),
+    mirror the friendship on your side." Same canonical-bytes
+    signature as the outbound side so a tampered or impersonated
+    message is rejected.
     """
     host_device_id: str
     host_label: str
     host_public_key_b64: str
+    host_x25519_public_b64: str
     claimant_device_id: str
     timestamp: float
     signature_b64: str
@@ -4234,6 +4244,7 @@ async def api_p2p_pair_notify(body: P2PPairNotifyBody, request: Request) -> dict
         host_device_id=body.host_device_id,
         host_label=body.host_label,
         host_public_key_b64=body.host_public_key_b64,
+        host_x25519_public_b64=body.host_x25519_public_b64,
         claimant_device_id=body.claimant_device_id,
         timestamp=body.timestamp,
     )
@@ -4254,6 +4265,7 @@ async def api_p2p_pair_notify(body: P2PPairNotifyBody, request: Request) -> dict
         ip=peer_ip or None,
         port=None,  # we don't know their FastAPI port — mDNS will fill in
         role="local",
+        x25519_public_b64=body.host_x25519_public_b64,
     )
     # Phase 2 mirror: also create a compute_worker row so the host
     # appears in our routing pool too. Symmetric with what the host

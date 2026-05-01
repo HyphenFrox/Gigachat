@@ -42,21 +42,22 @@ def _sign_pair_notify(
     host_device_id: str,
     host_label: str,
     host_public_key_b64: str,
+    host_x25519_public_b64: str,
     claimant_device_id: str,
     timestamp: float,
 ) -> bytes:
     """Canonical bytes for the pair-notify signature.
 
-    Pipe-separated, version-prefixed so a future format change can
-    bump the version without an ambiguous parse on the receiver side.
-    Same shape on both sides; mismatched serialisation breaks the
-    signature even when the data is identical.
+    Pipe-separated, version-prefixed (v2 — added X25519 pubkey).
+    Mismatched serialisation breaks the signature even when the
+    data is identical.
     """
     parts = [
-        b"gigachat-p2p-pair-notify-v1",
+        b"gigachat-p2p-pair-notify-v2",
         host_device_id.encode("ascii"),
         host_label.encode("utf-8"),
         host_public_key_b64.encode("ascii"),
+        host_x25519_public_b64.encode("ascii"),
         claimant_device_id.encode("ascii"),
         f"{timestamp:.6f}".encode("ascii"),
     ]
@@ -107,6 +108,7 @@ async def push_pair_notify(
         host_device_id=me.device_id,
         host_label=me.label,
         host_public_key_b64=me.public_key_b64,
+        host_x25519_public_b64=me.x25519_public_b64,
         claimant_device_id=peer_device_id,
         timestamp=ts,
     )
@@ -115,6 +117,7 @@ async def push_pair_notify(
         "host_device_id": me.device_id,
         "host_label": me.label,
         "host_public_key_b64": me.public_key_b64,
+        "host_x25519_public_b64": me.x25519_public_b64,
         "claimant_device_id": peer_device_id,
         "timestamp": ts,
         "signature_b64": sig,

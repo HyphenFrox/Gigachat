@@ -104,15 +104,18 @@ def _purge_expired(now: float | None = None) -> None:
 
 def start_pairing() -> dict:
     """Create a fresh pairing offer. Returns the data the host UI
-    needs to display:
+    needs to display + what the claimant needs to derive a valid
+    signed claim:
 
       * `pin` — what the user types on the other device.
       * `pairing_id` — opaque handle for status polling / cancel.
       * `expires_at` — UI countdown.
-      * `nonce` — handed to the claimant in the discovered-record
-        TXT so they can construct the signature without an extra
-        round-trip. Returned in the response too so the host UI
-        can display it for QR-code-flow users.
+      * `nonce` — anti-replay value bound into the signed claim.
+      * `host_public_key_b64` — host's Ed25519 (signing) pubkey.
+      * `host_x25519_public_b64` — host's X25519 (encryption)
+        pubkey. Captured by the claimant alongside the signing key
+        so subsequent peer-to-peer messages can be E2E-encrypted
+        for the host.
     """
     _purge_expired()
     me = identity.get_identity()
@@ -137,6 +140,7 @@ def start_pairing() -> dict:
         "host_device_id": me.device_id,
         "host_label": me.label,
         "host_public_key_b64": me.public_key_b64,
+        "host_x25519_public_b64": me.x25519_public_b64,
         "expires_at": rec.expires_at,
     }
 
@@ -203,6 +207,10 @@ def build_claim_signature(
     in-product "auto-pair from another tab" flow. Real cross-machine
     pairing has the claimant's frontend POST `accept_pairing` with the
     pre-computed signature.
+
+    Includes the claimant's X25519 (encryption) pubkey so the host
+    can store it alongside the signing key — both halves of the
+    crypto identity are exchanged in one round.
     """
     me = identity.get_identity()
     digest = _expected_signature_bytes(
@@ -213,6 +221,7 @@ def build_claim_signature(
         "claimant_device_id": me.device_id,
         "claimant_label": me.label,
         "claimant_public_key_b64": me.public_key_b64,
+        "claimant_x25519_public_b64": me.x25519_public_b64,
         "signature_b64": base64.b64encode(sig).decode("ascii"),
     }
 
@@ -227,6 +236,7 @@ def accept_pairing(
     signature_b64: str,
     claimant_ip: str | None = None,
     claimant_port: int | None = None,
+    claimant_x25519_public_b64: str | None = None,
 ) -> dict:
     """Verify a pairing claim and persist the trust anchor on success.
 
@@ -293,10 +303,12 @@ def accept_pairing(
         ip=claimant_ip,
         port=claimant_port,
         role="local",
+        x25519_public_b64=claimant_x25519_public_b64,
     )
     log.info(
-        "p2p: paired with device_id=%s label=%r",
+        "p2p: paired with device_id=%s label=%r e2e=%s",
         claimant_device_id, claimant_label,
+        bool(claimant_x25519_public_b64),
     )
     # Phase 2: paired devices become routable compute workers
     # automatically. We materialise a row in compute_workers keyed

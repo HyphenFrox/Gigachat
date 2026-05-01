@@ -677,6 +677,12 @@ def init() -> None:
             # DB or a migrated one.
             "CREATE INDEX IF NOT EXISTS idx_compute_workers_device_id "
             "ON compute_workers(gigachat_device_id)",
+            # Per-peer X25519 public key for end-to-end encryption.
+            # Captured at pair time alongside the existing Ed25519
+            # signing key. NULL means a peer paired before E2E
+            # encryption shipped — those peers need to re-pair to
+            # exchange keys before any encrypted traffic can flow.
+            "ALTER TABLE paired_devices ADD COLUMN x25519_public_b64 TEXT",
             # Phase 2 commit 24: optional path to a multimodal projector
             # GGUF (mmproj). When set, llama-server is launched with
             # `--mmproj <path>` so vision/image inputs work via Phase 2
@@ -856,7 +862,8 @@ def init() -> None:
             CREATE TABLE IF NOT EXISTS paired_devices (
                 id TEXT PRIMARY KEY,
                 device_id TEXT NOT NULL UNIQUE,
-                public_key_b64 TEXT NOT NULL,
+                public_key_b64 TEXT NOT NULL,           -- Ed25519 (signing)
+                x25519_public_b64 TEXT,                 -- X25519 (encryption)
                 label TEXT NOT NULL,
                 ip TEXT,
                 port INTEGER,
@@ -5349,14 +5356,16 @@ def upsert_paired_device(
     ip: str | None = None,
     port: int | None = None,
     role: str = "local",
+    x25519_public_b64: str | None = None,
 ) -> dict:
     """Insert or update a pairing record.
 
     `device_id` is the trust anchor — same device id ⇒ same physical
     peer. IP / port refresh on every re-seeing via mDNS so a paired
     laptop that hopped Wi-Fi networks reconnects automatically. The
-    public_key_b64 is captured at first pairing and never updated;
-    a peer that wants to rotate keys must explicitly re-pair.
+    public_key_b64 (Ed25519, signing) and x25519_public_b64 (X25519,
+    encryption) are captured at first pairing and never updated; a
+    peer that wants to rotate keys must explicitly re-pair.
 
     `role` is one of:
       * 'local'  — paired on the LAN (the only role v1 produces)
@@ -5367,7 +5376,8 @@ def upsert_paired_device(
     now = time.time()
     with _conn() as c:
         existing = c.execute(
-            "SELECT id, public_key_b64 FROM paired_devices WHERE device_id = ?",
+            "SELECT id, public_key_b64, x25519_public_b64 "
+            "FROM paired_devices WHERE device_id = ?",
             (device_id,),
         ).fetchone()
         if existing:
@@ -5375,22 +5385,34 @@ def upsert_paired_device(
             # public_key. If a peer with the same device_id presents a
             # different pubkey this is either MITM or a re-install — we
             # prefer the original (the user's prior trust decision wins).
+            # X25519 pubkey: backfill when the existing row has NULL
+            # (e.g. a peer paired before E2E shipped is now re-pairing
+            # and supplying its X25519 key for the first time).
+            sets: list[str] = ["label = ?", "ip = ?", "port = ?", "last_seen_at = ?"]
+            vals: list = [label[:64], ip, port, now]
+            try:
+                existing_x = existing["x25519_public_b64"]
+            except (IndexError, KeyError):
+                existing_x = None
+            if x25519_public_b64 and not existing_x:
+                sets.append("x25519_public_b64 = ?")
+                vals.append(x25519_public_b64)
+            vals.append(existing["id"])
             c.execute(
-                "UPDATE paired_devices SET label = ?, ip = ?, port = ?, "
-                "last_seen_at = ? WHERE id = ?",
-                (label[:64], ip, port, now, existing["id"]),
+                f"UPDATE paired_devices SET {', '.join(sets)} WHERE id = ?",
+                vals,
             )
             return get_paired_device(device_id) or {}
         # New row.
         rid = str(uuid.uuid4())
         c.execute(
             "INSERT INTO paired_devices "
-            "(id, device_id, public_key_b64, label, ip, port, "
-            " last_seen_at, paired_at, role) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, device_id, public_key_b64, x25519_public_b64, label, "
+            " ip, port, last_seen_at, paired_at, role) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                rid, device_id, public_key_b64, label[:64],
-                ip, port, now, now, role,
+                rid, device_id, public_key_b64, x25519_public_b64,
+                label[:64], ip, port, now, now, role,
             ),
         )
     return get_paired_device(device_id) or {}
@@ -5467,10 +5489,17 @@ def update_paired_device_last_seen(
 
 
 def _row_to_paired_device(row: sqlite3.Row) -> dict:
+    # x25519_public_b64 was added after the initial schema — defensive
+    # accessor so a row written before the migration ran still loads.
+    try:
+        x_pub = row["x25519_public_b64"]
+    except (IndexError, KeyError):
+        x_pub = None
     return {
         "id": row["id"],
         "device_id": row["device_id"],
         "public_key_b64": row["public_key_b64"],
+        "x25519_public_b64": x_pub,
         "label": row["label"],
         "ip": row["ip"],
         "port": row["port"],

@@ -1,24 +1,34 @@
 """Privacy guard for the P2P pool.
 
-Hard contract: the user's prompts NEVER leave their local pool.
+Updated contract (security model is encryption-based, not block-based):
+  Data WILL flow between peers across the LAN and the internet —
+  prompts, chat content, results, everything. The privacy guarantee
+  comes from end-to-end encryption (`p2p_crypto` module), not from
+  refusing to send data to remote peers.
 
-Definitions (per the user's policy):
-  * **Local pool peer** — host's own loopback Ollama OR any device
-    the user has explicitly added on their LAN. In practice this
-    means every row in the `compute_workers` table — both the rows
-    the user typed into Settings → Compute manually AND the rows
-    auto-created when the user pairs a device on the same LAN via
-    Settings → Network (the pair flow creates a worker row keyed
-    by the device id). Either way the trust anchor is "the user
-    explicitly included this destination on their LAN".
+What this module does now:
+  * Classifies any outbound URL as `loopback` / `paired_lan` / `unknown`.
+  * Provides `require_encryption(url)` — raises if a caller is about
+    to send PLAINTEXT to a destination that should be using the
+    encrypted envelope. Default-on for unknown destinations; default-
+    off for loopback (the host's own Ollama doesn't speak our
+    envelope and isn't on the wire anyway).
+  * Provides `is_loopback(url)` — for callers that need a fast
+    branch ("if local, use raw HTTP; otherwise wrap in envelope").
 
-  * **Non-local peer** — any destination NOT in `compute_workers`.
-    Public-pool peers found via the internet rendezvous, friend
-    peers added by public-key exchange across the internet,
-    anything reachable only via QUIC NAT-traversal. These are
-    donate-only targets: the user's spare compute can run public
-    workloads for these peers when Public Pool is on, but the
-    user's prompts never go out.
+Categories:
+  * **Loopback** — `127.0.0.1`, `localhost`, `::1`. The host's own
+    Ollama process. No encryption required (data never touches
+    the wire); plaintext HTTP is fine.
+  * **Paired LAN** — any host in `compute_workers` whose row carries
+    a non-NULL `gigachat_device_id`. These are friend peers we
+    paired with via PIN. Plaintext OK on a trusted home LAN; for
+    Wi-Fi networks shared with untrusted users (public/work),
+    encryption is recommended (toggle later).
+  * **Unknown** — anything else. Internet-reachable peers, hosts
+    we never paired with, the rendezvous service. Plaintext
+    forbidden — caller must wrap in `p2p_crypto.seal_json` and
+    POST that envelope to the peer's `/api/p2p/secure` endpoint.
 
 The guard offers two modes:
 
@@ -48,10 +58,11 @@ log = logging.getLogger("gigachat.p2p.privacy")
 
 
 class PrivacyViolation(RuntimeError):
-    """Raised when something tries to send prompt-bearing traffic to a
-    non-local-pool destination. Fail-closed: callers should let the
-    exception propagate. The user's prompts being leaked is a worse
-    outcome than the request failing.
+    """Raised when something tries to send PLAINTEXT data to a
+    destination that should be using the encrypted envelope.
+    Fail-closed: callers should let the exception propagate. Sending
+    plaintext to a non-local destination is worse than the request
+    failing.
     """
 
 
@@ -100,64 +111,93 @@ def _local_pool_hosts() -> set[str]:
     return hosts
 
 
-def check_outbound_is_local(url: str) -> bool:
-    """Fast boolean check. Returns True iff the destination is in
-    the local-pool whitelist.
+def is_loopback(url: str) -> bool:
+    """Fast boolean — True iff the destination is the host itself.
 
-    Use this when you want to BRANCH on local vs. remote (e.g.
-    "send the prompt only if local; otherwise fall back to host-only
-    inference"). Use ``assert_outbound_is_local`` when the call is
-    SUPPOSED to be local and a non-local destination is a bug.
+    Used by callers that need a "if loopback, plaintext OK; else
+    require envelope" branch. Loopback is the only category where
+    bytes never touch the network.
+    """
+    host = _hostname_of(url)
+    return bool(host) and host in _LOOPBACK_HOSTS
+
+
+def is_paired_lan_peer(url: str) -> bool:
+    """True iff the URL points at a host we paired with via PIN.
+
+    The pair flow auto-creates a `compute_workers` row for the peer
+    so the existing routing layer picks it up. We treat manual-add
+    `compute_workers` rows the same way — if the user typed the IP
+    in Settings → Compute, that's an explicit trust statement.
     """
     host = _hostname_of(url)
     if not host:
         return False
     if host in _LOOPBACK_HOSTS:
-        return True
+        return False
     return host in _local_pool_hosts()
 
 
-def assert_outbound_is_local(
-    url: str, *, kind: str = "chat",
-) -> None:
-    """Raise ``PrivacyViolation`` if the destination isn't local pool.
+def check_outbound_is_local(url: str) -> bool:
+    """Backwards-compat shim — returns True for loopback OR paired LAN.
 
-    `kind` is a free-text descriptor that ends up in the error
-    message and the audit log. Conventional values:
-      * "chat"      — main-loop inference (carries user prompts)
-      * "embed"     — semantic recall / search (sees query text)
-      * "subagent"  — delegated subagent (carries user prompt)
-      * "tool"      — generic tool-call dispatch
-    Any of these is prompt-bearing in our threat model and must
-    stay local.
+    Kept so any in-flight caller from the prior block-based guard
+    keeps compiling. New callers should use `is_loopback` /
+    `is_paired_lan_peer` / `require_encryption` directly because the
+    semantics they encode are clearer.
     """
-    host = _hostname_of(url)
-    if check_outbound_is_local(url):
+    return is_loopback(url) or is_paired_lan_peer(url)
+
+
+def require_encryption(url: str, *, kind: str = "chat") -> bool:
+    """Return True when `url` requires the encrypted envelope.
+
+    Decision matrix:
+      loopback         → False (no wire, plaintext fine)
+      paired LAN peer  → False (trusted LAN, plaintext historically OK;
+                                 callers MAY still wrap for defence in
+                                 depth on hostile networks)
+      unknown          → True  (internet peer, public-pool peer, etc.;
+                                 anything plaintext to here is forbidden)
+
+    Callers can use this as a routing decision:
+        if p2p_privacy.require_encryption(url):
+            envelope = p2p_crypto.seal_json(...)
+            httpx.post(url + "/api/p2p/secure", json=envelope)
+        else:
+            httpx.post(url + "/api/embeddings", json=raw_payload)
+    """
+    return not (is_loopback(url) or is_paired_lan_peer(url))
+
+
+def assert_plaintext_allowed(url: str, *, kind: str = "chat") -> None:
+    """Raise ``PrivacyViolation`` when sending plaintext to `url`
+    would violate the encryption-everywhere policy.
+
+    Wire this in at every place that's about to POST a raw, un-
+    enveloped JSON body to a peer URL. The check is cheap (one
+    SQLite SELECT, cached per process) so calling it in the hot
+    path is fine.
+    """
+    if not require_encryption(url):
         return
+    host = _hostname_of(url)
     msg = (
-        f"privacy guard refused {kind!r} to {host!r} — destination is "
-        f"not in the local pool whitelist. The local pool consists of "
-        f"loopback addresses + every host in `compute_workers`. To "
-        f"include a peer, pair it via Settings → Network or add it "
-        f"manually under Settings → Compute."
+        f"privacy guard refused PLAINTEXT {kind!r} to {host!r} — "
+        f"non-loopback / non-paired destinations require the encrypted "
+        f"envelope (see `p2p_crypto.seal_json`). Wrap the payload and "
+        f"POST to the peer's /api/p2p/secure endpoint."
     )
     log.warning("p2p_privacy: %s", msg)
     raise PrivacyViolation(msg)
 
 
-def assert_no_prompts_to_public_peer(
-    url: str, *, kind: str = "chat",
-) -> None:
-    """Alias used by the future P2P transport at the call site that
-    sends donation-only workloads to public-pool peers. The transport
-    is expected to mark its outbound traffic with a "public_workload"
-    flag (e.g. an HTTP header); anything that ISN'T marked must pass
-    this check.
+# ----- backwards-compat aliases for code paths that still call the
+# old names. Same behaviour as `assert_plaintext_allowed`.
 
-    Today this is identical to `assert_outbound_is_local`. Kept as a
-    separate symbol so the future transport call sites read cleanly:
-        # Donation-only outbound to a public peer:
-        if not is_marked_public_workload(req):
-            p2p_privacy.assert_no_prompts_to_public_peer(url, kind="chat")
-    """
-    assert_outbound_is_local(url, kind=kind)
+def assert_outbound_is_local(url: str, *, kind: str = "chat") -> None:
+    assert_plaintext_allowed(url, kind=kind)
+
+
+def assert_no_prompts_to_public_peer(url: str, *, kind: str = "chat") -> None:
+    assert_plaintext_allowed(url, kind=kind)
