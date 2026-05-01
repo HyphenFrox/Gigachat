@@ -4761,7 +4761,7 @@ class P2PFairnessConfigBody(BaseModel):
 def api_p2p_fairness_status() -> dict:
     """Real-time view of the fairness scheduler.
 
-    Surfaced in Settings → Network so the user sees how their
+    Surfaced in Settings → Compute pool so the user sees how their
     donation slice is being used right now: active jobs, per-peer
     slice (auto-balanced by `total_donations / active_consumers`),
     and the configured tunables.

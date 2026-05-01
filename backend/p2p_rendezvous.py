@@ -42,13 +42,23 @@ from . import db, identity
 
 log = logging.getLogger("gigachat.p2p.rendezvous")
 
+# Default public rendezvous URL — the Cloud Run instance the project
+# ships with. Means a fresh install on a new laptop joins the swarm
+# the moment Public Pool toggles on, without the user pasting a URL
+# anywhere. Override per-install via the Settings UI (stored in
+# user_settings.p2p_rendezvous_url) or env var GIGACHAT_RENDEZVOUS_URL
+# — both win over this fallback. Power users self-hosting their own
+# rendezvous (rendezvous/ folder + Cloud Run / Fly / VPS) just paste
+# their URL into Settings and it takes precedence.
+_DEFAULT_RENDEZVOUS_URL = "https://gigachat-rendezvous-1073047996056.us-central1.run.app"
+
 # Rendezvous URL resolution order:
 #   1. user_settings.p2p_rendezvous_url (set via the Settings UI;
 #      survives restarts; per-install).
 #   2. GIGACHAT_RENDEZVOUS_URL env var (operator override; useful for
 #      headless / CI deployments).
-#   3. Empty → loop stays disabled (logged at startup); LAN pairing
-#      keeps working unaffected.
+#   3. _DEFAULT_RENDEZVOUS_URL (the project's public Cloud Run instance)
+#      — always present, so a fresh install just works.
 def _current_rendezvous_url() -> str:
     """Resolve the rendezvous URL each time the loop checks it.
 
@@ -62,7 +72,10 @@ def _current_rendezvous_url() -> str:
             return str(stored).strip().rstrip("/")
     except Exception:
         pass
-    return (os.environ.get("GIGACHAT_RENDEZVOUS_URL") or "").strip().rstrip("/")
+    env_override = (os.environ.get("GIGACHAT_RENDEZVOUS_URL") or "").strip().rstrip("/")
+    if env_override:
+        return env_override
+    return _DEFAULT_RENDEZVOUS_URL
 
 
 def set_rendezvous_url(url: str | None) -> str:
