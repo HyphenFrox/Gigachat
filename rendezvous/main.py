@@ -11,7 +11,7 @@ Endpoints:
   POST /register   — peer registers its identity + STUN endpoints
   GET  /lookup/{device_id} — peer asks where another peer is
   POST /heartbeat  — peer keeps its registration alive
-  GET  /healthz    — Cloud Run health probe
+  GET  /health    — Cloud Run health probe
 
 The rendezvous never sees prompts, model weights, or any chat data.
 It stores the minimum needed for hole-punching:
@@ -268,9 +268,14 @@ def _build_heartbeat_message(body: HeartbeatBody) -> bytes:
 # ---------- Endpoints ----------
 
 
-@app.get("/healthz")
-async def healthz() -> dict:
-    """Cloud Run TCP/HTTP probe target. Trivial."""
+@app.get("/health")
+async def health() -> dict:
+    """Cloud Run probe target. Trivial.
+
+    Note: NOT /healthz — Google's frontend intercepts that path on
+    *.run.app domains and returns its own 404 page before requests
+    reach the container. /health works as expected.
+    """
     return {"ok": True, "peers": len(_peers)}
 
 
@@ -380,7 +385,7 @@ async def index() -> dict:
             "POST /register",
             "POST /heartbeat",
             "GET /lookup/{device_id}",
-            "GET /healthz",
+            "GET /health",
         ],
         "peers_registered": len(_peers),
         "ttl_sec": TTL_SEC,

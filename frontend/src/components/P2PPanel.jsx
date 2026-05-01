@@ -482,91 +482,183 @@ export default function P2PSection() {
 /* ----------------------- Sub-components ----------------------- */
 
 function RendezvousStatusCard({ status }) {
-  if (!status?.configured) {
-    return (
-      <section className="rounded-lg border border-border bg-card p-4">
-        <h3 className="mb-2 flex items-center gap-2 text-sm font-medium">
-          <Globe className="size-4 text-muted-foreground" />
-          Internet rendezvous
-        </h3>
-        <p className="text-xs leading-snug text-muted-foreground">
-          Public Pool is on, but no rendezvous URL is configured on this
-          install. Set <code>GIGACHAT_RENDEZVOUS_URL</code> to the public
-          URL of your <code>gigachat-rendezvous</code> Cloud Run service
-          (see <code>rendezvous/README.md</code>) so peers across the
-          internet can find this device. LAN pairing keeps working
-          regardless.
-        </p>
-      </section>
-    )
-  }
-  const running = !!status.running
-  const lastReg = status.last_register_at || 0
-  const lastRegPretty = lastReg
-    ? formatMessageTime(lastReg)
-    : 'never'
-  const cands = Array.isArray(status.candidates) ? status.candidates : []
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(status?.url || '')
+  const [saving, setSaving] = useState(false)
+
+  // When the underlying status updates from the parent (poll tick),
+  // refresh the draft only when we're NOT actively editing — otherwise
+  // typing would get clobbered by every poll.
+  useEffect(() => {
+    if (!editing) setDraft(status?.url || '')
+  }, [status?.url, editing])
+
+  const save = useCallback(async () => {
+    setSaving(true)
+    try {
+      await api.p2pRendezvousSetUrl(draft.trim())
+      toast.success(
+        draft.trim() ? 'Rendezvous URL updated' : 'Rendezvous URL cleared',
+      )
+      setEditing(false)
+    } catch (e) {
+      toast.error('Could not update rendezvous URL', {
+        description: e?.message || String(e),
+      })
+    } finally {
+      setSaving(false)
+    }
+  }, [draft])
+
+  const running = !!status?.running
+  const lastReg = status?.last_register_at || 0
+  const lastRegPretty = lastReg ? formatMessageTime(lastReg) : 'never'
+  const cands = Array.isArray(status?.candidates) ? status.candidates : []
+  const configured = !!status?.configured
+
   return (
     <section
       className={cn(
         'rounded-lg border p-4',
-        running && lastReg
+        configured && running && lastReg
           ? 'border-emerald-500/30 bg-emerald-500/5'
-          : 'border-amber-500/30 bg-amber-500/5',
+          : configured
+            ? 'border-amber-500/30 bg-amber-500/5'
+            : 'border-border bg-card',
       )}
     >
       <h3 className="mb-2 flex items-center gap-2 text-sm font-medium">
         <Globe
           className={cn(
             'size-4',
-            running && lastReg ? 'text-emerald-500' : 'text-amber-500',
+            configured && running && lastReg
+              ? 'text-emerald-500'
+              : configured
+                ? 'text-amber-500'
+                : 'text-muted-foreground',
           )}
         />
         Internet rendezvous
         <span
           className={cn(
             'ml-auto rounded px-1.5 py-0.5 text-[10px]',
-            running && lastReg
+            configured && running && lastReg
               ? 'bg-emerald-500/15 text-emerald-500'
-              : 'bg-amber-500/15 text-amber-500',
+              : configured
+                ? 'bg-amber-500/15 text-amber-500'
+                : 'bg-muted text-muted-foreground',
           )}
         >
-          {running && lastReg ? 'Connected' : running ? 'Connecting…' : 'Disconnected'}
+          {!configured
+            ? 'Not configured'
+            : running && lastReg
+              ? 'Connected'
+              : running
+                ? 'Connecting…'
+                : 'Disconnected'}
         </span>
       </h3>
-      <div className="space-y-1 text-xs text-muted-foreground">
-        <div>
-          <span className="font-medium text-foreground">Server:</span>{' '}
-          <code className="break-all">{status.url}</code>
-        </div>
-        {cands.length > 0 ? (
-          <div>
-            <span className="font-medium text-foreground">Candidates:</span>{' '}
-            {cands.map((c, i) => (
-              <span key={i} className="mr-2">
-                <code>{c.ip}:{c.port}</code>
-                <span className="ml-1 opacity-70">({c.source})</span>
-              </span>
-            ))}
-          </div>
+
+      {/* URL editor — works whether or not a URL is currently set. */}
+      <div className="mb-2 flex items-center gap-2">
+        <span className="w-16 shrink-0 text-xs text-muted-foreground">URL</span>
+        {editing ? (
+          <>
+            <Input
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') save()
+                if (e.key === 'Escape') {
+                  setDraft(status?.url || '')
+                  setEditing(false)
+                }
+              }}
+              placeholder="https://gigachat-rendezvous-…run.app"
+              className="h-7 flex-1 font-mono text-xs"
+              disabled={saving}
+              autoFocus
+            />
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={save}
+              disabled={saving}
+              className="size-7"
+              title="Save"
+            >
+              {saving ? <Loader2 className="size-3.5 animate-spin" /> : <Check className="size-3.5" />}
+            </Button>
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => {
+                setDraft(status?.url || '')
+                setEditing(false)
+              }}
+              disabled={saving}
+              className="size-7"
+              title="Cancel"
+            >
+              <X className="size-3.5" />
+            </Button>
+          </>
         ) : (
-          <div>
-            <span className="font-medium text-foreground">Candidates:</span>{' '}
-            none yet
-          </div>
+          <>
+            <code className="flex-1 truncate text-xs text-muted-foreground">
+              {status?.url || '(not set)'}
+            </code>
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => setEditing(true)}
+              className="size-7 text-muted-foreground hover:text-foreground"
+              title="Edit"
+            >
+              <Pencil className="size-3.5" />
+            </Button>
+          </>
         )}
-        <div>
-          <span className="font-medium text-foreground">Last registered:</span>{' '}
-          <span title={status.last_register_at ? formatFullTimestamp(status.last_register_at) : ''}>
-            {lastRegPretty}
-          </span>
-        </div>
-        {status.last_error ? (
-          <div className="text-red-400">
-            <span className="font-medium">Last error:</span> {status.last_error}
-          </div>
-        ) : null}
       </div>
+
+      {!configured ? (
+        <p className="text-xs leading-snug text-muted-foreground">
+          Public Pool is on, but no rendezvous URL is set. Deploy the
+          Cloud Run service (<code>rendezvous/README.md</code>) and paste
+          the URL above so peers across the internet can find this
+          device. LAN pairing keeps working without it.
+        </p>
+      ) : (
+        <div className="space-y-1 text-xs text-muted-foreground">
+          {cands.length > 0 ? (
+            <div>
+              <span className="font-medium text-foreground">Candidates:</span>{' '}
+              {cands.map((c, i) => (
+                <span key={i} className="mr-2">
+                  <code>{c.ip}:{c.port}</code>
+                  <span className="ml-1 opacity-70">({c.source})</span>
+                </span>
+              ))}
+            </div>
+          ) : (
+            <div>
+              <span className="font-medium text-foreground">Candidates:</span>{' '}
+              none yet
+            </div>
+          )}
+          <div>
+            <span className="font-medium text-foreground">Last registered:</span>{' '}
+            <span title={status.last_register_at ? formatFullTimestamp(status.last_register_at) : ''}>
+              {lastRegPretty}
+            </span>
+          </div>
+          {status.last_error ? (
+            <div className="text-red-400">
+              <span className="font-medium">Last error:</span> {status.last_error}
+            </div>
+          ) : null}
+        </div>
+      )}
     </section>
   )
 }

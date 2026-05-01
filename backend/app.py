@@ -4261,6 +4261,37 @@ def api_p2p_rendezvous_status() -> dict:
     return _rdv.status()
 
 
+class P2PRendezvousUrlBody(BaseModel):
+    """Body for PATCH /api/p2p/rendezvous/url. Empty url clears the
+    setting (loop will exit on the next tick)."""
+    url: str = ""
+
+
+@app.patch("/api/p2p/rendezvous/url")
+async def api_p2p_rendezvous_set_url(body: P2PRendezvousUrlBody) -> dict:
+    """Set (or clear) the rendezvous URL.
+
+    Stored in user_settings so the choice survives restarts. The
+    rendezvous loop is re-bounced so the new URL takes effect
+    within seconds (otherwise the next heartbeat would still
+    point at the old URL until the loop re-checked).
+    """
+    from . import p2p_rendezvous as _rdv
+    try:
+        cleaned = _rdv.set_rendezvous_url(body.url)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    # Bounce the loop so the new URL takes effect immediately
+    # without waiting for the next 30 s heartbeat tick.
+    try:
+        await _rdv.stop()
+        if cleaned:
+            await _rdv.start()
+    except Exception as e:
+        log.warning("p2p_rendezvous bounce failed: %s", e)
+    return {"url": cleaned}
+
+
 # ----------------------------------------------------------------------
 # Audit log endpoint — read-only cross-conversation list of every tool
 # call the agent ran. Filterable by conversation / tool / since-timestamp

@@ -42,11 +42,47 @@ from . import db, identity
 
 log = logging.getLogger("gigachat.p2p.rendezvous")
 
-# Default rendezvous URL. Operators set GIGACHAT_RENDEZVOUS_URL after
-# `gcloud run deploy gigachat-rendezvous --source rendezvous` prints
-# the public URL. With no env var set the loop disables itself
-# (logged at startup) — the rest of the app keeps working.
-_RENDEZVOUS_URL = (os.environ.get("GIGACHAT_RENDEZVOUS_URL") or "").strip()
+# Rendezvous URL resolution order:
+#   1. user_settings.p2p_rendezvous_url (set via the Settings UI;
+#      survives restarts; per-install).
+#   2. GIGACHAT_RENDEZVOUS_URL env var (operator override; useful for
+#      headless / CI deployments).
+#   3. Empty → loop stays disabled (logged at startup); LAN pairing
+#      keeps working unaffected.
+def _current_rendezvous_url() -> str:
+    """Resolve the rendezvous URL each time the loop checks it.
+
+    Reading on every loop iteration means a UI update via
+    `set_rendezvous_url(...)` takes effect within one heartbeat tick
+    without a process restart.
+    """
+    try:
+        stored = db.get_setting("p2p_rendezvous_url")
+        if stored:
+            return str(stored).strip().rstrip("/")
+    except Exception:
+        pass
+    return (os.environ.get("GIGACHAT_RENDEZVOUS_URL") or "").strip().rstrip("/")
+
+
+def set_rendezvous_url(url: str | None) -> str:
+    """Persist a rendezvous URL choice. Empty string clears it.
+
+    Caller is responsible for restarting the loop (or letting the
+    next tick pick it up). The status endpoint reflects the new URL
+    on the very next read.
+    """
+    cleaned = (url or "").strip().rstrip("/")
+    if cleaned:
+        # Light sanity: must be http(s):// — protects against the
+        # user accidentally typing a hostname without the scheme,
+        # which would silently fail every register call.
+        if not (cleaned.startswith("http://") or cleaned.startswith("https://")):
+            raise ValueError(
+                "rendezvous URL must start with http:// or https://"
+            )
+    db.set_setting("p2p_rendezvous_url", cleaned)
+    return cleaned
 
 # Heartbeat cadence. Server TTL is 60s; we heartbeat every 30 to stay
 # resident with safety margin against a missed network round.
@@ -282,7 +318,7 @@ async def _post_register(state: _RendezvousState) -> None:
     if state.client is None:
         return
     r = await state.client.post(
-        f"{_RENDEZVOUS_URL.rstrip('/')}/register",
+        f"{_current_rendezvous_url().rstrip('/')}/register",
         json=body, timeout=10.0,
     )
     if r.status_code >= 400:
@@ -308,7 +344,7 @@ async def _post_heartbeat(state: _RendezvousState) -> None:
     if state.client is None:
         return
     r = await state.client.post(
-        f"{_RENDEZVOUS_URL.rstrip('/')}/heartbeat",
+        f"{_current_rendezvous_url().rstrip('/')}/heartbeat",
         json=body, timeout=10.0,
     )
     # 404 = our entry expired (rendezvous restarted, missed window).
@@ -352,7 +388,7 @@ async def _loop(state: _RendezvousState) -> None:
     me = identity.get_identity()
     log.info(
         "p2p: rendezvous loop starting (device_id=%s, server=%s)",
-        me.device_id, _RENDEZVOUS_URL,
+        me.device_id, _current_rendezvous_url(),
     )
 
     # Initial discovery + registration. Errors logged at INFO; the loop
@@ -413,10 +449,11 @@ async def start() -> None:
     global _state
     if _state is not None and _state.task is not None and not _state.task.done():
         return
-    if not _RENDEZVOUS_URL:
+    if not _current_rendezvous_url():
         log.info(
-            "p2p: rendezvous disabled — set GIGACHAT_RENDEZVOUS_URL to "
-            "your Cloud Run URL to enable cross-internet peer discovery"
+            "p2p: rendezvous disabled — set the URL via Settings → "
+            "Network or the GIGACHAT_RENDEZVOUS_URL env var to enable "
+            "cross-internet peer discovery"
         )
         return
     if not _public_pool_enabled():
@@ -464,9 +501,10 @@ def status() -> dict:
     """Snapshot of rendezvous loop state for the API endpoint /
     Settings UI. Cheap — pure read of module-level state."""
     me = identity.get_identity()
+    url = _current_rendezvous_url()
     return {
-        "configured": bool(_RENDEZVOUS_URL),
-        "url": _RENDEZVOUS_URL,
+        "configured": bool(url),
+        "url": url,
         "running": (
             _state is not None
             and _state.task is not None
@@ -490,12 +528,13 @@ async def lookup_peer(device_id: str) -> dict | None:
     session with a friend by their device_id. Returns None on any
     error — the caller decides whether to retry or fail the request.
     """
-    if not _RENDEZVOUS_URL or not device_id:
+    url = _current_rendezvous_url()
+    if not url or not device_id:
         return None
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
             r = await client.get(
-                f"{_RENDEZVOUS_URL.rstrip('/')}/lookup/{device_id}",
+                f"{url.rstrip('/')}/lookup/{device_id}",
             )
             if r.status_code == 404:
                 return None

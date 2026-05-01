@@ -880,4 +880,11 @@ export const api = {
 
   /** Live rendezvous loop status — STUN candidates + last register/heartbeat. */
   p2pRendezvousStatus: () => request('/api/p2p/rendezvous/status'),
+
+  /** Set (or clear) the rendezvous URL. Persisted in user_settings. */
+  p2pRendezvousSetUrl: (url) =>
+    request('/api/p2p/rendezvous/url', {
+      method: 'PATCH',
+      body: JSON.stringify({ url: url || '' }),
+    }),
 }
