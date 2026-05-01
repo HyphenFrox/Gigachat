@@ -48,7 +48,15 @@ _SERVICE_TYPE = "_gigachat._tcp.local."
 # The mDNS browser fires `update_service` on any change; absence for
 # longer than this means the peer has gone away (laptop closed,
 # Wi-Fi dropped, app exited).
-_DISCOVERY_TTL_SEC = 120.0
+#
+# Set generously (5 min) so a single dropped multicast packet doesn't
+# kick a peer out of the picker. mDNS multicast is unreliable in
+# practice on home networks — Wi-Fi PSPMS, VPN split-tunnel software
+# (NordVPN, etc.), and some consumer routers all drop multicast
+# silently. The 5 min window absorbs those drops; a peer that's
+# genuinely gone (laptop closed) is still pruned, just on a slower
+# cadence than network jitter.
+_DISCOVERY_TTL_SEC = 300.0
 
 # Fallback advertised port. We default to the FastAPI port the user
 # is running on; if `start()` isn't passed an explicit value we read

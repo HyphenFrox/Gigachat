@@ -4227,6 +4227,158 @@ def api_p2p_pair_handshake() -> dict:
     }
 
 
+class P2PPairInitiateBody(BaseModel):
+    """Body for POST /api/p2p/pair/initiate.
+
+    The claimant's frontend calls THIS endpoint on its OWN backend
+    (loopback, no CORS). The backend looks up the target peer in its
+    mDNS discovery cache to get the IP / port / pubkey, then does the
+    cross-device HTTP exchange with the host:
+
+      1. GET http://<host_ip>:<host_port>/api/p2p/pair/handshake
+         → fetch pending offers (pairing_id + nonce, no PIN)
+      2. For each offer, build a signed claim against (pin, nonce,
+         host_pubkey)
+      3. POST claim to http://<host_ip>:<host_port>/api/p2p/pair/accept
+         → host verifies + persists + pushes pair-notify back
+
+    Doing the cross-device call server-side means the BROWSER never
+    has to make a cross-origin fetch — that would require CORS
+    headers on the host's side, which would expose the API to any
+    web page on the internet that knows the host's LAN IP. Keeping
+    cross-device traffic backend-to-backend keeps the trust boundary
+    clean.
+    """
+    device_id: str
+    pin: str
+
+
+@app.post("/api/p2p/pair/initiate")
+async def api_p2p_pair_initiate(body: P2PPairInitiateBody) -> dict:
+    """Drive the cross-device pair handshake from this backend.
+
+    See `P2PPairInitiateBody` for the protocol summary. Returns
+    ``{"ok": True, "paired": <peer_record>}`` on success.
+    Raises HTTPException 400 on every failure mode with a
+    user-friendly message the frontend surfaces in a Sonner toast.
+    """
+    pin = (body.pin or "").strip()
+    if not pin:
+        raise HTTPException(400, "PIN is required")
+    if not body.device_id:
+        raise HTTPException(400, "device_id is required")
+
+    # Resolve the peer's IP / port / pubkey from our own mDNS discovery
+    # cache. The frontend just clicks "Pair" on a discovered row, so
+    # we already have the address — no need to plumb it back through
+    # the request body.
+    from . import p2p_discovery as _disc
+    peer = next(
+        (d for d in _disc.list_discovered() if d.get("device_id") == body.device_id),
+        None,
+    )
+    if not peer:
+        raise HTTPException(
+            400,
+            "That device is no longer in the discovered-peers list. "
+            "Wait a couple of seconds for mDNS to refresh and try again.",
+        )
+    host_ip = peer.get("ip") or ""
+    host_port = int(peer.get("port") or 0)
+    host_public_key_b64 = peer.get("public_key_b64") or ""
+    if not (host_ip and host_port and host_public_key_b64):
+        raise HTTPException(
+            400,
+            "Discovered peer is missing IP / port / public key in the "
+            "mDNS record. Restart Gigachat on that device and retry.",
+        )
+    base_url = f"http://{host_ip}:{host_port}"
+    # 1. Fetch the host's pending offers (pairing_id + nonce, NO PIN).
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(f"{base_url}/api/p2p/pair/handshake")
+    except Exception as e:
+        raise HTTPException(
+            400,
+            f"Could not reach the host's pair endpoint at {base_url}: "
+            f"{type(e).__name__}: {e}. Check the device is on the same "
+            "Wi-Fi/Ethernet and Gigachat is running there.",
+        )
+    if r.status_code != 200:
+        raise HTTPException(
+            400,
+            f"Host returned HTTP {r.status_code} for /pair/handshake. "
+            "Make sure they clicked 'Show our PIN' within the last 5 "
+            "minutes.",
+        )
+    try:
+        offers = (r.json() or {}).get("offers") or []
+    except Exception:
+        raise HTTPException(400, "Host returned a malformed /handshake response.")
+    if not offers:
+        raise HTTPException(
+            400,
+            "The other device has no pending pair offer. Click 'Show "
+            "our PIN' on it and try again within 5 minutes.",
+        )
+
+    # 2. For each offer, build a signed claim and POST to host's /accept.
+    #    Host accepts the one whose PIN matches and rejects the rest
+    #    with "incorrect PIN" — that's expected when the host has
+    #    multiple offers open at once.
+    from . import p2p_pairing as _pair
+    last_err = ""
+    for offer in offers:
+        try:
+            claim = _pair.build_claim_signature(
+                pin=pin,
+                nonce_b64=offer.get("nonce") or "",
+                host_public_key_b64=body.host_public_key_b64,
+            )
+        except Exception as e:
+            last_err = f"build claim failed: {type(e).__name__}: {e}"
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                ar = await client.post(
+                    f"{base_url}/api/p2p/pair/accept",
+                    json={
+                        "pairing_id": offer.get("pairing_id"),
+                        "pin": pin,
+                        "claimant_device_id": claim["claimant_device_id"],
+                        "claimant_label": claim["claimant_label"],
+                        "claimant_public_key_b64": claim["claimant_public_key_b64"],
+                        "claimant_x25519_public_b64": claim["claimant_x25519_public_b64"],
+                        "signature_b64": claim["signature_b64"],
+                    },
+                )
+        except Exception as e:
+            last_err = f"accept POST failed: {type(e).__name__}: {e}"
+            continue
+        if ar.status_code == 200:
+            try:
+                paired = ar.json()
+            except Exception:
+                paired = None
+            return {"ok": True, "paired": paired}
+        # Capture the host's error message for the toast (most useful
+        # is the LAST one tried since earlier offers were probably
+        # "wrong PIN" by design when multiple were open).
+        try:
+            j = ar.json()
+            detail = j.get("error") or j.get("detail") or ""
+        except Exception:
+            detail = ar.text[:200]
+        last_err = f"HTTP {ar.status_code}{(' — ' + detail) if detail else ''}"
+
+    # Every offer rejected. The most likely cause for the user is a
+    # wrong PIN; surface the host's last reason as a hint.
+    raise HTTPException(
+        400,
+        f"Host rejected the PIN. {last_err}",
+    )
+
+
 @app.post("/api/p2p/pair/accept")
 def api_p2p_pair_accept(body: P2PPairAcceptBody) -> dict:
     """Verify a pairing claim and persist the trust anchor.

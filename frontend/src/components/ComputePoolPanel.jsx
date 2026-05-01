@@ -227,104 +227,27 @@ export default function ComputePoolSection() {
     setPairOffer(null)
   }, [pairOffer])
 
-  // Cross-device pair: claimant fetches the host's pending offers
-  // (via the host's /api/p2p/pair/handshake on its LAN IP), builds a
-  // signed claim against each offer's nonce + the host's pubkey (we
-  // have that from mDNS), and POSTs each candidate claim to the
-  // host's /api/p2p/pair/accept until one matches the PIN. Stops on
-  // the first 200 (success) or the last 400 (incorrect PIN — every
-  // offer rejected).
-  //
-  // Why try every offer: the host might have multiple pending PINs
-  // open (user clicked "Pair new device" twice). Only one matches,
-  // and the host returns "incorrect PIN" for the rest — that's
-  // expected and not worth surfacing.
+  // Cross-device pair: send a single local POST to /api/p2p/pair/initiate
+  // and let OUR backend do the cross-device HTTP exchange with the
+  // host. Doing it server-side avoids the browser-CORS problem
+  // (cross-origin fetch from this page to http://<host_lan_ip>:8000
+  // fails with "Failed to fetch" because the host doesn't send
+  // Access-Control-Allow-Origin headers — and adding them would
+  // expose the API to any web page on the internet that knows the
+  // host's LAN IP). Backend-to-backend is the cleaner trust boundary.
   const submitClaimToPeer = useCallback(async () => {
     if (!pairingTarget || !pairingPin) return
-    const peer = pairingTarget
-    if (!peer.ip || !peer.port) {
-      toast.error('Pairing failed', {
-        description: 'Discovered peer has no LAN address. Wait for the next mDNS tick and retry.',
-      })
-      return
-    }
-    if (!peer.public_key_b64) {
-      toast.error('Pairing failed', {
-        description: 'Discovered peer is missing its public key (legacy mDNS record). Restart Gigachat on that device and retry.',
-      })
-      return
-    }
     setPairingSubmitting(true)
-    const baseUrl = `http://${peer.ip}:${peer.port}`
     try {
-      // 1. Fetch the host's pending offers (pairing_id + nonce, NO PIN).
-      const handshakeRes = await fetch(`${baseUrl}/api/p2p/pair/handshake`)
-      if (!handshakeRes.ok) {
-        throw new Error(
-          `host returned HTTP ${handshakeRes.status} for /pair/handshake. ` +
-          `Make sure they clicked "Pair new device" within the last 5 minutes.`
-        )
-      }
-      const { offers } = await handshakeRes.json()
-      if (!Array.isArray(offers) || offers.length === 0) {
-        throw new Error(
-          `${peer.label || peer.device_id} has no pending pair offer. ` +
-          `Click "Pair new device" on that machine first.`
-        )
-      }
-
-      // 2. Try each offer with our typed PIN. The host accepts the one
-      //    whose PIN matches and rejects the rest with "incorrect PIN".
-      let lastErr = null
-      let paired = null
-      for (const offer of offers) {
-        try {
-          // Build the signed claim on OUR backend (loopback), bound to
-          // the host's nonce + pubkey.
-          const claim = await api.p2pPairBuildClaim(
-            pairingPin, offer.nonce, peer.public_key_b64,
-          )
-          // POST claim to the HOST'S /pair/accept (cross-device).
-          const acceptRes = await fetch(`${baseUrl}/api/p2p/pair/accept`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              pairing_id: offer.pairing_id,
-              pin: pairingPin,
-              claimant_device_id: claim.claimant_device_id,
-              claimant_label: claim.claimant_label,
-              claimant_public_key_b64: claim.claimant_public_key_b64,
-              claimant_x25519_public_b64: claim.claimant_x25519_public_b64,
-              signature_b64: claim.signature_b64,
-            }),
-          })
-          if (acceptRes.ok) {
-            paired = await acceptRes.json()
-            break
-          }
-          // Try to extract the host's error message for the toast.
-          let detail = ''
-          try {
-            const j = await acceptRes.json()
-            detail = j?.error || j?.detail || ''
-          } catch {
-            detail = await acceptRes.text()
-          }
-          lastErr = `HTTP ${acceptRes.status}${detail ? ` — ${detail}` : ''}`
-        } catch (perOfferErr) {
-          lastErr = perOfferErr?.message || String(perOfferErr)
-        }
-      }
-      if (paired) {
-        toast.success('Device paired', {
-          description: peer.label || peer.device_id,
-        })
-        setPairingTarget(null)
-        setPairingPin('')
-        setTick((n) => n + 1)
-      } else {
-        throw new Error(lastErr || 'host rejected every pending offer')
-      }
+      const result = await api.p2pPairInitiate({
+        device_id: pairingTarget.device_id,
+        pin: pairingPin,
+      })
+      const label = result?.paired?.label || pairingTarget.label || pairingTarget.device_id
+      toast.success('Device paired', { description: label })
+      setPairingTarget(null)
+      setPairingPin('')
+      setTick((n) => n + 1)
     } catch (e) {
       toast.error('Pairing failed', {
         description: e?.message || String(e),

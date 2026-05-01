@@ -836,6 +836,19 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  /**
+   * Drive the full cross-device pair handshake from the local backend.
+   * `body = {device_id, pin}` — backend looks up the peer in its mDNS
+   * discovery cache, fetches the host's pending offers, builds + posts
+   * a signed claim to the host's /pair/accept. Avoids the browser-CORS
+   * problem of doing those cross-device fetches client-side.
+   */
+  p2pPairInitiate: (body) =>
+    request('/api/p2p/pair/initiate', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
   /** List paired devices. */
   p2pListPaired: () => request('/api/p2p/paired'),
 
