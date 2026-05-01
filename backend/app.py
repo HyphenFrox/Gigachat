@@ -4350,7 +4350,7 @@ async def api_p2p_pair_initiate(body: P2PPairInitiateBody) -> dict:
             claim = _pair.build_claim_signature(
                 pin=pin,
                 nonce_b64=offer.get("nonce") or "",
-                host_public_key_b64=body.host_public_key_b64,
+                host_public_key_b64=host_public_key_b64,
             )
         except Exception as e:
             last_err = f"build claim failed: {type(e).__name__}: {e}"
