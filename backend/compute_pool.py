@@ -549,23 +549,28 @@ def _select_intel_backend_with_fallback(
     crashed for this worker.
 
     Preference chain (most aggressive → safest):
-      1. ``SYCL0,CPU`` — Intel's native compute path, best perf
-      2. ``Vulkan0,CPU`` — alternate iGPU path; works when SYCL
-         has a #21893-class kernel quirk
-      3. ``CPU`` — always works; gives up iGPU contribution
+      1. ``SYCL0`` — Intel iGPU only, single-device rpc-server.
+         Avoids the SYCL+CPU heterogeneous-allocator crash where
+         tensor layout mismatches between SYCL allocations and CPU
+         compute trip ggml-rpc.cpp's RPC_STATUS_ASSERT mid-decode
+         (verified against build 8940 by the upstream source: macro
+         at ggml-rpc.cpp:41 abort()s on any send/recv failure or
+         buffer-bounds mismatch, no retry path). Single-backend
+         rpc-server has no such pairing.
+      2. ``Vulkan0`` — alternate iGPU path, single device. Try
+         when SYCL crashes (which is rarer with ``SYCL0`` alone
+         vs ``SYCL0,CPU`` but still possible per #21893).
+      3. ``SYCL0,CPU`` — hybrid; gives the orchestrator both iGPU
+         and worker CPU layers but is the failure mode we're
+         trying to avoid. Tried only after both single-backend
+         options crashed within the cool-down window.
+      4. ``Vulkan0,CPU`` — same hybrid risk on Vulkan.
+      5. ``CPU`` — always works; gives up iGPU contribution.
 
-    The selector consults two capability flags persisted by the
-    failure-detection hook (``record_backend_failure``):
-      * ``sycl_split_failed_at`` — last UNIX time a split spawn
-        failed with SYCL exposed on this worker
-      * ``vulkan_split_failed_at`` — same for Vulkan
-
-    A flag older than ``_BACKEND_FAILURE_COOLDOWN_SEC`` is treated
-    as expired (the iGPU stack may have been fixed since). Outside
-    split mode (Phase 1 / embeddings / subagents) we always offer
-    SYCL+CPU because single-node inference doesn't trigger the
-    SYCL+RPC interaction that's the typical cause of a recorded
-    failure.
+    The selector consults capability flags persisted by the
+    failure-detection hook (``record_backend_failure``). A flag
+    older than ``_BACKEND_FAILURE_COOLDOWN_SEC`` is treated as
+    expired (the iGPU stack may have been fixed since).
     """
     if not in_split:
         return "SYCL0,CPU"
@@ -575,13 +580,25 @@ def _select_intel_backend_with_fallback(
         (now - float(caps.get("sycl_split_failed_at") or 0))
         < _BACKEND_FAILURE_COOLDOWN_SEC
     )
+    sycl_hybrid_dead = (
+        (now - float(caps.get("sycl_hybrid_split_failed_at") or 0))
+        < _BACKEND_FAILURE_COOLDOWN_SEC
+    )
     vulkan_dead = (
         (now - float(caps.get("vulkan_split_failed_at") or 0))
         < _BACKEND_FAILURE_COOLDOWN_SEC
     )
+    vulkan_hybrid_dead = (
+        (now - float(caps.get("vulkan_hybrid_split_failed_at") or 0))
+        < _BACKEND_FAILURE_COOLDOWN_SEC
+    )
     if not sycl_dead:
-        return "SYCL0,CPU"
+        return "SYCL0"  # single-backend SYCL — bypasses the hybrid layout bug
     if not vulkan_dead:
+        return "Vulkan0"
+    if not sycl_hybrid_dead:
+        return "SYCL0,CPU"
+    if not vulkan_hybrid_dead:
         return "Vulkan0,CPU"
     return "CPU"
 
@@ -599,21 +616,35 @@ def record_backend_failure(worker_id: str, backend: str) -> None:
         return
     caps = dict(w.get("capabilities") or {})
     backend_lower = (backend or "").lower()
+    is_hybrid = "," in (backend or "")
     now = time.time()
     if "sycl" in backend_lower:
-        caps["sycl_split_failed_at"] = now
-        log.info(
-            "compute_pool: recorded SYCL split failure for worker %s; "
-            "next split start will try Vulkan or CPU",
-            w.get("label"),
-        )
+        if is_hybrid:
+            caps["sycl_hybrid_split_failed_at"] = now
+            log.info(
+                "compute_pool: recorded SYCL+CPU hybrid split failure "
+                "for worker %s", w.get("label"),
+            )
+        else:
+            caps["sycl_split_failed_at"] = now
+            log.info(
+                "compute_pool: recorded SYCL-only split failure for "
+                "worker %s; next start will try Vulkan-only",
+                w.get("label"),
+            )
     elif "vulkan" in backend_lower:
-        caps["vulkan_split_failed_at"] = now
-        log.info(
-            "compute_pool: recorded Vulkan split failure for worker %s; "
-            "next split start will use CPU only",
-            w.get("label"),
-        )
+        if is_hybrid:
+            caps["vulkan_hybrid_split_failed_at"] = now
+            log.info(
+                "compute_pool: recorded Vulkan+CPU hybrid split failure "
+                "for worker %s", w.get("label"),
+            )
+        else:
+            caps["vulkan_split_failed_at"] = now
+            log.info(
+                "compute_pool: recorded Vulkan-only split failure for "
+                "worker %s", w.get("label"),
+            )
     else:
         # CPU has no fallback — record the failure but the next
         # selector will still return CPU (nothing safer to try).
