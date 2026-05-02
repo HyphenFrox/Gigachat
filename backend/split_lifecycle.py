@@ -885,6 +885,28 @@ def _compute_tensor_split_ratios(
         vram_bytes = int(caps.get("max_vram_seen_bytes") or 0)
         ram_free_gb = float(caps.get("ram_free_gb") or 0)
         capacity_gb = max(vram_bytes / (1024 ** 3), ram_free_gb)
+        # Hard cap: when the worker's rpc-server exposes a SYCL or
+        # Vulkan device, llama.cpp will try to allocate the worker's
+        # tensor-split share on that GPU device first — and if the
+        # share exceeds the iGPU's shared-memory pool (typically
+        # ~3 GB on Intel Iris Xe / Arc) the load FAILS with
+        # "can't allocate N bytes on device". Cap each worker's
+        # weight at its `vram_total_gb` so llama.cpp gets a share
+        # that physically fits the iGPU. Workers without an
+        # exposed GPU device (CPU-only rpc-server) keep their
+        # full RAM-based capacity.
+        current_backend = (caps.get("current_rpc_backend") or "").lower()
+        has_gpu_device = (
+            "sycl" in current_backend or "vulkan" in current_backend
+            or "cuda" in current_backend
+        )
+        if has_gpu_device:
+            vram_total_gb = float(caps.get("vram_total_gb") or 0)
+            if vram_total_gb > 0:
+                # 0.85 leaves room for KV cache + compute buffers
+                # that are also allocated on the device, plus the
+                # OS / driver overhead for the iGPU itself.
+                capacity_gb = min(capacity_gb, vram_total_gb * 0.85)
         if capacity_gb <= 0:
             return None
         weights.append(capacity_gb)
