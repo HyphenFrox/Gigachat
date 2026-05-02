@@ -1174,24 +1174,32 @@ def _compute_optimal_n_cpu_moe(
 
 
 def _should_use_row_split(worker_ids: list[str]) -> bool:
-    """Return True when the LAN is fast enough that `--split-mode row`
-    might beat the default layer-pipeline.
+    """Return True when `--split-mode row` should engage.
 
-    Row-mode tensor-parallel synchronizes partial sums per layer, so
-    every token requires several round-trips per RPC worker. On a
-    Gigabit-Ethernet LAN (typ. 1-3 ms RTT) the extra chatter is fast
-    enough to amortize against the row-parallel matmul speedup; on
-    typical Wi-Fi (8-30 ms RTT) the synchronization cost dominates and
-    pipeline-layer wins.
+    Two independent triggers, EITHER is sufficient:
 
-    We use the worker-probe latency as a real-time bandwidth proxy —
-    `_probe_one` already records `probe_latency_ms` on every sweep, so
-    no extra measurement traffic is needed. When ANY worker exceeds
-    the latency ceiling we stay on layer mode, since row-mode's slowest
-    sync gates the whole thing.
+    1. LAN is fast enough (low latency) that the per-token sync chatter
+       amortizes against the row-parallel matmul speedup. Original
+       criterion — preserved for the original tensor-parallel-on-fast-
+       LAN use case.
+
+    2. ANY worker exposes a small iGPU (<= 4 GB VRAM) AND models we
+       run are big enough that layer-mode would drop that iGPU from
+       placement (its proportional share is smaller than one whole
+       layer). With layer-mode, llama.cpp's auto-fit silently excludes
+       devices whose share rounds below 1 layer — the iGPU sits idle
+       even though it has free memory. Row-mode splits every layer's
+       matmul across ALL devices so the iGPU contributes a row-stripe
+       of every layer instead of needing to host whole layers. This is
+       the ONLY way to keep small iGPUs in the inference rotation.
+
+    Returns False only when the latency ceiling is exceeded AND no
+    small iGPU is in the pool (no reason to engage row-mode then).
     """
     if not worker_ids:
         return False
+    has_small_igpu = False
+    fast_lan = True
     for wid in worker_ids:
         w = db.get_compute_worker(wid)
         if not w or not w.get("enabled"):
@@ -1199,8 +1207,16 @@ def _should_use_row_split(worker_ids: list[str]) -> bool:
         caps = w.get("capabilities") or {}
         latency_ms = int(caps.get("probe_latency_ms") or 999)
         if latency_ms > _ROW_SPLIT_LATENCY_CEILING_MS:
-            return False
-    return True
+            fast_lan = False
+        # Small-iGPU detection: any worker exposing a GPU device with
+        # <= 4 GB VRAM. Intel Iris Xe shared pool typically reports
+        # 2-3 GB; AMD Vega iGPU similar. dGPUs (NVIDIA, Arc Bxx) are
+        # bigger than this threshold and don't trigger.
+        gpu_kind = (caps.get("gpu_kind") or "").lower()
+        vram_total = float(caps.get("vram_total_gb") or 0)
+        if gpu_kind in ("intel", "amd") and 0 < vram_total <= 4.0:
+            has_small_igpu = True
+    return fast_lan or has_small_igpu
 
 
 def _should_mlock_weights(target_size_bytes: int) -> bool:
