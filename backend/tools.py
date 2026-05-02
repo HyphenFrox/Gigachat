@@ -10302,12 +10302,28 @@ def load_project_memory_for_prompt(cwd: str | None) -> str:
     groups: dict[str, list[dict]] = {}
     for r in rows:
         groups.setdefault(r["topic"] or "General", []).append(r)
+    now = time.time()
     body_parts: list[str] = []
     for topic, items in groups.items():
         body_parts.append(f"### {topic}")
         for it in items:
             content = " ".join(it["content"].split())
-            body_parts.append(f"- {content}")
+            # Only memories that the AGENT auto-captured carry a
+            # `verify_within_days` budget. User-asserted memories
+            # have it as NULL and never go stale here. When set
+            # AND the age (since last verify) exceeds the budget,
+            # tag the line with [VERIFY] so the model knows to
+            # re-check the fact against current repo state before
+            # acting on it. The tag is informational, not a
+            # delete — content stays in the prompt either way.
+            vwd = it.get("verify_within_days")
+            last_verified = it.get("last_verified_at") or it.get("created_at") or 0
+            tag = ""
+            if vwd is not None and vwd > 0:
+                age_days = (now - float(last_verified)) / 86400.0
+                if age_days > float(vwd):
+                    tag = f" [VERIFY — last confirmed {int(age_days)}d ago]"
+            body_parts.append(f"- {content}{tag}")
         body_parts.append("")
     return (
         f"\n\n## Project memory — applies to every chat in this directory\n\n"

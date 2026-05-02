@@ -615,6 +615,27 @@ def init() -> None:
             # created with (the per-DB default below applies only to
             # NEW inserts on a fresh schema).
             "ALTER TABLE conversations ADD COLUMN quality_mode TEXT NOT NULL DEFAULT 'auto'",
+            # Skill anti-trigger field — lets a skill author say
+            # "DON'T use me when X" so the model has an explicit
+            # stop-signal alongside the usual "USE me when Y" hint.
+            # Default '' means no anti-trigger configured.
+            "ALTER TABLE skills ADD COLUMN avoid_when TEXT NOT NULL DEFAULT ''",
+            # Project-memory verification gate. Used ONLY for memories
+            # the agent auto-captured (e.g. inferred from a tool result)
+            # — when set, `verify_within_days` is the staleness budget
+            # and memories older than that get a [VERIFY] marker so the
+            # agent re-checks against current repo state before acting.
+            #
+            # CRITICAL: user-asserted memories ("remember that...")
+            # default to NULL `verify_within_days` which means NEVER
+            # auto-expire. If the user told us to remember something,
+            # we keep it. Only the model's own inferences get a sanity
+            # window.
+            #
+            # `last_verified_at` tracks the most recent confirmation
+            # (set by the agent or by an explicit user re-assertion).
+            "ALTER TABLE project_memories ADD COLUMN last_verified_at REAL",
+            "ALTER TABLE project_memories ADD COLUMN verify_within_days INTEGER",
             # Workflow extension columns on `hooks`. The hooks table started
             # life as a simple "fire shell on lifecycle event" pipe; these
             # turn it into a general workflow trigger system without
@@ -821,7 +842,12 @@ def init() -> None:
                 updated_at REAL NOT NULL,
                 last_used_at REAL,
                 use_count INTEGER NOT NULL DEFAULT 0,
-                success_count INTEGER NOT NULL DEFAULT 0
+                success_count INTEGER NOT NULL DEFAULT 0,
+                -- Anti-trigger guidance shown alongside `description` in the
+                -- model's tool manifest. Lets a skill author say "DON'T use
+                -- me when X" — gives the model an explicit stop-signal,
+                -- not just a go-signal. Empty string means no anti-trigger.
+                avoid_when TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name);
             CREATE INDEX IF NOT EXISTS idx_skills_used
@@ -3169,12 +3195,30 @@ def list_project_memories(cwd: str) -> list[dict]:
 
 
 def add_project_memory(
-    cwd: str, content: str, topic: str | None = None,
+    cwd: str,
+    content: str,
+    topic: str | None = None,
+    *,
+    verify_within_days: int | None = None,
 ) -> dict:
     """Insert a project memory and return the row. Same length caps as
     global memory so a runaway agent can't blow up the prompt.
 
     Content is encrypted at rest (see backend/db_encryption.py).
+
+    `verify_within_days`:
+      * None (default) — memory NEVER auto-expires. This is the right
+        default for memories the USER asserted ("remember that X");
+        forgetting them silently would defeat the point of memory.
+      * Some positive int — memory carries a verify budget. The render
+        path tags it [VERIFY] once age exceeds the budget, so the
+        agent re-checks it against current state before acting on it.
+        Used by the agent's own auto-capture path (where the model
+        might have misread something) — never by user-asserted saves.
+
+    `last_verified_at` is initialised to the create timestamp so a
+    fresh memory isn't rendered stale immediately on its own first
+    read.
     """
     from . import db_encryption as _enc
     key = _normalize_project_cwd(cwd)
@@ -3190,13 +3234,23 @@ def add_project_memory(
     t = (topic or "").strip() or None
     if t and len(t) > 80:
         raise ValueError("topic must be ≤ 80 chars")
+    if verify_within_days is not None:
+        try:
+            verify_within_days = int(verify_within_days)
+        except (TypeError, ValueError):
+            verify_within_days = None
+        if verify_within_days is not None and verify_within_days <= 0:
+            verify_within_days = None
     mid = str(uuid.uuid4())
     now = time.time()
     with _conn() as c:
         c.execute(
-            "INSERT INTO project_memories (id, cwd, content, topic, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (mid, key, _enc.encrypt(body), t, now, now),
+            "INSERT INTO project_memories "
+            "(id, cwd, content, topic, created_at, updated_at, "
+            "last_verified_at, verify_within_days) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (mid, key, _enc.encrypt(body), t, now, now,
+             now, verify_within_days),
         )
         row = c.execute(
             "SELECT * FROM project_memories WHERE id = ?", (mid,),
@@ -3239,6 +3293,18 @@ def delete_project_memories_matching(cwd: str, pattern: str) -> int:
 
 def _row_to_project_memory(row: sqlite3.Row) -> dict:
     from . import db_encryption as _enc
+    # Read the new columns defensively — pre-migration rows from a
+    # legacy DB won't have them. sqlite3.Row raises IndexError for
+    # unknown keys; wrap with try so a fresh schema and a half-
+    # migrated schema both render correctly.
+    try:
+        last_verified_at = row["last_verified_at"]
+    except (IndexError, KeyError):
+        last_verified_at = None
+    try:
+        verify_within_days = row["verify_within_days"]
+    except (IndexError, KeyError):
+        verify_within_days = None
     return {
         "id": row["id"],
         "cwd": row["cwd"],
@@ -3246,6 +3312,8 @@ def _row_to_project_memory(row: sqlite3.Row) -> dict:
         "topic": row["topic"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "last_verified_at": last_verified_at,
+        "verify_within_days": verify_within_days,
     }
 
 
@@ -4967,6 +5035,7 @@ def create_skill(
     description: str,
     body: str,
     tags: list[str] | None = None,
+    avoid_when: str | None = None,
 ) -> dict:
     """Insert one skill. Name must be a slug; body is markdown / plain text.
 
@@ -4974,6 +5043,11 @@ def create_skill(
     body is a procedure description it recalls and follows on similar
     future tasks. Body cap (16 KB) keeps a runaway agent from spamming
     the table; description cap (500 chars) keeps the search index small.
+
+    `avoid_when` is the optional anti-trigger. Renders alongside the
+    description in the model's tool manifest as "AVOID WHEN: ..." so
+    the model has an explicit stop-signal, not just a go-signal.
+    Capped at 300 chars so the manifest stays compact.
     """
     n = (name or "").strip().lower()
     if not n or not all(c.isalnum() or c in "_-" for c in n):
@@ -4990,18 +5064,21 @@ def create_skill(
         raise ValueError("body must not be empty")
     if len(txt) > 16_000:
         raise ValueError("body must be at most 16,000 characters")
+    aw = (avoid_when or "").strip()
+    if aw and len(aw) > 300:
+        raise ValueError("avoid_when must be at most 300 characters")
     sid = str(uuid.uuid4())
     now = time.time()
     with _conn() as c:
         try:
             c.execute(
                 "INSERT INTO skills (id, name, description, tags_json, body, "
-                " created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " created_at, updated_at, avoid_when) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     sid, n, desc,
                     _json_dumps([str(t).strip() for t in (tags or []) if str(t).strip()]),
-                    txt, now, now,
+                    txt, now, now, aw,
                 ),
             )
         except sqlite3.IntegrityError as e:

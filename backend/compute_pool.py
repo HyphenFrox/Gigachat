@@ -6892,12 +6892,71 @@ async def route_chat_for(
 
     info = resolve_ollama_model(model_name)
     if info is None:
-        # Not an Ollama-managed model. Could be a custom name the user
-        # set up another way, OR a public-pool peer is hosting it (we
-        # registered them above; pick_chat_target will route to them).
-        # Stay on the Ollama path — `pick_chat_target` will pick the
-        # right node, and if no eligible target exists Ollama on host
-        # surfaces its own error.
+        # Not on local Ollama. Could be a peer-hosted model. Check
+        # every paired peer's capability cache — if ANY peer has it,
+        # try to size-fit against THAT peer's free memory. If the
+        # model is bigger than every peer's available memory, engage
+        # the split path instead of letting Ollama OOM later.
+        #
+        # Verified-against-bug case: dolphin-mixtral:8x7b (26 GB) is
+        # only on FBS. Local routes here -> falls through to
+        # pick_chat_target -> picks FBS -> FBS Ollama returns
+        # 'requires more system memory (25.1 GiB) than is available
+        # (10.7 GiB)' because the model exceeds FBS's free RAM.
+        # Without this branch the user sees a misleading
+        # "model not found" error from the post-failure fallback to
+        # local Ollama.
+        peer_size = 0
+        peer_with_model = None
+        try:
+            for w in db.list_compute_workers(enabled_only=True):
+                caps = w.get("capabilities") or {}
+                for m in (caps.get("models") or []):
+                    if (m.get("name") or "") == model_name:
+                        sz = int(m.get("size") or 0)
+                        if sz > peer_size:
+                            peer_size = sz
+                            peer_with_model = w
+                        break
+        except Exception:
+            pass
+        if peer_size > 0 and peer_with_model is not None:
+            # Sanity-check the chosen peer's free RAM against the
+            # model size BEFORE routing the chat there. Without this,
+            # Ollama on the peer accepts the request, tries to load,
+            # then returns mid-stream "model requires more system
+            # memory (X GiB) than is available (Y GiB)" — the user
+            # sees a vague "Worker dropped" toast and the agent's
+            # retry falls back to host Ollama which doesn't have the
+            # model, surfacing the misleading "not found" error.
+            #
+            # 90% headroom because Ollama needs a buffer for KV cache
+            # + activations on top of weights. Verified live: FBS has
+            # 16 GB RAM but only ~10 GB free at peak — refuses
+            # dolphin-mixtral 25.1 GiB request.
+            caps = peer_with_model.get("capabilities") or {}
+            peer_free_bytes = int(
+                (float(caps.get("ram_free_gb") or 0)
+                 + float(caps.get("vram_total_gb") or 0))
+                * (1024 ** 3)
+            )
+            if peer_free_bytes > 0 and peer_size > int(peer_free_bytes * 0.90):
+                err = (
+                    f"Model {model_name!r} is {peer_size / 1e9:.1f} GB but "
+                    f"the only peer that has it ({peer_with_model.get('label')}) "
+                    f"has only {peer_free_bytes / 1e9:.1f} GB RAM+VRAM free — "
+                    f"Ollama on that peer would refuse the load with an OOM. "
+                    f"To run this model: (a) free up RAM on that peer, "
+                    f"(b) install the model on a node with more memory, or "
+                    f"(c) configure a split-model that distributes layers "
+                    f"across multiple nodes."
+                )
+                log.info("compute_pool: refusing route — %s", err)
+                await stop_all_running_splits()
+                return {"engine": "error", "error": err}
+        # Fall through to default Ollama path — pick_chat_target will
+        # route to whichever node has the model, and if no node has
+        # it Ollama on host surfaces its own "not found" error.
         await stop_all_running_splits()
         return {"engine": "ollama"}
 

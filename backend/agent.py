@@ -3325,6 +3325,17 @@ async def _run_turn_impl(
             log.warning("compute_pool: route_chat_for failed: %s", e)
             decision = {"engine": "ollama"}
 
+        # Pre-flight refusal: the router can decide the chat won't
+        # work BEFORE we hit Ollama (e.g. model would OOM the only
+        # peer that has it). Surface the router's clear error to the
+        # user instead of letting them watch a vague "Worker dropped"
+        # toast followed by an unrelated "model not found" fallback
+        # error from local Ollama.
+        if decision.get("engine") == "error":
+            err_msg = decision.get("error") or "router refused to dispatch"
+            yield {"type": "error", "error": err_msg}
+            return
+
         if decision.get("engine") == "llama_server":
             split_target = (decision["base_url"], decision["label"])
 
