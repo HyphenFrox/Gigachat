@@ -206,7 +206,9 @@ def _resolve_rpc_endpoints(worker_ids: list[str]) -> list[str]:
     weights computed by `_compute_tensor_split_ratios` MUST list
     entries in the same order this function does.
     """
-    out: list[str] = []
+    # First pass: collect each worker's endpoints in CPU-then-GPU
+    # order (we'll interleave across workers in a second pass).
+    per_worker: list[list[str]] = []
     for wid in worker_ids:
         w = db.get_compute_worker(wid)
         if not w:
@@ -226,29 +228,46 @@ def _resolve_rpc_endpoints(worker_ids: list[str]) -> list[str]:
             )
             continue
         host = (w.get("address") or "").strip()
-        # Strip http(s):// like _worker_base_url does in compute_pool.
         for prefix in ("http://", "https://"):
             if host.startswith(prefix):
                 host = host[len(prefix):]
         host = host.rstrip("/")
-        # Multi-rpc-server path: capabilities.rpc_endpoints is
-        # populated by `compute_pool.ensure_rpc_servers_via_proxy_multi`
-        # with the list of {port, backend} that succeeded. When
-        # present, expand into one --rpc entry per endpoint so
-        # llama.cpp sees the worker's iGPU AND CPU as separate
-        # compute targets.
         endpoints = caps.get("rpc_endpoints")
+        worker_eps: list[str] = []
         if isinstance(endpoints, list) and endpoints:
-            for ep in endpoints:
+            sorted_eps = sorted(
+                endpoints,
+                key=lambda e: 0 if (e.get("backend") or "").strip().upper() == "CPU" else 1,
+            )
+            for ep in sorted_eps:
                 try:
                     port = int(ep.get("port") or 50052)
                 except (TypeError, ValueError):
                     port = 50052
-                out.append(f"{host}:{port}")
-            continue
-        # Legacy single-port worker — one rpc-server, one entry.
-        port = caps.get("rpc_port") or 50052
-        out.append(f"{host}:{port}")
+                worker_eps.append(f"{host}:{port}")
+        else:
+            port = caps.get("rpc_port") or 50052
+            worker_eps.append(f"{host}:{port}")
+        per_worker.append(worker_eps)
+
+    # Second pass: INTERLEAVE across workers so no two consecutive
+    # --rpc entries share an IP. Critical for llama.cpp's RPC client
+    # which (verified live on b9002) FAILS to connect to the second
+    # rpc-server on a host when the first one was just connected
+    # to — looks like a connection-pool bug where the same-host
+    # socket is reused. By emitting [W0[0], W1[0], W2[0], W0[1],
+    # W1[1], ...], every consecutive pair is on a different IP and
+    # all 4 rpc-server processes register cleanly. Verified to
+    # produce ALL 4 RPC0..RPC3 entries in the device list with
+    # the per-port memory_breakdown tracking each one.
+    out: list[str] = []
+    if not per_worker:
+        return out
+    max_per_worker = max(len(x) for x in per_worker)
+    for round_idx in range(max_per_worker):
+        for worker_eps in per_worker:
+            if round_idx < len(worker_eps):
+                out.append(worker_eps[round_idx])
     return out
 
 
