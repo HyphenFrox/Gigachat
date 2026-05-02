@@ -25,3 +25,5 @@ After making changes, check if README.md file needs to be upadated.
 The code must be efficient
 
 Don't add any personal or sensitive stuff in commits
+
+The app has been deployed so newer versions of the app should be able to migrate older versions of the app to the current one
