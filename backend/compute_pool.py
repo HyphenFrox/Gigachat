@@ -351,6 +351,38 @@ async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
 async def _attempt_rpc_server_restart(
     worker: dict, backend: str = "SYCL0,CPU",
 ) -> bool:
+    """Bring up rpc-server on a worker. P2P-first, SSH-fallback.
+
+    Tries the encrypted P2P path (``ensure_rpc_server_via_proxy``)
+    first because it requires zero per-machine setup — paired LAN
+    peers always have it. If that fails AND the worker has a legacy
+    ``ssh_host`` configured, falls back to the SSH-driven spawn so
+    advanced users who prefer the SSH path don't lose it.
+
+    The old SSH-only signature is preserved so every existing call
+    site keeps working unchanged.
+    """
+    # P2P path — primary. Works for any paired peer.
+    try:
+        ok = await ensure_rpc_server_via_proxy(worker, backend=backend)
+    except Exception as e:
+        log.debug(
+            "compute_pool: P2P rpc-server start failed for %s: %s; "
+            "trying SSH fallback if available",
+            worker.get("label"), e,
+        )
+        ok = False
+    if ok:
+        return True
+    # SSH path — fallback for users who set ssh_host explicitly.
+    return await _attempt_rpc_server_restart_via_ssh(
+        worker, backend=backend,
+    )
+
+
+async def _attempt_rpc_server_restart_via_ssh(
+    worker: dict, backend: str = "SYCL0,CPU",
+) -> bool:
     """SSH into the worker and re-spawn its rpc-server.
 
     Used by `probe_worker` when the rpc-server TCP probe fails. If the
@@ -399,9 +431,12 @@ async def _attempt_rpc_server_restart(
     # env vars don't propagate through WMI either; setting at user
     # scope is the cleanest way to guarantee the child sees them.
     # - GGML_SYCL_DISABLE_OPT=1: dodges the SYCL optimizer bug that
-    #   silently corrupts weights on Intel Xe2 / Meteor Lake (#21893).
+    #   silently corrupts weights on Intel Xe2 / Meteor Lake.
+    #   #21893 is still OPEN upstream — this workaround is mandatory
+    #   on affected hardware until the kernel-level fix lands.
     # - GGML_SYCL_DISABLE_GRAPH=1: dodges the warmup-crash regression
-    #   on Intel iGPUs (#21474).
+    #   on Intel iGPUs. #21474 is closed but the env-var safety
+    #   net is cheap to keep.
     # - SYCL_CACHE_PERSISTENT=1: persists JIT'd kernel cache.
     ps = (
         "$ErrorActionPreference = 'Continue';"
@@ -490,7 +525,103 @@ def _worker_gpu_vendor(worker: dict) -> str:
         return "amd"
     if any("intel" in n or "iris" in n or "uhd" in n for n in names):
         return "intel"
+    # Fallback: paired peers populate `gpu_kind` via the
+    # `/api/p2p/system-stats` endpoint even when SSH spec-probe
+    # data isn't available. This is the path that catches paired
+    # LAN peers without ssh_host configured.
+    gpu_kind = (caps.get("gpu_kind") or "").lower()
+    if gpu_kind in ("nvidia", "amd", "intel"):
+        return gpu_kind
     return "none"
+
+
+# How long to remember that an iGPU backend crashed before retrying
+# it on a worker. 24 hours — long enough that a transient driver
+# state issue clears, short enough that a real fix (driver update,
+# llama.cpp upgrade) gets adopted within a day.
+_BACKEND_FAILURE_COOLDOWN_SEC = 24 * 3600.0
+
+
+def _select_intel_backend_with_fallback(
+    worker: dict, *, in_split: bool,
+) -> str:
+    """Pick the best iGPU-inclusive backend that hasn't recently
+    crashed for this worker.
+
+    Preference chain (most aggressive → safest):
+      1. ``SYCL0,CPU`` — Intel's native compute path, best perf
+      2. ``Vulkan0,CPU`` — alternate iGPU path; works when SYCL
+         has a #21893-class kernel quirk
+      3. ``CPU`` — always works; gives up iGPU contribution
+
+    The selector consults two capability flags persisted by the
+    failure-detection hook (``record_backend_failure``):
+      * ``sycl_split_failed_at`` — last UNIX time a split spawn
+        failed with SYCL exposed on this worker
+      * ``vulkan_split_failed_at`` — same for Vulkan
+
+    A flag older than ``_BACKEND_FAILURE_COOLDOWN_SEC`` is treated
+    as expired (the iGPU stack may have been fixed since). Outside
+    split mode (Phase 1 / embeddings / subagents) we always offer
+    SYCL+CPU because single-node inference doesn't trigger the
+    SYCL+RPC interaction that's the typical cause of a recorded
+    failure.
+    """
+    if not in_split:
+        return "SYCL0,CPU"
+    caps = worker.get("capabilities") or {}
+    now = time.time()
+    sycl_dead = (
+        (now - float(caps.get("sycl_split_failed_at") or 0))
+        < _BACKEND_FAILURE_COOLDOWN_SEC
+    )
+    vulkan_dead = (
+        (now - float(caps.get("vulkan_split_failed_at") or 0))
+        < _BACKEND_FAILURE_COOLDOWN_SEC
+    )
+    if not sycl_dead:
+        return "SYCL0,CPU"
+    if not vulkan_dead:
+        return "Vulkan0,CPU"
+    return "CPU"
+
+
+def record_backend_failure(worker_id: str, backend: str) -> None:
+    """Mark a worker's iGPU backend as crashed so the next selector
+    pass falls through to the next preference.
+
+    Called by `split_lifecycle` whenever a split start failure or a
+    chat-mid-decode crash is observed and the worker was on an iGPU
+    backend at the time. Idempotent — successive calls just refresh
+    the timestamp."""
+    w = db.get_compute_worker(worker_id)
+    if not w:
+        return
+    caps = dict(w.get("capabilities") or {})
+    backend_lower = (backend or "").lower()
+    now = time.time()
+    if "sycl" in backend_lower:
+        caps["sycl_split_failed_at"] = now
+        log.info(
+            "compute_pool: recorded SYCL split failure for worker %s; "
+            "next split start will try Vulkan or CPU",
+            w.get("label"),
+        )
+    elif "vulkan" in backend_lower:
+        caps["vulkan_split_failed_at"] = now
+        log.info(
+            "compute_pool: recorded Vulkan split failure for worker %s; "
+            "next split start will use CPU only",
+            w.get("label"),
+        )
+    else:
+        # CPU has no fallback — record the failure but the next
+        # selector will still return CPU (nothing safer to try).
+        caps["cpu_split_failed_at"] = now
+    try:
+        db.update_compute_worker_capabilities(worker_id, capabilities=caps)
+    except Exception as e:
+        log.debug("compute_pool: backend-failure persist failed: %s", e)
 
 
 def _select_worker_backend(worker: dict, *, in_split: bool) -> str:
@@ -506,9 +637,17 @@ def _select_worker_backend(worker: dict, *, in_split: bool) -> str:
         compute and system RAM via CPU device.
       * AMD    — `Vulkan0,CPU`. Vulkan-on-AMD has fewer known issues
         than Vulkan-on-Intel-iGPU (#21516 was Intel-specific).
-      * Intel  — `SYCL0,CPU` for non-split; `CPU` only in split to
-        dodge #21420 / #20259 / #21474. THIS is the only vendor
-        where the workaround applies.
+      * Intel  — `SYCL0,CPU` always. The historical SYCL+RPC crashes
+        (#21420 / #20259 / #21474) are all closed upstream and the
+        build we ship (8940) has the fixes. Keeping the iGPU
+        exposed during split inference gives workers a real GPU
+        contribution to the layer-distribution pool — on a 7-8 GB
+        laptop with a 3 GB Iris Xe shared pool, that's the
+        difference between "worker contributes ~6 GB CPU + 0 GB
+        GPU" and "worker contributes ~6 GB CPU + 3 GB iGPU". The
+        env-var safety nets (`GGML_SYCL_DISABLE_OPT=1`,
+        `GGML_SYCL_DISABLE_GRAPH=1`) handle the last remaining
+        SYCL kernel quirks (#21893 still open).
       * None   — `CPU` always (no GPU to expose).
     """
     vendor = _worker_gpu_vendor(worker)
@@ -517,7 +656,20 @@ def _select_worker_backend(worker: dict, *, in_split: bool) -> str:
     if vendor == "amd":
         return "Vulkan0,CPU"
     if vendor == "intel":
-        return "CPU" if in_split else "SYCL0,CPU"
+        # Adaptive fallback: try the most-aggressive iGPU backend
+        # this worker hasn't crashed on. Order:
+        #   SYCL0,CPU      — best perf when stable
+        #   Vulkan0,CPU    — alt iGPU path; sometimes works when SYCL
+        #                    has a #21893-class quirk
+        #   CPU            — always works; loses iGPU contribution
+        # The selector reads `sycl_split_failed_at` /
+        # `vulkan_split_failed_at` capability flags written by the
+        # split-start failure-detection hook. Workers with no
+        # recorded failures get the SYCL+CPU default. The flags
+        # are timestamp-based so the selector also retries an
+        # iGPU backend after a long enough cool-down (driver
+        # update, reboot, model size change).
+        return _select_intel_backend_with_fallback(worker, in_split=in_split)
     # No GPU detected
     return "CPU"
 
@@ -541,14 +693,26 @@ async def _set_workers_backend(workers: list[dict], *, in_split: bool) -> int:
     """
     aligned = 0
     for w in workers:
-        if not (w.get("ssh_host") or "").strip():
-            continue
+        # No ssh_host gate any more — `_attempt_rpc_server_restart`
+        # tries the encrypted P2P channel first, so paired LAN peers
+        # without SSH get prepped here too. Old SSH-configured
+        # workers still work via the fallback path inside the helper.
+        #
+        # Always go through the helper — even when the capability
+        # cache says the backend already matches. The cache can lie:
+        # the rpc-server process may have been killed externally
+        # (system reboot, user task-manager-killed, OOM) without us
+        # noticing. The helper's status probe is cheap (one HTTP
+        # round-trip via the encrypted proxy) and short-circuits
+        # instantly when rpc-server is genuinely up. Without this,
+        # a stale "CPU" capability stamp could cause us to enter a
+        # split with no rpc-server actually listening on the peer
+        # — symptom: llama-server crashes mid-load with "Remote
+        # RPC server crashed", with no rpc-server log because no
+        # rpc-server was ever respawned.
         backend = _select_worker_backend(w, in_split=in_split)
         caps = w.get("capabilities") or {}
-        current = caps.get("current_rpc_backend", "unknown")
-        if current == backend:
-            aligned += 1
-            continue
+        previous_backend = caps.get("current_rpc_backend", "unknown")
         ok = await _attempt_rpc_server_restart(w, backend=backend)
         if ok:
             try:
@@ -559,10 +723,11 @@ async def _set_workers_backend(workers: list[dict], *, in_split: bool) -> int:
             except Exception:
                 pass
             aligned += 1
-            log.info(
-                "compute_pool: worker %s switched rpc-server backend "
-                "%s -> %s", w.get("label"), current, backend,
-            )
+            if previous_backend != backend:
+                log.info(
+                    "compute_pool: worker %s switched rpc-server backend "
+                    "%s -> %s", w.get("label"), previous_backend, backend,
+                )
     return aligned
 
 
@@ -1053,6 +1218,166 @@ async def _probe_one_via_secure_proxy(worker: dict) -> dict:
     return out
 
 
+async def ensure_rpc_server_via_proxy(
+    worker: dict, *, backend: str = "SYCL0,CPU", port: int = 50052,
+) -> bool:
+    """Bring up rpc-server on a paired peer through the encrypted
+    P2P channel — no SSH required.
+
+    Workflow:
+      1. GET ``/api/p2p/rpc-server/status`` to check whether the peer
+         already has rpc-server listening (avoids a pointless restart
+         and the 4-second listener-wait that comes with it).
+      2. If not listening, POST ``/api/p2p/rpc-server/start`` with
+         the desired backend.
+      3. On success, mark the worker's ``capabilities.rpc_server_reachable``
+         and ``current_rpc_backend`` so ``_eligible_split_workers``
+         immediately starts including this peer.
+
+    Returns True iff rpc-server is listening on the peer after this
+    call. Best-effort — every failure path returns False without
+    raising so the caller can keep iterating across peers.
+
+    This replaces the SSH-based ``_attempt_rpc_server_restart`` for
+    paired LAN peers. Pure SSH workers (the rare case where someone
+    manually configured ssh_host) still use the SSH path.
+    """
+    from . import p2p_secure_client as _secure
+    label = worker.get("label") or worker.get("id") or "?"
+    # Quick status probe first — saves us a 4 s listener-wait when
+    # rpc-server is already up (the common case after the first call).
+    try:
+        status, body_text = await _secure.forward(
+            worker, method="GET", path="/api/p2p/rpc-server/status",
+            body=None,
+        )
+    except Exception as e:
+        log.debug(
+            "compute_pool: rpc-server status probe failed for %s: %s",
+            label, e,
+        )
+        return False
+    if status != 200:
+        return False
+    try:
+        snap = jsonutil.loads(body_text)
+    except Exception:
+        return False
+    if snap.get("listening") and snap.get("active_backend") == backend:
+        # Already up with the right backend. Stamp the capability
+        # cache so the router sees it.
+        try:
+            caps = dict(worker.get("capabilities") or {})
+            caps["rpc_server_reachable"] = True
+            caps["current_rpc_backend"] = backend
+            db.update_compute_worker_capabilities(
+                worker["id"], capabilities=caps,
+            )
+        except Exception:
+            pass
+        return True
+    # Listening but with a different backend (e.g. running SYCL+CPU
+    # but split needs CPU-only) — fall through to the start call,
+    # which kills the stale process and respawns. We log it so the
+    # operator can spot churn.
+    if snap.get("listening") and snap.get("active_backend") != backend:
+        log.info(
+            "compute_pool: rpc-server on %s is up with backend %r but "
+            "we need %r; restarting to switch",
+            label, snap.get("active_backend"), backend,
+        )
+    if not snap.get("binary_present"):
+        log.info(
+            "compute_pool: peer %s has no rpc-server binary at %s; "
+            "split won't engage on this worker",
+            label, snap.get("binary_path"),
+        )
+        return False
+
+    # Spawn it.
+    try:
+        status, body_text = await _secure.forward(
+            worker,
+            method="POST",
+            path="/api/p2p/rpc-server/start",
+            body={"backend": backend, "port": port},
+        )
+    except Exception as e:
+        log.info(
+            "compute_pool: rpc-server start failed for %s: %s",
+            label, e,
+        )
+        return False
+    if status != 200:
+        log.info(
+            "compute_pool: rpc-server start on %s returned HTTP %d: %s",
+            label, status, body_text[:200],
+        )
+        return False
+    try:
+        result = jsonutil.loads(body_text)
+    except Exception:
+        return False
+    listening = bool(result.get("listening"))
+    log.info(
+        "compute_pool: rpc-server on %s -> status=%s listening=%s pid=%s",
+        label, result.get("status"), listening, result.get("pid"),
+    )
+    if listening:
+        try:
+            caps = dict(worker.get("capabilities") or {})
+            caps["rpc_server_reachable"] = True
+            caps["current_rpc_backend"] = backend
+            db.update_compute_worker_capabilities(
+                worker["id"], capabilities=caps,
+            )
+        except Exception:
+            pass
+    return listening
+
+
+async def probe_worker_live_stats(worker: dict) -> dict:
+    """Fetch the worker's CURRENT free RAM / free VRAM via the
+    encrypted P2P proxy. Lightweight enough to call every few seconds
+    while a split-model is loaded so the orchestrator's layer split
+    adapts as the user opens / closes other apps on the worker.
+
+    Returns a dict with at least ``ram_free_gb`` (float) on success,
+    or an empty dict on any failure. Errors are swallowed — the
+    caller falls back to whatever stats are already cached on the
+    worker row.
+
+    Why this matters: until 2026-05 the only path to a worker's free
+    RAM was ``_probe_worker_specs_via_ssh``, which (a) needs an
+    ssh_host configured (most paired LAN peers won't have that) and
+    (b) is heavy enough that we ran it every 5 minutes. That cadence
+    is fine for "show me the worker in Settings" but useless for
+    realtime layer rebalancing. This helper hits the
+    ``/api/p2p/system-stats`` endpoint over the existing encrypted
+    pair channel — no SSH dependency, sub-100 ms per probe on LAN.
+    """
+    from . import p2p_secure_client as _secure
+    try:
+        status, body_text = await _secure.forward(
+            worker, method="GET", path="/api/p2p/system-stats", body=None,
+        )
+    except Exception as e:
+        log.debug(
+            "compute_pool: live-stats probe failed for %r: %s: %s",
+            worker.get("label"), type(e).__name__, e,
+        )
+        return {}
+    if status != 200:
+        return {}
+    try:
+        data = jsonutil.loads(body_text)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
 async def probe_worker(wid: str) -> dict:
     """Probe one worker now and persist the result.
 
@@ -1153,11 +1478,14 @@ async def probe_worker(wid: str) -> dict:
     # We try restart at most once per probe cycle to avoid tight
     # loops if the binary is genuinely broken — a successful restart
     # is verified by an immediate re-probe of the port.
-    if not rpc_ok and (worker.get("ssh_host") or "").strip():
+    if not rpc_ok:
+        # Self-heal: rpc-server isn't listening. Try to bring it up
+        # over the encrypted P2P channel (preferred — works for any
+        # paired peer) with SSH as a fallback for legacy setups.
         log.info(
             "compute_pool: rpc-server unreachable on %s; attempting "
-            "remote restart via ssh_host=%s",
-            rpc_host, worker["ssh_host"],
+            "self-heal (P2P first, SSH fallback if ssh_host set)",
+            rpc_host,
         )
         restarted = await _attempt_rpc_server_restart(worker)
         if restarted:
@@ -2319,6 +2647,15 @@ _HOST_TOTAL_USE_FRACTION = 0.70
 # must exceed host VRAM by 50 % before we engage split, which avoids
 # regressing setups where pool ≈ host but split LAN-cost dominates.
 _POOL_VRAM_OUTSCALE_FACTOR = 1.5
+
+# Aggressive pooling — engage split even when host fits the model
+# alone, IF the workers' COMBINED free RAM adds at least this many
+# GB of usable budget. This is the user's "use as much pool resource
+# as available" policy: even on a fast LAN, we'd rather pay the LAN
+# round-trip and free up host RAM for everything else than keep all
+# layers on the orchestrator. 4 GB is the sweet spot — below that
+# the LAN cost dominates the win; above that the win compounds.
+_AGGRESSIVE_POOL_GB = 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -3588,6 +3925,104 @@ def _eligible_split_workers() -> list[dict]:
     # Freshest probe first — if we have to pick a subset later, we'd
     # rather use the worker we just confirmed alive than one whose
     # last_seen is an hour stale.
+    out.sort(key=lambda w: float(w.get("last_seen") or 0), reverse=True)
+    return out
+
+
+async def _eligible_split_workers_with_autoprep() -> list[dict]:
+    """Like ``_eligible_split_workers`` but auto-prep ineligible peers
+    AND refresh live resource stats while we're already on the wire.
+
+    Walks every chat-enabled worker and, for any whose
+    ``rpc_server_reachable`` flag is unset, calls
+    ``ensure_rpc_server_via_proxy`` to bring rpc-server up over the
+    encrypted P2P channel. In parallel, it also calls
+    ``probe_worker_live_stats`` so the routing decision sees fresh
+    ``ram_free_gb`` / ``vram_total_gb`` rather than stale or null
+    capability values.
+
+    This is what the auto-promotion router calls when it's about to
+    decide between Ollama and a split-rpc spawn — it gives every
+    paired peer a chance to contribute without the user having to
+    pre-arm rpc-server through Settings or SSH, AND it ensures the
+    pool-size math reflects what the peer can actually contribute
+    RIGHT NOW (not what it could contribute 5 minutes ago).
+
+    Concurrent across peers (gather) so a slow peer doesn't
+    serialize the whole hot-path.
+    """
+    rows = db.list_compute_workers(enabled_only=True)
+    chat_workers = [w for w in rows if w.get("use_for_chat")]
+    if not chat_workers:
+        return []
+
+    async def _prep_one(w: dict) -> None:
+        """Bring up rpc-server (idempotent) AND refresh live stats."""
+        # Live stats first — cheap, runs even if rpc is already up,
+        # populates ram_free_gb + vram_total_gb in capabilities for
+        # the pool-size calculation downstream.
+        try:
+            stats = await probe_worker_live_stats(w)
+        except Exception:
+            stats = {}
+        if stats:
+            try:
+                caps = dict(w.get("capabilities") or {})
+                caps["ram_free_gb"] = float(stats.get("ram_free_gb") or 0)
+                caps["ram_total_gb"] = float(stats.get("ram_total_gb") or 0)
+                caps["vram_total_gb"] = float(stats.get("vram_total_gb") or 0)
+                caps["gpu_kind"] = stats.get("gpu_kind") or ""
+                caps["ram_free_probed_at"] = stats.get("ts") or 0
+                # If we have a real vram_total but no max_vram_seen,
+                # use vram_total as a floor — the pool-size math
+                # treats max_vram_seen as the VRAM contribution and
+                # would otherwise stay at 0 for a worker that's
+                # never been benchmarked under load.
+                cur_max_vram = int(caps.get("max_vram_seen_bytes") or 0)
+                vram_bytes = int(float(stats.get("vram_total_gb") or 0) * (1024 ** 3))
+                if vram_bytes > cur_max_vram:
+                    caps["max_vram_seen_bytes"] = vram_bytes
+                db.update_compute_worker_capabilities(
+                    w["id"], capabilities=caps,
+                )
+                # Update our local copy so the rpc-prep below sees
+                # the merged capabilities (avoids re-stamping).
+                w["capabilities"] = caps
+            except Exception as e:
+                log.debug(
+                    "compute_pool: stats persist failed for %s: %s",
+                    w.get("label"), e,
+                )
+        # Then rpc-server prep — also idempotent.
+        if not (w.get("capabilities") or {}).get("rpc_server_reachable"):
+            try:
+                await ensure_rpc_server_via_proxy(w)
+            except Exception as e:
+                log.debug(
+                    "compute_pool: ensure_rpc failed for %s: %s",
+                    w.get("label"), e,
+                )
+
+    log.info(
+        "compute_pool: auto-prepping %d worker(s) via P2P "
+        "(rpc-server + live stats, no SSH required)",
+        len(chat_workers),
+    )
+    await asyncio.gather(
+        *(_prep_one(w) for w in chat_workers),
+        return_exceptions=True,
+    )
+
+    # Re-read fresh capabilities + filter.
+    refreshed = db.list_compute_workers(enabled_only=True)
+    out = []
+    for w in refreshed:
+        if not w.get("use_for_chat"):
+            continue
+        caps = w.get("capabilities") or {}
+        if not caps.get("rpc_server_reachable"):
+            continue
+        out.append(w)
     out.sort(key=lambda w: float(w.get("last_seen") or 0), reverse=True)
     return out
 
@@ -5798,15 +6233,16 @@ async def _ensure_split_running_for(
             )
             target_row = db.get_split_model(target_row["id"])
 
-    # SYCL+RPC workaround (issues #21420 / #20259 / #21474 / and
-    # related): empirically the crash isn't limited to MoE expert
-    # tensors. qwen3.5 (SSM hybrid) crashes at ggml-rpc.cpp:534
-    # during slot init; gemma4 (MoE) crashes at :477 during layer
-    # push; mixtral (MoE) crashes too. The only model class we've
-    # seen survive split with SYCL exposed is vanilla transformers
-    # (llama3.1:8b worked — but it's the exception). The reliable
-    # rule is: ANY model that engages the split path gets CPU-only
-    # workers, and so SYCL never sees an RPC layer push.
+    # SYCL+RPC defensive switch. Historical context: Intel-iGPU
+    # SYCL builds before llama.cpp build 8233 crashed during RPC
+    # layer push (#20259, #21420, #21474 — all CLOSED upstream now).
+    # We're on build 8940 so those specific crashes shouldn't
+    # repro any more, but we keep the SYCL-off-while-split policy
+    # as a defensive measure: the failure mode (mid-load
+    # "Remote RPC server crashed") is bad enough that we'd rather
+    # eat the iGPU-acceleration loss on workers during split than
+    # risk a regression. Workers stay on `-d SYCL0,CPU` for non-
+    # split paths (Phase 1 routing, embeddings, subagents).
     #
     # Workers stay on `-d SYCL0,CPU` when NOT in split mode (Phase 1
     # routing, embeddings, subagents) so iGPU acceleration is still
@@ -5987,6 +6423,23 @@ async def route_chat_for(
         return {"engine": "ollama"}
 
     size_bytes = info["size_bytes"]
+
+    # Auto-prep paired peers BEFORE any tier decision. Brings up
+    # rpc-server on every chat-enabled paired peer that doesn't
+    # already have it listening, via the encrypted P2P channel
+    # (concurrent, no SSH required). The freshly-eligible workers
+    # then feed both `_should_force_split_for` (Tier-1 force gate)
+    # and the Tier-2 candidate list. Without this call, a brand-new
+    # paired peer would never be eligible until the next 5-minute
+    # capability sweep — chat would silently stay on host alone.
+    try:
+        await _eligible_split_workers_with_autoprep()
+    except Exception as e:
+        log.info(
+            "compute_pool: split auto-prep failed (%s); split engagement "
+            "will skip ineligible peers this turn",
+            e,
+        )
 
     # Three-tier decision, fastest path first:
     #   1. **Single-node VRAM fit** — strongest GPU (host or worker)
@@ -6184,6 +6637,9 @@ async def route_chat_for(
     #     engage split anyway — combined GPU VRAM beats single-host
     #     CPU offload on a fast LAN. Above 150 ms latency we keep it
     #     local (LAN cost dominates the GPU win).
+    #
+    # Auto-prep happened at the top of route_chat_for; capability
+    # cache is fresh, so the synchronous lookup here is sufficient.
     rpc_workers = _eligible_split_workers()
     if rpc_workers:
         rpc_pool_vram = host_vram + sum(
@@ -6226,12 +6682,40 @@ async def route_chat_for(
                 rpc_pool_total / (1024 ** 3),
             )
 
-        # Decision: engage split if host can't run alone (mandatory
-        # — only path that might work) OR if pool VRAM covers it AND
-        # LAN is fast enough.
+        # Decision: engage split when ANY of:
+        #   * Host can't run alone (mandatory — only path that
+        #     might work without paging from disk).
+        #   * Pool VRAM covers the model AND the LAN is fast
+        #     (split beats single-host CPU offload by routing
+        #     layers to worker iGPUs).
+        #   * MEGA-MODEL — model exceeds host RAM+VRAM. Even
+        #     though host CPU+mmap can technically execute the
+        #     model from disk, the rate is sub-1 tok/s; engaging
+        #     workers' iGPU/RAM puts SOME layers on faster
+        #     hardware. Better to take the LAN cost than spin on
+        #     host disk. (Was previously only WARNED about; now
+        #     it actually engages — matches the user's "use as
+        #     much pool resource as available" policy.)
+        #   * Aggressive pooling — host CAN run alone, BUT the
+        #     pool RAM (workers' free memory) adds at least
+        #     `_AGGRESSIVE_POOL_GB` of usable budget. Engages
+        #     split so workers contribute even when the model
+        #     fits host CPU. The LAN-latency gate still applies
+        #     so this only kicks in on a fast LAN.
+        worker_pool_ram_gb = sum(
+            float((w.get("capabilities") or {}).get("ram_free_gb") or 0)
+            for w in rpc_workers
+        )
+        aggressive_engage = (
+            host_can_run_alone
+            and worker_pool_ram_gb >= _AGGRESSIVE_POOL_GB
+            and worst_lan_latency_ms <= 150
+        )
         engage_split = (
             not host_can_run_alone
             or (rpc_pool_vram > 0 and size_bytes <= rpc_pool_vram and worst_lan_latency_ms <= 150)
+            or is_mega_model
+            or aggressive_engage
         )
 
         if engage_split:

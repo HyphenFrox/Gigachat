@@ -74,7 +74,7 @@ class _DiscoveryState:
 
     __slots__ = (
         "zeroconf", "service_info", "browser", "started_at",
-        "discovered", "lock",
+        "discovered", "lock", "port",
     )
 
     def __init__(self) -> None:
@@ -82,6 +82,10 @@ class _DiscoveryState:
         self.service_info = None
         self.browser = None
         self.started_at = 0.0
+        # The advertised FastAPI port. Captured at start() so other
+        # modules (e.g. p2p_lan_client.push_pair_notify) can tell
+        # peers where to reach us without re-deriving from env.
+        self.port = 0
         # Keyed by device_id. Each entry:
         #   {"device_id", "label", "ip", "port", "version", "last_seen_at"}
         # Updated by the Zeroconf listener callbacks (which run on the
@@ -92,6 +96,23 @@ class _DiscoveryState:
 
 
 _state: _DiscoveryState | None = None
+
+
+def get_advertised_port() -> int:
+    """Return the FastAPI port we advertise to peers, or 8000 if the
+    discovery loop hasn't started yet.
+
+    Used by sibling modules (e.g. ``p2p_lan_client.push_pair_notify``)
+    to tell freshly-paired peers exactly where to reach us so they
+    don't have to guess + fall through to the 8000 default. Falling
+    through is fine when we're on the canonical port, but a dev
+    instance on 8001 / 8080 would otherwise be stored as
+    ``port: null`` on the peer side and become unroutable until mDNS
+    or an active scan fills the gap.
+    """
+    if _state is not None and _state.port:
+        return _state.port
+    return _DEFAULT_ADVERTISE_PORT
 
 
 def merge_discovered_peers(peers: list[dict]) -> int:
@@ -461,6 +482,7 @@ async def start(advertise_port: int | None = None) -> None:
 
     me = identity.get_identity()
     port = int(advertise_port or _DEFAULT_ADVERTISE_PORT)
+    state.port = port
     # Advertise on EVERY RFC1918 / link-local IPv4 we have. On a
     # multi-NIC laptop (Wi-Fi + Ethernet + virtual switches), peers
     # on any of those subnets pick the address that routes to them.

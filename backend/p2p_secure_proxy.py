@@ -92,11 +92,56 @@ _FORWARDABLE_PATHS = frozenset({
     "/api/embed",
     "/api/chat",
     "/api/generate",
+    "/api/version",     # Ollama version string — read-only metadata
     "/api/tags",        # model list — read-only metadata
     "/api/show",        # model info — read-only metadata
     "/api/ps",          # which models are currently loaded — read-only
     "/api/pull",        # auto-pull from official source on the executor
+    # Gigachat-internal stats endpoint. Routes to local Gigachat (port
+    # 8000), not Ollama (11434). The orchestrator polls this on each
+    # worker every ~10 s while a split-model is loaded so the layer
+    # split adapts in real time as the user opens/closes other apps
+    # on the worker.
+    "/api/p2p/system-stats",
+    # Local rpc-server lifecycle endpoints — let an orchestrator
+    # bring up llama.cpp's rpc-server on this peer over the
+    # encrypted P2P channel, replacing the old SSH-based prep path.
+    # The orchestrator calls these to make the peer eligible for
+    # split-model layer placement (see ``compute_pool``).
+    "/api/p2p/rpc-server/start",
+    "/api/p2p/rpc-server/status",
+    "/api/p2p/rpc-server/stop",
+    # LAN-first binary fetch — orchestrator installs missing
+    # llama-cpp DLLs by pulling from a peer that already has the
+    # file (saves hundreds of MB of internet bandwidth per fresh
+    # peer). The list path is light; the get path streams the file.
+    "/api/p2p/binary/list",
 })
+
+# Paths that should be forwarded to the LOCAL GIGACHAT backend rather
+# than to Ollama. Everything outside this set goes to Ollama via
+# `_LOCAL_OLLAMA`. Kept as a tight enum so a malicious peer can't
+# coax our proxy into hitting arbitrary Gigachat internals — only
+# the explicitly listed paths leak.
+_GIGACHAT_INTERNAL_PATHS = frozenset({
+    "/api/p2p/system-stats",
+    "/api/p2p/rpc-server/start",
+    "/api/p2p/rpc-server/status",
+    "/api/p2p/rpc-server/stop",
+    "/api/p2p/binary/list",
+})
+
+# Note: ``/api/p2p/binary/get/<file>`` deliberately is NOT in the
+# encrypted-proxy whitelist. The endpoint serves multi-hundred-MB
+# DLLs which would blow the per-envelope size cap. The orchestrator
+# fetches binaries via a direct LAN HTTP GET (the path is in
+# ``app._P2P_LAN_PREFIXES`` so the auth middleware lets paired-peer
+# IPs through). Confidentiality isn't a concern — the files are
+# standard llama.cpp release artifacts, not user data.
+
+# Where the Gigachat backend is reachable on this host. Loopback only —
+# we never forward a peer's request to a remote Gigachat.
+_LOCAL_GIGACHAT = "http://127.0.0.1:8000"
 
 # Whitelist for DISCOVERED peers — peers we know about via the
 # rendezvous bootstrap but haven't accepted into our compute pool
@@ -106,6 +151,7 @@ _FORWARDABLE_PATHS = frozenset({
 # on peer Y" across the whole swarm without giving every swarm peer
 # a free ride on our GPU.
 _DISCOVERED_PEER_PATHS = frozenset({
+    "/api/version",
     "/api/tags",
     "/api/show",
     "/api/ps",
@@ -253,7 +299,19 @@ async def serve_forward_one_shot(envelope: dict) -> dict:
     body = payload.get("body")
     extra_headers = payload.get("headers") or {}
 
-    url = f"{_LOCAL_OLLAMA}{path}"
+    # Pick the forward target. Gigachat-internal paths (e.g. the
+    # adaptive system-stats endpoint) hit our own loopback Gigachat
+    # backend; everything else goes to local Ollama. Keeping this
+    # routing decision next to the path-whitelist check above makes
+    # it harder to accidentally widen the surface — a path has to be
+    # in BOTH whitelists for it to land on Gigachat.
+    if path in _GIGACHAT_INTERNAL_PATHS:
+        upstream = _LOCAL_GIGACHAT
+        upstream_label = "Gigachat"
+    else:
+        upstream = _LOCAL_OLLAMA
+        upstream_label = "Ollama"
+    url = f"{upstream}{path}"
     async with httpx.AsyncClient(timeout=120.0) as client:
         try:
             r = await client.request(
@@ -263,7 +321,8 @@ async def serve_forward_one_shot(envelope: dict) -> dict:
             )
         except Exception as e:
             raise p2p_crypto.CryptoError(
-                f"upstream Ollama request failed: {type(e).__name__}: {e}"
+                f"upstream {upstream_label} request failed: "
+                f"{type(e).__name__}: {e}"
             )
 
     # Refuse to forward a response larger than the cap — defends

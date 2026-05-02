@@ -192,8 +192,13 @@ async def lifespan(_app: FastAPI):
     try:
         from . import p2p_discovery as _p2pd
         # Pick the same port FastAPI is serving on so peers know
-        # exactly where to reach us. uvicorn sets PORT in env.
-        adv_port = int(os.environ.get("PORT", "8000"))
+        # exactly where to reach us. `server.py` reads GIGACHAT_PORT
+        # before it calls uvicorn.run, so we read the same env var
+        # here. (uvicorn does NOT propagate the chosen port via
+        # an env var of its own — that's a Heroku convention, not
+        # a uvicorn one.) Both default to 8000 so this is a no-op
+        # in the common case.
+        adv_port = int(os.environ.get("GIGACHAT_PORT", "8000"))
         await _p2pd.start(advertise_port=adv_port)
     except Exception as e:
         log.warning("p2p_discovery startup failed: %s", e)
@@ -347,6 +352,11 @@ _P2P_LAN_PREFIXES = (
     "/api/p2p/pair/notify",     # symmetric-pair notify from the other side
     "/api/p2p/pair/unpair-notify",
     "/api/p2p/pair/handshake",  # claimant fetches host's pending offer
+    # LAN-first binary fetch — DLL/EXE artifacts (llama-cpp release
+    # files) served direct over LAN HTTP. Bypasses the encrypted-
+    # proxy size cap; files are standard release artifacts (no user
+    # data) so confidentiality isn't a concern.
+    "/api/p2p/binary/",
                                 #   (pairing_id + nonce, NO PIN) so it can
                                 #   build a signed claim against the host's
                                 #   actual challenge.
@@ -721,9 +731,19 @@ async def _capture_main_loop() -> None:
     any sync endpoint might fire — `on_event("startup")` handlers execute
     in the order registered, so declaring this here (early in the module)
     is sufficient.
+
+    Also propagate the captured loop into `p2p_lan_client` so its
+    `fire_and_forget` helper can schedule pair-notify / unpair-notify
+    coroutines onto the main loop when called from sync handlers (which
+    FastAPI dispatches on a threadpool worker, not on the event loop).
+    Without this, every notify scheduled from a sync `def` handler hit
+    `coro.close()` and silently dropped — symmetric pairings only ever
+    completed via manual probe scripts that called `asyncio.run()` directly.
     """
     global _MAIN_LOOP
     _MAIN_LOOP = asyncio.get_running_loop()
+    from . import p2p_lan_client as _lan
+    _lan.register_main_loop(_MAIN_LOOP)
 
 
 async def _start_scheduler() -> None:
@@ -1032,18 +1052,29 @@ async def _start_compute_pool_probe() -> None:
 
 
 async def _reconcile_split_models() -> None:
-    """Reset stale `running`/`loading` rows on boot.
+    """Reset stale `running`/`loading` rows on boot, then start the
+    adaptive layer-rebalance watchdog.
 
     If the previous app process was killed mid-flight, llama-server
     children went with it but the DB still says `running`. Without
     reconcile the UI shows phantom green pills and chat routing tries
-    to talk to a port nothing is bound to."""
+    to talk to a port nothing is bound to.
+
+    Starting the adaptive watchdog here (rather than in its own
+    lifespan step) keeps the split-model lifecycle coherent: reconcile
+    cleans the slate, watchdog then keeps live entries balanced
+    against current pool free RAM. Idle when nothing is loaded.
+    """
     try:
         n = split_lifecycle.reconcile_on_boot()
         if n:
             print(f"[split] reconciled {n} stale split-model row(s) to stopped", file=sys.stderr)
     except Exception as e:
         print(f"[split] boot reconcile failed: {e}", file=sys.stderr)
+    try:
+        split_lifecycle.start_adaptive_watchdog()
+    except Exception as e:
+        print(f"[split] adaptive watchdog failed to start: {e}", file=sys.stderr)
 
 
 async def _start_mcp() -> None:
@@ -4159,6 +4190,139 @@ def api_p2p_identity() -> dict:
     }
 
 
+@app.get("/api/p2p/binary/list")
+def api_p2p_binary_list() -> dict:
+    """List llama-cpp DLLs/EXEs THIS peer has, with sha256 + size.
+
+    Used by the LAN-first installer: when an orchestrator notices a
+    paired worker is missing a DLL (e.g. ``ggml-sycl.dll`` on a
+    fresh laptop), it queries this list across paired peers and
+    fetches from whichever peer already has it — saves the worker
+    from a multi-hundred-MB internet download.
+    """
+    from . import p2p_binary_fetch as _bf
+    return _bf.list_local_binaries()
+
+
+@app.get("/api/p2p/binary/get/{filename}")
+def api_p2p_binary_get(filename: str):
+    """Stream the requested binary back. Body is the raw file
+    bytes; ``Content-Length`` set so the receiver can show progress.
+
+    Refuses anything outside the llama-cpp install dir or outside
+    the transferable-extensions whitelist (see
+    ``p2p_binary_fetch.open_local_binary``)."""
+    from . import p2p_binary_fetch as _bf
+    from fastapi.responses import FileResponse
+    resolved = _bf.open_local_binary(filename)
+    if resolved is None:
+        raise HTTPException(404, "binary not available")
+    path, size = resolved
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        headers={"Content-Length": str(size)},
+        filename=path.name,
+    )
+
+
+@app.post("/api/p2p/rpc-server/start")
+def api_p2p_rpc_server_start(body: dict | None = None) -> dict:
+    """Bring up llama.cpp's rpc-server locally so paired peers can use
+    THIS machine as a split-inference worker.
+
+    Replaces the old SSH-based rpc-server spawn path: paired peers
+    call this through the encrypted secure-proxy whitelist (see
+    ``p2p_secure_proxy._FORWARDABLE_PATHS``) and we spawn the
+    process in our own user session with detach flags so it survives
+    this handler returning.
+
+    Optional body:
+      ``{"backend": "SYCL0,CPU", "port": 50052}``
+    Defaults match what the orchestrator's split-router expects.
+    """
+    from . import p2p_rpc_server as _rpc
+    body = body or {}
+    backend = (body.get("backend") or "SYCL0,CPU").strip() or "SYCL0,CPU"
+    try:
+        port = int(body.get("port") or 50052)
+    except (TypeError, ValueError):
+        port = 50052
+    return _rpc.start_local_rpc_server(backend=backend, port=port)
+
+
+@app.get("/api/p2p/rpc-server/status")
+def api_p2p_rpc_server_status() -> dict:
+    """Quick snapshot for the orchestrator: is rpc-server up here?"""
+    from . import p2p_rpc_server as _rpc
+    return _rpc.get_local_rpc_server_status()
+
+
+@app.post("/api/p2p/rpc-server/stop")
+def api_p2p_rpc_server_stop() -> dict:
+    """Tear down the local rpc-server. Used by orchestrators that
+    want to free a worker's compute when the active split-model is
+    stopped or the user removes the pairing."""
+    from . import p2p_rpc_server as _rpc
+    return _rpc.stop_local_rpc_server()
+
+
+@app.get("/api/p2p/system-stats")
+def api_p2p_system_stats() -> dict:
+    """Return THIS install's live system stats so a paired peer can
+    do realtime resource-aware split-model layer balancing.
+
+    Paired peers reach this via the encrypted-proxy whitelist (see
+    ``p2p_secure_proxy._FORWARDABLE_PATHS``); the orchestrator host
+    polls every ~10 s while a split-model is loaded so opening or
+    closing other apps on the worker (Chrome, Slack, etc.) shifts
+    the layer split without restarting the whole pool.
+
+    Fields are intentionally minimal — only what
+    ``split_lifecycle._compute_optimal_ngl`` consumes — so the
+    response stays small and the encrypted round-trip is cheap.
+    Stable enough that older orchestrators that don't yet read all
+    fields still benefit.
+    """
+    import time as _t
+    snapshot: dict[str, float | int | str] = {
+        "ts": _t.time(),
+    }
+    # System RAM via psutil (already a hard dep of sysdetect).
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        snapshot["ram_total_gb"] = round(vm.total / (1024 ** 3), 2)
+        # `available` is the right number to budget against — it
+        # accounts for cached + reclaimable pages, unlike `free`
+        # which under-reports on Windows after the OS has cached
+        # files. Matches what Task Manager calls "Available".
+        snapshot["ram_free_gb"] = round(vm.available / (1024 ** 3), 2)
+        snapshot["ram_used_pct"] = round(vm.percent, 1)
+    except Exception as e:
+        snapshot["ram_error"] = f"{type(e).__name__}: {e}"
+    # CPU load over a short window — useful so the orchestrator can
+    # avoid overloading a peer that's already saturated even if RAM
+    # looks free.
+    try:
+        import psutil
+        snapshot["cpu_pct"] = psutil.cpu_percent(interval=0.0)
+    except Exception:
+        snapshot["cpu_pct"] = -1
+    # GPU VRAM (best-effort; cached probe). Workers without GPUs
+    # report vram=0; the orchestrator treats that as "iGPU drawing
+    # from system RAM" and uses ram_free_gb as the upper bound.
+    try:
+        from . import sysdetect
+        spec = sysdetect.detect_system()
+        snapshot["vram_total_gb"] = float(spec.get("vram_gb") or 0)
+        snapshot["gpu_kind"] = spec.get("gpu_kind") or ""
+    except Exception:
+        snapshot["vram_total_gb"] = 0.0
+        snapshot["gpu_kind"] = ""
+    return snapshot
+
+
 @app.patch("/api/p2p/identity")
 def api_p2p_set_label(body: P2PIdentityLabelBody) -> dict:
     """Rename the local device. Identity (keypair) is unchanged —
@@ -4487,6 +4651,12 @@ class P2PPairNotifyBody(BaseModel):
     claimant_device_id: str
     timestamp: float
     signature_b64: str
+    # Optional unsigned routing hint added in 2026-05. Pre-existing
+    # peers paired before this field shipped won't include it; newer
+    # ones will. NOT part of the signature digest — tampering only
+    # results in unreachability (which mDNS / active scan recovers
+    # from), so signing the field would buy nothing.
+    host_port: int | None = None
 
 
 class P2PUnpairNotifyBody(BaseModel):
@@ -4585,12 +4755,16 @@ async def api_p2p_pair_notify(request: Request) -> dict:
     peer_ip = ""
     if request.client:
         peer_ip = request.client.host or ""
+    # Prefer the host's self-reported port (added 2026-05). Falls
+    # back to None for peers running older code; mDNS / active scan
+    # will fill it in on the next sweep, and unrouted calls
+    # transparently default to 8000 in `push_*` helpers.
     rec = db.upsert_paired_device(
         device_id=body.host_device_id,
         public_key_b64=body.host_public_key_b64,
         label=body.host_label,
         ip=peer_ip or None,
-        port=None,  # we don't know their FastAPI port — mDNS will fill in
+        port=body.host_port,
         role="local",
         x25519_public_b64=body.host_x25519_public_b64,
     )
@@ -4599,16 +4773,19 @@ async def api_p2p_pair_notify(request: Request) -> dict:
     # did when it accepted us. Encrypted-proxy mode by default —
     # all compute traffic to the host's machine flows via their
     # Gigachat secure proxy (X25519+ChaCha20), never plaintext.
-    # We don't know the host's Gigachat port from this notify
-    # (mDNS will fill it in later); fall back to the standard 8000
-    # which the host's mDNS ad will refresh on the next sweep.
+    # `ollama_port` here is misnamed — in encrypted-proxy mode it's
+    # actually the host's GIGACHAT backend port (the secure proxy
+    # endpoint that fronts Ollama). Prefer the host's self-reported
+    # port from the notify body; fall back to 8000 for peers paired
+    # before host_port shipped (their mDNS ad will refresh it on the
+    # next sweep).
     try:
         existing = db.get_compute_worker_by_device_id(body.host_device_id)
         if not existing and peer_ip:
             db.create_compute_worker(
                 label=body.host_label or body.host_device_id,
                 address=peer_ip,
-                ollama_port=8000,
+                ollama_port=int(body.host_port or 8000),
                 enabled=True,
                 use_for_chat=True,
                 use_for_embeddings=True,

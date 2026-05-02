@@ -118,11 +118,24 @@ async def push_pair_notify(
         timestamp=ts,
     )
     sig = base64.b64encode(me.sign(digest)).decode("ascii")
+    # Tell the peer which port to reach us on. Unsigned routing
+    # metadata — NOT in the signature digest, because tampering it
+    # is harmless (worst case: the peer can't reach us and falls
+    # back to mDNS / active scan). Keeping it outside the signed
+    # bytes also makes the wire format additive: peers running
+    # older code that don't expect `host_port` ignore it (Pydantic
+    # default), and we don't have to bump the signature version.
+    try:
+        from . import p2p_discovery as _disc
+        host_port = _disc.get_advertised_port()
+    except Exception:
+        host_port = 8000
     inner_body = {
         "host_device_id": me.device_id,
         "host_label": me.label,
         "host_public_key_b64": me.public_key_b64,
         "host_x25519_public_b64": me.x25519_public_b64,
+        "host_port": host_port,
         "claimant_device_id": peer_device_id,
         "timestamp": ts,
         "signature_b64": sig,
@@ -238,20 +251,68 @@ async def push_unpair_notify(
         return False
 
 
+# Reference to the main asyncio loop the FastAPI app is running on.
+# Captured during lifespan startup (see `register_main_loop`) so that
+# code running on a threadpool worker (FastAPI dispatches sync `def`
+# handlers there) can still schedule coroutines on the main loop via
+# `run_coroutine_threadsafe`.
+#
+# Why this matters: until 2026-05 `fire_and_forget` only worked when
+# called from an async context, because `asyncio.get_event_loop()` in
+# a threadpool thread returns a fresh, non-running loop and the
+# `is_running()` check sent every coroutine straight to `coro.close()`.
+# That silently dropped every pair-notify / unpair-notify scheduled
+# from sync handlers — symmetric pairings only "worked" via manual
+# probe scripts that called `asyncio.run()` directly, never through
+# the natural pair flow.
+_MAIN_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def register_main_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Capture the FastAPI app's main asyncio loop.
+
+    Called once during app startup so `fire_and_forget` can dispatch
+    coroutines onto the right loop even when invoked from a sync
+    handler running on a threadpool worker.
+    """
+    global _MAIN_LOOP
+    _MAIN_LOOP = loop
+
+
 def fire_and_forget(coro) -> None:
     """Schedule an async coroutine without awaiting it.
 
     Used at the API endpoint level so the user's pair/unpair click
     returns immediately while the notify is still in flight to the
     peer. Errors are swallowed inside the coroutine.
+
+    Three cases, in order of preference:
+      1. We're already on the running loop — `create_task` it directly.
+      2. We're on a threadpool worker (sync handler) but the main loop
+         is registered and running — `run_coroutine_threadsafe` dispatches
+         it cross-thread.
+      3. No usable loop — drop the coroutine cleanly. Reaching here
+         means we're being called during shutdown or before the app
+         finished booting; either way there's nowhere to schedule.
     """
+    # Case 1: same-thread async dispatch.
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.create_task(coro)
-            return
+        running = asyncio.get_running_loop()
+        running.create_task(coro)
+        return
     except RuntimeError:
+        # No running loop on this thread — fall through to cross-thread.
         pass
-    # No running loop — drop. Background tasks during shutdown end
-    # up here; the caller's user-facing action has already returned.
+    # Case 2: cross-thread dispatch onto the registered main loop.
+    main = _MAIN_LOOP
+    if main is not None and main.is_running():
+        try:
+            asyncio.run_coroutine_threadsafe(coro, main)
+            return
+        except RuntimeError:
+            # Loop closed between is_running() check and submission;
+            # fall through to drop.
+            pass
+    # Case 3: nowhere to schedule. Closing the coroutine prevents the
+    # "coroutine was never awaited" RuntimeWarning at GC time.
     coro.close()

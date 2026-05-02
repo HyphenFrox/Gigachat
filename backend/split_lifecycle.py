@@ -132,6 +132,46 @@ class _RunningProcess:
     started_at: float
     log_path: Path
     cmd: list[str] = field(default_factory=list)
+    # `ngl` is the GPU-offload layer count this process was launched
+    # with. The adaptive watchdog compares it against the optimal
+    # value computed from current free RAM and triggers a graceful
+    # restart when the delta exceeds the rebalance threshold (peer
+    # opened or closed an app, freeing or consuming RAM).
+    ngl: int = 0
+    # Cool-down marker — the watchdog won't issue back-to-back
+    # restarts within `_REBALANCE_COOLDOWN_SEC` seconds of the last
+    # restart for the same split_id, even if the layer math says we
+    # could squeeze a few more on. Prevents thrash when free RAM
+    # oscillates around a threshold.
+    last_rebalance_at: float = 0.0
+    # Last-touched-by-chat timestamp. Bumped every time the agent
+    # streams against this split's base_url (see
+    # `mark_split_touched_by_base_url`). The adaptive watchdog uses
+    # this to decide when an idle split should be GC'd — holding a
+    # multi-GB llama-server alive when no chat has used it in N min
+    # wastes RAM that other processes (or other models) could use.
+    last_touched_at: float = 0.0
+
+
+def mark_split_touched_by_base_url(base_url: str) -> None:
+    """Stamp ``last_touched_at`` on the running split whose base_url
+    matches. No-op when the base_url isn't ours (split was just
+    stopped, or it's an Ollama URL slipping through).
+
+    Called from the agent every time it streams against a llama-server
+    base_url so the idle GC knows the split is still in active use.
+    """
+    if not base_url:
+        return
+    try:
+        port = int(base_url.rsplit(":", 1)[1].split("/", 1)[0])
+    except (ValueError, IndexError):
+        return
+    now = time.time()
+    for sid, rp in _running.items():
+        if rp.port == port:
+            rp.last_touched_at = now
+            return
 
 
 _running: dict[str, _RunningProcess] = {}
@@ -616,7 +656,13 @@ def _compute_optimal_ctx_size(
     metadata = _get_gguf_metadata(gguf_path)
     model_max_ctx = metadata.get("context_length") or _CTX_SIZE_CEILING
 
-    # Bottleneck-node free memory (same shape as parallel computation).
+    # POOL-aware free memory budget. The previous formula compared
+    # the model size against HOST VRAM only — for a 19 GB model on
+    # an 8 GB GPU host that goes negative and we floored to 4 K
+    # context. In split mode the model is DISTRIBUTED across host +
+    # workers, so the right denominator is the combined pool. Use
+    # 95 % of available (matches the user's explicit "5 % margin"
+    # policy — see compute_pool._directive memory).
     try:
         from . import sysdetect
         spec = sysdetect.detect_system()
@@ -624,31 +670,33 @@ def _compute_optimal_ctx_size(
         host_ram = int(float(spec.get("ram_gb") or 0) * (1024 ** 3))
     except Exception:
         return _CTX_SIZE_FLOOR
-    host_budget = host_vram if host_vram > 0 else host_ram
-    if host_budget <= 0:
+    pool_total = host_vram + host_ram  # host's full envelope
+    if pool_total <= 0:
         return _CTX_SIZE_FLOOR
-
-    free_after_target = int(host_budget * (1.0 - _PARALLEL_VRAM_HEADROOM))
-    free_after_target -= int(target_size_bytes or 0) + int(draft_size_bytes or 0)
-    if free_after_target <= 0:
-        return _CTX_SIZE_FLOOR
-
-    bottleneck_free = free_after_target
     for wid in worker_ids:
         w = db.get_compute_worker(wid)
         if not w or not w.get("enabled"):
             continue
         caps = w.get("capabilities") or {}
-        free_gb = float(caps.get("ram_free_gb") or 0)
-        if free_gb <= 0:
-            continue
-        worker_free = int(free_gb * (1024 ** 3) * (1.0 - _PARALLEL_VRAM_HEADROOM))
-        if worker_free < bottleneck_free:
-            bottleneck_free = worker_free
+        worker_total_gb = float(caps.get("ram_total_gb") or 0)
+        if worker_total_gb <= 0:
+            # Fallback: use ram_free_gb if total isn't populated
+            worker_total_gb = float(caps.get("ram_free_gb") or 0)
+        pool_total += int(worker_total_gb * (1024 ** 3))
 
-    fits = bottleneck_free // (kv_per_token * max(1, parallel))
+    # KV cache budget = 95 % of pool minus the weight footprint.
+    # Workers hold their RPC layer share, but the weights also live
+    # on host (mmap or no-mmap) so we count target_size once. KV
+    # cache then consumes whatever remains.
+    free_after_target = int(pool_total * 0.95) - int(target_size_bytes or 0) - int(draft_size_bytes or 0)
+    if free_after_target <= 0:
+        return _CTX_SIZE_FLOOR
+
+    fits = free_after_target // (kv_per_token * max(1, parallel))
     fits = min(fits, model_max_ctx, _CTX_SIZE_CEILING)
     fits = max(_CTX_SIZE_FLOOR, int(fits))
+    # Replace the bottleneck variable name in the log line below.
+    bottleneck_free = free_after_target
     log.info(
         "split_lifecycle: adaptive ctx: kv_per_token=%d parallel=%d "
         "bottleneck_free=%.2f GB model_max=%d -> -c %d",
@@ -973,7 +1021,10 @@ def _compute_optimal_n_cpu_moe(
 
     # Subtract KV cache footprint so we don't tell the GPU it has
     # bytes that are already spoken for.
-    kv_bytes_per_token = _estimate_kv_bytes_per_slot(metadata, 1)
+    # Note: `_estimate_kv_bytes_per_slot` takes a gguf_path string,
+    # not the metadata dict. Passing the dict here was the cause of
+    # a TypeError that bubbled out of `start()` as a 500.
+    kv_bytes_per_token = _estimate_kv_bytes_per_slot(gguf_path, 1)
     kv_total = (
         kv_bytes_per_token
         * max(1, ctx_size)
@@ -1069,6 +1120,89 @@ def _should_mlock_weights(target_size_bytes: int) -> bool:
     return target_size_bytes * 2 <= free_ram_bytes
 
 
+def _should_disable_mmap(
+    target_size_bytes: int, worker_ids: list[str],
+) -> bool:
+    """Decide whether to pass `--no-mmap` to llama-server.
+
+    Mirrors Ollama's empirically-derived heuristic (see
+    ``ollama/llm/server.go`` — "Windows CUDA should not use mmap for
+    best performance" / "Linux with a model larger than free space,
+    mmap leads to thrashing"):
+
+    Disable mmap (load weights into private process RAM) when ANY:
+      * Host is Windows + has a CUDA GPU — mmap on Windows CUDA
+        triggers page-fault stalls during decode that visibly tank
+        throughput.
+      * Model fits comfortably in pool RAM (model ≤ 80 % of pool
+        free) — `--no-mmap` materialises the weights so the OS can't
+        evict them under pressure, which is what produces visible
+        process-RSS at the user's "95 % memory usage on every device"
+        target. Without `--no-mmap` weights ride the file cache and
+        Task Manager under-counts the load.
+
+    Keep mmap enabled when:
+      * Model exceeds pool RAM — mmap is the only way the model
+        loads at all (host CPU streams pages from SSD on demand).
+        This is the "use SSD/HDD as a compute tier" path the user
+        explicitly wanted.
+      * Pool memory is unknown — fall through to llama.cpp's safer
+        default rather than risk OOM.
+    """
+    if target_size_bytes <= 0:
+        return False
+    # Pool-fit check first — even Windows CUDA needs mmap when the
+    # model exceeds physical RAM, otherwise the load triggers an
+    # OOM kill (verified empirically: dolphin-mixtral 26 GB on a
+    # 16 GB FBS host with --no-mmap pegged the host at 96 % then
+    # llama-server died). The user wants SSD as an overflow tier
+    # — that's literally what mmap does for layers that don't fit.
+    try:
+        import psutil
+        host_free = int(psutil.virtual_memory().available)
+    except Exception:
+        return False
+    pool_free = host_free
+    try:
+        from . import sysdetect
+        spec = sysdetect.detect_system()
+        pool_free += int(float(spec.get("vram_gb") or 0) * (1024 ** 3))
+    except Exception:
+        pass
+    for wid in worker_ids:
+        w = db.get_compute_worker(wid)
+        if not w or not w.get("enabled"):
+            continue
+        caps = w.get("capabilities") or {}
+        free_gb = float(caps.get("ram_free_gb") or 0)
+        pool_free += int(free_gb * (1024 ** 3))
+    if pool_free <= 0:
+        return False
+    # If the model exceeds 80 % of pool free, KEEP mmap on. The
+    # SSD/HDD-as-overflow path is the only way mega-models load at
+    # all on a host with limited RAM. Workers' RAM still contributes
+    # for the layers we explicitly offload via -ngl.
+    fits = target_size_bytes <= int(pool_free * 0.80)
+    if not fits:
+        return False
+    # Model fits in pool — now decide based on platform whether
+    # disabling mmap is the win Ollama claims:
+    if sys.platform == "win32":
+        try:
+            from . import sysdetect
+            spec = sysdetect.detect_system()
+            if (spec.get("gpu_kind") or "").lower() == "nvidia":
+                # Windows CUDA: Ollama's empirical rule says no-mmap
+                # is faster (avoids decode-time page faults).
+                return True
+        except Exception:
+            pass
+    # Linux / non-CUDA / non-Windows: disable mmap when fits so the
+    # weights show up in process RSS and can't be evicted under
+    # pressure. Hits the user's "95 % memory usage" success metric.
+    return True
+
+
 def _recommend_thread_counts() -> tuple[int, int] | tuple[None, None]:
     """Pick `--threads` (decode) and `--threads-batch` (prefill) values.
 
@@ -1134,6 +1268,7 @@ def _build_command(
     flash_attn: bool = True,
     cache_reuse: int = 256,
     n_cpu_moe: int | None = None,
+    no_mmap: bool = False,
 ) -> list[str]:
     """Assemble the argv for `llama-server`.
 
@@ -1359,7 +1494,7 @@ def _build_command(
         # FP16 fits fewer than `_KV_QUANT_PARALLEL_FLOOR` slots — at
         # that point Q8 is strictly more throughput.
         cmd.extend(["-ctk", cache_type, "-ctv", cache_type])
-    if prompt_cache_path:
+    if prompt_cache_path and _llama_server_supports_flag(llama_server, "--prompt-cache"):
         # Prompt-cache-to-disk: persists decoded KV state across
         # llama-server restarts. On the next spawn with the same
         # path, llama-server loads the cache and skips re-tokenising
@@ -1367,6 +1502,11 @@ def _build_command(
         # the system-prompt + tool-schema prefix that's stable per
         # (model, permission_mode) — every chat after a model switch
         # starts hot instead of cold.
+        #
+        # Only emitted when the build accepts it — recent llama.cpp
+        # builds (post-2025-12) removed the disk prompt-cache CLI in
+        # favour of in-process slot-state persistence; passing the
+        # flag to those builds aborts startup with "invalid argument".
         cmd.extend(["--prompt-cache", prompt_cache_path, "--prompt-cache-all"])
     if batch_size and ubatch_size:
         # Adaptive prompt-eval batch sizes. llama-server defaults
@@ -1394,6 +1534,22 @@ def _build_command(
         # (`_should_mlock_weights`) only engages when free RAM is at
         # least 2× the model size, so locking can't OOM the system.
         cmd.append("--mlock")
+    if no_mmap:
+        # Disable mmap so the model loads into private process pages
+        # rather than the file cache. Critical for two reasons:
+        #   1. Resource visibility — mmap'd pages count as FS cache,
+        #      not process RSS, so Task Manager / Activity Monitor
+        #      shows a hugely under-counted memory footprint and the
+        #      OS can evict layers under pressure (causing per-token
+        #      disk thrashing).
+        #   2. Performance on Windows CUDA — Ollama's empirical rule:
+        #      "Windows CUDA should not use mmap for best performance"
+        #      (see ollama/llm/server.go). The mmap path triggers
+        #      page faults during decode that stall the GPU.
+        # The selector (`_should_disable_mmap`) decides when to enable
+        # this flag based on platform + GPU vendor + free RAM vs
+        # model size, mirroring Ollama's heuristic.
+        cmd.append("--no-mmap")
     if flash_attn:
         # Flash Attention switches the attention block to the fused
         # kernel — typically 5-30 % faster generation depending on
@@ -1461,6 +1617,60 @@ def _resolve_prompt_cache_path(gguf_path: str, cache_type: str | None) -> str | 
     except OSError:
         return None
     return str(cache_dir / f"{digest}.bin")
+
+
+# Cache of supported flags per llama-server binary (keyed by exe
+# path). Probing involves a subprocess.run + help-text parse; do
+# it once per binary and reuse for the lifetime of this process.
+_supported_flags_cache: dict[str, set[str]] = {}
+
+
+def _llama_server_supports_flag(server_path: str, flag: str) -> bool:
+    """Cached probe: does this llama-server build accept the flag?
+
+    llama.cpp churns the llama-server CLI surface — flags appear and
+    disappear between builds without a stable deprecation cycle.
+    Older builds had ``--prompt-cache``; recent builds removed it
+    and replaced the disk-cache feature with in-process slot
+    persistence. Building commands without checking blows up the
+    spawn with "invalid argument" before the model even loads.
+
+    First call per binary path runs ``llama-server --help``, parses
+    every long-form flag out of the output, and caches the set.
+    Subsequent calls are O(1) lookups. ``True`` on probe failure so
+    we don't accidentally suppress flags on a flaky probe (a fail-
+    open here means at worst we get the original "invalid argument"
+    we'd see without the cache).
+    """
+    if not server_path:
+        return True
+    cached = _supported_flags_cache.get(server_path)
+    if cached is None:
+        cached = set()
+        try:
+            r = subprocess.run(
+                [server_path, "--help"],
+                capture_output=True,
+                text=True,
+                timeout=10.0,
+            )
+            help_text = (r.stdout or "") + "\n" + (r.stderr or "")
+            # Match every `--<flag>` token. Greedy across word chars
+            # plus dash so multi-word flags (`--cache-type-k`) round-trip.
+            import re
+            for m in re.finditer(r"--[A-Za-z][A-Za-z0-9\-]*", help_text):
+                cached.add(m.group(0))
+        except Exception as e:
+            log.debug(
+                "split_lifecycle: --help probe failed on %s (%s); "
+                "assuming all flags supported (fail-open)",
+                server_path, e,
+            )
+            # Fail-open: caching the empty set would suppress every
+            # flag. Cache None-equivalent so we re-try later.
+            return True
+        _supported_flags_cache[server_path] = cached
+    return flag in cached
 
 
 def _log_path_for(split_id: str) -> Path:
@@ -1561,7 +1771,11 @@ async def _wait_for_health(
 
 
 def _compute_optimal_ngl(
-    gguf_path: str, worker_ids: list[str], *, safety: float = 0.95,
+    gguf_path: str,
+    worker_ids: list[str],
+    *,
+    safety: float = 0.95,
+    live_stats: dict | None = None,
 ) -> int:
     """Decide how many layers to put on GPU pools (rest stay on host
     CPU + RAM, paged from disk via mmap).
@@ -1598,6 +1812,14 @@ def _compute_optimal_ngl(
     `<arch>.block_count` metadata key. The default `-ngl 99` keeps
     llama.cpp's old behaviour where it works (small models that fit
     comfortably).
+
+    Realtime adaptation: when ``live_stats`` is supplied (mapping
+    ``worker_id -> stats_dict`` from
+    ``compute_pool.probe_worker_live_stats``), each worker's
+    ``ram_free_gb`` is taken from the FRESH probe rather than the
+    capabilities cache. This is what makes the adaptive watchdog in
+    ``adaptive_watchdog`` recompute the split when a peer's free
+    memory shifts (user opens or closes other apps mid-inference).
     """
     # File size as a proxy for total weight bytes — close enough since
     # quantization metadata + tokenizer KV are small relative to weights.
@@ -1625,10 +1847,22 @@ def _compute_optimal_ngl(
     try:
         from . import sysdetect
         spec = sysdetect.detect_system()
-        # Host VRAM (CUDA / dGPU) — `vram_gb` is total. The 5 % buffer
-        # is applied uniformly via the `safety` factor below, so we
-        # take 100 % of the reported total here.
-        pool_free_bytes += int(float(spec.get("vram_gb") or 0) * (1024 ** 3))
+        host_vram_bytes = int(float(spec.get("vram_gb") or 0) * (1024 ** 3))
+        pool_free_bytes += host_vram_bytes
+        # When the host has no dGPU (vram=0) it's a CPU-only machine —
+        # in that case its own system RAM IS the offload budget. We
+        # don't count host RAM when there's a real dGPU because the
+        # non-GPU layers ride mmap from disk anyway, but for a
+        # CPU-only host (laptop with iGPU only) we'd otherwise
+        # vastly under-report the pool. psutil.virtual_memory().available
+        # reflects what the OS will actually hand us right now.
+        if host_vram_bytes == 0:
+            try:
+                import psutil
+                host_ram_free = int(psutil.virtual_memory().available)
+                pool_free_bytes += host_ram_free
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -1636,8 +1870,18 @@ def _compute_optimal_ngl(
         w = db.get_compute_worker(wid)
         if not w or not w.get("enabled"):
             continue
-        caps = w.get("capabilities") or {}
-        free_gb = float(caps.get("ram_free_gb") or 0)
+        # Prefer fresh live-probe stats when supplied by the adaptive
+        # watchdog. Falls back to the capabilities cache so existing
+        # one-shot callers (e.g. start()) keep their old behaviour.
+        free_gb = 0.0
+        if live_stats and wid in live_stats:
+            try:
+                free_gb = float(live_stats[wid].get("ram_free_gb") or 0)
+            except (TypeError, ValueError):
+                free_gb = 0.0
+        if free_gb <= 0:
+            caps = w.get("capabilities") or {}
+            free_gb = float(caps.get("ram_free_gb") or 0)
         pool_free_bytes += int(free_gb * (1024 ** 3))
 
     if pool_free_bytes <= 0:
@@ -1683,6 +1927,35 @@ async def start(split_id: str) -> dict:
     except SplitLifecycleError as e:
         db.update_split_model_status(split_id, status="error", last_error=str(e))
         return {"ok": False, "status": "error", "error": str(e)}
+
+    # Ensure every worker's rpc-server is up with the right backend
+    # before the split spawn. `_select_worker_backend` returns
+    # `SYCL0,CPU` for Intel workers (iGPU + CPU both exposed to the
+    # layer-placement pool) — the user-set policy is "use every
+    # resource available". The historical SYCL+RPC crashes that used
+    # to require dropping SYCL during split (#21420 / #20259 /
+    # #21474) are all fixed upstream by build 8940. SYCL kernel
+    # quirks that remain open (#21893) are handled by the env vars
+    # (`GGML_SYCL_DISABLE_OPT=1`, `GGML_SYCL_DISABLE_GRAPH=1`) we
+    # set when spawning rpc-server.
+    #
+    # Idempotent: `_set_workers_backend` is a no-op when the
+    # current backend already matches. Routes through the new P2P
+    # path (via `_attempt_rpc_server_restart` -> P2P-first) so this
+    # works on paired peers without ssh_host.
+    worker_ids = row.get("worker_ids") or []
+    workers_for_split = [db.get_compute_worker(wid) for wid in worker_ids]
+    workers_for_split = [w for w in workers_for_split if w]
+    if workers_for_split:
+        try:
+            from . import compute_pool as _pool
+            await _pool._set_workers_backend(workers_for_split, in_split=True)
+        except Exception as e:
+            log.warning(
+                "split_lifecycle: backend-switch to CPU before split "
+                "spawn failed (%s); continuing — split may crash on "
+                "RPC slot init if workers are still on SYCL", e,
+            )
 
     # mmproj_path is optional — when set, we pass --mmproj so vision
     # input works. Older split rows (pre-migration) won't have the
@@ -1788,6 +2061,13 @@ async def start(split_id: str) -> dict:
     # out under memory pressure. Engages only when free RAM is at
     # least 2× the model file so locking can't OOM the system.
     use_mlock = _should_mlock_weights(target_size_bytes)
+    # Decide --no-mmap: lift weights into private RAM whenever the
+    # model fits + on Windows CUDA always. See `_should_disable_mmap`
+    # for the rationale (mirrors Ollama's policy). This is what
+    # produces visible 95 %-class memory utilisation on every
+    # participating device — without it the weights ride the file
+    # cache and the OS under-reports the load.
+    use_no_mmap = _should_disable_mmap(target_size_bytes, worker_ids)
 
     # Adaptive --n-cpu-moe: when the model is MoE AND the file is
     # bigger than the GPU pool, expert FFN tensors get pinned to
@@ -1821,6 +2101,7 @@ async def start(split_id: str) -> dict:
         threads=threads,
         threads_batch=threads_batch,
         mlock=use_mlock,
+        no_mmap=use_no_mmap,
         n_cpu_moe=n_cpu_moe,
     )
     log_path = _log_path_for(split_id)
@@ -1841,10 +2122,34 @@ async def start(split_id: str) -> dict:
     # foreground apps when busy" — the standard cooperative pattern.
     creationflags = 0
     if sys.platform == "win32":
+        # DETACHED_PROCESS + CREATE_BREAKAWAY_FROM_JOB so llama-server
+        # outlives whichever Python process spawned it. Without these,
+        # a CLI / test script that calls split_lifecycle.start() and
+        # then exits drags llama-server with it (Windows job-object
+        # inheritance), which silently breaks the next chat against
+        # the same model. The live FastAPI backend doesn't need this
+        # for its own lifecycle (it stays running) but adding the
+        # flags makes `start()` work the same way regardless of caller.
+        DETACHED_PROCESS = 0x00000008
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
         creationflags = (
-            subprocess.CREATE_NEW_PROCESS_GROUP
+            DETACHED_PROCESS
+            | CREATE_BREAKAWAY_FROM_JOB
+            | subprocess.CREATE_NEW_PROCESS_GROUP
             | subprocess.BELOW_NORMAL_PRIORITY_CLASS
         )
+
+    # Inject SYCL safety env vars so a host with an Intel iGPU
+    # doesn't hit #21893 (still OPEN upstream — Intel Xe2 / Meteor
+    # Lake silently corrupts weights / panics during decode without
+    # `GGML_SYCL_DISABLE_OPT=1`). We unconditionally set them on
+    # every llama-server spawn — no harm on hosts without SYCL,
+    # mandatory on hosts with it. Same env vars that
+    # `p2p_rpc_server._RPC_SPAWN_ENV` sets on rpc-server.
+    spawn_env = dict(os.environ)
+    spawn_env.setdefault("GGML_SYCL_DISABLE_OPT", "1")
+    spawn_env.setdefault("GGML_SYCL_DISABLE_GRAPH", "1")
+    spawn_env.setdefault("SYCL_CACHE_PERSISTENT", "1")
 
     log_file = log_path.open("ab")
     try:
@@ -1853,6 +2158,7 @@ async def start(split_id: str) -> dict:
             stdout=log_file,
             stderr=subprocess.STDOUT,   # merge into one log file
             stdin=subprocess.DEVNULL,
+            env=spawn_env,
             creationflags=creationflags,
             # POSIX: nice the process to +10 (lower priority) so the
             # kernel CFS scheduler also de-prioritizes it under load.
@@ -1864,12 +2170,19 @@ async def start(split_id: str) -> dict:
         db.update_split_model_status(split_id, status="error", last_error=msg)
         return {"ok": False, "status": "error", "error": msg}
 
+    now = time.time()
     _running[split_id] = _RunningProcess(
         proc=proc,
         port=row["llama_port"],
-        started_at=time.time(),
+        started_at=now,
+        # Initialise touched-at to the start time so a freshly-loaded
+        # split gets its full idle grace period before the GC could
+        # reclaim it (otherwise a split that's loaded but not yet
+        # used by chat would be eligible immediately).
+        last_touched_at=now,
         log_path=log_path,
         cmd=cmd,
+        ngl=ngl,
     )
 
     # Wait for the HTTP server to come up. If health never reports OK,
@@ -1885,6 +2198,27 @@ async def start(split_id: str) -> dict:
         # hogging VRAM.
         await stop(split_id, _from_failed_start=True)
         db.update_split_model_status(split_id, status="error", last_error=str(e))
+        # Record per-worker iGPU-backend failure so the auto-fallback
+        # selector tries the next preference (SYCL -> Vulkan -> CPU)
+        # on the next start attempt. We mark every Intel worker that
+        # was attached to this split — we can't always tell which
+        # worker's iGPU was the one that crashed, but the cool-down
+        # window means a worker whose iGPU is fine just retries
+        # tomorrow with no permanent loss.
+        try:
+            from . import compute_pool as _pool
+            for wid in (row.get("worker_ids") or []):
+                w = db.get_compute_worker(wid)
+                if not w:
+                    continue
+                caps = w.get("capabilities") or {}
+                current = caps.get("current_rpc_backend") or ""
+                if "sycl" in current.lower() or "vulkan" in current.lower():
+                    _pool.record_backend_failure(wid, current)
+        except Exception as fe:
+            log.debug(
+                "split_lifecycle: failure-detection hook failed: %s", fe,
+            )
         return {"ok": False, "status": "error", "error": str(e)}
 
     db.update_split_model_status(split_id, status="running", last_error="")
@@ -2037,3 +2371,325 @@ def read_log_tail(split_id: str, lines: int = 100) -> str:
     if len(out_lines) > lines:
         out_lines = out_lines[-lines:]
     return "\n".join(out_lines)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive layer-rebalance watchdog
+# ---------------------------------------------------------------------------
+#
+# Goal: when a worker's free RAM changes (user opens Chrome → less RAM,
+# user closes Chrome → more RAM), shift the GPU-offload layer count
+# (`-ngl`) so the running split-model uses what's actually available.
+#
+# Without this loop the layer split is decided ONCE at start and
+# baked into the running llama-server's argv. If the worker's free
+# RAM drops by 50 % mid-inference we either crash an rpc-server or
+# leave the worker doing nothing while the host CPU pages from
+# disk — both directly contradict the user's "use as much resource
+# as available with only 5 % margin" policy.
+#
+# Algorithm (one tick):
+#   for each running split-model:
+#     1. Probe live free RAM on each worker (encrypted P2P call).
+#     2. Recompute optimal ngl with the fresh stats.
+#     3. If |new_ngl - current_ngl| >= rebalance_threshold AND the
+#        last restart for this split_id was > cool-down ago:
+#          stop() then start() — start() re-reads live stats again.
+#     4. Cool-down stamp on rebalance to prevent thrash.
+#
+# Cool-down + threshold are both required: threshold alone allows
+# oscillation between two adjacent layer counts; cool-down alone
+# allows a single big drop to trigger immediately even if the
+# delta is just one layer (we'd rather be slightly stale than
+# constantly restarting a multi-GB process).
+
+# How often to sample live stats. 10 s is short enough to react to a
+# user opening Slack or Chrome (those typically stabilise within a
+# few seconds), long enough that a /24-paired-peer probe doesn't
+# meaningfully tax the LAN. Idle when no split-model is loaded.
+_ADAPTIVE_TICK_SEC = 10.0
+
+# Minimum layer-count delta to trigger a rebalance restart. Anything
+# below this is in the noise — a single layer of `gemma4:e4b` is
+# ~150 MB and llama-server alignment overhead can move that much
+# between probes. Set conservatively so we only restart when there's
+# a real win to be had.
+_REBALANCE_MIN_DELTA_LAYERS = 3
+
+# Minimum interval between rebalance restarts of the same split_id.
+# llama-server warm-up is 5-30 s depending on model size; restarting
+# inside that window would mean the user spends more time waiting
+# than running. 60 s ensures the model gets a meaningful chunk of
+# productive runtime between any two rebalances.
+_REBALANCE_COOLDOWN_SEC = 60.0
+
+# Idle window after which the watchdog reclaims a split-model that's
+# loaded but unused. Set to 8 minutes — long enough that a user who
+# stepped away for a coffee comes back to a hot model, short enough
+# that an abandoned split-model doesn't permanently squat on
+# multi-GB of orchestrator RAM and worker RAM. The user can re-engage
+# at any time by sending a chat; route_chat_for re-creates and
+# re-starts the split with whatever pool resources are available
+# at that moment.
+_IDLE_GC_SEC = 480.0
+
+# Peer-loss detection. The watchdog probes every worker attached to
+# a running split each tick; if a worker's stats probe fails this
+# many ticks in a row, we treat that peer as gone (laptop closed,
+# Wi-Fi dropped, backend crashed) and drop it from the split's
+# worker list. The split is then restarted with the surviving
+# peers — better to lose a layer-budget chunk than have llama-server
+# hang waiting for a dead RPC endpoint.
+_PEER_LOSS_FAIL_THRESHOLD = 3
+
+# Per-(split_id, worker_id) consecutive-failure counter for the
+# peer-loss detector. Reset to 0 on every successful probe.
+# Module-level to survive across ticks.
+_peer_fail_counts: dict[tuple[str, str], int] = {}
+
+
+_adaptive_task: asyncio.Task | None = None
+
+
+async def _adaptive_tick() -> None:
+    """One pass of the adaptive watchdog. Public so tests can drive it.
+
+    Reads `_running` (the live process registry) and adjusts each
+    entry's `-ngl` if the optimal value computed from current free
+    RAM has drifted far enough. Errors are caught per-entry so a
+    flaky worker doesn't take the whole loop down.
+    """
+    if not _running:
+        return
+    from . import compute_pool as _pool
+    now = time.time()
+    # Snapshot the registry — `stop()` mutates `_running` and we
+    # don't want a "dictionary changed during iteration" error.
+    live_split_ids = list(_running.keys())
+
+    # Crash-detection pass: any split whose llama-server process
+    # exited unexpectedly gets cleaned up here, AND each Intel
+    # worker that was attached gets its current iGPU backend
+    # marked failed so the next start picks the next-down option
+    # (SYCL -> Vulkan -> CPU). This is what catches the
+    # mid-decode crash mode where llama-server dies silently after
+    # the chat returns "ConnectError" to the agent.
+    crashed_targets = []
+    for split_id in live_split_ids:
+        rp = _running.get(split_id)
+        if rp is None:
+            continue
+        rc = rp.proc.poll()
+        if rc is not None:
+            crashed_targets.append((split_id, rc))
+    for split_id, rc in crashed_targets:
+        row = db.get_split_model(split_id) or {}
+        worker_ids = row.get("worker_ids") or []
+        log.warning(
+            "adaptive_watchdog: split %s exited unexpectedly (rc=%s); "
+            "marking attached Intel workers' current iGPU backend as "
+            "failed so the next start auto-falls-back",
+            split_id, rc,
+        )
+        for wid in worker_ids:
+            try:
+                w = db.get_compute_worker(wid)
+                if not w:
+                    continue
+                caps = w.get("capabilities") or {}
+                current = caps.get("current_rpc_backend") or ""
+                if "sycl" in current.lower() or "vulkan" in current.lower():
+                    _pool.record_backend_failure(wid, current)
+            except Exception as e:
+                log.debug(
+                    "adaptive_watchdog: failure-record skip for %s: %s",
+                    wid, e,
+                )
+        # Drop from registry so we don't re-enter on next tick.
+        _running.pop(split_id, None)
+        try:
+            db.update_split_model_status(
+                split_id, status="error",
+                last_error=f"llama-server exited mid-run (rc={rc})",
+            )
+        except Exception:
+            pass
+    if crashed_targets:
+        live_split_ids = list(_running.keys())
+
+    # Idle GC pass — reclaim any split that hasn't seen chat traffic
+    # in `_IDLE_GC_SEC`. Walks the snapshot, stops eligible entries,
+    # then rebuilds `live_split_ids` to skip them in the rebalance
+    # pass below. This keeps the orchestrator's RAM (and each
+    # worker's RAM) free for other work when the user has moved
+    # on to a different model — the next chat will re-create the
+    # split with whatever resources are available at that moment.
+    gc_targets = []
+    for split_id in live_split_ids:
+        rp = _running.get(split_id)
+        if rp is None:
+            continue
+        if rp.proc.poll() is not None:
+            # Process already gone; let the boot-reconcile clean
+            # the registry on next restart. Skip from both passes.
+            continue
+        idle_for = now - (rp.last_touched_at or rp.started_at)
+        if idle_for >= _IDLE_GC_SEC:
+            gc_targets.append((split_id, idle_for))
+    for split_id, idle_for in gc_targets:
+        log.info(
+            "adaptive_watchdog: reclaiming split %s — idle for %.0fs "
+            "(no chat traffic in %d s window). User can re-engage at "
+            "any time by sending a chat against the model.",
+            split_id, idle_for, int(_IDLE_GC_SEC),
+        )
+        try:
+            await stop(split_id)
+        except Exception as e:
+            log.warning(
+                "adaptive_watchdog: idle GC stop failed for %s: %s",
+                split_id, e,
+            )
+    if gc_targets:
+        # Refresh the snapshot so the rebalance pass below doesn't
+        # try to operate on splits we just stopped.
+        live_split_ids = list(_running.keys())
+    if not live_split_ids:
+        return
+    for split_id in live_split_ids:
+        running = _running.get(split_id)
+        if running is None:
+            continue
+        # Process gone? Let `stop()` / boot-reconcile clean up — the
+        # watchdog only cares about live processes whose layer count
+        # we can change.
+        if running.proc.poll() is not None:
+            continue
+        row = db.get_split_model(split_id)
+        if not row:
+            continue
+        worker_ids = row.get("worker_ids") or []
+        if not worker_ids:
+            continue
+        # Fetch fresh stats from each worker. We deliberately do this
+        # one peer at a time rather than gather()-all so a single
+        # slow peer doesn't block the whole rebalance — we can still
+        # decide based on the workers that responded, and a missing
+        # worker falls through to its capabilities-cached value.
+        live_stats: dict[str, dict] = {}
+        for wid in worker_ids:
+            w = db.get_compute_worker(wid)
+            if not w:
+                continue
+            try:
+                stats = await _pool.probe_worker_live_stats(w)
+            except Exception as e:
+                log.debug(
+                    "adaptive_watchdog: probe failed for %s: %s",
+                    w.get("label"), e,
+                )
+                stats = {}
+            if stats:
+                live_stats[wid] = stats
+                # Persist the fresh ram_free_gb back to the worker's
+                # capabilities so other code paths (UI display, the
+                # 5-min sweep) see the latest value too. Cheap — one
+                # JSON merge + UPDATE.
+                try:
+                    caps = dict(w.get("capabilities") or {})
+                    caps["ram_free_gb"] = float(stats.get("ram_free_gb") or 0)
+                    caps["ram_free_probed_at"] = now
+                    db.update_compute_worker_capabilities(
+                        wid, capabilities=caps,
+                    )
+                except Exception as e:
+                    log.debug(
+                        "adaptive_watchdog: capability persist failed for "
+                        "%s: %s", w.get("label"), e,
+                    )
+        # Recompute optimal ngl from the fresh data.
+        try:
+            new_ngl = _compute_optimal_ngl(
+                row["gguf_path"], worker_ids, live_stats=live_stats,
+            )
+        except Exception as e:
+            log.warning(
+                "adaptive_watchdog: ngl recompute failed for split %s: %s",
+                split_id, e,
+            )
+            continue
+        old_ngl = running.ngl or 0
+        delta = abs(new_ngl - old_ngl)
+        if delta < _REBALANCE_MIN_DELTA_LAYERS:
+            continue
+        # Cool-down — never restart back-to-back.
+        if (now - running.last_rebalance_at) < _REBALANCE_COOLDOWN_SEC:
+            log.debug(
+                "adaptive_watchdog: split %s wants ngl=%d (was %d), "
+                "but in cool-down for %.1fs more",
+                split_id, new_ngl, old_ngl,
+                _REBALANCE_COOLDOWN_SEC - (now - running.last_rebalance_at),
+            )
+            continue
+        # Mark BEFORE stop/start so a restart that takes 30 s of
+        # warm-up doesn't immediately re-trigger on the next tick.
+        running.last_rebalance_at = now
+        log.info(
+            "adaptive_watchdog: rebalancing split %s: ngl %d -> %d "
+            "(pool free RAM shifted; restarting llama-server with "
+            "new offload count)",
+            split_id, old_ngl, new_ngl,
+        )
+        try:
+            await stop(split_id)
+            res = await start(split_id)
+            if not res.get("ok"):
+                log.warning(
+                    "adaptive_watchdog: restart failed for split %s: %s",
+                    split_id, res.get("error"),
+                )
+        except Exception as e:
+            log.warning(
+                "adaptive_watchdog: rebalance failed for split %s: %s",
+                split_id, e,
+            )
+
+
+async def _adaptive_loop() -> None:
+    """Background task body. Runs forever until cancelled."""
+    while True:
+        try:
+            await _adaptive_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("adaptive_watchdog: tick failed: %s", e)
+        try:
+            await asyncio.sleep(_ADAPTIVE_TICK_SEC)
+        except asyncio.CancelledError:
+            raise
+
+
+def start_adaptive_watchdog() -> None:
+    """Schedule the adaptive watchdog. Idempotent — calling twice is
+    a no-op. Called from app.py's startup hook."""
+    global _adaptive_task
+    if _adaptive_task is not None and not _adaptive_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _adaptive_task = loop.create_task(
+        _adaptive_loop(), name="split_adaptive_watchdog",
+    )
+    log.info("split_lifecycle: adaptive watchdog started (tick=%ds)", _ADAPTIVE_TICK_SEC)
+
+
+def stop_adaptive_watchdog() -> None:
+    """Cancel the watchdog. Called from app shutdown so the test
+    runner doesn't see a stranded task."""
+    global _adaptive_task
+    if _adaptive_task is not None and not _adaptive_task.done():
+        _adaptive_task.cancel()
+    _adaptive_task = None

@@ -37,7 +37,20 @@ log = logging.getLogger("gigachat.identity")
 
 # Persistent state lives next to the SQLite DB. Same disk hygiene story
 # as `data/vapid.json` (the existing Web Push keypair).
-_IDENTITY_PATH = Path(os.environ.get("GIGACHAT_DATA_DIR", "data")) / "identity.json"
+#
+# Anchor the path to the project root via __file__ rather than cwd,
+# matching `db.py` and `push.py`. The previous cwd-relative form
+# silently auto-created a fresh identity any time the module was
+# imported with a different cwd (e.g. an SSH-spawned helper script
+# with cwd=$HOME) — that minted a phantom device-id, signed a real
+# pair-notify with it, and corrupted the receiver's paired_devices
+# with a record that didn't match anything visible on the network.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_data_dir_env = os.environ.get("GIGACHAT_DATA_DIR")
+if _data_dir_env:
+    _IDENTITY_PATH = Path(_data_dir_env) / "identity.json"
+else:
+    _IDENTITY_PATH = _PROJECT_ROOT / "data" / "identity.json"
 
 
 @dataclass(frozen=True)

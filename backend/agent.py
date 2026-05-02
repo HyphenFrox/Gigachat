@@ -3565,6 +3565,17 @@ async def _run_turn_impl(
             # streamer-agnostic.
             if split_target is not None:
                 split_base, split_label = split_target
+                # Touch the split's last-used clock so the idle GC in
+                # `split_lifecycle._adaptive_loop` knows this split is
+                # still in active use. Without this, an active chat
+                # against a split-model could get GC'd mid-conversation
+                # because the previous use timestamp aged past the
+                # idle window.
+                try:
+                    from . import split_lifecycle as _sl
+                    _sl.mark_split_touched_by_base_url(split_base)
+                except Exception:
+                    pass
                 stream_iter = _stream_llama_server_chat(
                     split_label, stream_msgs,
                     base_url=split_base,
