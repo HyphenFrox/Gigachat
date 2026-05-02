@@ -2150,6 +2150,17 @@ async def start(split_id: str) -> dict:
     spawn_env.setdefault("GGML_SYCL_DISABLE_OPT", "1")
     spawn_env.setdefault("GGML_SYCL_DISABLE_GRAPH", "1")
     spawn_env.setdefault("SYCL_CACHE_PERSISTENT", "1")
+    # Per-RPC-call timeout. Without this, when an rpc-server peer
+    # silently dies (laptop sleep, OOM, network drop, SYCL crash),
+    # llama-server's RPC dispatch hangs indefinitely waiting for
+    # the dead peer's response — the user sees a chat that never
+    # finishes. 30 seconds is generous (a healthy peer answers a
+    # layer push in tens of ms even on Wi-Fi); anything longer
+    # than this and the orchestrator should treat the peer as
+    # gone, surface an error, and let the watchdog's crash detector
+    # mark + auto-fall-back. The env var is read by ggml-rpc.cpp's
+    # send/recv path inside llama-server.
+    spawn_env.setdefault("GGML_RPC_TIMEOUT", "30000")  # milliseconds
 
     log_file = log_path.open("ab")
     try:

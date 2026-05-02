@@ -1049,6 +1049,13 @@ async def _start_compute_pool_probe() -> None:
         compute_pool.start_periodic_probe()
     except Exception as e:
         print(f"[compute_pool] periodic probe failed to start: {e}", file=sys.stderr)
+    # Fast peer-reachability heartbeat — sub-30s detection of paired
+    # peer drops + auto-reconnect on recovery. Distinct from the 5-min
+    # spec sweep above; this loop only does light system-stats GETs.
+    try:
+        compute_pool.start_peer_heartbeat()
+    except Exception as e:
+        print(f"[compute_pool] peer heartbeat failed to start: {e}", file=sys.stderr)
 
 
 async def _reconcile_split_models() -> None:

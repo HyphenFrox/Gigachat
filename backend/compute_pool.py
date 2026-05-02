@@ -710,6 +710,30 @@ async def _set_workers_backend(workers: list[dict], *, in_split: bool) -> int:
         # — symptom: llama-server crashes mid-load with "Remote
         # RPC server crashed", with no rpc-server log because no
         # rpc-server was ever respawned.
+        #
+        # Pre-stamp gpu_kind from live stats before selecting the
+        # backend. Without this, callers that bypass the auto-prep
+        # path in `route_chat_for` see vendor="none" and the
+        # iGPU-aware fallback chain can't engage. We re-read the
+        # worker after stamping so the freshly-set gpu_kind is in
+        # the dict the selector sees.
+        try:
+            live_stats = await probe_worker_live_stats(w)
+        except Exception:
+            live_stats = {}
+        if live_stats:
+            try:
+                caps = dict(w.get("capabilities") or {})
+                caps["gpu_kind"] = live_stats.get("gpu_kind") or caps.get("gpu_kind") or ""
+                caps["ram_total_gb"] = float(live_stats.get("ram_total_gb") or caps.get("ram_total_gb") or 0)
+                caps["ram_free_gb"] = float(live_stats.get("ram_free_gb") or 0)
+                caps["vram_total_gb"] = float(live_stats.get("vram_total_gb") or caps.get("vram_total_gb") or 0)
+                db.update_compute_worker_capabilities(
+                    w["id"], capabilities=caps,
+                )
+                w["capabilities"] = caps
+            except Exception:
+                pass
         backend = _select_worker_backend(w, in_split=in_split)
         caps = w.get("capabilities") or {}
         previous_backend = caps.get("current_rpc_backend", "unknown")
@@ -1244,6 +1268,35 @@ async def ensure_rpc_server_via_proxy(
     """
     from . import p2p_secure_client as _secure
     label = worker.get("label") or worker.get("id") or "?"
+
+    # Stamp gpu_kind / ram_total_gb from system-stats so the auto-
+    # fallback selector knows the worker's vendor (intel/nvidia/amd)
+    # without having to wait for the route_chat_for autoprep path.
+    # Without this stamp, callers like _set_workers_backend (which
+    # `start()` invokes directly, bypassing route_chat_for) see
+    # `gpu_kind=null` -> vendor="none" -> always returns "CPU"
+    # regardless of whether the worker has a usable iGPU.
+    try:
+        live_stats = await probe_worker_live_stats(worker)
+    except Exception:
+        live_stats = {}
+    if live_stats:
+        try:
+            caps = dict(worker.get("capabilities") or {})
+            caps["gpu_kind"] = live_stats.get("gpu_kind") or caps.get("gpu_kind") or ""
+            caps["ram_total_gb"] = float(live_stats.get("ram_total_gb") or caps.get("ram_total_gb") or 0)
+            caps["ram_free_gb"] = float(live_stats.get("ram_free_gb") or 0)
+            caps["vram_total_gb"] = float(live_stats.get("vram_total_gb") or caps.get("vram_total_gb") or 0)
+            db.update_compute_worker_capabilities(
+                worker["id"], capabilities=caps,
+            )
+            worker["capabilities"] = caps
+        except Exception as e:
+            log.debug(
+                "compute_pool: live-stats stamp failed for %s: %s",
+                label, e,
+            )
+
     # Quick status probe first — saves us a 4 s listener-wait when
     # rpc-server is already up (the common case after the first call).
     try:
@@ -1336,7 +1389,50 @@ async def ensure_rpc_server_via_proxy(
     return listening
 
 
-async def probe_worker_live_stats(worker: dict) -> dict:
+async def probe_worker_bandwidth(worker: dict) -> float:
+    """Measure usable LAN/internet bandwidth between this orchestrator
+    and the worker, in MB/s. Returns 0 on any failure.
+
+    Method: time the wall-clock cost of fetching the worker's
+    `/api/p2p/binary/list` response (manifest of llama-cpp DLLs +
+    sha256 sums). This is a small JSON response (~5-15 KB) so it's
+    a coarse round-trip latency measurement, not a true throughput
+    benchmark — but it correlates with bandwidth on shared media
+    (Wi-Fi vs Ethernet vs Tailscale), which is what routing cares
+    about. We avoid an explicit "send 10 MB ping" benchmark because
+    it would burn pool bandwidth that the user paid for; the manifest
+    GET happens during normal LAN-first install probing anyway.
+
+    For workers behind a slow link the measured time will be
+    multi-second and the routing decision can demote them out of
+    the split engagement set (where layer-push latency dominates
+    chat throughput).
+    """
+    from . import p2p_secure_client as _secure
+    import time as _t
+    label = worker.get("label") or worker.get("id") or "?"
+    t0 = _t.perf_counter()
+    try:
+        status, body_text = await _secure.forward(
+            worker, method="GET", path="/api/p2p/binary/list", body=None,
+        )
+    except Exception as e:
+        log.debug(
+            "compute_pool: bandwidth probe failed for %s: %s",
+            label, e,
+        )
+        return 0.0
+    elapsed = _t.perf_counter() - t0
+    if status != 200 or elapsed <= 0:
+        return 0.0
+    bytes_recv = len(body_text.encode("utf-8")) if isinstance(body_text, str) else len(body_text)
+    if bytes_recv <= 0:
+        return 0.0
+    # MB/s = bytes / 1e6 / seconds
+    return round((bytes_recv / 1e6) / elapsed, 2)
+
+
+async def probe_worker_live_stats(worker: dict, *, timeout: float | None = None) -> dict:
     """Fetch the worker's CURRENT free RAM / free VRAM via the
     encrypted P2P proxy. Lightweight enough to call every few seconds
     while a split-model is loaded so the orchestrator's layer split
@@ -1360,6 +1456,7 @@ async def probe_worker_live_stats(worker: dict) -> dict:
     try:
         status, body_text = await _secure.forward(
             worker, method="GET", path="/api/p2p/system-stats", body=None,
+            timeout=timeout,
         )
     except Exception as e:
         log.debug(
@@ -1823,6 +1920,166 @@ def stop_periodic_probe() -> None:
     if _PROBE_TASK and not _PROBE_TASK.done():
         _PROBE_TASK.cancel()
     _PROBE_TASK = None
+
+
+# ---------------------------------------------------------------------------
+# Fast peer heartbeat — sub-30 s detection of paired-peer drops + auto-
+# reconnect on recovery. Distinct from the 5-min spec sweep above.
+#
+# Why a separate loop:
+#   * The spec sweep (5 min) is heavy — it pulls /api/version + /api/tags
+#     + /api/ps + capability JSON + measures throughput. Running it
+#     every 30 s would wreck a low-bandwidth pool.
+#   * This loop is light — one /api/p2p/system-stats GET per peer
+#     (small JSON, no model loads). Tells us whether the peer is
+#     ALIVE and gives us live RAM as a side-effect.
+#   * On a missed heartbeat, we mark `rpc_server_reachable = False`
+#     immediately so the routing layer demotes the peer from the
+#     split-engagement set. On a successful heartbeat after a miss,
+#     we call `ensure_rpc_server_via_proxy` to rebuild rpc-server
+#     state (in case the peer rebooted and lost its rpc-server
+#     process).
+#
+# Cadence: 20 s active probe interval. After 3 consecutive misses
+# (~60 s) the peer is treated as offline. Recovery is instant on
+# the next successful heartbeat.
+_HEARTBEAT_INTERVAL_SEC = 20.0
+_HEARTBEAT_MISS_THRESHOLD = 3
+_heartbeat_miss_counts: dict[str, int] = {}
+_HEARTBEAT_TASK: asyncio.Task | None = None
+
+
+async def _heartbeat_loop() -> None:
+    """Active reachability ping for every paired worker every
+    _HEARTBEAT_INTERVAL_SEC. Catches drops in <60s and re-arms
+    rpc-server on recovery."""
+    while True:
+        try:
+            workers = db.list_compute_workers(enabled_only=True)
+        except Exception:
+            workers = []
+        # One probe at a time per worker, but workers in parallel.
+        async def _probe_one(w: dict) -> None:
+            wid = w["id"]
+            label = w.get("label") or wid
+            stats = {}
+            try:
+                # Tight 5 s timeout for the heartbeat path. A dead peer
+                # would otherwise stall the loop for the default 120 s
+                # one-shot timeout, blocking liveness checks for every
+                # OTHER peer for that whole window.
+                stats = await probe_worker_live_stats(w, timeout=5.0)
+            except Exception:
+                stats = {}
+            # Bandwidth probe — every 5th heartbeat tick (~100s).
+            # Bandwidth changes slower than RAM, no need to re-measure
+            # every tick. Cheap when stale anyway (one binary-list GET).
+            should_measure_bw = False
+            try:
+                last_bw_ts = float((w.get("capabilities") or {}).get("bandwidth_probed_at") or 0)
+                should_measure_bw = (time.time() - last_bw_ts) >= 100.0
+            except Exception:
+                pass
+            bw = 0.0
+            if stats and should_measure_bw:
+                try:
+                    bw = await probe_worker_bandwidth(w)
+                except Exception:
+                    bw = 0.0
+            if stats:
+                # Reset miss counter, refresh stats.
+                prev_misses = _heartbeat_miss_counts.pop(wid, 0)
+                try:
+                    caps = dict(w.get("capabilities") or {})
+                    caps["ram_free_gb"] = float(stats.get("ram_free_gb") or 0)
+                    caps["ram_total_gb"] = float(stats.get("ram_total_gb") or caps.get("ram_total_gb") or 0)
+                    caps["vram_total_gb"] = float(stats.get("vram_total_gb") or caps.get("vram_total_gb") or 0)
+                    caps["gpu_kind"] = stats.get("gpu_kind") or caps.get("gpu_kind") or ""
+                    caps["ram_free_probed_at"] = stats.get("ts") or 0
+                    if bw > 0:
+                        caps["bandwidth_mbps"] = bw
+                        caps["bandwidth_probed_at"] = time.time()
+                    # Heartbeat alive → make sure rpc_server_reachable
+                    # is True (it may have been flipped to False earlier).
+                    # Don't auto-set True if we don't know rpc state —
+                    # let ensure_rpc_server_via_proxy handle that on
+                    # the next prep call.
+                    if caps.get("rpc_server_reachable") is False and prev_misses >= _HEARTBEAT_MISS_THRESHOLD:
+                        # Recovery: clear the stale-offline flag so the
+                        # next routing decision re-considers this peer.
+                        # ensure_rpc_server_via_proxy below will set
+                        # the flag definitively based on actual probe.
+                        caps.pop("rpc_server_reachable", None)
+                    db.update_compute_worker_capabilities(
+                        wid, capabilities=caps, last_seen=time.time(),
+                    )
+                except Exception:
+                    pass
+                # Recovery path: peer was offline and just came back.
+                # Re-arm rpc-server so split inference can resume.
+                if prev_misses >= _HEARTBEAT_MISS_THRESHOLD:
+                    log.info(
+                        "heartbeat: %s recovered after %d missed pings; "
+                        "re-arming rpc-server via P2P",
+                        label, prev_misses,
+                    )
+                    try:
+                        await ensure_rpc_server_via_proxy(w)
+                    except Exception as e:
+                        log.debug(
+                            "heartbeat: re-arm failed for %s: %s", label, e,
+                        )
+                return
+            # Miss path.
+            misses = _heartbeat_miss_counts.get(wid, 0) + 1
+            _heartbeat_miss_counts[wid] = misses
+            if misses == _HEARTBEAT_MISS_THRESHOLD:
+                # Threshold crossed — flip the rpc_server_reachable flag
+                # so the routing layer treats this peer as offline.
+                # Routing decisions instantly skip it; the next chat
+                # turn won't try to engage a dead worker as RPC peer.
+                try:
+                    caps = dict(w.get("capabilities") or {})
+                    caps["rpc_server_reachable"] = False
+                    db.update_compute_worker_capabilities(
+                        wid, capabilities=caps,
+                        last_error=f"missed {misses} consecutive heartbeats — peer offline",
+                    )
+                except Exception:
+                    pass
+                log.info(
+                    "heartbeat: %s offline after %d missed pings; "
+                    "demoted from split-eligible set", label, misses,
+                )
+        if workers:
+            await asyncio.gather(
+                *(_probe_one(w) for w in workers),
+                return_exceptions=True,
+            )
+        try:
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            raise
+
+
+def start_peer_heartbeat() -> None:
+    """Kick off the fast peer-reachability heartbeat. Idempotent."""
+    global _HEARTBEAT_TASK
+    if _HEARTBEAT_TASK and not _HEARTBEAT_TASK.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _HEARTBEAT_TASK = loop.create_task(_heartbeat_loop(), name="peer_heartbeat")
+
+
+def stop_peer_heartbeat() -> None:
+    """Cancel the fast heartbeat. Called from shutdown."""
+    global _HEARTBEAT_TASK
+    if _HEARTBEAT_TASK and not _HEARTBEAT_TASK.done():
+        _HEARTBEAT_TASK.cancel()
+    _HEARTBEAT_TASK = None
 
 
 # ---------------------------------------------------------------------------
@@ -3957,7 +4214,9 @@ async def _eligible_split_workers_with_autoprep() -> list[dict]:
         return []
 
     async def _prep_one(w: dict) -> None:
-        """Bring up rpc-server (idempotent) AND refresh live stats."""
+        """Bring up rpc-server (idempotent) AND refresh live stats +
+        bandwidth measurement so the routing decision sees fresh
+        per-peer link quality."""
         # Live stats first — cheap, runs even if rpc is already up,
         # populates ram_free_gb + vram_total_gb in capabilities for
         # the pool-size calculation downstream.
@@ -3965,6 +4224,13 @@ async def _eligible_split_workers_with_autoprep() -> list[dict]:
             stats = await probe_worker_live_stats(w)
         except Exception:
             stats = {}
+        # Bandwidth probe — coarse but cheap (single existing API
+        # round-trip); persists `bandwidth_mbps` so future routing
+        # can demote slow peers from split engagement.
+        try:
+            bw = await probe_worker_bandwidth(w)
+        except Exception:
+            bw = 0.0
         if stats:
             try:
                 caps = dict(w.get("capabilities") or {})
@@ -3973,6 +4239,9 @@ async def _eligible_split_workers_with_autoprep() -> list[dict]:
                 caps["vram_total_gb"] = float(stats.get("vram_total_gb") or 0)
                 caps["gpu_kind"] = stats.get("gpu_kind") or ""
                 caps["ram_free_probed_at"] = stats.get("ts") or 0
+                if bw > 0:
+                    caps["bandwidth_mbps"] = bw
+                    caps["bandwidth_probed_at"] = stats.get("ts") or 0
                 # If we have a real vram_total but no max_vram_seen,
                 # use vram_total as a floor — the pool-size math
                 # treats max_vram_seen as the VRAM contribution and

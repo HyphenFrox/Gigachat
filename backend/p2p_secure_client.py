@@ -69,6 +69,7 @@ async def forward(
     path: str,
     body: dict | list | str | None = None,
     headers: dict | None = None,
+    timeout: float | None = None,
 ) -> tuple[int, str]:
     """Send a one-shot encrypted request to a peer's secure proxy.
 
@@ -76,6 +77,12 @@ async def forward(
     ``SecureProxyError`` on any failure: peer unreachable, peer
     refused the envelope (rate-limited, unknown sender, replay), or
     response failed to decrypt.
+
+    `timeout` overrides the default ``_ONE_SHOT_TIMEOUT_SEC`` (120 s).
+    Heartbeat / liveness callers should pass a tight value (5 s) so
+    a dead peer doesn't stall the calling loop for 2 minutes; chat /
+    embed callers should leave it None to keep the generous default
+    that accommodates a slow LLM response.
 
     Caller is expected to interpret status_code + body the same way
     they would from a direct Ollama call — the proxy preserves both.
@@ -108,7 +115,7 @@ async def forward(
     direct_failed: Exception | None = None
     response_envelope: dict | None = None
     try:
-        async with httpx.AsyncClient(timeout=_ONE_SHOT_TIMEOUT_SEC) as client:
+        async with httpx.AsyncClient(timeout=(timeout or _ONE_SHOT_TIMEOUT_SEC)) as client:
             r = await client.post(url, json=envelope)
             r.raise_for_status()
             response_envelope = r.json()
