@@ -6972,24 +6972,108 @@ async def route_chat_for(
                 * (1024 ** 3)
             )
             if peer_free_bytes > 0 and peer_size > int(peer_free_bytes * 0.90):
-                err = (
-                    f"Model {model_name!r} is {peer_size / 1e9:.1f} GB but "
-                    f"the only peer that has it ({peer_with_model.get('label')}) "
-                    f"has only {peer_free_bytes / 1e9:.1f} GB RAM+VRAM free — "
-                    f"Ollama on that peer would refuse the load with an OOM. "
-                    f"To run this model: (a) free up RAM on that peer, "
-                    f"(b) install the model on a node with more memory, or "
-                    f"(c) configure a split-model that distributes layers "
-                    f"across multiple nodes."
+                # Peer has the model but can't fit it alone. Don't
+                # refuse — engage the layer-split path so compute
+                # fans across host + every eligible worker.
+                #
+                # Split-mode REQUIRES the GGUF on the orchestrator
+                # (host). If host doesn't have it yet, auto-pull
+                # from the official Ollama registry. Progress
+                # streams to the SSE turn via on_pull_progress so
+                # the user sees "Downloading dolphin-mixtral 12%"
+                # instead of a silent multi-minute hang.
+                #
+                # After the pull completes, resolve_ollama_model
+                # finds info["gguf_path"] on host and the rest of
+                # this function naturally drops into Tier 2 split:
+                # llama-server with --rpc to every worker. Layers
+                # fan across host CUDA + iGPU + each worker iGPU/
+                # CPU, so the 26 GB model runs even though no
+                # single node fits it alone.
+                pool_total_bytes = _host_total_capacity_bytes() + sum(
+                    int((float((w.get("capabilities") or {}).get("ram_free_gb") or 0)
+                         + float((w.get("capabilities") or {}).get("vram_total_gb") or 0))
+                        * (1024 ** 3))
+                    for w in db.list_compute_workers(enabled_only=True)
                 )
-                log.info("compute_pool: refusing route — %s", err)
-                await stop_all_running_splits()
-                return {"engine": "error", "error": err}
-        # Fall through to default Ollama path — pick_chat_target will
-        # route to whichever node has the model, and if no node has
-        # it Ollama on host surfaces its own "not found" error.
-        await stop_all_running_splits()
-        return {"engine": "ollama"}
+                if pool_total_bytes >= peer_size:
+                    log.info(
+                        "compute_pool: %s (%.1f GB) exceeds peer %s alone "
+                        "(%.1f GB free) but fits the combined pool (%.1f GB) "
+                        "— auto-pulling GGUF to host so layer-split can "
+                        "engage across host + every worker.",
+                        model_name, peer_size / 1e9,
+                        peer_with_model.get("label"),
+                        peer_free_bytes / 1e9,
+                        pool_total_bytes / 1e9,
+                    )
+                    try:
+                        from . import p2p_pool_routing as _ppr
+                        # Long timeout (60 min) — large MoE/dense
+                        # models are 25-50 GB; on a 50 Mbps home
+                        # link that's 70+ minutes. We rely on the
+                        # progress callback to keep the user
+                        # informed during the download.
+                        pulled = await _ppr.auto_pull_on_host(
+                            model_name,
+                            timeout_sec=3600.0,
+                            on_progress=on_pull_progress,
+                        )
+                        if pulled:
+                            # Re-resolve — the pull just landed
+                            # the GGUF on host. Falls through to
+                            # the normal Tier 2 split path below.
+                            info = resolve_ollama_model(model_name)
+                            if info is not None:
+                                log.info(
+                                    "compute_pool: %s now on host after "
+                                    "auto-pull, engaging Tier 2 split.",
+                                    model_name,
+                                )
+                                # Don't `return` — let the rest of
+                                # route_chat_for run with the now-
+                                # populated info. Jump out of the
+                                # not-on-host branch by breaking
+                                # the if/else flow:
+                                pass  # control falls through to size_bytes line
+                    except Exception as e:
+                        log.info(
+                            "compute_pool: auto-pull of %r for split "
+                            "engagement failed: %s — will fall through "
+                            "to peer Ollama (likely OOM, but we surface "
+                            "the real error rather than refusing).",
+                            model_name, e,
+                        )
+                    # If we got info populated, drop down to the
+                    # main flow. Otherwise fall through to the
+                    # peer-Ollama route below (Ollama on the peer
+                    # will surface its own OOM, which is at least
+                    # actionable: the user sees the actual reason
+                    # and can free RAM).
+                    if info is None:
+                        await stop_all_running_splits()
+                        return {"engine": "ollama"}
+                else:
+                    # Pool genuinely can't fit this model anywhere.
+                    # Surface the clear error rather than letting
+                    # Ollama on the peer hang and OOM mid-load.
+                    err = (
+                        f"Model {model_name!r} is {peer_size / 1e9:.1f} GB but "
+                        f"the entire compute pool combined "
+                        f"({pool_total_bytes / 1e9:.1f} GB) cannot hold it. "
+                        f"Free RAM on at least one node, install the model "
+                        f"on a node with more memory, or pick a smaller "
+                        f"variant."
+                    )
+                    log.info("compute_pool: refusing route — %s", err)
+                    await stop_all_running_splits()
+                    return {"engine": "error", "error": err}
+        # Fall through: either info is now populated (auto-pull
+        # succeeded — drop into Tier 2 split below) or no peer has
+        # the model and pick_chat_target will surface "not found".
+        if info is None:
+            await stop_all_running_splits()
+            return {"engine": "ollama"}
 
     size_bytes = info["size_bytes"]
 

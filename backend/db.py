@@ -620,22 +620,6 @@ def init() -> None:
             # stop-signal alongside the usual "USE me when Y" hint.
             # Default '' means no anti-trigger configured.
             "ALTER TABLE skills ADD COLUMN avoid_when TEXT NOT NULL DEFAULT ''",
-            # Project-memory verification gate. Used ONLY for memories
-            # the agent auto-captured (e.g. inferred from a tool result)
-            # — when set, `verify_within_days` is the staleness budget
-            # and memories older than that get a [VERIFY] marker so the
-            # agent re-checks against current repo state before acting.
-            #
-            # CRITICAL: user-asserted memories ("remember that...")
-            # default to NULL `verify_within_days` which means NEVER
-            # auto-expire. If the user told us to remember something,
-            # we keep it. Only the model's own inferences get a sanity
-            # window.
-            #
-            # `last_verified_at` tracks the most recent confirmation
-            # (set by the agent or by an explicit user re-assertion).
-            "ALTER TABLE project_memories ADD COLUMN last_verified_at REAL",
-            "ALTER TABLE project_memories ADD COLUMN verify_within_days INTEGER",
             # Workflow extension columns on `hooks`. The hooks table started
             # life as a simple "fire shell on lifecycle event" pipe; these
             # turn it into a general workflow trigger system without
@@ -3195,30 +3179,12 @@ def list_project_memories(cwd: str) -> list[dict]:
 
 
 def add_project_memory(
-    cwd: str,
-    content: str,
-    topic: str | None = None,
-    *,
-    verify_within_days: int | None = None,
+    cwd: str, content: str, topic: str | None = None,
 ) -> dict:
     """Insert a project memory and return the row. Same length caps as
     global memory so a runaway agent can't blow up the prompt.
 
     Content is encrypted at rest (see backend/db_encryption.py).
-
-    `verify_within_days`:
-      * None (default) — memory NEVER auto-expires. This is the right
-        default for memories the USER asserted ("remember that X");
-        forgetting them silently would defeat the point of memory.
-      * Some positive int — memory carries a verify budget. The render
-        path tags it [VERIFY] once age exceeds the budget, so the
-        agent re-checks it against current state before acting on it.
-        Used by the agent's own auto-capture path (where the model
-        might have misread something) — never by user-asserted saves.
-
-    `last_verified_at` is initialised to the create timestamp so a
-    fresh memory isn't rendered stale immediately on its own first
-    read.
     """
     from . import db_encryption as _enc
     key = _normalize_project_cwd(cwd)
@@ -3234,23 +3200,13 @@ def add_project_memory(
     t = (topic or "").strip() or None
     if t and len(t) > 80:
         raise ValueError("topic must be ≤ 80 chars")
-    if verify_within_days is not None:
-        try:
-            verify_within_days = int(verify_within_days)
-        except (TypeError, ValueError):
-            verify_within_days = None
-        if verify_within_days is not None and verify_within_days <= 0:
-            verify_within_days = None
     mid = str(uuid.uuid4())
     now = time.time()
     with _conn() as c:
         c.execute(
-            "INSERT INTO project_memories "
-            "(id, cwd, content, topic, created_at, updated_at, "
-            "last_verified_at, verify_within_days) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (mid, key, _enc.encrypt(body), t, now, now,
-             now, verify_within_days),
+            "INSERT INTO project_memories (id, cwd, content, topic, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (mid, key, _enc.encrypt(body), t, now, now),
         )
         row = c.execute(
             "SELECT * FROM project_memories WHERE id = ?", (mid,),
@@ -3293,18 +3249,6 @@ def delete_project_memories_matching(cwd: str, pattern: str) -> int:
 
 def _row_to_project_memory(row: sqlite3.Row) -> dict:
     from . import db_encryption as _enc
-    # Read the new columns defensively — pre-migration rows from a
-    # legacy DB won't have them. sqlite3.Row raises IndexError for
-    # unknown keys; wrap with try so a fresh schema and a half-
-    # migrated schema both render correctly.
-    try:
-        last_verified_at = row["last_verified_at"]
-    except (IndexError, KeyError):
-        last_verified_at = None
-    try:
-        verify_within_days = row["verify_within_days"]
-    except (IndexError, KeyError):
-        verify_within_days = None
     return {
         "id": row["id"],
         "cwd": row["cwd"],
@@ -3312,8 +3256,6 @@ def _row_to_project_memory(row: sqlite3.Row) -> dict:
         "topic": row["topic"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
-        "last_verified_at": last_verified_at,
-        "verify_within_days": verify_within_days,
     }
 
 
