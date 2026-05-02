@@ -2525,6 +2525,58 @@ async def _adaptive_tick() -> None:
             )
         except Exception:
             pass
+
+        # Auto-rebuild with surviving workers. Volatile-network case:
+        # a worker laptop sleeps mid-inference, the orchestrator
+        # detects the crash, marks the SYCL backend failed, and
+        # NOW we re-spawn with whichever workers are still
+        # heartbeat-reachable. Falls through cleanly if NO workers
+        # remain (split row stays in error status; next chat turn
+        # triggers route_chat_for which goes single-host).
+        try:
+            surviving = []
+            for wid in worker_ids:
+                w = db.get_compute_worker(wid)
+                if not w:
+                    continue
+                caps = w.get("capabilities") or {}
+                if caps.get("rpc_server_reachable"):
+                    surviving.append(wid)
+            if surviving and len(surviving) < len(worker_ids):
+                log.info(
+                    "adaptive_watchdog: rebuilding split %s with %d "
+                    "surviving worker(s) (was %d)",
+                    split_id, len(surviving), len(worker_ids),
+                )
+                # Update worker_ids to only living peers and restart.
+                db.update_split_model(
+                    split_id, worker_ids=surviving,
+                )
+                res = await start(split_id)
+                if not res.get("ok"):
+                    log.warning(
+                        "adaptive_watchdog: rebuild failed: %s",
+                        res.get("error"),
+                    )
+            elif surviving:
+                # All original workers still reachable — just retry.
+                log.info(
+                    "adaptive_watchdog: retrying split %s with same "
+                    "workers (auto-fallback should now pick a safer "
+                    "backend per failure flags)",
+                    split_id,
+                )
+                res = await start(split_id)
+                if not res.get("ok"):
+                    log.warning(
+                        "adaptive_watchdog: retry failed: %s",
+                        res.get("error"),
+                    )
+        except Exception as e:
+            log.warning(
+                "adaptive_watchdog: post-crash rebuild failed for "
+                "%s: %s", split_id, e,
+            )
     if crashed_targets:
         live_split_ids = list(_running.keys())
 

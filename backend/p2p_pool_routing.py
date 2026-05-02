@@ -198,6 +198,50 @@ async def ensure_public_peer_worker(model_name: str) -> dict | None:
                     "public-pool: seed capabilities failed for %s: %s",
                     device_id, e,
                 )
+
+            # Seed live-stats + bandwidth + latency on registration so
+            # the next routing decision has REAL numbers, not zeros.
+            # Without this, a public peer's `probe_latency_ms`
+            # defaults to 0 and `worst_lan_latency_ms <= 150` passes
+            # trivially — split engagement engages a 200+ ms public
+            # peer as if it were a LAN peer. The probe is async-safe
+            # because we're already in an async function.
+            try:
+                from . import compute_pool as _pool
+                worker_for_probe = db.get_compute_worker(wid)
+                if worker_for_probe:
+                    import time as _t
+                    t0 = _t.perf_counter()
+                    stats = await _pool.probe_worker_live_stats(
+                        worker_for_probe, timeout=8.0,
+                    )
+                    rtt_ms = int((_t.perf_counter() - t0) * 1000)
+                    bw = await _pool.probe_worker_bandwidth(worker_for_probe)
+                    if stats or rtt_ms > 0:
+                        caps = dict(worker_for_probe.get("capabilities") or {})
+                        if stats:
+                            caps["ram_free_gb"] = float(stats.get("ram_free_gb") or 0)
+                            caps["ram_total_gb"] = float(stats.get("ram_total_gb") or 0)
+                            caps["vram_total_gb"] = float(stats.get("vram_total_gb") or 0)
+                            caps["gpu_kind"] = stats.get("gpu_kind") or ""
+                        if rtt_ms > 0:
+                            caps["probe_latency_ms"] = rtt_ms
+                        if bw > 0:
+                            caps["bandwidth_mbps"] = bw
+                            caps["bandwidth_probed_at"] = time.time()
+                        db.update_compute_worker_capabilities(
+                            wid, capabilities=caps,
+                        )
+                        worker = db.get_compute_worker(wid)
+                        log.info(
+                            "public-pool: probed %s rtt=%dms bw=%.2f MB/s",
+                            device_id, rtt_ms, bw,
+                        )
+            except Exception as e:
+                log.debug(
+                    "public-pool: live probe on registration failed for "
+                    "%s: %s", device_id, e,
+                )
             log.info(
                 "public-pool: registered peer %s as compute worker for %r",
                 device_id, model_name,

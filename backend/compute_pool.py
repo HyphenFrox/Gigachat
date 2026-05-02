@@ -6929,6 +6929,29 @@ async def route_chat_for(
             (w.get("capabilities") or {}).get("probe_latency_ms") or 0
             for w in rpc_workers
         )
+        # Bandwidth-aware filter: drop workers whose measured
+        # bandwidth is below the per-token RPC cost threshold. Per-
+        # token layer-push for a 7B model is ~200-500 KB; with
+        # < 5 MB/s bandwidth that's 50-100 ms per-token tax which
+        # dominates token generation rate and makes split slower
+        # than single-host. We MEASURE bandwidth on each
+        # heartbeat (capabilities.bandwidth_mbps) and on
+        # public-pool registration; workers that haven't been
+        # measured yet (None / 0) are kept in (no demote) so a
+        # fresh peer doesn't get permanently excluded.
+        rpc_workers = [
+            w for w in rpc_workers
+            if not (w.get("capabilities") or {}).get("bandwidth_mbps")
+            or float((w.get("capabilities") or {}).get("bandwidth_mbps") or 0) >= 5.0
+        ]
+        if not rpc_workers:
+            log.info(
+                "compute_pool: every rpc worker measured below 5 MB/s "
+                "bandwidth — dropping back to host-only path for %s",
+                model_name,
+            )
+            await stop_all_running_splits()
+            return {"engine": "ollama"}
 
         # Mega-model: model exceeds combined pool memory. Engages
         # split anyway — llama.cpp's adaptive `-ngl` puts as many
