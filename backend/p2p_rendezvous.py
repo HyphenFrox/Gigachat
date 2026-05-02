@@ -326,7 +326,7 @@ def _build_heartbeat_message(device_id: str, timestamp: float) -> bytes:
 
 
 async def _post_register(state: _RendezvousState) -> None:
-    me = identity.get_identity()
+    me = identity.get_public_identity()
     ts = time.time()
     msg = _build_register_message(
         me.device_id, me.public_key_b64, me.x25519_public_b64,
@@ -364,7 +364,7 @@ async def _post_register(state: _RendezvousState) -> None:
 
 
 async def _post_heartbeat(state: _RendezvousState) -> None:
-    me = identity.get_identity()
+    me = identity.get_public_identity()
     ts = time.time()
     msg = _build_heartbeat_message(me.device_id, ts)
     sig = base64.b64encode(me.sign(msg)).decode("ascii")
@@ -417,7 +417,7 @@ async def _loop(state: _RendezvousState) -> None:
     We attempt initial registration immediately so a freshly-toggled-on
     install is discoverable within seconds.
     """
-    me = identity.get_identity()
+    me = identity.get_public_identity()
     log.info(
         "p2p: rendezvous loop starting (device_id=%s, server=%s)",
         me.device_id, _current_rendezvous_url(),
@@ -532,7 +532,7 @@ async def stop() -> None:
 def status() -> dict:
     """Snapshot of rendezvous loop state for the API endpoint /
     Settings UI. Cheap — pure read of module-level state."""
-    me = identity.get_identity()
+    me = identity.get_public_identity()
     url = _current_rendezvous_url()
     return {
         "configured": bool(url),

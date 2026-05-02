@@ -49,8 +49,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _data_dir_env = os.environ.get("GIGACHAT_DATA_DIR")
 if _data_dir_env:
     _IDENTITY_PATH = Path(_data_dir_env) / "identity.json"
+    _PUBLIC_IDENTITY_PATH = Path(_data_dir_env) / "public_identity.json"
 else:
     _IDENTITY_PATH = _PROJECT_ROOT / "data" / "identity.json"
+    _PUBLIC_IDENTITY_PATH = _PROJECT_ROOT / "data" / "public_identity.json"
 
 
 @dataclass(frozen=True)
@@ -321,6 +323,140 @@ def set_label(new_label: str) -> Identity:
     )
     log.info("identity: label updated to %r", label)
     return _CACHED
+
+
+# ===========================================================================
+# Public-pool identity — separate keypair used ONLY for rendezvous /
+# public-pool participation. Decouples internet-facing identity from the
+# LAN identity so anyone observing the rendezvous can't fingerprint our
+# LAN-paired interactions.
+#
+# The LAN identity (`get_identity()`) is what we publish to LAN peers
+# during the PIN-pair handshake — those peers explicitly trusted us
+# face-to-face, so they SEE our real label and persistent device-id.
+# Public-pool peers (= internet strangers) only ever see this separate
+# `public_identity.json` keypair; the link to our LAN identity is not
+# observable from outside our local network.
+#
+# Trade-off: a single rotating identity per public-pool session would be
+# ideal anonymity but breaks reachability — peers can't re-find us next
+# time. We compromise on a separate-but-persistent keypair that at least
+# stops cross-domain correlation between LAN-pair and public-pool
+# interactions. Future iteration could rotate per N days if a Privacy
+# Mode toggle warrants it.
+# ===========================================================================
+
+_CACHED_PUBLIC: Identity | None = None
+
+
+def get_public_identity() -> Identity:
+    """Return the singleton public-pool identity, generating it on
+    first call.
+
+    Distinct from `get_identity()` (the LAN identity used for PIN
+    pairing). The two never share keys: a public-pool peer that sees
+    our public_identity device_id has NO way to derive or correlate
+    our LAN identity from rendezvous data.
+    """
+    global _CACHED_PUBLIC
+    if _CACHED_PUBLIC is not None:
+        return _CACHED_PUBLIC
+    if _PUBLIC_IDENTITY_PATH.exists():
+        try:
+            payload = json.loads(_PUBLIC_IDENTITY_PATH.read_text(encoding="utf-8"))
+            from cryptography.hazmat.primitives.serialization import (
+                load_pem_private_key,
+            )
+            priv = load_pem_private_key(
+                payload["private_key_pem"].encode("ascii"),
+                password=None,
+            )
+            x_priv = load_pem_private_key(
+                payload["x25519_private_pem"].encode("ascii"),
+                password=None,
+            )
+            x_pub_bytes = x_priv.public_key().public_bytes(
+                encoding=Encoding.Raw, format=PublicFormat.Raw,
+            )
+            _CACHED_PUBLIC = Identity(
+                device_id=str(payload["device_id"]),
+                # Public-pool identity has NO label — that would be a
+                # fingerprint. Display name stays an empty string.
+                label="",
+                public_key_b64=str(payload["public_key_b64"]),
+                private_key=priv,
+                x25519_private=x_priv,
+                x25519_public_b64=base64.b64encode(x_pub_bytes).decode("ascii"),
+            )
+            return _CACHED_PUBLIC
+        except Exception as e:
+            log.warning(
+                "public_identity: failed to load %s (%s); regenerating",
+                _PUBLIC_IDENTITY_PATH, e,
+            )
+            try:
+                _PUBLIC_IDENTITY_PATH.rename(
+                    _PUBLIC_IDENTITY_PATH.with_suffix(".broken")
+                )
+            except OSError:
+                pass
+    # First public-pool opt-in or recovery from corrupt file: mint
+    # a fresh keypair specifically for public-pool participation.
+    priv = Ed25519PrivateKey.generate()
+    x_priv = X25519PrivateKey.generate()
+    pub_bytes = priv.public_key().public_bytes(
+        encoding=Encoding.Raw, format=PublicFormat.Raw,
+    )
+    x_pub_bytes = x_priv.public_key().public_bytes(
+        encoding=Encoding.Raw, format=PublicFormat.Raw,
+    )
+    device_id = _device_id_from_pubkey(pub_bytes)
+    # Persist with the same on-disk shape as the LAN identity so the
+    # loader above can read it back uniformly. No `label` field —
+    # see the dataclass comment above.
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding as _E, PrivateFormat, NoEncryption,
+    )
+    _PUBLIC_IDENTITY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 2,
+        "device_id": device_id,
+        "public_key_b64": base64.b64encode(pub_bytes).decode("ascii"),
+        "private_key_pem": priv.private_bytes(
+            encoding=_E.PEM,
+            format=PrivateFormat.PKCS8,
+            encryption_algorithm=NoEncryption(),
+        ).decode("ascii"),
+        "x25519_public_b64": base64.b64encode(x_pub_bytes).decode("ascii"),
+        "x25519_private_pem": x_priv.private_bytes(
+            encoding=_E.PEM,
+            format=PrivateFormat.PKCS8,
+            encryption_algorithm=NoEncryption(),
+        ).decode("ascii"),
+    }
+    tmp = _PUBLIC_IDENTITY_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    if hasattr(os, "chmod"):
+        try:
+            import stat
+            os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+    os.replace(tmp, _PUBLIC_IDENTITY_PATH)
+    _CACHED_PUBLIC = Identity(
+        device_id=device_id,
+        label="",
+        public_key_b64=base64.b64encode(pub_bytes).decode("ascii"),
+        private_key=priv,
+        x25519_private=x_priv,
+        x25519_public_b64=base64.b64encode(x_pub_bytes).decode("ascii"),
+    )
+    log.info(
+        "public_identity: generated separate public-pool identity %s "
+        "(decoupled from LAN identity for cross-domain anonymity)",
+        device_id,
+    )
+    return _CACHED_PUBLIC
 
 
 def verify_signature(public_key_b64: str, message: bytes, signature: bytes) -> bool:
