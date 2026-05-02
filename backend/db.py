@@ -594,7 +594,7 @@ def init() -> None:
             # doesn't have to re-load everything after a backend bounce.
             "ALTER TABLE conversations ADD COLUMN loaded_tools_json TEXT NOT NULL DEFAULT '[]'",
             # Quality-mode wrapper around the chat call. Values:
-            #   'standard'  — single-pass chat, current behaviour.
+            #   'standard'  — single-pass chat, fastest path.
             #   'refine'    — after the model produces a final answer,
             #                 same model critiques + revises if issues
             #                 found. ~2x compute, big lift on small
@@ -604,9 +604,17 @@ def init() -> None:
             #                 ~3-5x compute, biggest lift on math /
             #                 logic. Uses pool workers when available
             #                 to keep wall-time near 1x.
-            # Per-conversation; defaults to 'standard' so existing chats
-            # behave identically until the user opts in.
-            "ALTER TABLE conversations ADD COLUMN quality_mode TEXT NOT NULL DEFAULT 'standard'",
+            #   'personas'  — multi-perspective expansion before answer.
+            #   'auto'      — pick refine / consensus / personas (or
+            #                 skip) per turn based on the user's prompt.
+            #                 Default for new conversations; lets the
+            #                 model lean on the pool's spare compute
+            #                 only when the prompt actually benefits.
+            # Per-conversation; defaults to 'auto'. Existing rows from
+            # before this migration keep whatever default they were
+            # created with (the per-DB default below applies only to
+            # NEW inserts on a fresh schema).
+            "ALTER TABLE conversations ADD COLUMN quality_mode TEXT NOT NULL DEFAULT 'auto'",
             # Workflow extension columns on `hooks`. The hooks table started
             # life as a simple "fire shell on lifecycle event" pipe; these
             # turn it into a general workflow trigger system without
@@ -921,6 +929,7 @@ def create_conversation(
     auto_approve: bool = False,
     permission_mode: str | None = None,
     project: str | None = None,
+    quality_mode: str = "auto",
 ) -> dict:
     """Insert a new conversation row and return the hydrated dict.
 
@@ -945,12 +954,18 @@ def create_conversation(
     if project is not None:
         s = " ".join(str(project).split())[:80]
         proj = s if s else None
+    # Validate quality_mode — fall back to 'auto' on anything unknown.
+    # 'auto' is the new default because it lets the model use the
+    # pool's spare compute (refine / consensus / personas) when the
+    # prompt actually benefits, and stays single-pass otherwise.
+    if quality_mode not in {"standard", "refine", "consensus", "personas", "auto"}:
+        quality_mode = "auto"
     with _conn() as c:
         c.execute(
             "INSERT INTO conversations "
-            "(id, title, model, auto_approve, permission_mode, cwd, project, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (cid, title, model, auto_bit, permission_mode, cwd, proj, now, now),
+            "(id, title, model, auto_approve, permission_mode, cwd, project, quality_mode, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (cid, title, model, auto_bit, permission_mode, cwd, proj, quality_mode, now, now),
         )
     return get_conversation(cid)
 
@@ -3553,13 +3568,14 @@ def _row_to_conversation(row: sqlite3.Row) -> dict:
     except (IndexError, KeyError):
         project = None
     # Quality mode wraps the chat path with self-refine / self-consistency
-    # passes when set. Default 'standard' preserves existing behaviour.
+    # passes when set. Default 'auto' lets the model decide per turn —
+    # see `create_conversation` for the rationale.
     try:
-        quality_mode = row["quality_mode"] or "standard"
+        quality_mode = row["quality_mode"] or "auto"
     except (IndexError, KeyError):
-        quality_mode = "standard"
+        quality_mode = "auto"
     if quality_mode not in {"standard", "refine", "consensus", "personas", "auto"}:
-        quality_mode = "standard"
+        quality_mode = "auto"
     # Permission mode supersedes the old auto_approve bit, but we keep the
     # legacy field in the response so any code still reading conv["auto_approve"]
     # keeps working during the transition. Source of truth is permission_mode.

@@ -277,7 +277,12 @@ function PermissionModePicker({ conv, onPatch }) {
  * permission picker — it's a per-conversation knob, not a global setting.
  */
 function QualityModePicker({ conv, onPatch }) {
-  const mode = conv.quality_mode || 'standard'
+  // Default to 'auto' — the model picks refine/consensus/personas (or
+  // skips) per turn based on the prompt, leaning on the pool's spare
+  // compute only when it actually helps. Older conversations created
+  // before this default was introduced still carry their original
+  // quality_mode value via conv.quality_mode.
+  const mode = conv.quality_mode || 'auto'
 
   const config = {
     standard: {
