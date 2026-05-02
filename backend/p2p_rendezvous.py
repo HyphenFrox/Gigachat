@@ -250,23 +250,23 @@ def _stun_discover_blocking(server: str, port: int) -> _StunCandidate | None:
 async def _gather_candidates() -> list[_StunCandidate]:
     """Try each public STUN server in turn; return the first success.
 
-    Also tags the host's local LAN IP as a "lan" candidate so peers
-    on the SAME network can connect without traversing NAT (faster
-    + zero rendezvous-load when both peers are at home).
+    PRIVACY: we DELIBERATELY do NOT publish our RFC1918 LAN IP to
+    the rendezvous. Earlier versions tagged the host's local LAN
+    address as a "lan" candidate so peers on the SAME network could
+    skip NAT traversal — but that exposed our internal subnet
+    (192.168.x.y / 10.x.y.z / 172.16-31.x.y) to every public-pool
+    peer AND to any attacker observing the rendezvous. Same-LAN
+    peers don't need it: mDNS (`p2p_discovery`) and the active
+    LAN-scan fallback (`p2p_lan_scan`) discover each other on the
+    LAN without going near the rendezvous. The only candidate we
+    publish is the STUN-discovered public IP, which is what public-
+    pool peers actually need to reach us through NAT.
     """
     cands: list[_StunCandidate] = []
-    # LAN candidate first — same trick we use in p2p_discovery.
-    try:
-        from . import p2p_discovery as _p2pd
-        lan_ip = _p2pd._local_ip()
-        port = int(os.environ.get("PORT", "8000"))
-        if lan_ip and lan_ip != "127.0.0.1":
-            cands.append(_StunCandidate(ip=lan_ip, port=port, source="lan"))
-    except Exception:
-        pass
-    # Then STUN. Stops at first success — no need to multiply
-    # candidates from different servers (they'd all report the same
-    # public IP for the same NAT mapping anyway).
+    # STUN-only: the public NAT mapping that internet peers actually
+    # need. Stops at first success — no need to multiply candidates
+    # from different servers (they'd all report the same public IP
+    # for the same NAT mapping anyway).
     for server, sport in _STUN_SERVERS:
         try:
             cand = await asyncio.to_thread(
