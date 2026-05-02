@@ -765,24 +765,50 @@ async def _set_workers_backend(workers: list[dict], *, in_split: bool) -> int:
                 w["capabilities"] = caps
             except Exception:
                 pass
-        backend = _select_worker_backend(w, in_split=in_split)
-        caps = w.get("capabilities") or {}
-        previous_backend = caps.get("current_rpc_backend", "unknown")
-        ok = await _attempt_rpc_server_restart(w, backend=backend)
-        if ok:
-            try:
-                db.update_compute_worker_capabilities(
-                    w["id"],
-                    capabilities={**caps, "current_rpc_backend": backend},
-                )
-            except Exception:
-                pass
+        # Multi-rpc-server engagement: spawn ONE rpc-server per
+        # compute tier (iGPU on 50052 + CPU on 50053 for an Intel
+        # worker) so the worker contributes BOTH its iGPU memory
+        # AND its system RAM as separate compute targets to the
+        # orchestrator's --tensor-split. Falls back to the single-
+        # backend path automatically when the worker has no GPU.
+        #
+        # The returned list of {port, backend} endpoints is persisted
+        # in capabilities.rpc_endpoints; `split_lifecycle._resolve_
+        # rpc_endpoints` reads it to build the llama-server --rpc
+        # flag with one entry per endpoint.
+        endpoints = await ensure_rpc_servers_via_proxy_multi(w)
+        if endpoints:
             aligned += 1
-            if previous_backend != backend:
+            previous = (w.get("capabilities") or {}).get("current_rpc_backend", "unknown")
+            primary_backend = endpoints[0]["backend"]
+            if previous != primary_backend:
                 log.info(
-                    "compute_pool: worker %s switched rpc-server backend "
-                    "%s -> %s", w.get("label"), previous_backend, backend,
+                    "compute_pool: worker %s rpc-server set: primary=%s, "
+                    "%d endpoint(s) total",
+                    w.get("label"), primary_backend, len(endpoints),
                 )
+        else:
+            # Multi-spawn failed — fall back to legacy single-spawn
+            # using the auto-fallback selector (which knows about
+            # SYCL→Vulkan→CPU per-failure flags).
+            backend = _select_worker_backend(w, in_split=in_split)
+            caps = w.get("capabilities") or {}
+            previous_backend = caps.get("current_rpc_backend", "unknown")
+            ok = await _attempt_rpc_server_restart(w, backend=backend)
+            if ok:
+                try:
+                    db.update_compute_worker_capabilities(
+                        w["id"],
+                        capabilities={**caps, "current_rpc_backend": backend},
+                    )
+                except Exception:
+                    pass
+                aligned += 1
+                if previous_backend != backend:
+                    log.info(
+                        "compute_pool: worker %s switched rpc-server backend "
+                        "%s -> %s", w.get("label"), previous_backend, backend,
+                    )
     return aligned
 
 
@@ -1271,6 +1297,159 @@ async def _probe_one_via_secure_proxy(worker: dict) -> dict:
         out["loaded_count"] = len(loaded)
     out["transport"] = "encrypted-proxy"
     return out
+
+
+# Multi-rpc-server port assignments. Each worker can expose its
+# iGPU and its CPU+RAM as TWO separate single-backend rpc-servers
+# on adjacent ports. Each rpc-server is single-backend internally
+# (no hybrid SYCL+CPU on the same process) so ggml-rpc.cpp's
+# layout-mismatch crash has no surface to fire on. The orchestrator
+# treats the two ports as independent compute endpoints in
+# `--rpc <ip>:<port1>,<ip>:<port2>` and `--tensor-split` weights
+# them per-endpoint, mapping cleanly to llama.cpp's per-device
+# allocator.
+_MULTI_RPC_GPU_PORT = 50052   # iGPU device only (SYCL0 / Vulkan0 / CUDA0)
+_MULTI_RPC_CPU_PORT = 50053   # CPU + system RAM only
+
+
+def select_multi_rpc_specs(worker: dict) -> list[dict]:
+    """Return the list of {port, backend} specs to spawn on this
+    worker so it contributes EVERY available compute tier (iGPU +
+    CPU+RAM, or just CPU+RAM if no iGPU).
+
+    Mirrors `_select_worker_backend`'s logic but emits a per-endpoint
+    list instead of one combined string. Each entry is a single-
+    backend rpc-server — bypasses the SYCL+CPU hybrid layout-mismatch
+    crash that ggml-rpc.cpp's RPC_STATUS_ASSERT trips when both
+    devices share an allocator.
+
+    Failure-flag walk (per backend, single-device only):
+      * Intel + SYCL0 not crashed -> [SYCL0:50052, CPU:50053]
+      * Intel + Vulkan0 not crashed (SYCL crashed) -> [Vulkan0:50052, CPU:50053]
+      * Intel + both crashed -> [CPU:50052]  (single endpoint, CPU only)
+      * NVIDIA -> [CUDA0:50052, CPU:50053]
+      * AMD    -> [Vulkan0:50052, CPU:50053]
+      * No GPU -> [CPU:50052]
+    """
+    vendor = _worker_gpu_vendor(worker)
+    caps = worker.get("capabilities") or {}
+    now = time.time()
+    if vendor == "nvidia":
+        return [
+            {"port": _MULTI_RPC_GPU_PORT, "backend": "CUDA0"},
+            {"port": _MULTI_RPC_CPU_PORT, "backend": "CPU"},
+        ]
+    if vendor == "amd":
+        return [
+            {"port": _MULTI_RPC_GPU_PORT, "backend": "Vulkan0"},
+            {"port": _MULTI_RPC_CPU_PORT, "backend": "CPU"},
+        ]
+    if vendor == "intel":
+        sycl_dead = (
+            (now - float(caps.get("sycl_split_failed_at") or 0))
+            < _BACKEND_FAILURE_COOLDOWN_SEC
+        )
+        vulkan_dead = (
+            (now - float(caps.get("vulkan_split_failed_at") or 0))
+            < _BACKEND_FAILURE_COOLDOWN_SEC
+        )
+        if not sycl_dead:
+            return [
+                {"port": _MULTI_RPC_GPU_PORT, "backend": "SYCL0"},
+                {"port": _MULTI_RPC_CPU_PORT, "backend": "CPU"},
+            ]
+        if not vulkan_dead:
+            return [
+                {"port": _MULTI_RPC_GPU_PORT, "backend": "Vulkan0"},
+                {"port": _MULTI_RPC_CPU_PORT, "backend": "CPU"},
+            ]
+        # Both iGPU paths crashed within the cool-down — fall back
+        # to CPU-only on the primary port. Single endpoint; the
+        # secondary CPU port is omitted because we'd just be
+        # exposing the same compute tier twice.
+        return [{"port": _MULTI_RPC_GPU_PORT, "backend": "CPU"}]
+    # No GPU detected — single CPU endpoint.
+    return [{"port": _MULTI_RPC_GPU_PORT, "backend": "CPU"}]
+
+
+async def ensure_rpc_servers_via_proxy_multi(worker: dict) -> list[dict]:
+    """Bring up MULTIPLE rpc-server processes on a paired peer (one
+    per (port, backend) spec from `select_multi_rpc_specs`) via the
+    encrypted P2P channel. Returns the list of endpoints that came
+    up successfully, each as ``{"port": int, "backend": str}``.
+
+    The receiver (`/api/p2p/rpc-server/ensure-multi`) starts each
+    spec independently — restarting one doesn't take down the other.
+    Used by the split-router to engage iGPU + CPU+RAM contribution
+    per worker without the SYCL+CPU hybrid layout-mismatch bug.
+    """
+    from . import p2p_secure_client as _secure
+    label = worker.get("label") or worker.get("id") or "?"
+    specs = select_multi_rpc_specs(worker)
+    if not specs:
+        return []
+    try:
+        status, body_text = await _secure.forward(
+            worker,
+            method="POST",
+            path="/api/p2p/rpc-server/ensure-multi",
+            body={"specs": specs},
+        )
+    except Exception as e:
+        log.info(
+            "compute_pool: ensure-multi rpc-server failed for %s: %s",
+            label, e,
+        )
+        return []
+    if status != 200:
+        log.info(
+            "compute_pool: ensure-multi on %s returned HTTP %d: %s",
+            label, status, body_text[:200],
+        )
+        return []
+    try:
+        result = jsonutil.loads(body_text)
+    except Exception:
+        return []
+    # Walk results dict to figure out which ports succeeded.
+    results = result.get("results") or {}
+    live_endpoints: list[dict] = []
+    for spec in specs:
+        port = spec["port"]
+        # results dict keys may be strings (JSON) or ints (Python).
+        per_port = results.get(port) or results.get(str(port)) or {}
+        if per_port.get("listening"):
+            live_endpoints.append({
+                "port": port,
+                "backend": per_port.get("active_backend") or spec["backend"],
+            })
+    log.info(
+        "compute_pool: %s exposes %d rpc endpoint(s): %s",
+        label, len(live_endpoints),
+        ", ".join(f"{e['port']}={e['backend']}" for e in live_endpoints),
+    )
+    # Persist the endpoint list so the split-router can read it
+    # without re-probing.
+    if live_endpoints:
+        try:
+            caps = dict(worker.get("capabilities") or {})
+            caps["rpc_server_reachable"] = True
+            caps["rpc_endpoints"] = live_endpoints
+            # Keep the legacy current_rpc_backend stamped to the
+            # primary (iGPU) endpoint so older code paths (status
+            # display, single-port readers) still see something
+            # informative.
+            caps["current_rpc_backend"] = live_endpoints[0]["backend"]
+            db.update_compute_worker_capabilities(
+                worker["id"], capabilities=caps,
+            )
+            worker["capabilities"] = caps
+        except Exception as e:
+            log.debug(
+                "compute_pool: rpc_endpoints persist failed for %s: %s",
+                label, e,
+            )
+    return live_endpoints
 
 
 async def ensure_rpc_server_via_proxy(

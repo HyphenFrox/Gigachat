@@ -111,6 +111,13 @@ _FORWARDABLE_PATHS = frozenset({
     "/api/p2p/rpc-server/start",
     "/api/p2p/rpc-server/status",
     "/api/p2p/rpc-server/stop",
+    # Multi-rpc-server orchestration: lets the orchestrator ask the
+    # worker to run BOTH a SYCL rpc-server (iGPU only) and a CPU
+    # rpc-server (CPU+RAM only) on different ports concurrently.
+    # Each is single-backend so ggml-rpc.cpp's hybrid layout-mismatch
+    # bug doesn't apply, but the worker contributes both compute
+    # tiers to the orchestrator's --tensor-split.
+    "/api/p2p/rpc-server/ensure-multi",
     # LAN-first binary fetch — orchestrator installs missing
     # llama-cpp DLLs by pulling from a peer that already has the
     # file (saves hundreds of MB of internet bandwidth per fresh
@@ -128,6 +135,7 @@ _GIGACHAT_INTERNAL_PATHS = frozenset({
     "/api/p2p/rpc-server/start",
     "/api/p2p/rpc-server/status",
     "/api/p2p/rpc-server/stop",
+    "/api/p2p/rpc-server/ensure-multi",
     "/api/p2p/binary/list",
 })
 

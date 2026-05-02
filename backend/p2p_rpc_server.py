@@ -59,11 +59,19 @@ _RPC_SERVER_EXE = _RPC_SERVER_BIN_DIR / (
 _DEFAULT_PORT = 50052
 _DEFAULT_BACKEND = "SYCL0,CPU"
 
-# Backend the currently-running rpc-server was launched with. We
-# track this on the peer so the orchestrator can ask "are you
-# running CPU-only or SYCL+CPU?" and decide whether to request a
-# restart. Reset to None when nothing's running, set in
-# `start_local_rpc_server` on a successful spawn.
+# Per-port active backend map. Replaces the old singleton so the
+# orchestrator can ask the worker to run MULTIPLE rpc-servers
+# concurrently — typically one bound to `-d SYCL0` (iGPU only) on
+# 50052 and one bound to `-d CPU` (CPU+RAM only) on 50053. Each
+# rpc-server has a single backend internally so the hybrid-allocator
+# layout-mismatch crash (ggml-rpc.cpp's RPC_STATUS_ASSERT) is bypassed,
+# AND the worker contributes BOTH its iGPU memory AND its system RAM
+# as separate compute targets to the orchestrator's --tensor-split.
+_active_backends: dict[int, str] = {}
+
+# Backwards-compatible singleton. Mirrors `_active_backends.get(
+# _DEFAULT_PORT)`. Code paths that only know about the default port
+# (legacy callers, single-port status endpoint) keep working.
 _active_backend: str | None = None
 
 # Stability env vars for SYCL on Intel Xe2 / Meteor Lake.
@@ -107,9 +115,15 @@ def _is_listening_on(port: int) -> bool:
         return False
 
 
-def _kill_running_rpc_servers() -> int:
+def _kill_running_rpc_servers(only_listening_on_port: int | None = None) -> int:
     """Best-effort kill of every existing rpc-server process owned by
     this user. Returns the count killed.
+
+    `only_listening_on_port`: when set, only kill rpc-server processes
+    whose listening sockets include that port. Used by the multi-port
+    spawn path so kill of port 50052 doesn't take down an unrelated
+    rpc-server bound to 50053. Default behaviour (None) kills every
+    rpc-server we own — matches the legacy single-port assumption.
 
     Reuses psutil (already a hard dep of sysdetect) instead of
     shelling out to taskkill / pkill so the same code works on
@@ -132,6 +146,21 @@ def _kill_running_rpc_servers() -> int:
             # an unrelated reason).
             if me and (p.info.get("username") or "").lower().split("\\")[-1] != me.lower():
                 continue
+            # Per-port scoping: skip processes whose listener doesn't
+            # include the requested port. Each rpc-server binds one
+            # TCP port, so `psutil.Process(pid).net_connections()`
+            # tells us which port it's holding.
+            if only_listening_on_port is not None:
+                try:
+                    proc = psutil.Process(p.info["pid"])
+                    ports = {
+                        c.laddr.port for c in proc.net_connections(kind="inet")
+                        if c.status == psutil.CONN_LISTEN
+                    }
+                    if only_listening_on_port not in ports:
+                        continue
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
             p.terminate()
             killed += 1
         except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -410,15 +439,17 @@ def start_local_rpc_server(
         "backend": backend,
         "port": port,
     }
-    # Already up with the SAME backend? Don't rebuild — saves the
-    # orchestrator from churn. If the desired backend differs from
-    # what's currently running, fall through to the kill+respawn
-    # path below so the worker actually serves what the caller
-    # asked for.
-    if _is_listening_on(port) and _active_backend == backend:
+    # Already up with the SAME backend on this port? Don't rebuild —
+    # saves the orchestrator from churn. If the desired backend
+    # differs from what's currently running ON THIS PORT, fall
+    # through to the kill+respawn path below so the worker actually
+    # serves what the caller asked for. Other ports (e.g. a sibling
+    # rpc-server on 50053 with a different backend) are untouched.
+    current_on_port = _active_backends.get(port)
+    if _is_listening_on(port) and current_on_port == backend:
         out["status"] = "already_running"
         out["listening"] = True
-        out["active_backend"] = _active_backend
+        out["active_backend"] = current_on_port
         return out
 
     if not _RPC_SERVER_EXE.is_file():
@@ -441,8 +472,15 @@ def start_local_rpc_server(
         out["listening"] = False
         return out
 
-    killed = _kill_running_rpc_servers()
+    # Kill ONLY the rpc-server bound to THIS port, leaving sibling
+    # rpc-servers on other ports running. Critical for the multi-
+    # backend deployment: restarting the SYCL rpc-server on 50052
+    # must not take down the CPU rpc-server on 50053.
+    killed = _kill_running_rpc_servers(only_listening_on_port=port)
     out["killed_stale"] = killed
+    # Drop the stale entry from the active map (the new spawn below
+    # will re-stamp on success).
+    _active_backends.pop(port, None)
 
     cmd = [
         str(_RPC_SERVER_EXE),
@@ -477,24 +515,73 @@ def start_local_rpc_server(
     if listening:
         _try_lower_priority(pid)
         out["status"] = "started"
-        # Stamp the backend so subsequent calls can short-circuit
-        # the restart when the request matches what's running.
-        # `global` was declared at the top of the function.
-        _active_backend = backend
+        # Stamp BOTH the per-port map (multi-rpc world) and the
+        # legacy singleton (port == _DEFAULT_PORT only) so old
+        # readers keep working. `global` was declared at the top.
+        _active_backends[port] = backend
+        if port == _DEFAULT_PORT:
+            _active_backend = backend
         out["active_backend"] = backend
     else:
         out["status"] = "spawned_but_not_listening"
     return out
 
 
-def stop_local_rpc_server() -> dict:
-    """Kill every rpc-server process this user owns. Returns count.
+def ensure_local_rpc_servers(specs: list[dict]) -> dict:
+    """Ensure a SET of rpc-servers are running, one per (port, backend).
 
-    Used by `stop_all_running_splits` cleanup paths and by tests
-    that want a known-clean state.
+    `specs` is a list like::
+
+        [{"port": 50052, "backend": "SYCL0"},
+         {"port": 50053, "backend": "CPU"}]
+
+    Spawns / restarts each as needed using `start_local_rpc_server`,
+    which is idempotent per port. Returns a dict mapping port to the
+    per-port spawn result so the caller can see which succeeded.
+
+    This is the entry point the orchestrator calls when it wants the
+    worker to expose BOTH iGPU and CPU as separate compute targets.
+    Each rpc-server has a single backend internally — the prior
+    SYCL+CPU hybrid layout-mismatch bug doesn't apply to either —
+    and the orchestrator's `--rpc` lists both endpoints so layers
+    can be placed on either device with correct `--tensor-split`
+    weight per ENDPOINT.
     """
-    killed = _kill_running_rpc_servers()
+    results: dict[int, dict] = {}
+    for spec in specs or []:
+        try:
+            port = int(spec.get("port") or _DEFAULT_PORT)
+            backend = (spec.get("backend") or _DEFAULT_BACKEND).strip()
+        except (TypeError, ValueError):
+            continue
+        if not backend:
+            continue
+        results[port] = start_local_rpc_server(backend=backend, port=port)
+    return {
+        "specs": specs,
+        "results": results,
+        "active_backends": dict(_active_backends),
+    }
+
+
+def stop_local_rpc_server(port: int | None = None) -> dict:
+    """Kill rpc-server process(es) this user owns. Returns count.
+
+    `port`: when set, only kill the rpc-server bound to that port
+    (sibling rpc-servers on other ports keep running). When None,
+    kills every rpc-server we own — matches the legacy single-port
+    assumption used by full-shutdown / test-reset paths.
+    """
     global _active_backend
+    if port is not None:
+        killed = _kill_running_rpc_servers(only_listening_on_port=port)
+        _active_backends.pop(port, None)
+        if port == _DEFAULT_PORT:
+            _active_backend = None
+        return {"killed": killed, "port": port,
+                "listening": _is_listening_on(port)}
+    killed = _kill_running_rpc_servers()
+    _active_backends.clear()
     _active_backend = None
     return {"killed": killed, "listening": _is_listening_on(_DEFAULT_PORT)}
 
@@ -503,15 +590,17 @@ def get_local_rpc_server_status(port: int = _DEFAULT_PORT) -> dict:
     """Snapshot of the local rpc-server's state for the orchestrator
     to query before deciding whether to spawn.
 
-    Includes ``active_backend`` so the orchestrator can compare it
-    to what it WANTS the worker on (e.g. CPU-only for split safety
-    vs SYCL+CPU for non-split paths) and decide whether to request
-    a restart with a different backend.
+    Includes:
+      * ``active_backend`` for the requested port (legacy single-port
+        callers keep their existing API contract)
+      * ``active_backends`` — the FULL per-port map so multi-rpc
+        callers can ask "what's running on every port?" in one call.
     """
     return {
         "binary_present": _RPC_SERVER_EXE.is_file(),
         "binary_path": str(_RPC_SERVER_EXE),
         "listening": _is_listening_on(port),
         "port": port,
-        "active_backend": _active_backend,
+        "active_backend": _active_backends.get(port),
+        "active_backends": dict(_active_backends),
     }

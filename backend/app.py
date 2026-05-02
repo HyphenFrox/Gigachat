@@ -4266,12 +4266,49 @@ def api_p2p_rpc_server_status() -> dict:
 
 
 @app.post("/api/p2p/rpc-server/stop")
-def api_p2p_rpc_server_stop() -> dict:
+def api_p2p_rpc_server_stop(body: dict | None = None) -> dict:
     """Tear down the local rpc-server. Used by orchestrators that
     want to free a worker's compute when the active split-model is
-    stopped or the user removes the pairing."""
+    stopped or the user removes the pairing.
+
+    Optional body ``{"port": 50053}`` scopes the kill to one
+    rpc-server (sibling rpc-servers on other ports keep running).
+    Default behaviour (no body) kills every rpc-server we own —
+    matches the legacy single-port assumption used by full
+    shutdown / unpair.
+    """
     from . import p2p_rpc_server as _rpc
-    return _rpc.stop_local_rpc_server()
+    body = body or {}
+    port = body.get("port")
+    try:
+        port = int(port) if port is not None else None
+    except (TypeError, ValueError):
+        port = None
+    return _rpc.stop_local_rpc_server(port=port)
+
+
+@app.post("/api/p2p/rpc-server/ensure-multi")
+def api_p2p_rpc_server_ensure_multi(body: dict | None = None) -> dict:
+    """Ensure a SET of rpc-servers are running, one per (port, backend).
+
+    Body:
+      ``{"specs": [{"port": 50052, "backend": "SYCL0"},
+                  {"port": 50053, "backend": "CPU"}]}``
+
+    Each spec is brought up independently — restarting the SYCL
+    rpc-server on 50052 doesn't touch the CPU rpc-server on 50053.
+    This is the orchestrator's hook for engaging BOTH the worker's
+    iGPU AND its CPU+RAM as separate compute targets without
+    tripping ggml-rpc.cpp's hybrid-allocator layout-mismatch crash
+    (each rpc-server has a single backend internally, so the bug
+    has no surface to fire on).
+    """
+    from . import p2p_rpc_server as _rpc
+    body = body or {}
+    specs = body.get("specs") or []
+    if not isinstance(specs, list):
+        raise HTTPException(400, "specs must be a list of {port, backend} objects")
+    return _rpc.ensure_local_rpc_servers(specs)
 
 
 @app.get("/api/p2p/system-stats")

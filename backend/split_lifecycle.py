@@ -182,7 +182,11 @@ _running: dict[str, _RunningProcess] = {}
 # ---------------------------------------------------------------------------
 
 def _resolve_rpc_endpoints(worker_ids: list[str]) -> list[str]:
-    """Look up each worker_id and produce a `<host>:<port>` string.
+    """Look up each worker_id and produce a list of `<host>:<port>`
+    strings. A single worker may emit MULTIPLE entries when it
+    exposes more than one rpc-server (typical for the multi-rpc-
+    server pattern where the worker runs an iGPU rpc-server on
+    50052 AND a CPU rpc-server on 50053).
 
     Skips:
       * worker rows that have been deleted since the split_model row
@@ -194,9 +198,13 @@ def _resolve_rpc_endpoints(worker_ids: list[str]) -> list[str]:
         — passing those to llama-server would just cause connection
         refusals during the actual inference.
 
-    Returns the endpoints in the same order as `worker_ids`. Order
-    matters: llama.cpp uses it to assign layer ranges (worker[0] gets
-    the first GPU-layer chunk, worker[1] the next, etc.).
+    Returns the endpoints in the same order as `worker_ids`, with
+    each worker's endpoints in the order produced by
+    `compute_pool.select_multi_rpc_specs` (iGPU port first, CPU
+    port second). Order matters: llama.cpp uses it to assign layer
+    ranges and to map per-device --tensor-split weights, so the
+    weights computed by `_compute_tensor_split_ratios` MUST list
+    entries in the same order this function does.
     """
     out: list[str] = []
     for wid in worker_ids:
@@ -223,6 +231,22 @@ def _resolve_rpc_endpoints(worker_ids: list[str]) -> list[str]:
             if host.startswith(prefix):
                 host = host[len(prefix):]
         host = host.rstrip("/")
+        # Multi-rpc-server path: capabilities.rpc_endpoints is
+        # populated by `compute_pool.ensure_rpc_servers_via_proxy_multi`
+        # with the list of {port, backend} that succeeded. When
+        # present, expand into one --rpc entry per endpoint so
+        # llama.cpp sees the worker's iGPU AND CPU as separate
+        # compute targets.
+        endpoints = caps.get("rpc_endpoints")
+        if isinstance(endpoints, list) and endpoints:
+            for ep in endpoints:
+                try:
+                    port = int(ep.get("port") or 50052)
+                except (TypeError, ValueError):
+                    port = 50052
+                out.append(f"{host}:{port}")
+            continue
+        # Legacy single-port worker — one rpc-server, one entry.
         port = caps.get("rpc_port") or 50052
         out.append(f"{host}:{port}")
     return out
@@ -872,29 +896,75 @@ def _compute_tensor_split_ratios(
     if host_capacity_gb <= 0:
         return None
 
+    # If ANY worker exposes multi-rpc endpoints, return None so
+    # `_build_command` omits the `-ts` flag entirely. Reason:
+    # llama.cpp's `common_fit_params` auto-fit ABORTS with
+    # "model_params::tensor_split already set by user, abort"
+    # when `-ts` is provided alongside `-ngl 0` (auto-fit mode).
+    # The two flags are mutually exclusive in b9002+. Let auto-fit
+    # do the per-device sizing — it knows each device's hard memory
+    # cap and walks ngl down until everything fits.
+    for wid in worker_ids:
+        w = db.get_compute_worker(wid)
+        if not w:
+            continue
+        eps = (w.get("capabilities") or {}).get("rpc_endpoints")
+        if isinstance(eps, list) and len(eps) > 1:
+            log.info(
+                "split_lifecycle: multi-rpc endpoints detected, omitting "
+                "-ts so llama.cpp's auto-fit can pick per-device shares",
+            )
+            return None
+
     weights: list[float] = [host_capacity_gb]
     for wid in worker_ids:
         w = db.get_compute_worker(wid)
         if not w or not w.get("enabled"):
             return None  # missing worker — can't size; let llama.cpp pick
         caps = w.get("capabilities") or {}
+        # Multi-rpc-server path: the worker exposes one rpc-server
+        # PER backend (e.g. iGPU on 50052, CPU on 50053). Emit a
+        # weight per ENDPOINT, not per worker — `_resolve_rpc_endpoints`
+        # produces matching `host:port` entries in the same order, so
+        # llama.cpp's per-device --tensor-split maps cleanly. iGPU
+        # endpoint capped at VRAM ceiling; CPU endpoint sized by
+        # remaining RAM after the iGPU portion.
+        endpoints = caps.get("rpc_endpoints")
+        if isinstance(endpoints, list) and endpoints:
+            ram_free_gb = float(caps.get("ram_free_gb") or 0)
+            vram_total_gb = float(caps.get("vram_total_gb") or 0)
+            ram_total_gb = float(caps.get("ram_total_gb") or 0)
+            for ep in endpoints:
+                ep_backend = (ep.get("backend") or "").lower()
+                if any(k in ep_backend for k in ("sycl", "vulkan", "cuda")):
+                    # iGPU / dGPU endpoint — cap at VRAM ceiling.
+                    # 0.85 leaves headroom for KV cache + compute
+                    # buffers also allocated on the device.
+                    if vram_total_gb > 0:
+                        weights.append(vram_total_gb * 0.85)
+                    elif ram_free_gb > 0:
+                        # No vram info — fall back to a small share
+                        # so we don't over-commit.
+                        weights.append(min(ram_free_gb * 0.30, 2.0))
+                    else:
+                        weights.append(1.0)
+                else:
+                    # CPU endpoint — gets the worker's free RAM
+                    # MINUS what the iGPU endpoint will take from
+                    # shared memory (Intel UMA: iGPU draws from
+                    # the same physical RAM pool). Total per-worker
+                    # contribution = ram_free, split between the
+                    # two endpoints based on which device gets it.
+                    cpu_capacity = max(0.5, ram_free_gb - vram_total_gb * 0.85)
+                    weights.append(cpu_capacity)
+            continue
+        # Legacy single-rpc-server path — one weight per worker.
         # Worker capacity prefers `max_vram_seen_bytes` (proven GPU memory
         # from `/api/ps`) and falls back to `ram_free_gb` from the SSH
-        # spec probe. iGPUs draw from system RAM so ram_free_gb is the
-        # right ceiling for them; dGPUs report VRAM via /api/ps.
+        # spec probe.
         vram_bytes = int(caps.get("max_vram_seen_bytes") or 0)
         ram_free_gb = float(caps.get("ram_free_gb") or 0)
         capacity_gb = max(vram_bytes / (1024 ** 3), ram_free_gb)
-        # Hard cap: when the worker's rpc-server exposes a SYCL or
-        # Vulkan device, llama.cpp will try to allocate the worker's
-        # tensor-split share on that GPU device first — and if the
-        # share exceeds the iGPU's shared-memory pool (typically
-        # ~3 GB on Intel Iris Xe / Arc) the load FAILS with
-        # "can't allocate N bytes on device". Cap each worker's
-        # weight at its `vram_total_gb` so llama.cpp gets a share
-        # that physically fits the iGPU. Workers without an
-        # exposed GPU device (CPU-only rpc-server) keep their
-        # full RAM-based capacity.
         current_backend = (caps.get("current_rpc_backend") or "").lower()
         has_gpu_device = (
             "sycl" in current_backend or "vulkan" in current_backend
@@ -1343,7 +1413,15 @@ def _build_command(
         # clamps to the model's actual layer count, so 99 effectively
         # means "as many as fit". Layers that don't fit GPUs cascade
         # to CPU+RAM.
-        "-ngl", str(ngl),
+        #
+        # `ngl=0` is a sentinel meaning "let llama.cpp's auto-fit
+        # pick" — emitted by `_compute_optimal_ngl` when the pool
+        # has small heterogeneous devices (e.g. multi-rpc-server
+        # workers with ~2 GB iGPUs) where a fixed user-set ngl
+        # is more likely to abort llama-server's
+        # `common_fit_params: failed to fit ... abort` than help.
+        # We omit the flag entirely in that case so auto-fit runs.
+        *(["-ngl", str(ngl)] if ngl > 0 else []),
         # Context size: adaptive — `_compute_optimal_ctx_size` picks
         # the largest window the pool can hold given the model's KV
         # geometry, the chosen `--parallel` slot count, and the
@@ -1904,10 +1982,77 @@ def _compute_optimal_ngl(
         if free_gb <= 0:
             caps = w.get("capabilities") or {}
             free_gb = float(caps.get("ram_free_gb") or 0)
-        pool_free_bytes += int(free_gb * (1024 ** 3))
+        else:
+            caps = w.get("capabilities") or {}
+        # Per-endpoint contribution (multi-rpc-server world):
+        # When the worker exposes BOTH an iGPU (SYCL/Vulkan) endpoint
+        # AND a CPU endpoint via rpc_endpoints, the pool budget for
+        # this worker is the SUM of:
+        #   - iGPU capacity (capped at vram_total * 0.85 — the iGPU
+        #     can't allocate more than its shared-memory pool)
+        #   - CPU capacity (worker's free RAM, minus what the iGPU
+        #     will draw from the same physical pool on Intel UMA)
+        # Sum != worker's free RAM because Intel UMA charges iGPU
+        # use against system RAM. The cap matches what
+        # `_compute_tensor_split_ratios` will actually request.
+        endpoints = caps.get("rpc_endpoints")
+        if isinstance(endpoints, list) and endpoints:
+            vram_total_gb = float(caps.get("vram_total_gb") or 0)
+            has_gpu = any(
+                any(k in (ep.get("backend") or "").lower() for k in ("sycl", "vulkan", "cuda"))
+                for ep in endpoints
+            )
+            has_cpu = any(
+                "cpu" == (ep.get("backend") or "").lower().strip()
+                or (ep.get("backend") or "").lower().endswith(",cpu")
+                for ep in endpoints
+            )
+            worker_pool_gb = 0.0
+            if has_gpu and vram_total_gb > 0:
+                worker_pool_gb += vram_total_gb * 0.85
+            if has_cpu:
+                # Intel UMA: iGPU draws from system RAM, so subtract
+                # what the iGPU will take. Floor at 0.5 GB so a
+                # tiny CPU contribution still counts.
+                cpu_share = max(0.5, free_gb - vram_total_gb * 0.85)
+                worker_pool_gb += cpu_share
+            elif not has_gpu:
+                # CPU-only worker — no iGPU subtraction.
+                worker_pool_gb += free_gb
+            pool_free_bytes += int(worker_pool_gb * (1024 ** 3))
+        else:
+            # Legacy single-rpc-server worker: full ram_free as the
+            # contribution. Matches the prior behaviour.
+            pool_free_bytes += int(free_gb * (1024 ** 3))
 
     if pool_free_bytes <= 0:
         return _DEFAULT_NGL
+
+    # When ANY worker exposes multiple rpc-server endpoints (multi-
+    # rpc-server pattern), defer to llama.cpp's auto-fit by emitting
+    # the sentinel ngl=0. Reason: with small heterogeneous iGPU
+    # devices (~2 GB Intel Iris Xe / Arc), a fixed `-ngl` causes
+    # b9002+ llama-server to abort with "common_fit_params: failed
+    # to fit ... abort" because the per-device share for the iGPU
+    # endpoints exceeds their VRAM ceiling. Auto-fit walks devices
+    # and shrinks ngl until everything fits — much more reliable
+    # than our pool-summed math which doesn't know about per-device
+    # GPU memory hard caps that llama.cpp's allocator enforces.
+    has_multi_rpc = False
+    for wid in worker_ids:
+        w = db.get_compute_worker(wid)
+        if not w:
+            continue
+        eps = (w.get("capabilities") or {}).get("rpc_endpoints")
+        if isinstance(eps, list) and len(eps) > 1:
+            has_multi_rpc = True
+            break
+    if has_multi_rpc:
+        log.info(
+            "split_lifecycle: multi-rpc endpoints detected, deferring to "
+            "llama.cpp auto-fit (ngl=0 sentinel)",
+        )
+        return 0
 
     fits = int(pool_free_bytes * safety / avg_layer_bytes)
     fits = max(0, min(n_layers, fits))
