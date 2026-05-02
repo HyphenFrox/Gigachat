@@ -2479,12 +2479,43 @@ def _eligible_workers(flag: str, model: str | None = None) -> list[dict]:
     """
     rows = db.list_compute_workers(enabled_only=True)
     now = time.time()
+    # Read the public-pool toggle ONCE for this call. When the user
+    # has disabled "join public compute pool" in Settings, we MUST
+    # exclude every public-pool peer from the eligible set even if
+    # they're already in compute_workers — otherwise the toggle is
+    # cosmetic and a previously-registered public peer keeps getting
+    # our chat traffic forever. The flag is the user's explicit
+    # privacy / resource-control choice; honouring it is non-optional.
+    public_pool_on = True
+    try:
+        from . import p2p_pool_routing as _ppr
+        public_pool_on = _ppr._public_pool_enabled()
+    except Exception:
+        pass
     out: list[dict] = []
     for w in rows:
         if not w.get(flag):
             continue
         if not _is_fresh(w, now=now):
             continue
+        # Drop public-pool peers when the toggle is OFF. We detect
+        # public peers two ways for robustness: (a) the explicit
+        # `paired_devices.role='public'` tag set by
+        # `p2p_pool_routing.ensure_public_peer_worker`, AND (b) the
+        # legacy `label=public:<device_id>` naming convention used
+        # in older registrations.
+        if not public_pool_on:
+            label = (w.get("label") or "")
+            is_public = label.startswith("public:")
+            if not is_public and w.get("gigachat_device_id"):
+                try:
+                    paired = db.get_paired_device(w["gigachat_device_id"])
+                    if paired and paired.get("role") == "public":
+                        is_public = True
+                except Exception:
+                    pass
+            if is_public:
+                continue
         if model:
             if _worker_has_model(w, model):
                 out.append(w)

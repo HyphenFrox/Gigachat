@@ -265,6 +265,25 @@ def _verify_inbound(envelope: dict) -> tuple[dict, dict]:
             "sender has no X25519 key on file — cannot encrypt "
             "response back. Re-pair to exchange keys."
         )
+    # Public-pool toggle gate: when the user has disabled "join
+    # public compute pool" in Settings, refuse compute requests
+    # from peers we know about ONLY because of the rendezvous
+    # (`role='public'`). LAN-paired peers (`role='local'`) are
+    # untouched — they were explicitly trusted via the PIN flow
+    # and the public-pool toggle is about INTERNET strangers,
+    # not LAN friends.
+    sender_role = (peer.get("role") or "").lower()
+    if sender_role == "public":
+        try:
+            from . import p2p_pool_routing as _ppr
+            public_pool_on = _ppr._public_pool_enabled()
+        except Exception:
+            public_pool_on = True
+        if not public_pool_on:
+            raise p2p_crypto.CryptoError(
+                "public-pool sharing is disabled in Settings; "
+                "refusing compute request from public-pool peer"
+            )
     _check_inbound_rate_limit(sender_device_id)
     payload, sender = p2p_crypto.open_envelope_json(
         envelope,

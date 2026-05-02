@@ -5038,6 +5038,46 @@ async def api_p2p_public_pool_set(body: P2PPublicPoolBody) -> dict:
             await _relay.stop()
     except Exception as e:
         log.warning("p2p_relay toggle failed: %s", e)
+    # On toggle OFF, prune existing public-pool peers from
+    # `compute_workers` and `paired_devices`. Without this, peers
+    # that were registered while the toggle was ON keep persisting
+    # in the DB and the routing layer would still consider them
+    # eligible (the eligibility filter we added to
+    # `_eligible_workers` covers the immediate case, but the rows
+    # would also surface in the UI's paired-devices list and
+    # mislead the user about who they're sharing with).
+    if not body.enabled:
+        pruned_workers = 0
+        pruned_paired = 0
+        try:
+            for w in db.list_compute_workers():
+                label = w.get("label") or ""
+                is_public = label.startswith("public:")
+                if not is_public and w.get("gigachat_device_id"):
+                    paired = db.get_paired_device(w["gigachat_device_id"])
+                    if paired and paired.get("role") == "public":
+                        is_public = True
+                if is_public:
+                    try:
+                        db.delete_compute_worker(w["id"])
+                        pruned_workers += 1
+                    except Exception:
+                        pass
+            for p in db.list_paired_devices():
+                if (p.get("role") or "").lower() == "public":
+                    try:
+                        db.delete_paired_device(p["device_id"])
+                        pruned_paired += 1
+                    except Exception:
+                        pass
+            if pruned_workers or pruned_paired:
+                log.info(
+                    "p2p public-pool toggle OFF: pruned %d compute_worker(s) "
+                    "+ %d paired_device(s) of role='public'",
+                    pruned_workers, pruned_paired,
+                )
+        except Exception as e:
+            log.warning("p2p public-pool prune failed: %s", e)
     return {"enabled": bool(body.enabled)}
 
 
