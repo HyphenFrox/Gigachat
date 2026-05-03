@@ -6779,6 +6779,169 @@ async def _ensure_split_running_for(
     return f"http://127.0.0.1:{fresh['llama_port']}"
 
 
+async def _ensure_peer_orchestrated_split(
+    peer_worker: dict,
+    model_name: str,
+    *,
+    port: int = 8090,
+) -> str | None:
+    """Drive a paired peer to spawn its own llama-server using ITS
+    local GGUF, with our local rpc-server as a `--rpc` backend.
+
+    Used when the model is too big to fit any single peer alone but
+    lives on `peer_worker`'s disk already. Compute fans across the
+    peer + this host (host's rpc-server on 50052 receives layer
+    pushes; peer's llama-server holds the rest). Zero data transfer.
+
+    Returns the base URL of the peer's llama-server (direct LAN HTTP)
+    on success, or None if the peer can't be driven (no llama-server
+    binary, no local GGUF for that model, encrypted-proxy unreachable,
+    etc.). Caller falls through to the legacy plain-Ollama path on None.
+
+    Privacy: chat traffic to the returned URL is plaintext over LAN —
+    same trust model as ``ensure_worker_chat_server`` (worker-side
+    speculative llama-server). The peer is by definition paired,
+    which puts it in the local-pool whitelist of
+    ``p2p_privacy.assert_plaintext_allowed``.
+    """
+    from . import p2p_secure_client as _sec
+    from . import p2p_rpc_server as _rpc_srv
+    import json as _json
+
+    # First make sure OUR rpc-server is up — the peer's llama-server
+    # needs us to be reachable as a backend. Idempotent; usually a
+    # no-op because the rpc-server is brought up at backend boot.
+    try:
+        local_status = _rpc_srv.get_local_rpc_server_status(port=50052)
+        if not local_status.get("listening"):
+            _rpc_srv.start_local_rpc_server(backend="SYCL0,CPU", port=50052)
+    except Exception as e:
+        log.warning(
+            "compute_pool: peer-orchestrated split — local rpc-server "
+            "prep failed: %s; falling back",
+            e,
+        )
+        return None
+
+    # Build the rpc_targets the peer's llama-server should connect to
+    # — our LAN IP + port 50052 (where rpc-server listens). Try each
+    # routable RFC1918 IP we own; the peer connects to whichever is
+    # routable from its subnet.
+    try:
+        from .p2p_discovery import _local_lan_ips as _lan_ips
+        host_ips = _lan_ips()
+    except Exception:
+        host_ips = []
+    if not host_ips:
+        log.info(
+            "compute_pool: peer-orchestrated split — no LAN IPs to "
+            "advertise as rpc backends",
+        )
+        return None
+    rpc_targets = [f"{ip}:50052" for ip in host_ips]
+
+    # Sized for chat — the peer keeps most layers on its own GPU/RAM
+    # (n_gpu_layers=99 means "as many as fit"). The rest spill via
+    # `--rpc` to host. Split-mode in llama-server auto-distributes
+    # layers based on each backend's reported memory.
+    spawn_body = {
+        "model": model_name,
+        "port": port,
+        "rpc_targets": rpc_targets,
+        "n_gpu_layers": 99,
+        "context_size": 4096,
+        "parallel": 1,
+    }
+
+    # Send the spawn request via the encrypted secure proxy. Generous
+    # timeout — start_local_llama_server BLOCKS until the listener
+    # comes up (or 60 s budget expires), and on cold start that
+    # includes the GGUF mmap + RPC backend handshakes.
+    try:
+        status, body_text = await _sec.forward(
+            peer_worker,
+            method="POST",
+            path="/api/p2p/llama-server/start",
+            body=spawn_body,
+            timeout=120.0,
+        )
+    except Exception as e:
+        log.warning(
+            "compute_pool: peer-orchestrated split — encrypted proxy "
+            "spawn request to %s failed: %s",
+            peer_worker.get("label"), e,
+        )
+        return None
+
+    if status != 200:
+        log.warning(
+            "compute_pool: peer-orchestrated split — peer %s returned "
+            "HTTP %d for spawn request: %s",
+            peer_worker.get("label"), status, (body_text or "")[:300],
+        )
+        return None
+
+    try:
+        result = _json.loads(body_text or "{}")
+    except _json.JSONDecodeError:
+        log.warning(
+            "compute_pool: peer-orchestrated split — peer %s returned "
+            "non-JSON spawn response: %s",
+            peer_worker.get("label"), (body_text or "")[:200],
+        )
+        return None
+
+    if not result.get("ok"):
+        log.warning(
+            "compute_pool: peer-orchestrated split — peer %s spawn "
+            "failed (status=%s): %s",
+            peer_worker.get("label"),
+            result.get("status"), result.get("error"),
+        )
+        return None
+
+    # Peer is now serving llama-server on its loopback (port 8090
+    # default). Build the LAN URL the orchestrator's chat dispatcher
+    # connects to. The peer's llama-server binds to 0.0.0.0 so the
+    # LAN IP is reachable directly — no encrypted-proxy tunneling
+    # needed for the chat traffic itself (plaintext is allowed for
+    # paired-LAN peers per `p2p_privacy.require_encryption`).
+    peer_addr = peer_worker.get("address") or ""
+    if not peer_addr:
+        log.warning(
+            "compute_pool: peer-orchestrated split — peer %s has no "
+            "address on its compute_workers row, can't build URL",
+            peer_worker.get("label"),
+        )
+        return None
+    base_url = f"http://{peer_addr}:{port}"
+
+    # Sanity-check reachability with a short /health probe. If the
+    # peer's llama-server reports listening but the LAN path is
+    # firewalled (Windows Defender, etc.), surface the failure now
+    # instead of silently failing on the first chat token.
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(f"{base_url}/health")
+            if r.status_code >= 400:
+                log.warning(
+                    "compute_pool: peer-orchestrated split — peer %s "
+                    "llama-server /health returned HTTP %d, may be "
+                    "unreachable from host",
+                    peer_worker.get("label"), r.status_code,
+                )
+    except Exception as e:
+        log.warning(
+            "compute_pool: peer-orchestrated split — health probe to "
+            "peer %s at %s failed: %s. Process is up on the peer but "
+            "may not be reachable from host (firewall?).",
+            peer_worker.get("label"), base_url, e,
+        )
+        return None
+
+    return base_url
+
+
 async def stop_all_running_splits() -> None:
     """Free VRAM held by any running llama-server. Called when the
     router decides the upcoming chat turn fits Ollama on host alone —
@@ -6952,19 +7115,23 @@ async def route_chat_for(
         except Exception:
             pass
         if peer_size > 0 and peer_with_model is not None:
-            # Sanity-check the chosen peer's free RAM against the
-            # model size BEFORE routing the chat there. Without this,
-            # Ollama on the peer accepts the request, tries to load,
-            # then returns mid-stream "model requires more system
-            # memory (X GiB) than is available (Y GiB)" — the user
-            # sees a vague "Worker dropped" toast and the agent's
-            # retry falls back to host Ollama which doesn't have the
-            # model, surfacing the misleading "not found" error.
+            # Peer has the model but our pre-flight check finds it
+            # can't fit on that peer alone — Ollama on the peer would
+            # OOM mid-load. The user's intent in selecting this model
+            # is to RUN it, so we don't refuse.
             #
-            # 90% headroom because Ollama needs a buffer for KV cache
-            # + activations on top of weights. Verified live: FBS has
-            # 16 GB RAM but only ~10 GB free at peak — refuses
-            # dolphin-mixtral 25.1 GiB request.
+            # The right architecture: spawn llama-server ON THAT PEER
+            # using its local GGUF, with our local rpc-server as a
+            # `--rpc` backend. Compute fans across both nodes; layers
+            # that don't fit the peer's RAM ride to host's CUDA / RAM
+            # over the LAN socket. Zero data transfer — the peer's
+            # existing GGUF stays in place.
+            #
+            # Verified case: dolphin-mixtral:8x7b (26.4 GB) lives on
+            # FBS (16.6 GB free, can't fit alone). Host has 8 GB CUDA
+            # + 32 GB RAM and rpc-server already listening on 50052.
+            # Peer-led split runs the model with no internet pull and
+            # no host disk pressure.
             caps = peer_with_model.get("capabilities") or {}
             peer_free_bytes = int(
                 (float(caps.get("ram_free_gb") or 0)
@@ -6972,108 +7139,42 @@ async def route_chat_for(
                 * (1024 ** 3)
             )
             if peer_free_bytes > 0 and peer_size > int(peer_free_bytes * 0.90):
-                # Peer has the model but can't fit it alone. Don't
-                # refuse — engage the layer-split path so compute
-                # fans across host + every eligible worker.
-                #
-                # Split-mode REQUIRES the GGUF on the orchestrator
-                # (host). If host doesn't have it yet, auto-pull
-                # from the official Ollama registry. Progress
-                # streams to the SSE turn via on_pull_progress so
-                # the user sees "Downloading dolphin-mixtral 12%"
-                # instead of a silent multi-minute hang.
-                #
-                # After the pull completes, resolve_ollama_model
-                # finds info["gguf_path"] on host and the rest of
-                # this function naturally drops into Tier 2 split:
-                # llama-server with --rpc to every worker. Layers
-                # fan across host CUDA + iGPU + each worker iGPU/
-                # CPU, so the 26 GB model runs even though no
-                # single node fits it alone.
-                pool_total_bytes = _host_total_capacity_bytes() + sum(
-                    int((float((w.get("capabilities") or {}).get("ram_free_gb") or 0)
-                         + float((w.get("capabilities") or {}).get("vram_total_gb") or 0))
-                        * (1024 ** 3))
-                    for w in db.list_compute_workers(enabled_only=True)
-                )
-                if pool_total_bytes >= peer_size:
-                    log.info(
-                        "compute_pool: %s (%.1f GB) exceeds peer %s alone "
-                        "(%.1f GB free) but fits the combined pool (%.1f GB) "
-                        "— auto-pulling GGUF to host so layer-split can "
-                        "engage across host + every worker.",
-                        model_name, peer_size / 1e9,
-                        peer_with_model.get("label"),
-                        peer_free_bytes / 1e9,
-                        pool_total_bytes / 1e9,
+                try:
+                    base_url = await _ensure_peer_orchestrated_split(
+                        peer_with_model, model_name,
                     )
-                    try:
-                        from . import p2p_pool_routing as _ppr
-                        # Long timeout (60 min) — large MoE/dense
-                        # models are 25-50 GB; on a 50 Mbps home
-                        # link that's 70+ minutes. We rely on the
-                        # progress callback to keep the user
-                        # informed during the download.
-                        pulled = await _ppr.auto_pull_on_host(
-                            model_name,
-                            timeout_sec=3600.0,
-                            on_progress=on_pull_progress,
-                        )
-                        if pulled:
-                            # Re-resolve — the pull just landed
-                            # the GGUF on host. Falls through to
-                            # the normal Tier 2 split path below.
-                            info = resolve_ollama_model(model_name)
-                            if info is not None:
-                                log.info(
-                                    "compute_pool: %s now on host after "
-                                    "auto-pull, engaging Tier 2 split.",
-                                    model_name,
-                                )
-                                # Don't `return` — let the rest of
-                                # route_chat_for run with the now-
-                                # populated info. Jump out of the
-                                # not-on-host branch by breaking
-                                # the if/else flow:
-                                pass  # control falls through to size_bytes line
-                    except Exception as e:
+                    if base_url:
                         log.info(
-                            "compute_pool: auto-pull of %r for split "
-                            "engagement failed: %s — will fall through "
-                            "to peer Ollama (likely OOM, but we surface "
-                            "the real error rather than refusing).",
-                            model_name, e,
+                            "compute_pool: peer-orchestrated split engaged "
+                            "— peer %s runs llama-server with our "
+                            "rpc-server as --rpc backend (model %s, "
+                            "%.1f GB, no GGUF transfer)",
+                            peer_with_model.get("label"),
+                            model_name, peer_size / 1e9,
                         )
-                    # If we got info populated, drop down to the
-                    # main flow. Otherwise fall through to the
-                    # peer-Ollama route below (Ollama on the peer
-                    # will surface its own OOM, which is at least
-                    # actionable: the user sees the actual reason
-                    # and can free RAM).
-                    if info is None:
                         await stop_all_running_splits()
-                        return {"engine": "ollama"}
-                else:
-                    # Pool genuinely can't fit this model anywhere.
-                    # Surface the clear error rather than letting
-                    # Ollama on the peer hang and OOM mid-load.
-                    err = (
-                        f"Model {model_name!r} is {peer_size / 1e9:.1f} GB but "
-                        f"the entire compute pool combined "
-                        f"({pool_total_bytes / 1e9:.1f} GB) cannot hold it. "
-                        f"Free RAM on at least one node, install the model "
-                        f"on a node with more memory, or pick a smaller "
-                        f"variant."
+                        return {
+                            "engine": "llama_server",
+                            "base_url": base_url,
+                            "label": model_name,
+                            "host_node": (
+                                f"worker:{peer_with_model['id']}"
+                            ),
+                            "peer_orchestrated": True,
+                        }
+                except Exception as e:
+                    log.warning(
+                        "compute_pool: peer-orchestrated split for %s on "
+                        "%s failed (%s) — falling through to peer Ollama "
+                        "(may OOM, but the error is surfaceable).",
+                        model_name, peer_with_model.get("label"), e,
                     )
-                    log.info("compute_pool: refusing route — %s", err)
-                    await stop_all_running_splits()
-                    return {"engine": "error", "error": err}
-        # Fall through: either info is now populated (auto-pull
-        # succeeded — drop into Tier 2 split below) or no peer has
-        # the model and pick_chat_target will surface "not found".
-        if info is None:
-            await stop_all_running_splits()
-            return {"engine": "ollama"}
+        # Fall through to default Ollama path — pick_chat_target will
+        # route to whichever node has the model. If the peer can't
+        # fit it Ollama surfaces its own OOM error, which is at
+        # least actionable for the user.
+        await stop_all_running_splits()
+        return {"engine": "ollama"}
 
     size_bytes = info["size_bytes"]
 

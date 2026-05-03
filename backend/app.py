@@ -4311,6 +4311,85 @@ def api_p2p_rpc_server_ensure_multi(body: dict | None = None) -> dict:
     return _rpc.ensure_local_rpc_servers(specs)
 
 
+@app.post("/api/p2p/llama-server/start")
+def api_p2p_llama_server_start(body: dict | None = None) -> dict:
+    """Bring up llama-server LOCALLY using THIS peer's GGUF, with
+    optional remote `--rpc` backends.
+
+    Body:
+      ``{"model": "dolphin-mixtral:8x7b",
+         "port": 8090,
+         "rpc_targets": ["192.168.1.4:50052"],
+         "n_gpu_layers": 99,
+         "context_size": 4096,
+         "parallel": 1}``
+
+    Used for the peer-orchestrated split path: when a paired peer
+    (this one) has a model that's too big to fit alone, the
+    orchestrator (host) calls this endpoint via the encrypted proxy
+    so this peer runs its own llama-server pointed at its local GGUF
+    and uses host's rpc-server as a backend — fans compute across
+    BOTH nodes without any GGUF transfer.
+
+    Returns the spawn result dict — see ``p2p_llama_server.start_local_llama_server``.
+    """
+    from . import p2p_llama_server as _ls
+    body = body or {}
+    model = (body.get("model") or "").strip()
+    if not model:
+        raise HTTPException(400, "model is required")
+    try:
+        port = int(body.get("port") or 8090)
+    except (TypeError, ValueError):
+        port = 8090
+    rpc_targets = body.get("rpc_targets") or []
+    if not isinstance(rpc_targets, list):
+        raise HTTPException(400, "rpc_targets must be a list of host:port strings")
+    rpc_targets = [str(t).strip() for t in rpc_targets if str(t).strip()]
+    try:
+        n_gpu_layers = int(body.get("n_gpu_layers") or 99)
+    except (TypeError, ValueError):
+        n_gpu_layers = 99
+    try:
+        context_size = int(body.get("context_size") or 4096)
+    except (TypeError, ValueError):
+        context_size = 4096
+    try:
+        parallel = int(body.get("parallel") or 1)
+    except (TypeError, ValueError):
+        parallel = 1
+    return _ls.start_local_llama_server(
+        model=model,
+        port=port,
+        rpc_targets=rpc_targets,
+        n_gpu_layers=n_gpu_layers,
+        context_size=context_size,
+        parallel=parallel,
+    )
+
+
+@app.get("/api/p2p/llama-server/status")
+def api_p2p_llama_server_status(port: int = 8090) -> dict:
+    """Snapshot of the local llama-server's state on `port`."""
+    from . import p2p_llama_server as _ls
+    return _ls.get_local_llama_server_status(port=port)
+
+
+@app.post("/api/p2p/llama-server/stop")
+def api_p2p_llama_server_stop(body: dict | None = None) -> dict:
+    """Kill llama-server process(es). Body ``{"port": 8090}`` scopes
+    the kill to one port; no body kills every llama-server we own.
+    """
+    from . import p2p_llama_server as _ls
+    body = body or {}
+    port = body.get("port")
+    try:
+        port = int(port) if port is not None else None
+    except (TypeError, ValueError):
+        port = None
+    return _ls.stop_local_llama_server(port=port)
+
+
 @app.get("/api/p2p/system-stats")
 def api_p2p_system_stats() -> dict:
     """Return THIS install's live system stats so a paired peer can

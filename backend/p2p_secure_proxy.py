@@ -118,6 +118,15 @@ _FORWARDABLE_PATHS = frozenset({
     # bug doesn't apply, but the worker contributes both compute
     # tiers to the orchestrator's --tensor-split.
     "/api/p2p/rpc-server/ensure-multi",
+    # Peer-led split — orchestrator asks a paired peer to spawn its
+    # OWN llama-server using its local GGUF, with the orchestrator's
+    # rpc-server as a `--rpc` backend. Used when the model lives on
+    # the peer but is too big for the peer alone — fans compute
+    # across both nodes WITHOUT any data transfer (the peer's GGUF
+    # stays in place).
+    "/api/p2p/llama-server/start",
+    "/api/p2p/llama-server/status",
+    "/api/p2p/llama-server/stop",
     # LAN-first binary fetch — orchestrator installs missing
     # llama-cpp DLLs by pulling from a peer that already has the
     # file (saves hundreds of MB of internet bandwidth per fresh
@@ -136,6 +145,9 @@ _GIGACHAT_INTERNAL_PATHS = frozenset({
     "/api/p2p/rpc-server/status",
     "/api/p2p/rpc-server/stop",
     "/api/p2p/rpc-server/ensure-multi",
+    "/api/p2p/llama-server/start",
+    "/api/p2p/llama-server/status",
+    "/api/p2p/llama-server/stop",
     "/api/p2p/binary/list",
 })
 
