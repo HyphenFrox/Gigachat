@@ -6808,25 +6808,72 @@ async def _ensure_peer_orchestrated_split(
     from . import p2p_rpc_server as _rpc_srv
     import json as _json
 
-    # Bring up BOTH our rpc-servers so the peer's llama-server has
-    # the full picture of our compute: SYCL+CPU on 50052 (advertises
-    # iGPU + system RAM) AND CPU-only on 50053 (advertises ONLY
-    # system RAM). They appear to llama.cpp as separate backends,
-    # so the layer split engine can place layers on each
-    # independently. Every drop of host resource — Intel iGPU, CPU,
-    # full system RAM — gets surfaced to the peer's split decision.
-    # User intent: "use as much resources as possible on pool. No
-    # underutilization at all."
+    # Bring up two SINGLE-BACKEND rpc-servers so the peer's llama-server
+    # sees clean, non-hybrid backends. Hybrid SYCL+CPU on the same
+    # rpc-server (`-d SYCL0,CPU`) trips ggml-rpc.cpp's
+    # layout-mismatch crash mid-load on big models — confirmed live
+    # with dolphin-mixtral 26 GB which crashed at
+    # "ggml-rpc.cpp:505: Remote RPC server crashed or returned
+    # malformed response" right after layer placement. Splitting
+    # into two single-backend rpc-servers (SYCL0 on 50052, CPU on
+    # 50053) makes each rpc-server expose ONE memory pool and
+    # llama.cpp's layer allocator handles them as independent
+    # devices — no hybrid path, no crash.
+    #
+    # This is the same pattern compute_pool.select_multi_rpc_specs
+    # produces for worker-side multi-rpc spawn; we just apply it
+    # locally too to keep host's compute surface symmetric with
+    # what we ask peers to expose.
     try:
-        if not _rpc_srv.get_local_rpc_server_status(port=50052).get("listening"):
-            _rpc_srv.start_local_rpc_server(backend="SYCL0,CPU", port=50052)
+        # Restart 50052 if it's currently running with the hybrid
+        # backend — switching to SYCL0-only requires a respawn.
+        s52 = _rpc_srv.get_local_rpc_server_status(port=50052)
+        existing_52 = (s52.get("active_backend") or "").strip().upper()
+        if not s52.get("listening") or "CPU" in existing_52:
+            _rpc_srv.start_local_rpc_server(backend="SYCL0", port=50052)
     except Exception as e:
-        log.info("compute_pool: SYCL+CPU rpc-server prep skipped: %s", e)
+        log.info("compute_pool: SYCL0-only rpc-server prep skipped: %s", e)
     try:
         if not _rpc_srv.get_local_rpc_server_status(port=50053).get("listening"):
             _rpc_srv.start_local_rpc_server(backend="CPU", port=50053)
     except Exception as e:
         log.info("compute_pool: CPU-only rpc-server prep skipped: %s", e)
+
+    # Same for every paired peer — drive their rpc-servers to be
+    # single-backend each, via the encrypted-proxy ensure-multi
+    # endpoint we built earlier. Failures here are best-effort:
+    # an offline peer or a stale capability cache shouldn't block
+    # the spawn we're about to do on the orchestrator peer.
+    try:
+        for w in db.list_compute_workers(enabled_only=True):
+            if w.get("id") == peer_worker.get("id"):
+                continue
+            if not w.get("use_for_chat"):
+                continue
+            try:
+                await _sec.forward(
+                    w,
+                    method="POST",
+                    path="/api/p2p/rpc-server/ensure-multi",
+                    body={"specs": [
+                        {"port": 50052, "backend": "SYCL0"},
+                        {"port": 50053, "backend": "CPU"},
+                    ]},
+                    timeout=20.0,
+                )
+            except Exception as e:
+                log.info(
+                    "compute_pool: peer %s rpc-server ensure-multi "
+                    "failed (%s); their iGPU/RAM won't contribute "
+                    "to this turn",
+                    w.get("label"), e,
+                )
+    except Exception as e:
+        log.info(
+            "compute_pool: failed to drive peer rpc-servers (%s); "
+            "split will run with whatever rpc-servers are already up",
+            e,
+        )
 
     # Build the FULL rpc_targets list: every paired LAN peer's
     # rpc endpoints (both 50052 + 50053). The peer's llama-server
