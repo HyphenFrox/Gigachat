@@ -6855,20 +6855,60 @@ async def _ensure_peer_orchestrated_split(
             "resources (no host RAM contribution)",
         )
 
-    # Don't pass an explicit n_gpu_layers — let llama.cpp's `--fit`
-    # auto-distribute layers across every available backend
-    # (peer's local GPU, peer's CPU+RAM, host's CPU+RAM via `--rpc`)
-    # based on each one's reported free memory. Setting -ngl 99 here
-    # would block auto-fit and force ALL layers onto the peer's
-    # local GPU, which OOMs for any model bigger than peer VRAM.
-    # Verified case: dolphin-mixtral 26 GB on FBS (8 GB CUDA) with
-    # -ngl 99 OOMed on cudaMalloc; without the explicit -ngl,
-    # llama.cpp puts ~5 layers on FBS-CUDA + ~30 on FBS-RAM + ~30
-    # on host-RAM via RPC and the model loads cleanly.
+    # Compute the n_gpu_layers cap based on the peer's CUDA VRAM
+    # vs the model size. llama.cpp's `--fit on` REFUSES to lower
+    # ngl below whatever the build defaults set (typically 99 on a
+    # CUDA build), so it tries to pack the entire 26 GB model onto
+    # the peer's 8 GB CUDA and OOMs. We compute the cap ourselves
+    # from peer VRAM and pass it explicitly:
+    #
+    #   ngl_cap = floor((peer_vram_free_GB * 0.8) / per_layer_GB)
+    #
+    # where per_layer_GB ≈ model_size_GB / num_layers (rough). For
+    # dolphin-mixtral 8x7B on RTX 3060 Ti 8 GB: per layer ≈ 0.8 GB,
+    # 8 GB free * 0.8 / 0.8 ≈ 8 layers fit on CUDA. The remaining
+    # 24 layers fan to peer-RAM + host-RAM via `--rpc`.
+    peer_caps = peer_worker.get("capabilities") or {}
+    peer_vram_gb = float(peer_caps.get("vram_total_gb") or 0)
+    peer_vram_free_gb = float(peer_caps.get("vram_free_gb") or peer_vram_gb)
+    # Best-effort layer count from the GGUF metadata cache; fall
+    # back to a conservative estimate from model size if unknown.
+    model_layer_count = 32  # Mixtral 8x7B has 32; conservative default.
+    try:
+        for m in (peer_caps.get("models") or []):
+            if (m.get("name") or "") == model_name:
+                model_layer_count = int(m.get("num_layers") or 32) or 32
+                break
+    except (TypeError, ValueError):
+        pass
+    # Heuristic per-layer footprint: model size / layer count, in GB.
+    # peer_size is the bytes value resolved earlier in the caller;
+    # we recompute from the worker's models cache here for safety.
+    target_size_gb = 26.0  # safe upper bound for the heavy MoE case
+    try:
+        for m in (peer_caps.get("models") or []):
+            if (m.get("name") or "") == model_name:
+                target_size_gb = float(m.get("size") or 0) / (1024 ** 3)
+                break
+    except (TypeError, ValueError):
+        pass
+    per_layer_gb = max(0.05, target_size_gb / max(1, model_layer_count))
+    if peer_vram_free_gb > 0.5:
+        ngl_cap = max(0, int((peer_vram_free_gb * 0.80) / per_layer_gb))
+    else:
+        ngl_cap = 0  # No usable VRAM → CPU+RAM only on the peer.
+    log.info(
+        "compute_pool: peer-orchestrated split sizing — peer %s VRAM "
+        "free=%.1f GB, per-layer~%.2f GB, ngl_cap=%d (rest fans to "
+        "RAM + host-RPC)",
+        peer_worker.get("label"), peer_vram_free_gb, per_layer_gb, ngl_cap,
+    )
+
     spawn_body = {
         "model": model_name,
         "port": port,
         "rpc_targets": rpc_targets,
+        "n_gpu_layers": ngl_cap,
         "context_size": 4096,
         "parallel": 1,
     }
