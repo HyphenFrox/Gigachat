@@ -106,13 +106,25 @@ if errorlevel 1 (
 )
 cd /d %ROOT%
 
-REM -- 4. Firewall rule -------------------------------------------------
-echo  [4/4] Adding Windows Firewall rule ^(TCP 8000, Private profile^) ...
+REM -- 4. Firewall rules ------------------------------------------------
+REM Open EVERY port Gigachat needs for the compute pool to function
+REM end-to-end so the user never has to fight the firewall after install:
+REM   * 8000  — backend HTTP (P2P pair / compute proxy)
+REM   * 50052 — rpc-server SYCL/CUDA backend (split-mode layer push)
+REM   * 50053 — rpc-server CPU+RAM backend (split-mode CPU layer push)
+REM   * 8090  — llama-server (peer-orchestrated split: when this device
+REM             holds a GGUF too big for any single peer alone, we run
+REM             llama-server here with other peers as `--rpc` backends)
+REM Private profile only — these endpoints stay on the LAN. Public
+REM profiles never see the listeners.
+echo  [4/4] Adding Windows Firewall rules ^(TCP 8000/50052/50053/8090, Private profile^) ...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference = 'Stop';" ^
-  "Get-NetFirewallRule -DisplayName 'Gigachat backend (port 8000)' -ErrorAction SilentlyContinue | Remove-NetFirewallRule;" ^
-  "Get-NetFirewallRule -DisplayName 'Gigachat backend (port 8000, Private)' -ErrorAction SilentlyContinue | Remove-NetFirewallRule;" ^
-  "New-NetFirewallRule -DisplayName 'Gigachat backend (port 8000)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8000 -Profile Private -Description 'Allows P2P endpoints (encrypted compute proxy + pair handshake) to be reached from other Gigachat installs on the same physical network.' | Out-Null;"
+  "@('Gigachat backend (port 8000)','Gigachat backend (port 8000, Private)','Gigachat rpc-server SYCL (port 50052)','Gigachat rpc-server CPU (port 50053)','Gigachat llama-server (port 8090)') | ForEach-Object { Get-NetFirewallRule -DisplayName $_ -ErrorAction SilentlyContinue | Remove-NetFirewallRule };" ^
+  "New-NetFirewallRule -DisplayName 'Gigachat backend (port 8000)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8000 -Profile Private -Description 'P2P endpoints (encrypted compute proxy + pair handshake)' | Out-Null;" ^
+  "New-NetFirewallRule -DisplayName 'Gigachat rpc-server SYCL (port 50052)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 50052 -Profile Private -Description 'llama.cpp rpc-server (SYCL/CUDA backend) for split-mode layer push' | Out-Null;" ^
+  "New-NetFirewallRule -DisplayName 'Gigachat rpc-server CPU (port 50053)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 50053 -Profile Private -Description 'llama.cpp rpc-server (CPU/RAM backend) for split-mode layer push' | Out-Null;" ^
+  "New-NetFirewallRule -DisplayName 'Gigachat llama-server (port 8090)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8090 -Profile Private -Description 'llama-server for peer-orchestrated split (when this device holds the GGUF)' | Out-Null;"
 
 if errorlevel 1 (
   echo.

@@ -159,6 +159,17 @@ async def lifespan(_app: FastAPI):
     # Capture the running event loop so threadpool endpoints can schedule
     # background work via `run_coroutine_threadsafe`.
     await _capture_main_loop()
+    # Migrate firewall rules. Older installs only opened TCP 8000; the
+    # full pool needs 50052/50053/8090 too. This is idempotent and
+    # silently no-ops when (a) not on Windows or (b) already-installed
+    # rules cover everything. When the backend isn't elevated we log
+    # a one-line hint pointing the user at install.bat — never raises,
+    # never blocks startup.
+    try:
+        from . import firewall_setup as _fw
+        _fw.ensure_firewall_rules()
+    except Exception as e:
+        log.warning("firewall_setup: skipped at startup (%s)", e)
     # Background daemons that watchdog state and reclaim resources.
     await _start_scheduler()
     await _start_retention_sweeper()
