@@ -2534,6 +2534,14 @@ async def _stream_ollama_chat_via_secure_proxy(
         "model": model,
         "messages": messages,
         "stream": True,
+        # Auto-unload after 5 min idle. Without this, peer Ollama
+        # keeps the model in RAM indefinitely (Ollama's default
+        # behaviour with empty/missing keep_alive is to hold the
+        # model until process restart). User reported "ollama.exe
+        # keeps being left behind in memory" — this releases the
+        # model weights when nothing else needs them so other
+        # models can swap in.
+        "keep_alive": "5m",
         "options": {
             "temperature": 0.3,
             "num_ctx": NUM_CTX,
@@ -2643,6 +2651,11 @@ async def _stream_ollama_chat(
         "model": model,
         "messages": messages,
         "stream": True,
+        # Auto-unload after 5 min idle. See keep_alive note in
+        # _stream_ollama_chat_via_secure_proxy — without this,
+        # Ollama keeps the model in RAM until process restart and
+        # other models can't load on the same node.
+        "keep_alive": "5m",
         # Low temperature + reasonable context window.
         # Small models (Gemma 4 e4b) need a low temperature for reliable
         # tool-call emission — at 0.7 they sometimes refuse to call tools even
@@ -3696,6 +3709,35 @@ async def _run_turn_impl(
                                         f"chat stream interrupted: "
                                         f"{type(e).__name__}"
                                     ),
+                                )
+                                break
+                except Exception:
+                    pass
+                # Peer-orchestrated split mid-stream crash detection.
+                # When the dead URL is the :8090 endpoint we spawned
+                # via _ensure_peer_orchestrated_split AND we used
+                # rpc_targets (b9002 mid-decode crash signature),
+                # stamp a per-peer cooldown so the next attempt
+                # spawns llama-server without --rpc backends. This
+                # is the smart fallback for the upstream b9002 bug:
+                # we TRY rpc_targets to use the full pool, and DEMOTE
+                # to peer-only on confirmed crash so the user's next
+                # message succeeds.
+                try:
+                    target_meta = _LAST_CHAT_TARGET.get(conversation_id) or {}
+                    base = target_meta.get("base_url") or ""
+                    if ":8090" in base:
+                        from . import compute_pool as _cp
+                        peer_addr = base.replace("http://", "").split(":", 1)[0]
+                        for w in db.list_compute_workers(enabled_only=True):
+                            if (w.get("address") or "") == peer_addr:
+                                _cp.record_peer_rpc_split_failure(w["id"])
+                                log.info(
+                                    "agent: peer-orchestrated split mid-"
+                                    "stream crash on %s — recording 24h "
+                                    "rpc-targets cooldown so the next "
+                                    "respawn uses peer-only resources",
+                                    w.get("label"),
                                 )
                                 break
                 except Exception:

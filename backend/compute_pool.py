@@ -655,6 +655,35 @@ def record_backend_failure(worker_id: str, backend: str) -> None:
         log.debug("compute_pool: backend-failure persist failed: %s", e)
 
 
+def record_peer_rpc_split_failure(worker_id: str) -> None:
+    """Stamp a 24h cooldown on rpc_targets for peer-orchestrated split.
+
+    Called by the chat dispatcher when a mid-stream HTTPError on
+    the peer's :8090 llama-server URL is observed — the b9002
+    ggml-rpc.cpp:640 mid-decode crash signature. The next
+    `_ensure_peer_orchestrated_split` for THIS peer will skip
+    rpc_targets and run llama-server on peer-only resources, which
+    survives long enough to actually return tokens.
+
+    After 24 h the stamp expires and we re-attempt with rpc_targets
+    — the smart fallback for the upstream b9002 bug. When llama.cpp
+    fixes ggml-rpc.cpp:640 in a future build, the post-cooldown
+    retry succeeds and we automatically fall back to using the full
+    pool with no code changes.
+    """
+    w = db.get_compute_worker(worker_id)
+    if not w:
+        return
+    caps = dict(w.get("capabilities") or {})
+    caps["peer_orchestrated_rpc_failed_at"] = time.time()
+    try:
+        db.update_compute_worker_capabilities(worker_id, capabilities=caps)
+    except Exception as e:
+        log.debug(
+            "compute_pool: failed to persist peer_orchestrated_rpc_failed_at: %s", e,
+        )
+
+
 def _select_worker_backend(worker: dict, *, in_split: bool) -> str:
     """Pick the right `-d` flag for this worker.
 
@@ -6961,21 +6990,68 @@ async def _ensure_peer_orchestrated_split(
             e,
         )
 
-    # rpc_targets DISABLED for now. Both SYCL and pure-CPU
-    # rpc-servers cause llama.cpp b9002 to crash with
-    # "ggml-rpc.cpp:640: Remote RPC server crashed or returned
-    # malformed response" mid-decode, even with GGML_RPC_TIMEOUT
-    # bumped to 120 s. The crash fires after the prompt eval
-    # completes but BEFORE the first generated token, which means
-    # the chat layer always returns empty + the user sees the
-    # "Worker became unreachable mid-response" toast.
+    # Smart fallback for the b9002 ggml-rpc.cpp:640 mid-decode
+    # crash. Strategy: TRY with rpc_targets to use the full pool;
+    # if a recent crash is on file for this peer, DEMOTE to no-rpc
+    # so the user's chat actually completes.
     #
-    # We trade pool contribution for chat reliability: the peer's
-    # local GPU + RAM (with mmap from disk for layers that don't
-    # fit) is the only path that survives long enough to actually
-    # return tokens. Re-enable rpc_targets when upstream b9002+
-    # fixes the RPC regression.
-    rpc_targets: list[str] = []
+    # The cooldown stamp is set by the chat dispatcher
+    # (`agent._stream_llama_server_chat` HTTPError handler →
+    # `record_peer_rpc_split_failure`) the moment a mid-stream
+    # crash is observed. After 24 h the stamp expires and we
+    # retry with rpc_targets — which automatically picks up any
+    # upstream b9002 fix without code changes here.
+    peer_caps = peer_worker.get("capabilities") or {}
+    rpc_failed_at = float(peer_caps.get("peer_orchestrated_rpc_failed_at") or 0)
+    cooldown_active = (time.time() - rpc_failed_at) < (24 * 3600)
+    if cooldown_active:
+        log.info(
+            "compute_pool: peer-orchestrated split — peer %s had a "
+            "ggml-rpc.cpp:640 crash %.0f h ago; staying within "
+            "24 h cooldown and spawning llama-server with no "
+            "rpc_targets (peer-only resources, slower but reliable)",
+            peer_worker.get("label"),
+            (time.time() - rpc_failed_at) / 3600,
+        )
+        rpc_targets: list[str] = []
+    else:
+        # Cool-down expired (or never tripped) — try the full pool.
+        try:
+            from .p2p_discovery import _local_lan_ips as _lan_ips
+            host_ips = _lan_ips()
+        except Exception:
+            host_ips = []
+        rpc_targets: list[str] = []
+        for ip in host_ips:
+            rpc_targets.append(f"{ip}:50053")
+        try:
+            for w in db.list_compute_workers(enabled_only=True):
+                if w.get("id") == peer_worker.get("id"):
+                    continue
+                if not w.get("use_for_chat"):
+                    continue
+                other_addr = (w.get("address") or "").strip()
+                if not other_addr:
+                    continue
+                caps = w.get("capabilities") or {}
+                if not caps.get("rpc_server_reachable"):
+                    continue
+                rpc_targets.append(f"{other_addr}:50053")
+        except Exception as e:
+            log.info(
+                "compute_pool: failed to enumerate other peers' rpc "
+                "endpoints (%s); peer-orchestrated split will run "
+                "without their contribution",
+                e,
+            )
+        if rpc_targets:
+            log.info(
+                "compute_pool: peer-orchestrated split — trying "
+                "rpc_targets %s (no recent b9002 crash on file; "
+                "if it crashes mid-decode we'll demote to "
+                "peer-only for 24 h)",
+                rpc_targets,
+            )
 
     if not rpc_targets:
         log.info(

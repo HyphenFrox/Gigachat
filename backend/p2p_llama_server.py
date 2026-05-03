@@ -53,10 +53,21 @@ import os
 import platform
 import socket
 import subprocess
+import threading
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+
+# How long llama-server may sit idle (no in-flight inference) before
+# the watchdog kills it to free RAM. 5 min matches Ollama's default
+# `OLLAMA_KEEP_ALIVE` so users have a familiar mental model — recent
+# conversations stay warm, dormant ones release memory for other
+# models. Configurable via env so power users can pin a model.
+_IDLE_TIMEOUT_SEC = int(os.environ.get("GIGACHAT_LLAMA_IDLE_TIMEOUT", "300"))
 
 
 # Where llama-server.exe lives on this install. Same path as
@@ -440,7 +451,21 @@ def start_local_llama_server(
             "pid": pid,
             "model_path": model_path,
             "started_at": time.time(),
+            "last_active_at": time.time(),
         }
+        # Spawn a daemon thread that watches for idle and kills the
+        # llama-server when it's been doing nothing for too long.
+        # Without this, llama-server squats however many GB the
+        # model loaded into RAM (11+ GB for dolphin-mixtral on FBS)
+        # forever — blocking other models from loading on the same
+        # peer until the user manually restarts.
+        t = threading.Thread(
+            target=_idle_watchdog,
+            args=(port, pid, _IDLE_TIMEOUT_SEC),
+            daemon=True,
+            name=f"llama-server-idle-watch-{port}",
+        )
+        t.start()
     else:
         out["status"] = "spawned_but_not_listening"
         out["error"] = (
@@ -452,6 +477,105 @@ def start_local_llama_server(
             "during weight load."
         )
     return out
+
+
+def _idle_watchdog(port: int, pid: int, idle_timeout_sec: int) -> None:
+    """Background thread: poll llama-server's `/slots` endpoint and
+    kill the process when it's been idle for `idle_timeout_sec`.
+
+    We use `/slots` (not just /health) because /health returns 200
+    even while inference is running. /slots returns the actual slot
+    state — when every slot's `state == 0` (SLOT_STATE_IDLE), the
+    server has nothing in flight. We track the last time we saw
+    ANY slot busy; if that's too far in the past, kill.
+
+    Polls every 30 s. Exits when the process is gone (someone else
+    killed it, e.g. user restart) or after the kill we trigger.
+
+    Critical for FBS: dolphin-mixtral's llama-server holds 11 GB of
+    RAM. Without this, FBS sits at 96 % memory permanently after a
+    chat — every other model on FBS Ollama then 500's with
+    "model requires more system memory than is available".
+    """
+    poll_interval_sec = 30.0
+    url = f"http://127.0.0.1:{port}/slots"
+    last_active = time.time()
+    log.info(
+        "p2p_llama_server: idle watchdog started for port %d pid %d "
+        "(timeout %ds)", port, pid, idle_timeout_sec,
+    )
+    while True:
+        try:
+            time.sleep(poll_interval_sec)
+        except Exception:
+            return
+        # If process is gone, exit cleanly.
+        try:
+            import psutil
+            if not psutil.pid_exists(pid):
+                log.info(
+                    "p2p_llama_server: idle watchdog port %d — process "
+                    "%d already gone, watchdog exiting",
+                    port, pid,
+                )
+                _active_servers.pop(port, None)
+                return
+        except ImportError:
+            # psutil unavailable — fall back to socket probe.
+            if not _is_listening_on(port):
+                log.info(
+                    "p2p_llama_server: idle watchdog port %d — listener "
+                    "gone, watchdog exiting", port,
+                )
+                _active_servers.pop(port, None)
+                return
+        # Probe /slots and check whether ANY slot is busy.
+        any_busy = False
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                slots = json.loads(r.read())
+                # Newer llama-server returns a list of slot dicts;
+                # older builds return a {"slots": [...]} envelope.
+                if isinstance(slots, dict):
+                    slots = slots.get("slots") or []
+                for slot in (slots or []):
+                    state = slot.get("state")
+                    # state 0 == SLOT_STATE_IDLE per llama.cpp.
+                    # Anything else (1, 2, 3) means the slot is
+                    # processing a request right now.
+                    if state and state != 0:
+                        any_busy = True
+                        break
+        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError) as e:
+            # Probe failed — could be llama-server not yet ready, or
+            # crashed mid-call. Don't reset last_active on probe
+            # error so a hung llama-server gets killed quickly.
+            log.debug(
+                "p2p_llama_server: /slots probe failed for port %d: %s",
+                port, e,
+            )
+            continue
+        if any_busy:
+            last_active = time.time()
+            continue
+        idle_for = time.time() - last_active
+        if idle_for >= idle_timeout_sec:
+            log.info(
+                "p2p_llama_server: port %d pid %d idle for %.0fs "
+                "(threshold %ds) — killing to free RAM. Next chat "
+                "for this model will respawn fresh.",
+                port, pid, idle_for, idle_timeout_sec,
+            )
+            try:
+                _kill_running_llama_servers(only_listening_on_port=port)
+            except Exception as e:
+                log.warning(
+                    "p2p_llama_server: idle-kill of port %d failed: %s",
+                    port, e,
+                )
+            _active_servers.pop(port, None)
+            return
 
 
 def get_local_llama_server_status(port: int = _DEFAULT_PORT) -> dict:
