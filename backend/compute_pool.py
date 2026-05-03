@@ -6808,51 +6808,85 @@ async def _ensure_peer_orchestrated_split(
     from . import p2p_rpc_server as _rpc_srv
     import json as _json
 
-    # Bring up a CPU-only rpc-server on the orchestrator (us). The
-    # peer's llama-server uses this as a `--rpc` backend so layers
-    # spill into our 32 GB system RAM without llama-server trying
-    # to also pack 15+ GB onto our 8 GB CUDA — which is what causes
-    # the cudaMalloc OOM. CPU-only rpc-server reports only RAM as
-    # available, so llama-server's auto-distribution doesn't see
-    # CUDA at all on this backend and the OOM disappears.
-    #
-    # Port 50053 is the canonical "CPU-only rpc-server" port across
-    # the codebase (matches the multi-rpc orchestration that
-    # `compute_pool.select_multi_rpc_specs` produces).
+    # Bring up BOTH our rpc-servers so the peer's llama-server has
+    # the full picture of our compute: SYCL+CPU on 50052 (advertises
+    # iGPU + system RAM) AND CPU-only on 50053 (advertises ONLY
+    # system RAM). They appear to llama.cpp as separate backends,
+    # so the layer split engine can place layers on each
+    # independently. Every drop of host resource — Intel iGPU, CPU,
+    # full system RAM — gets surfaced to the peer's split decision.
+    # User intent: "use as much resources as possible on pool. No
+    # underutilization at all."
     try:
-        cpu_status = _rpc_srv.get_local_rpc_server_status(port=50053)
-        if not cpu_status.get("listening"):
+        if not _rpc_srv.get_local_rpc_server_status(port=50052).get("listening"):
+            _rpc_srv.start_local_rpc_server(backend="SYCL0,CPU", port=50052)
+    except Exception as e:
+        log.info("compute_pool: SYCL+CPU rpc-server prep skipped: %s", e)
+    try:
+        if not _rpc_srv.get_local_rpc_server_status(port=50053).get("listening"):
             _rpc_srv.start_local_rpc_server(backend="CPU", port=50053)
     except Exception as e:
-        log.warning(
-            "compute_pool: peer-orchestrated split — local CPU-only "
-            "rpc-server prep failed: %s; will spawn peer llama-server "
-            "with no RPC backends (peer uses its own resources only)",
-            e,
-        )
+        log.info("compute_pool: CPU-only rpc-server prep skipped: %s", e)
 
-    # Build the rpc_targets the peer's llama-server should connect to.
-    # Use port 50053 (CPU-only) NOT 50052 (SYCL,CUDA) so layers ride
-    # into host's 32 GB RAM instead of being misrouted onto host's
-    # 8 GB VRAM where they OOM. Without this, llama.cpp's split-mode
-    # auto-allocator tries to fill CUDA first and bails when a 15 GB
-    # tensor doesn't fit 8 GB.
+    # Build the FULL rpc_targets list: every paired LAN peer's
+    # rpc endpoints (both 50052 + 50053). The peer's llama-server
+    # tries each on connect; unreachable ones are silently dropped
+    # at handshake. Each endpoint that DOES respond becomes its own
+    # backend in llama.cpp's split-mode allocator.
+    #
+    # Pool contribution (verified live for this user's setup):
+    #   * host:50052  → host Intel iGPU (~2 GB) + host RAM (~7 GB)
+    #   * host:50053  → host RAM only (~7 GB) — redundant with above
+    #     in capacity but exposed as a separate "CPU device" so
+    #     llama.cpp's allocator can treat it as a sink for layers
+    #     that don't fit elsewhere.
+    #   * naresh:50052 → naresh Intel iGPU (~2 GB) + naresh RAM (~7 GB)
+    #   * naresh:50053 → naresh RAM only — same redundancy story.
+    # Plus FBS's local CUDA (8 GB) + FBS RAM (~16 GB), capped by ngl
+    # below so we don't OOM on FBS's CUDA.
     try:
         from .p2p_discovery import _local_lan_ips as _lan_ips
         host_ips = _lan_ips()
     except Exception:
         host_ips = []
     rpc_targets: list[str] = []
-    if host_ips:
-        # CPU-only rpc-server's status check above happens via the
-        # local socket probe; here we can list the LAN IPs unconditionally
-        # because the peer probes each on connect and skips dead ones.
-        rpc_targets = [f"{ip}:50053" for ip in host_ips]
-    else:
+    # Host endpoints first.
+    for ip in host_ips:
+        rpc_targets.append(f"{ip}:50052")
+        rpc_targets.append(f"{ip}:50053")
+    # Then every OTHER paired peer's endpoints (excludes the peer
+    # we're spawning llama-server on — it uses its own GPU/RAM
+    # locally, no need to RPC into itself).
+    try:
+        for w in db.list_compute_workers(enabled_only=True):
+            if w.get("id") == peer_worker.get("id"):
+                continue
+            if not w.get("use_for_chat"):
+                continue
+            other_addr = (w.get("address") or "").strip()
+            if not other_addr:
+                continue
+            caps = w.get("capabilities") or {}
+            # Only include if rpc-server is reachable on that peer.
+            # Avoids silently-dead endpoints clogging the spawn-time
+            # connect attempts.
+            if not caps.get("rpc_server_reachable"):
+                continue
+            rpc_targets.append(f"{other_addr}:50052")
+            rpc_targets.append(f"{other_addr}:50053")
+    except Exception as e:
         log.info(
-            "compute_pool: peer-orchestrated split — no LAN IPs "
-            "available; peer llama-server will run on peer-only "
-            "resources (no host RAM contribution)",
+            "compute_pool: failed to enumerate other peers' rpc "
+            "endpoints (%s); peer-orchestrated split will run "
+            "without their contribution",
+            e,
+        )
+
+    if not rpc_targets:
+        log.info(
+            "compute_pool: peer-orchestrated split — no rpc endpoints "
+            "available (no host LAN IPs and no other peers reachable); "
+            "peer llama-server will run on its own resources only",
         )
 
     # Compute the n_gpu_layers cap based on the peer's CUDA VRAM
