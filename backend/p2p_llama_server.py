@@ -258,7 +258,7 @@ def start_local_llama_server(
     model: str,
     port: int = _DEFAULT_PORT,
     rpc_targets: list[str] | None = None,
-    n_gpu_layers: int = 99,
+    n_gpu_layers: int | None = None,
     context_size: int = 4096,
     parallel: int = 1,
 ) -> dict:
@@ -275,9 +275,13 @@ def start_local_llama_server(
             additional `--rpc` backends. Each target is a remote
             rpc-server we'll fan layers to. Empty list means
             single-node mode (this peer's GPU + CPU only).
-        n_gpu_layers: How many layers to request on this peer's GPU
-            (orchestrator can override based on its capacity model;
-            99 means "as many as fit").
+        n_gpu_layers: How many layers to request on this peer's GPU.
+            None (default) lets llama.cpp's `--fit` auto-distribute
+            layers across local GPU + local CPU + every `--rpc`
+            backend based on each device's reported free memory —
+            the right choice when the model exceeds any single
+            device. Pass an explicit value (e.g. 99) only when you
+            KNOW the model fits the local GPU alone.
         context_size: --ctx-size value. 4096 is a safe default for
             chat; the orchestrator may bump to 8192 / 16384 for
             longer-context models.
@@ -376,11 +380,19 @@ def start_local_llama_server(
         "-ctk", "q8_0", "-ctv", "q8_0",
         "--cache-reuse", "256",
         "--jinja",
-        "-ngl", str(n_gpu_layers),
         "-c", str(context_size),
         "--no-warmup",
         "--parallel", str(parallel),
     ]
+    # `-ngl` is the explicit "force this many layers on the local GPU"
+    # knob. Only set it when the caller provided a value — otherwise
+    # llama.cpp's `--fit` defaults to auto-distributing layers across
+    # every device (local GPU + local CPU + every `--rpc` backend)
+    # based on each one's reported free memory. That's the right
+    # choice for big-model peer-orchestrated split where the model
+    # exceeds any single GPU.
+    if n_gpu_layers is not None:
+        cmd += ["-ngl", str(n_gpu_layers)]
     if rpc_targets:
         cmd += ["--rpc", ",".join(rpc_targets)]
 

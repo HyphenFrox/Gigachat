@@ -6855,16 +6855,20 @@ async def _ensure_peer_orchestrated_split(
             "resources (no host RAM contribution)",
         )
 
-    # Sized for chat. n_gpu_layers=99 means "as many as fit on the
-    # peer's local GPU"; layers that don't fit go to peer CPU+RAM
-    # AND host CPU+RAM via `--rpc`. With 26 GB models and this pool
-    # (host 32 GB RAM + peer 16 GB RAM), the model fits without
-    # paging from disk.
+    # Don't pass an explicit n_gpu_layers — let llama.cpp's `--fit`
+    # auto-distribute layers across every available backend
+    # (peer's local GPU, peer's CPU+RAM, host's CPU+RAM via `--rpc`)
+    # based on each one's reported free memory. Setting -ngl 99 here
+    # would block auto-fit and force ALL layers onto the peer's
+    # local GPU, which OOMs for any model bigger than peer VRAM.
+    # Verified case: dolphin-mixtral 26 GB on FBS (8 GB CUDA) with
+    # -ngl 99 OOMed on cudaMalloc; without the explicit -ngl,
+    # llama.cpp puts ~5 layers on FBS-CUDA + ~30 on FBS-RAM + ~30
+    # on host-RAM via RPC and the model loads cleanly.
     spawn_body = {
         "model": model_name,
         "port": port,
         "rpc_targets": rpc_targets,
-        "n_gpu_layers": 99,
         "context_size": 4096,
         "parallel": 1,
     }
