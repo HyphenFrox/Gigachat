@@ -976,6 +976,19 @@ async def _probe_one(client: httpx.AsyncClient, base: str, token: str | None) ->
         out["gpu_present"] = any_gpu
         out["max_vram_seen_bytes"] = max_vram
         out["loaded_count"] = len(loaded)
+    # /api/ps only sees gpu_present=True for models CURRENTLY loaded
+    # with VRAM allocated. A peer with a real GPU but no model loaded
+    # right now reports gpu_present=False — which makes the router
+    # weight the peer as CPU-only and keeps chat traffic on host even
+    # when the peer is actually the strongest node. Fall back to the
+    # static hardware probe (vram_total_gb / gpu_kind from sysdetect)
+    # so a freshly-restarted peer still ranks correctly.
+    if not out.get("gpu_present"):
+        if (
+            float(out.get("vram_total_gb") or 0.0) > 0.5
+            or (out.get("gpu_kind") or "").lower() in {"nvidia", "amd", "intel"}
+        ):
+            out["gpu_present"] = True
     return out
 
 
@@ -1295,6 +1308,15 @@ async def _probe_one_via_secure_proxy(worker: dict) -> dict:
         out["gpu_present"] = gpu_present
         out["max_vram_seen_bytes"] = max_vram
         out["loaded_count"] = len(loaded)
+    # See note in the LAN probe path above — fall back to static
+    # hardware signals so a peer with a GPU but no currently-loaded
+    # model still ranks as a GPU node.
+    if not out.get("gpu_present"):
+        if (
+            float(out.get("vram_total_gb") or 0.0) > 0.5
+            or (out.get("gpu_kind") or "").lower() in {"nvidia", "amd", "intel"}
+        ):
+            out["gpu_present"] = True
     out["transport"] = "encrypted-proxy"
     return out
 
@@ -2386,10 +2408,20 @@ def _capability_score(worker: dict) -> tuple:
     for workers without measurement data yet.
     """
     caps = worker.get("capabilities") or {}
+    # Prefer max_vram_seen_bytes (lower bound — proven by an actual
+    # load), but fall back to vram_total_gb when no model has been
+    # loaded yet. Without the fallback, a freshly-restarted peer
+    # with an 8 GB CUDA card scores 0 for VRAM and loses the routing
+    # comparison to a host with a 2 GB iGPU — a verified bug that
+    # caused chat for FBS-only models to get sent to host Ollama
+    # (which doesn't have them) → 404 model not found.
+    max_vram_bytes = int(caps.get("max_vram_seen_bytes") or 0)
+    if max_vram_bytes == 0:
+        max_vram_bytes = int(float(caps.get("vram_total_gb") or 0.0) * (1024 ** 3))
     return (
         float(caps.get("tokens_per_second") or 0.0),
         1 if caps.get("gpu_present") else 0,
-        int(caps.get("max_vram_seen_bytes") or 0),
+        max_vram_bytes,
         float(caps.get("ram_total_gb") or 0.0),
         int(caps.get("cpu_threads") or 0),
         float(worker.get("last_seen") or 0),
@@ -6875,59 +6907,21 @@ async def _ensure_peer_orchestrated_split(
             e,
         )
 
-    # Build the FULL rpc_targets list: every paired LAN peer's
-    # rpc endpoints (both 50052 + 50053). The peer's llama-server
-    # tries each on connect; unreachable ones are silently dropped
-    # at handshake. Each endpoint that DOES respond becomes its own
-    # backend in llama.cpp's split-mode allocator.
+    # rpc_targets DISABLED for now. Both SYCL and pure-CPU
+    # rpc-servers cause llama.cpp b9002 to crash with
+    # "ggml-rpc.cpp:640: Remote RPC server crashed or returned
+    # malformed response" mid-decode, even with GGML_RPC_TIMEOUT
+    # bumped to 120 s. The crash fires after the prompt eval
+    # completes but BEFORE the first generated token, which means
+    # the chat layer always returns empty + the user sees the
+    # "Worker became unreachable mid-response" toast.
     #
-    # Pool contribution (verified live for this user's setup):
-    #   * host:50052  → host Intel iGPU (~2 GB) + host RAM (~7 GB)
-    #   * host:50053  → host RAM only (~7 GB) — redundant with above
-    #     in capacity but exposed as a separate "CPU device" so
-    #     llama.cpp's allocator can treat it as a sink for layers
-    #     that don't fit elsewhere.
-    #   * naresh:50052 → naresh Intel iGPU (~2 GB) + naresh RAM (~7 GB)
-    #   * naresh:50053 → naresh RAM only — same redundancy story.
-    # Plus FBS's local CUDA (8 GB) + FBS RAM (~16 GB), capped by ngl
-    # below so we don't OOM on FBS's CUDA.
-    try:
-        from .p2p_discovery import _local_lan_ips as _lan_ips
-        host_ips = _lan_ips()
-    except Exception:
-        host_ips = []
+    # We trade pool contribution for chat reliability: the peer's
+    # local GPU + RAM (with mmap from disk for layers that don't
+    # fit) is the only path that survives long enough to actually
+    # return tokens. Re-enable rpc_targets when upstream b9002+
+    # fixes the RPC regression.
     rpc_targets: list[str] = []
-    # Host endpoints first.
-    for ip in host_ips:
-        rpc_targets.append(f"{ip}:50052")
-        rpc_targets.append(f"{ip}:50053")
-    # Then every OTHER paired peer's endpoints (excludes the peer
-    # we're spawning llama-server on — it uses its own GPU/RAM
-    # locally, no need to RPC into itself).
-    try:
-        for w in db.list_compute_workers(enabled_only=True):
-            if w.get("id") == peer_worker.get("id"):
-                continue
-            if not w.get("use_for_chat"):
-                continue
-            other_addr = (w.get("address") or "").strip()
-            if not other_addr:
-                continue
-            caps = w.get("capabilities") or {}
-            # Only include if rpc-server is reachable on that peer.
-            # Avoids silently-dead endpoints clogging the spawn-time
-            # connect attempts.
-            if not caps.get("rpc_server_reachable"):
-                continue
-            rpc_targets.append(f"{other_addr}:50052")
-            rpc_targets.append(f"{other_addr}:50053")
-    except Exception as e:
-        log.info(
-            "compute_pool: failed to enumerate other peers' rpc "
-            "endpoints (%s); peer-orchestrated split will run "
-            "without their contribution",
-            e,
-        )
 
     if not rpc_targets:
         log.info(
@@ -6990,7 +6984,12 @@ async def _ensure_peer_orchestrated_split(
         "port": port,
         "rpc_targets": rpc_targets,
         "n_gpu_layers": ngl_cap,
-        "context_size": 4096,
+        # 16K context — Gigachat's own system prompt + conversation
+        # history routinely runs 4-8K, so 4K is too tight (the very
+        # first chat turn 400's with "request exceeds context").
+        # 16K accommodates ~30 multi-turn exchanges; KV q8_0 keeps
+        # the memory footprint sane (~halves vs default).
+        "context_size": 16384,
         "parallel": 1,
     }
 
@@ -7057,28 +7056,51 @@ async def _ensure_peer_orchestrated_split(
         return None
     base_url = f"http://{peer_addr}:{port}"
 
-    # Sanity-check reachability with a short /health probe. If the
-    # peer's llama-server reports listening but the LAN path is
-    # firewalled (Windows Defender, etc.), surface the failure now
-    # instead of silently failing on the first chat token.
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(f"{base_url}/health")
-            if r.status_code >= 400:
-                log.warning(
-                    "compute_pool: peer-orchestrated split — peer %s "
-                    "llama-server /health returned HTTP %d, may be "
-                    "unreachable from host",
-                    peer_worker.get("label"), r.status_code,
-                )
-    except Exception as e:
+    # Wait for the peer's llama-server to finish LOADING the model
+    # before we hand the URL back to the chat dispatcher. /health
+    # returns 503 "Loading model" while llama-server is mmapping
+    # weights and uploading layers to RPC backends. For a 26 GB MoE
+    # model split across CUDA + RAM + multiple RPC backends, this
+    # routinely takes 3-5 minutes on first load. The chat layer
+    # reasonably gives up on a single 503; better to block here
+    # until the model is actually ready.
+    #
+    # We yield while polling so the agent's pull-progress drain loop
+    # keeps surfacing events to the SSE stream — the user sees the
+    # chat is "live" even though we're waiting on the model.
+    health_deadline = time.time() + 360.0  # 6 minutes hard cap
+    last_status = None
+    healthy = False
+    while time.time() < health_deadline:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(f"{base_url}/health")
+                last_status = r.status_code
+                if r.status_code == 200:
+                    # llama-server returns {"status":"ok"} once the
+                    # model is loaded and the slots are idle.
+                    try:
+                        body = r.json()
+                        if body.get("status") in ("ok", "no slot available"):
+                            healthy = True
+                            break
+                    except Exception:
+                        # Treat any 200 as healthy if body's not JSON
+                        healthy = True
+                        break
+        except Exception:
+            # Transient network blip — keep polling.
+            pass
+        await asyncio.sleep(2.0)
+
+    if not healthy:
         log.warning(
-            "compute_pool: peer-orchestrated split — health probe to "
-            "peer %s at %s failed: %s. Process is up on the peer but "
-            "may not be reachable from host (firewall?).",
-            peer_worker.get("label"), base_url, e,
+            "compute_pool: peer-orchestrated split — peer %s "
+            "llama-server still loading after 360s (last /health "
+            "status=%s). Returning URL anyway; the chat layer will "
+            "retry if the model isn't ready yet.",
+            peer_worker.get("label"), last_status,
         )
-        return None
 
     return base_url
 

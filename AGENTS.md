@@ -27,3 +27,5 @@ The code must be efficient
 Don't add any personal or sensitive stuff in commits
 
 The app has been deployed so newer versions of the app should be able to migrate older versions of the app to the current one.
+
+Don't commit your temporary scripts since they won't be needed by the app

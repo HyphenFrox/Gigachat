@@ -92,6 +92,14 @@ _SPAWN_ENV: dict[str, str] = {
     # detached process whose CWD isn't the binary dir on every Windows
     # release. Belt-and-suspenders alongside subprocess `cwd=`.
     "PATH": str(_LLAMA_SERVER_BIN_DIR) + os.pathsep + os.environ.get("PATH", ""),
+    # Bump RPC TCP timeouts. Default is ~5 s which trips the
+    # "Remote RPC server crashed or returned malformed response"
+    # crash on big models — the rpc-server is busy doing compute
+    # and doesn't ack a control message in time, llama-server
+    # interprets the silence as a crash and aborts the whole
+    # forward pass. 120 s gives slow CPU rpc-servers time to
+    # finish a layer before we declare them dead.
+    "GGML_RPC_TIMEOUT": "120000",
 }
 
 # How long to wait for the freshly-spawned llama-server to start
