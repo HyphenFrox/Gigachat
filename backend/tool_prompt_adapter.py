@@ -180,13 +180,23 @@ async def needs_adapter(
             async with httpx.AsyncClient(timeout=5.0) as owned:
                 info = await _probe(owned)
     except Exception as e:
+        # Probe failed — most often because the model lives on a
+        # paired peer (so /api/show against host's Ollama returns
+        # 404). DEFAULT TO ADAPTER MODE here. Safer baseline:
+        # adapter prompt-space tools work on every model, native
+        # tools only work on the subset that advertise the
+        # capability AND render `.Tools` in their template. Falsely
+        # assuming "native works" surfaces as
+        # `{"error":"... does not support tools"}` on the first
+        # chat turn.
         log.warning(
             "tool_prompt_adapter: /api/show probe failed for %s (%s); "
-            "assuming native tool calling works",
+            "defaulting to prompt-adapter mode (safer than assuming "
+            "native tool support).",
             model, e,
         )
-        _ADAPTER_CACHE[cache_key] = False
-        return False
+        _ADAPTER_CACHE[cache_key] = True
+        return True
 
     caps = info.get("capabilities") or []
     template = info.get("template") or ""

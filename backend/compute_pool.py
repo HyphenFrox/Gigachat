@@ -2550,6 +2550,45 @@ def _eligible_workers(flag: str, model: str | None = None) -> list[dict]:
                 continue
         if model:
             if _worker_has_model(w, model):
+                # Memory-aware filter: skip the worker only when its
+                # available memory is FAR below the model size AND
+                # the model isn't currently loaded there. Ollama
+                # keeps recently-used models warm for ~5 min; if the
+                # model is already in the worker's loaded set, the
+                # NEXT chat reuses that load and needs no additional
+                # RAM — so the cached ram_free_gb reading (which
+                # already excludes the loaded model's footprint)
+                # would falsely scare us off a perfectly viable
+                # warm worker.
+                #
+                # Conservative cutoff: skip only when the model is
+                # at least 3x the cached free memory. This catches
+                # the obvious "another big model is squatting all
+                # the RAM" case (e.g. dolphin-mixtral 26 GB
+                # llama-server holding 11 GB on FBS, blocking a
+                # cold gemma3 4 GB load) while letting through the
+                # routine warm-cache case (Naresh has gemma3:4b
+                # loaded and 0.9 GB free → still serves the next
+                # gemma3 chat instantly).
+                model_size_gb = 0.0
+                caps = w.get("capabilities") or {}
+                for m in (caps.get("models") or []):
+                    if (m.get("name") or "") == model:
+                        model_size_gb = float(m.get("size") or 0) / (1024 ** 3)
+                        break
+                if model_size_gb > 0:
+                    free_ram = float(caps.get("ram_free_gb") or 0)
+                    free_vram = float(caps.get("vram_free_gb") or 0)
+                    available = free_ram + free_vram
+                    if available > 0 and model_size_gb > available * 3.0:
+                        log.info(
+                            "compute_pool: skipping %s for model %r — "
+                            "needs ~%.1f GB but worker has only %.1f GB "
+                            "free (3x+ shortfall = blocked by another "
+                            "loaded model); routing to a less-loaded peer.",
+                            w.get("label"), model, model_size_gb, available,
+                        )
+                        continue
                 out.append(w)
             elif w.get("ssh_host"):
                 _maybe_kickoff_lan_sync(w, model)
@@ -2842,8 +2881,14 @@ def pick_chat_worker(
     if worker_score[0] <= 0 or host_score[0] <= 0:
         worker_score = (0.0,) + worker_score[1:]
         host_score = (0.0,) + host_score[1:]
-    if worker_score <= host_score and not is_host_mega_busy():
-        return None
+    if worker_score <= host_score:
+        # Same model-presence guard as pick_chat_target — host
+        # only wins when it actually has the model installed,
+        # otherwise return the worker so the agent can dispatch
+        # via encrypted proxy instead of 404'ing on host Ollama.
+        host_has_model = resolve_ollama_model(model) is not None
+        if host_has_model and not is_host_mega_busy():
+            return None
     return w
 
 
@@ -3095,18 +3140,27 @@ def pick_chat_target(
         host_score = (0.0,) + host_score[1:]
 
     if worker_score <= host_score:
-        # Host wins (using measured throughput when available, else
-        # falling back to GPU/VRAM/RAM/CPU heuristics). Normally we'd
-        # stay local — but when the host is currently mmapping a
-        # mega-model from disk, ANY in-flight chat that ALSO routes
-        # to host competes with that page-in stream for I/O bandwidth
-        # and slows everyone down. Bias to the worker in that case
-        # even when the worker is technically less capable: a slower-
-        # running worker beats a host whose disk is saturated. If no
-        # eligible worker exists, the picker returns None (host) which
-        # is unchanged behaviour.
-        if not is_host_mega_busy():
+        # Host wins on capability — but ONLY return host when host
+        # actually has the model installed. Otherwise routing to
+        # host means hitting host's Ollama with a model it doesn't
+        # have, which 404's with "model not found" and the user
+        # sees a useless error. The worker (which has the model)
+        # is the correct choice in that case even if it's slightly
+        # less capable on paper.
+        host_has_model = resolve_ollama_model(model) is not None
+        if not host_has_model:
+            log.info(
+                "compute_pool: host beats worker on capability for "
+                "%r but host doesn't have the model installed — "
+                "routing to worker %s anyway (avoids 404)",
+                model, w.get("label"),
+            )
+        elif not is_host_mega_busy():
+            # Host wins AND has the model AND isn't disk-saturated
+            # → stay local (no LAN hop, KV cache stays warm).
             return None
+        # Otherwise: host either lacks the model or is mega-busy →
+        # fall through and return the worker.
     return (_worker_base_url(w), db.get_compute_worker_auth_token(w["id"]))
 
 

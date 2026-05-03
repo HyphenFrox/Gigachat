@@ -428,6 +428,35 @@ async def serve_forward_stream(envelope: dict) -> AsyncGenerator[str, None]:
                 method, url,
                 json=body if isinstance(body, (dict, list)) else None,
             ) as r:
+                # If upstream returned a 4xx/5xx, surface that as a
+                # `_stream: error` envelope BEFORE forwarding any line
+                # data. Otherwise the receiver sees the error JSON
+                # body as a normal NDJSON chunk, fails to parse it,
+                # and the stream silently ends with no tokens — the
+                # user just sees an empty assistant reply.
+                #
+                # Verified-against-bug case: peer Ollama returns
+                # `{"error":"model requires more system memory ..."}`
+                # with HTTP 500 when a new chat picks a worker whose
+                # llama-server is already squatting all the RAM.
+                # Without this branch, the user sees nothing; with it,
+                # they see the actual OOM message.
+                if r.status_code >= 400:
+                    body_bytes = await r.aread()
+                    err_body = body_bytes.decode("utf-8", errors="replace")[:400]
+                    err_envelope = p2p_crypto.seal_json(
+                        recipient_x25519_pub_b64=recipient_x25519,
+                        recipient_device_id=sender_id,
+                        payload={
+                            "_stream": "error",
+                            "message": (
+                                f"upstream HTTP {r.status_code}: "
+                                f"{err_body.strip()}"
+                            ),
+                        },
+                    )
+                    yield json.dumps(err_envelope) + "\n"
+                    return
                 # Each upstream NDJSON line gets its own envelope. The
                 # envelope itself is a single JSON object; we write
                 # one per line so the receiver can split on '\n'.
