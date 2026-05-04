@@ -74,6 +74,27 @@ _IDLE_TIMEOUT_SEC = int(os.environ.get("GIGACHAT_LLAMA_IDLE_TIMEOUT", "300"))
 # ``p2p_rpc_server._RPC_SERVER_BIN_DIR`` — the `p2p_binary_fetch`
 # auto-installer drops everything llama.cpp into one directory, so
 # both binaries are siblings.
+#
+# IMPORTANT — pinned llama.cpp build: **b8840** (system_fingerprint
+# `b8840-9e5647aff`). Releases ≥ b8841 ship PR #21998 ("rpc:
+# refactor the RPC transport") which introduced a regression: any
+# multi-node split chat crashes mid-decode at ggml-rpc.cpp:640
+# ("Remote RPC server crashed or returned malformed response /
+# send failed bytes_sent=0") AFTER prompt eval but BEFORE the
+# first generated token. Reproduces with both SYCL and pure-CPU
+# rpc-servers, regardless of GGML_RPC_TIMEOUT.
+#
+# b8840 is the last release before that PR landed (PR merged
+# Apr 19, b8840 cut Apr 18). Verified live: dolphin-mixtral 26 GB
+# layer-split across host + Naresh CPU rpc-servers + FBS local
+# CUDA returns tokens cleanly on b8840, crashes on b9002.
+#
+# When upstream patches the regression (track at
+# https://github.com/ggml-org/llama.cpp/issues/...), bump to that
+# build and remove this pin. The download URLs:
+#   https://github.com/ggml-org/llama.cpp/releases/tag/b8840
+# (CUDA 12.4 zip + cudart for NVIDIA peers, SYCL zip for Intel
+# iGPU peers — both layer onto cpu zip's base RPC + CPU DLLs.)
 _LLAMA_SERVER_BIN_DIR = Path.home() / ".gigachat" / "llama-cpp"
 _LLAMA_SERVER_EXE = _LLAMA_SERVER_BIN_DIR / (
     "llama-server.exe" if platform.system() == "Windows" else "llama-server"
