@@ -2990,6 +2990,47 @@ async def _stream_llama_server_chat(
                 await asyncio.sleep(2.0)
                 continue
             raise
+        except httpx.HTTPStatusError as e:
+            # Patched llama.cpp's RPC-resilience layer surfaces a
+            # transient RPC backend failure as a 5xx with
+            # "rpc backend transient failure" in the body. The model
+            # is still loaded; only the inflight decode died. Retry
+            # the request once before propagating to the user — net
+            # effect from their POV is a brief stall instead of a
+            # broken chat.
+            body_text = ""
+            try:
+                body_text = (e.response.text if e.response is not None else "") or ""
+            except Exception:
+                body_text = ""
+            is_rpc_transient = (
+                e.response is not None
+                and e.response.status_code >= 500
+                and (
+                    "rpc backend transient failure" in body_text.lower()
+                    or "rpc_remote_failure" in body_text.lower()
+                    or "remote rpc server" in body_text.lower()
+                )
+            )
+            if is_rpc_transient and attempt == 0 and not received_first_token:
+                log.info(
+                    "agent: llama-server reported transient RPC failure "
+                    "(%s); retrying once after 2 s",
+                    e.response.status_code if e.response is not None else "?",
+                )
+                yield {
+                    "_pass_through": {
+                        "type": "stream_retry",
+                        "reason": "rpc_backend_blip",
+                        "message": (
+                            "split-pool RPC backend hiccupped; "
+                            "auto-retrying once"
+                        ),
+                    },
+                }
+                await asyncio.sleep(2.0)
+                continue
+            raise
 
 
 async def run_turn(

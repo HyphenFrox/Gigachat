@@ -143,6 +143,79 @@ _SPAWN_ENV: dict[str, str] = {
 _LISTEN_WAIT_SEC = 60.0
 
 
+# ============================================================================
+# Gigachat patched llama.cpp manifest.
+#
+# We ship our own patched build that adds RPC-resilience: instead of aborting
+# the whole llama-server process when an RPC backend hiccups (the upstream
+# behaviour, which manifests as STATUS_STACK_BUFFER_OVERRUN on Windows and
+# kills every in-flight chat), the patched build throws a recoverable
+# `rpc_remote_failure` exception that the server catches + surfaces to the
+# client as a 5xx — the chat layer in `agent._stream_llama_server_chat`
+# auto-retries the request once, so the user sees a brief stutter instead
+# of a broken chat.
+#
+# `gigachat_patch_marker.txt` lives next to the binaries. When present, this
+# install is using the patched build and the safety net is engaged. When
+# absent, we know we're running stock upstream — chat dispatch's retry path
+# still applies to (almost any) HTTP-level failure but the underlying RPC
+# crash will hard-kill llama-server. The marker is checked at every spawn so
+# a user who manually drops in newer (or older) binaries gets an automatic
+# warning that they've lost the patch.
+# ============================================================================
+_GIGACHAT_PATCH_MARKER = _LLAMA_SERVER_BIN_DIR / "gigachat_patch_marker.txt"
+
+
+def is_patched_llama_cpp_installed() -> bool:
+    """Return True iff the binaries in ``_LLAMA_SERVER_BIN_DIR`` are the
+    Gigachat-patched build (RPC throws-instead-of-aborts + transport
+    layer retries on transient send/recv failures).
+
+    Read by the chat dispatcher so the UI can show "split-mode is
+    crash-resilient" vs "split-mode may abort on RPC blip" hints.
+    """
+    return _GIGACHAT_PATCH_MARKER.is_file()
+
+
+def _ensure_patched_llama_cpp_or_warn() -> None:
+    """Log a one-shot warning when the user is running stock llama.cpp
+    instead of the patched build. Idempotent — only warns once per
+    process, since logging on every spawn would clutter the log.
+
+    Doesn't auto-download the patched binaries: that's the operator's
+    explicit step (the binary fetch path requires LAN-paired peers OR
+    a release URL, both of which need user setup). But surfacing the
+    warning makes it obvious WHY a chat just died from an RPC crash.
+    """
+    global _PATCHED_BUILD_WARNED
+    try:
+        already = _PATCHED_BUILD_WARNED
+    except NameError:
+        already = False
+    if already:
+        return
+    _PATCHED_BUILD_WARNED = True
+    if is_patched_llama_cpp_installed():
+        log.info(
+            "p2p_llama_server: patched llama.cpp build detected "
+            "(gigachat_patch_marker.txt present) — RPC failures will be "
+            "auto-recovered by the chat layer"
+        )
+    else:
+        log.warning(
+            "p2p_llama_server: STOCK llama.cpp detected at %s "
+            "(no gigachat_patch_marker.txt). RPC backend hiccups will "
+            "hard-kill llama-server with STATUS_STACK_BUFFER_OVERRUN. "
+            "Replace the binaries with the patched build to enable "
+            "automatic crash recovery — see "
+            "C:\\Users\\Gautam\\Downloads\\llama.cpp\\build-sycl\\bin",
+            str(_LLAMA_SERVER_BIN_DIR),
+        )
+
+
+_PATCHED_BUILD_WARNED = False
+
+
 def _is_listening_on(port: int) -> bool:
     """Return True iff TCP port `port` has at least one listener."""
     try:
@@ -347,6 +420,10 @@ def start_local_llama_server(
           (check log_path).
     """
     rpc_targets = list(rpc_targets or [])
+    # Surface a one-shot warning if the binaries here aren't the
+    # Gigachat-patched build — the user needs to know that an RPC
+    # blip will hard-kill the process instead of being auto-recovered.
+    _ensure_patched_llama_cpp_or_warn()
     out: dict = {
         "ok": False,
         "binary_path": str(_LLAMA_SERVER_EXE),
@@ -354,6 +431,7 @@ def start_local_llama_server(
         "port": port,
         "rpc_targets": rpc_targets,
         "log_path": str(_LLAMA_SERVER_BIN_DIR / "llama-server.log"),
+        "patched_build": is_patched_llama_cpp_installed(),
     }
 
     # Already running with the exact same model+rpc_targets on this

@@ -3546,8 +3546,41 @@ def _should_force_split_for(
     host_tps = _route_tps_for(model_name, "host")
     if split_tps is not None and host_tps is not None:
         return split_tps > host_tps
-    if not _eligible_split_workers():
+    eligible = _eligible_split_workers()
+    if not eligible:
         return False
+    # iGPU-first engagement: when ANY participant in the pool exposes
+    # an Intel / SYCL / Vulkan iGPU, prefer the split path. Ollama on
+    # Windows ships with CUDA + CPU backends only — it CANNOT use
+    # iGPUs at all. The split path runs llama-server with SYCL on
+    # host AND fans layers via `--rpc <peer>:50052` to peer SYCL
+    # rpc-servers, lighting up every iGPU on the LAN. Without this
+    # branch, every chat that fits a single peer's NVIDIA falls
+    # straight to Ollama and the laptops' iGPUs sit at 0 % util.
+    #
+    # Safe to engage default-on now that we ship a patched llama.cpp
+    # build (gigachat_patch_marker.txt) where ggml-rpc.cpp throws a
+    # recoverable exception instead of GGML_ABORT()ing on transient
+    # RPC failures — the chat layer auto-retries on 5xx so a Wi-Fi
+    # blip mid-decode is invisible to the user.
+    has_igpu_anywhere = False
+    for w in eligible:
+        caps = w.get("capabilities") or {}
+        kind = (caps.get("gpu_kind") or "").lower()
+        if kind in ("intel", "vulkan", "sycl"):
+            has_igpu_anywhere = True
+            break
+    if not has_igpu_anywhere:
+        try:
+            from . import sysdetect
+            host_kind = (sysdetect.detect_system().get("gpu_kind") or "").lower()
+            if host_kind in ("intel", "vulkan", "sycl"):
+                has_igpu_anywhere = True
+        except Exception:
+            pass
+    if has_igpu_anywhere and pool_vram_total > 0:
+        return True
+    # Legacy outscale fallback for the rare iGPU-less pool.
     if strongest_single_vram <= 0:
         return False
     return pool_vram_total >= strongest_single_vram * _POOL_VRAM_OUTSCALE_FACTOR
@@ -7967,8 +8000,16 @@ async def route_chat_for(
             and worker_pool_ram_gb >= _AGGRESSIVE_POOL_GB
             and worst_lan_latency_ms <= 150
         )
+        # `force_split_engagement` is the iGPU-first override. It
+        # bypasses the LAN-latency gate because the gate's purpose is
+        # to avoid LAN cost dominating the GPU-vs-CPU win — but for
+        # iGPUs the WHOLE point is to engage them at all (Ollama can't),
+        # so we want split engaged even over a slower link. Safe-by-
+        # default since the patched llama.cpp build catches transient
+        # RPC failures cleanly.
         engage_split = (
-            not host_can_run_alone
+            force_split_engagement
+            or not host_can_run_alone
             or (rpc_pool_vram > 0 and size_bytes <= rpc_pool_vram and worst_lan_latency_ms <= 150)
             or is_mega_model
             or aggressive_engage
