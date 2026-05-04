@@ -551,13 +551,18 @@ def start_local_llama_server(
             "model_path": model_path,
             "started_at": time.time(),
             "last_active_at": time.time(),
+            # Persisted spawn args so the crash-respawn watchdog can
+            # rebuild the exact same command line if llama-server dies
+            # unexpectedly (e.g. RPC backend crash that propagates
+            # through C frames past our patched throw to terminate).
+            "spawn_args": {
+                "n_gpu_layers": n_gpu_layers,
+                "context_size": context_size,
+                "parallel": parallel,
+            },
         }
         # Spawn a daemon thread that watches for idle and kills the
         # llama-server when it's been doing nothing for too long.
-        # Without this, llama-server squats however many GB the
-        # model loaded into RAM (11+ GB for dolphin-mixtral on FBS)
-        # forever — blocking other models from loading on the same
-        # peer until the user manually restarts.
         t = threading.Thread(
             target=_idle_watchdog,
             args=(port, pid, _IDLE_TIMEOUT_SEC),
@@ -565,6 +570,25 @@ def start_local_llama_server(
             name=f"llama-server-idle-watch-{port}",
         )
         t.start()
+        # Spawn a SECOND daemon thread that watches for unexpected
+        # death and auto-respawns. The patched ggml-rpc.cpp throws a
+        # recoverable exception on transient RPC failure instead of
+        # GGML_ABORT()ing, but the throw still unwinds through C
+        # frames in ggml's backend dispatcher and terminates the
+        # process. This watchdog catches that case (process gone
+        # while we still EXPECT it to be running) and respawns with
+        # the same args. Net effect: a transient RPC blip becomes a
+        # 30-60 s pause (model reload) instead of a permanent
+        # broken split-mode chat. The chat layer's retry logic in
+        # `agent._stream_llama_server_chat` papers over the gap.
+        crash_t = threading.Thread(
+            target=_crash_respawn_watchdog,
+            args=(port, pid, model, rpc_targets, n_gpu_layers,
+                  context_size, parallel),
+            daemon=True,
+            name=f"llama-server-crash-watch-{port}",
+        )
+        crash_t.start()
     else:
         out["status"] = "spawned_but_not_listening"
         out["error"] = (
@@ -576,6 +600,138 @@ def start_local_llama_server(
             "during weight load."
         )
     return out
+
+
+def _crash_respawn_watchdog(
+    port: int,
+    initial_pid: int,
+    model: str,
+    rpc_targets: list[str],
+    n_gpu_layers: int | None,
+    context_size: int,
+    parallel: int,
+) -> None:
+    """Background thread: detect when llama-server dies UNEXPECTEDLY
+    (i.e. _active_servers still expects it on this port AND the
+    process is gone AND we're not in a clean-shutdown path) and
+    auto-respawn with the original args.
+
+    The patched ggml-rpc.cpp + ggml-sycl.cpp throw recoverable
+    exceptions on transient RPC failures / SYCL DEVICE_LOST instead
+    of GGML_ABORT()ing — but the throws still unwind through ggml's
+    C backend-dispatcher frames and terminate the process. Without
+    this watchdog every transient hardware blip leaves the user with
+    a permanently dead llama-server until manual restart.
+
+    Polls every 5 s. Caps respawn attempts at 5 within 60 s — past
+    that we assume the failure is structural (model OOM, GPU truly
+    dead, etc.) and stop trying so a runaway respawn loop can't pin
+    the box. Each successful respawn resets the counter.
+
+    Cooperates with `_idle_watchdog`: when the idle watchdog kills
+    the process intentionally, it pops the port from `_active_servers`
+    BEFORE killing — so the crash watchdog sees an empty entry and
+    exits without respawning.
+    """
+    import urllib.error
+    import urllib.request
+    POLL_SEC = 5.0
+    RESPAWN_BUDGET = 5
+    BUDGET_WINDOW_SEC = 60.0
+    respawn_history: list[float] = []
+    expected_pid = initial_pid
+    log.info(
+        "p2p_llama_server: crash-respawn watchdog started for port %d "
+        "pid %d (model=%s, rpc_targets=%d)",
+        port, expected_pid, model, len(rpc_targets),
+    )
+    try:
+        import psutil
+    except ImportError:
+        log.warning(
+            "p2p_llama_server: crash-respawn watchdog disabled — "
+            "psutil missing, can't detect process exit reliably"
+        )
+        return
+    while True:
+        time.sleep(POLL_SEC)
+        # If the orchestrator no longer expects llama-server on this
+        # port (clean stop, or idle-watchdog killed it), exit silently.
+        active = _active_servers.get(port)
+        if not active:
+            return
+        # If the model + rpc_targets on the active record drifted
+        # (someone called start_local_llama_server with different
+        # args), let that handler take over — we'd be respawning the
+        # OLD model otherwise.
+        if active.get("model") != model or active.get("rpc_targets") != rpc_targets:
+            log.info(
+                "p2p_llama_server: crash watchdog port %d — active model "
+                "or rpc_targets changed, exiting (replacement watchdog "
+                "will take over)", port,
+            )
+            return
+        if psutil.pid_exists(expected_pid):
+            continue
+        # Process gone but we still expect it. RESPAWN.
+        now = time.time()
+        respawn_history = [t for t in respawn_history if (now - t) < BUDGET_WINDOW_SEC]
+        if len(respawn_history) >= RESPAWN_BUDGET:
+            log.warning(
+                "p2p_llama_server: crash watchdog port %d — exhausted "
+                "respawn budget (%d in last %.0fs); stopping respawn "
+                "attempts. Manually restart via "
+                "/api/p2p/llama-server/start when the underlying issue "
+                "is resolved.",
+                port, RESPAWN_BUDGET, BUDGET_WINDOW_SEC,
+            )
+            _active_servers.pop(port, None)
+            return
+        log.warning(
+            "p2p_llama_server: crash watchdog port %d — process %d died "
+            "unexpectedly (likely transient RPC backend crash or SYCL "
+            "DEVICE_LOST that unwound past our patched catch). "
+            "Respawning attempt %d/%d with same args.",
+            port, expected_pid, len(respawn_history) + 1, RESPAWN_BUDGET,
+        )
+        respawn_history.append(now)
+        # Drop the dead record before re-spawn so start_local_llama_server's
+        # short-circuit doesn't think it's already running.
+        _active_servers.pop(port, None)
+        try:
+            result = start_local_llama_server(
+                model=model,
+                port=port,
+                rpc_targets=rpc_targets,
+                n_gpu_layers=n_gpu_layers,
+                context_size=context_size,
+                parallel=parallel,
+            )
+        except Exception as e:
+            log.warning(
+                "p2p_llama_server: crash watchdog respawn raised: %s: %s",
+                type(e).__name__, e,
+            )
+            continue
+        if not result.get("ok"):
+            log.warning(
+                "p2p_llama_server: crash watchdog respawn failed for "
+                "port %d: status=%s error=%s",
+                port, result.get("status"), result.get("error"),
+            )
+            # Don't return — we'll try again next tick (subject to budget).
+            continue
+        new_pid = result.get("pid")
+        if new_pid:
+            expected_pid = int(new_pid)
+            log.info(
+                "p2p_llama_server: crash watchdog respawned port %d as "
+                "pid %d", port, expected_pid,
+            )
+        # NOTE: start_local_llama_server already started a new
+        # _crash_respawn_watchdog thread for the new pid, so the next
+        # iteration of THIS thread will find _active_servers[port]
+        # pointing at the new entry and exit on the model/rpc check.
 
 
 def _idle_watchdog(port: int, pid: int, idle_timeout_sec: int) -> None:

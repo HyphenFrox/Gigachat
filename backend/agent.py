@@ -2979,9 +2979,30 @@ async def _stream_llama_server_chat(
                     except (asyncio.CancelledError, Exception):
                         pass
         except httpx.NetworkError as e:
+            # NetworkError covers ConnectError + RemoteProtocolError +
+            # ReadError. ConnectError mid-call typically means
+            # llama-server died (SYCL DEVICE_LOST or RPC peer crash
+            # propagated through C frames to terminate). On a fresh
+            # attempt we retry; if we'd already streamed tokens, we
+            # surface a stream_interrupted so the chat layer can
+            # recover and the user picks up from where it stopped.
             if attempt == 0 and not received_first_token:
-                # Retry once after a brief pause — the model is
-                # still loaded on the peer; only the TCP died.
+                # Mark the split as failed so subsequent chats route
+                # via Ollama until the cooldown expires. Without this
+                # stamp, every subsequent chat would re-attempt the
+                # crashy split path and hit the same llama-server
+                # death loop. The stamp is on the orchestrator-side
+                # split target, identified by base_url's host:port.
+                try:
+                    from urllib.parse import urlparse
+                    host = urlparse(base_url).hostname or ""
+                    from . import compute_pool as _cp
+                    if hasattr(_cp, "record_peer_rpc_split_failure"):
+                        _cp.record_peer_rpc_split_failure_by_host(host) \
+                            if hasattr(_cp, "record_peer_rpc_split_failure_by_host") \
+                            else None
+                except Exception:
+                    pass
                 log.info(
                     "agent: chat dispatch transient network failure "
                     "(%s); retrying once after 2 s",
