@@ -349,7 +349,7 @@ async def _probe_worker_specs_via_ssh(worker: dict) -> dict:
 
 
 async def _attempt_rpc_server_restart(
-    worker: dict, backend: str = "SYCL0,CPU",
+    worker: dict, backend: str | None = None,
 ) -> bool:
     """Bring up rpc-server on a worker. P2P-first, SSH-fallback.
 
@@ -359,9 +359,16 @@ async def _attempt_rpc_server_restart(
     ``ssh_host`` configured, falls back to the SSH-driven spawn so
     advanced users who prefer the SSH path don't lose it.
 
-    The old SSH-only signature is preserved so every existing call
-    site keeps working unchanged.
+    Backend selection: when the caller doesn't pin a `backend`, we
+    pick it from the worker's GPU vendor via ``_select_worker_backend``
+    so an NVIDIA peer gets ``CUDA0,CPU`` instead of the legacy
+    ``SYCL0,CPU`` default — sending SYCL0 to a CUDA-only rpc-server
+    binary makes it bail with `error: unknown device: SYCL0` and the
+    spawn never lists. This was the root cause of FBS sitting in a
+    `spawned_but_not_listening` loop after the b9002 deploy.
     """
+    if backend is None:
+        backend = _select_worker_backend(worker, in_split=True)
     # P2P path — primary. Works for any paired peer.
     try:
         ok = await ensure_rpc_server_via_proxy(worker, backend=backend)
@@ -1504,7 +1511,7 @@ async def ensure_rpc_servers_via_proxy_multi(worker: dict) -> list[dict]:
 
 
 async def ensure_rpc_server_via_proxy(
-    worker: dict, *, backend: str = "SYCL0,CPU", port: int = 50052,
+    worker: dict, *, backend: str | None = None, port: int = 50052,
 ) -> bool:
     """Bring up rpc-server on a paired peer through the encrypted
     P2P channel — no SSH required.
@@ -1557,6 +1564,13 @@ async def ensure_rpc_server_via_proxy(
                 "compute_pool: live-stats stamp failed for %s: %s",
                 label, e,
             )
+
+    # Resolve backend AFTER the live-stats stamp updates gpu_kind so
+    # the selector sees the freshly-discovered vendor instead of a
+    # stale `gpu_kind=null` row that would route every worker to CPU
+    # via the "no GPU" fallback.
+    if backend is None:
+        backend = _select_worker_backend(worker, in_split=True)
 
     # Quick status probe first — saves us a 4 s listener-wait when
     # rpc-server is already up (the common case after the first call).

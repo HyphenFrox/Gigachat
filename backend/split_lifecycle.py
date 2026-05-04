@@ -309,6 +309,38 @@ def _host_primary_backend() -> str:
     }.get(kind, "CPU")
 
 
+def _host_has_sycl_backend() -> bool:
+    """True when the host has an Intel iGPU + the SYCL backend DLL
+    that llama-server will load into the device list at startup.
+
+    Used by `_build_command` to detect the SYCL+RPC hybrid config
+    that crashes ggml-backend.cpp:898 in the auto-fit pre-pass. Both
+    conditions must hold:
+      * vendor==intel — without an Intel iGPU there's no SYCL device
+        for the SYCL backend to claim.
+      * `ggml-sycl.dll` present in the install dir — without it
+        llama-server skips loading SYCL even when the iGPU exists,
+        and the bug doesn't trigger.
+
+    Returns False on any error (probe failure, missing detector) —
+    callers default to the standard auto-fit path which still works
+    on every config except SYCL+RPC.
+    """
+    try:
+        from . import sysdetect
+        kind = (sysdetect.detect_system() or {}).get("gpu_kind") or ""
+        if kind != "intel":
+            return False
+    except Exception:
+        return False
+    install = split_runtime.get_install_status()
+    install_dir = install.install_dir
+    if not install_dir:
+        return False
+    sycl_dll = "ggml-sycl.dll" if sys.platform == "win32" else "libggml-sycl.so"
+    return (Path(install_dir) / sycl_dll).is_file()
+
+
 def _model_needs_fit_off(gguf_path: str) -> bool:
     """Return True only for Gemma 3n PLE variants whose forward graph
     is wide enough to trip `GGML_ASSERT(n_inputs <
@@ -1497,6 +1529,21 @@ def _build_command(
         # other slots stay quiescent.
         "--parallel", str(max(1, int(parallel))),
     ]
+    # Hybrid SYCL+RPC config also crashes the auto-fit pre-pass:
+    #   D:/.../ggml/src/ggml-backend.cpp:898: pre-allocated tensor
+    #   (blk.N.attn_q.weight) in a buffer (SYCL_Split) that cannot
+    #   run the operation (NONE)
+    # The auto-fit step samples device memory by allocating sample
+    # tensors in SYCL_Split buffers. When the host has SYCL backend
+    # AND we have at least one RPC endpoint, llama.cpp's scheduler
+    # ends up routing some pre-allocated SYCL_Split tensor to the
+    # NONE device and aborts. Same workaround as Gemma 3n PLE: skip
+    # auto-fit. Detected by the presence of any --rpc endpoint AND
+    # the host having a SYCL device — both conditions together are
+    # the trigger. We don't apply this blindly because non-SYCL hosts
+    # (pure CUDA host or CPU-only host) hit the auto-fit path cleanly
+    # and the adaptive context sizing is genuinely useful there.
+    sycl_rpc_hybrid = bool(rpc_endpoints) and _host_has_sycl_backend()
     # Gemma 3n PLE variants whose graph trips
     # `GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS)` need TWO
     # workarounds together (llama.cpp issue #21730):
@@ -1555,6 +1602,29 @@ def _build_command(
         cmd.extend([
             "-ot", f".*(altup|laurel|per_layer|inp_gate).*={host_dev}",
         ])
+    elif sycl_rpc_hybrid:
+        # Hybrid SYCL host + RPC peers — `-fit on` (default) crashes
+        # at ggml-backend.cpp:898 during the auto-fit pre-pass with
+        # "pre-allocated tensor in a buffer (SYCL_Split) that cannot
+        # run the operation (NONE)". Workaround: skip auto-fit.
+        #
+        # NOTE: even with `-fit off`, the SYCL_Split buffer is still
+        # created during sched_reserve when the host has SYCL backend
+        # AND there are RPC peers. The follow-up workaround lives in
+        # `_disable_host_gpu_backends_for_split_spawn` which renames
+        # ggml-sycl.dll / ggml-vulkan.dll out of the install dir so
+        # the host process can't load them — the RPC peers' SYCL /
+        # CUDA contributions stay engaged via their own rpc-server
+        # processes. The host iGPU still gets used: compute_pool can
+        # bring up a same-machine rpc-server with `-d SYCL0` that
+        # exposes the host's iGPU as just-another RPC endpoint.
+        cmd.extend(["-fit", "off"])
+        log.info(
+            "split_lifecycle: SYCL+RPC hybrid detected (host has "
+            "Intel iGPU and rpc_endpoints=%s) — emitting `-fit off` "
+            "to dodge ggml-backend.cpp:898 SYCL_Split crash",
+            len(rpc_endpoints),
+        )
     # MoE expert auto-pin to CPU when GPU VRAM clearly can't fit
     # them. Engages only for MoE models whose file size exceeds host
     # VRAM (`_should_pin_experts_to_cpu`); the existing pool-side

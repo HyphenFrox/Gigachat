@@ -283,11 +283,27 @@ def _missing_rpc_dlls() -> list[str]:
 def _missing_optional_dlls() -> list[str]:
     """Optional DLLs (e.g. SYCL acceleration) we'd LIKE to have.
     Used to drive opportunistic LAN-first install — we don't fail
-    the spawn when these are missing."""
+    the spawn when these are missing.
+
+    Skip-marker support: a file ``<dll>.skip-install`` next to the
+    install dir marks that backend DLL as deliberately disabled —
+    we should NOT try to fetch it again. This is the escape hatch
+    used by the host-orchestrator path to keep host's llama-server
+    from loading a SYCL backend that triggers the SYCL_Split crash
+    (ggml-backend.cpp:898) when host has an Intel iGPU AND there's
+    at least one RPC peer in the split. Without this guard, every
+    time the host's compute_pool calls ``start_local_rpc_server``
+    (e.g. for the peer-orchestrated split path) the auto-fetcher
+    silently re-downloads ggml-sycl.dll from a LAN peer and the
+    next split spawn crashes again.
+    """
     out = []
     for name in _OPTIONAL_RPC_DLLS:
-        if not (_RPC_SERVER_BIN_DIR / name).is_file():
-            out.append(name)
+        if (_RPC_SERVER_BIN_DIR / name).is_file():
+            continue
+        if (_RPC_SERVER_BIN_DIR / f"{name}.skip-install").is_file():
+            continue
+        out.append(name)
     return out
 
 

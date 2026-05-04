@@ -87,6 +87,9 @@ class _BgSampler:
         # endpoint falls back to a zeroed shape until first probe lands.
         self._gpu_snap: dict[str, Any] | None = None
         self._last_gpu_ts: float = 0.0
+        # Per-pid GPU usage (cached on the same cadence as the device-
+        # level probe — both shell out to the same vendor tools).
+        self._per_pid_gpu_snap: dict[int, dict[str, Any]] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="ResourceTrackerBgSampler", daemon=True
@@ -112,6 +115,7 @@ class _BgSampler:
         # Prime GPU snapshot in the bg so the first request has data.
         try:
             self._gpu_snap = _probe_gpu()
+            self._per_pid_gpu_snap = _probe_per_pid_gpu()
             self._last_gpu_ts = time.time()
         except Exception as e:
             log.debug("BgSampler initial gpu probe failed: %s", e)
@@ -159,9 +163,17 @@ class _BgSampler:
                         self._gpu_snap = _probe_gpu()
                     except Exception as e:
                         log.debug("BgSampler gpu probe failed: %s", e)
+                    try:
+                        self._per_pid_gpu_snap = _probe_per_pid_gpu()
+                    except Exception as e:
+                        log.debug("BgSampler per-pid gpu probe failed: %s", e)
                     self._last_gpu_ts = now
             except Exception as e:
                 log.debug("BgSampler tick failed: %s", e)
+
+    @property
+    def per_pid_gpu_snap(self) -> dict[int, dict[str, Any]]:
+        return dict(self._per_pid_gpu_snap)
 
     @property
     def gpu_snap(self) -> dict[str, Any]:
@@ -541,12 +553,191 @@ def _app_process_snapshot() -> dict[str, Any]:
             pass
 
     cpu_count = max(1, psutil.cpu_count(logical=True) or 1)
+
+    # Per-app GPU usage. Cross-vendor: nvidia-smi gives us per-pid
+    # VRAM + util on NVIDIA; Windows perf-counter `GPU Process Memory`
+    # gives per-pid VRAM on Intel iGPU; AMD has no portable per-pid
+    # query so we leave it 0. Only sum entries whose pid is in our
+    # `matched` set so other apps' GPU usage doesn't get attributed
+    # to Gigachat.
+    matched_pids = {int(p.pid) for p in matched}
+    app_vram_used_gb = 0.0
+    app_gpu_util_pct = 0.0
+    try:
+        gpu_per_pid = _per_pid_gpu_snapshot()
+        for pid, info in gpu_per_pid.items():
+            if pid in matched_pids:
+                app_vram_used_gb += float(info.get("vram_used_gb") or 0)
+                app_gpu_util_pct += float(info.get("gpu_util_pct") or 0)
+    except Exception as e:
+        log.debug("per-pid GPU snapshot failed: %s", e)
+
+    # Disk I/O per process via psutil (Windows: requires admin for
+    # OTHER processes, but processes WE spawned report fine because
+    # they share our token).
+    app_disk_read_bytes = 0
+    app_disk_write_bytes = 0
+    for p in matched:
+        try:
+            io = p.io_counters()
+            app_disk_read_bytes += int(io.read_bytes)
+            app_disk_write_bytes += int(io.write_bytes)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except Exception:
+            pass
+
     return {
         "processes": len(matched),
         "cpu_pct": round(total_cpu / cpu_count, 1),
         "ram_used_gb": round(total_rss / (1024 ** 3), 2),
+        "vram_used_gb": round(app_vram_used_gb, 2),
+        "gpu_util_pct": round(min(100.0, app_gpu_util_pct), 1),
+        "disk_read_total_gb": round(app_disk_read_bytes / (1024 ** 3), 2),
+        "disk_write_total_gb": round(app_disk_write_bytes / (1024 ** 3), 2),
         "names": [f"{k}x{v}" if v > 1 else k for k, v in sorted(names_seen.items())],
     }
+
+
+def _per_pid_gpu_snapshot() -> dict[int, dict[str, Any]]:
+    """Map of {pid: {vram_used_gb, gpu_util_pct}} for processes with
+    GPU activity. Aggregates across NVIDIA + Intel sources; AMD has
+    no portable per-pid path so its processes are absent (treated as
+    zero by the caller). All probes are cached briefly inside the
+    BG sampler so the request handler doesn't pay the subprocess
+    cost on every snapshot.
+    """
+    sampler = _BgSampler.get()
+    return sampler.per_pid_gpu_snap
+
+
+def _probe_per_pid_gpu_nvidia() -> dict[int, dict[str, Any]]:
+    """nvidia-smi --query-compute-apps=pid,used_memory — pid + VRAM
+    in MB. Util is per-device only on NVIDIA, not per-pid; we
+    distribute the device's util pro-rata to each pid by VRAM
+    share so a Gigachat process that's holding 6 of 8 GB of
+    weights gets 75 % of the device util.
+    """
+    out: dict[int, dict[str, Any]] = {}
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=3.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return out
+    if result.returncode != 0:
+        return out
+    apps: list[tuple[int, float]] = []
+    for line in (result.stdout or "").strip().splitlines():
+        parts = [p.strip() for p in line.split(",", 1)]
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        apps.append((int(parts[0]), int(parts[1]) / 1024.0))
+    if not apps:
+        return out
+    # Device util — for distribution.
+    device_util = 0.0
+    try:
+        r2 = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2.0,
+        )
+        if r2.returncode == 0:
+            line = (r2.stdout or "").strip().splitlines()
+            if line and line[0].strip().replace(".", "", 1).isdigit():
+                device_util = float(line[0].strip())
+    except Exception:
+        pass
+    total_vram = sum(v for _, v in apps) or 1.0
+    for pid, vram_gb in apps:
+        share = vram_gb / total_vram
+        out[pid] = {
+            "vram_used_gb": vram_gb,
+            "gpu_util_pct": device_util * share,
+        }
+    return out
+
+
+def _probe_per_pid_gpu_intel() -> dict[int, dict[str, Any]]:
+    """Windows-only. Reads `\\GPU Process Memory(pid_*)\\Local Usage`
+    perf counters which Task Manager itself uses. The `pid_<N>` part
+    of the instance name carries the pid, so we map back to our
+    matched processes. Intel iGPU has no per-pid util signal — we
+    leave gpu_util_pct as 0 here and rely on the device-level total.
+    """
+    out: dict[int, dict[str, Any]] = {}
+    if sys.platform != "win32":
+        return out
+    cmd = (
+        "(Get-Counter '\\GPU Process Memory(*)\\Local Usage' "
+        "-ErrorAction SilentlyContinue).CounterSamples "
+        "| ForEach-Object { \"$($_.InstanceName)|$($_.CookedValue)\" }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            capture_output=True, text=True, timeout=4.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return out
+    if result.returncode != 0:
+        return out
+    # Aggregate across all GPU engines per pid.
+    per_pid_bytes: dict[int, float] = {}
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|", 1)
+        if len(parts) != 2:
+            continue
+        instance = parts[0]
+        # "pid_12345_luid_..._phys_0_eng_0_engtype_3D"
+        if "pid_" not in instance:
+            continue
+        try:
+            pid_str = instance.split("pid_", 1)[1].split("_", 1)[0]
+            pid = int(pid_str)
+            val = float(parts[1])
+        except (ValueError, IndexError):
+            continue
+        per_pid_bytes[pid] = per_pid_bytes.get(pid, 0.0) + val
+    for pid, b in per_pid_bytes.items():
+        if b <= 0:
+            continue
+        out[pid] = {
+            "vram_used_gb": b / (1024 ** 3),
+            "gpu_util_pct": 0.0,
+        }
+    return out
+
+
+def _probe_per_pid_gpu() -> dict[int, dict[str, Any]]:
+    """Merge per-pid GPU snapshots from every available vendor probe."""
+    merged: dict[int, dict[str, Any]] = {}
+    for probe in (_probe_per_pid_gpu_nvidia, _probe_per_pid_gpu_intel):
+        try:
+            for pid, info in probe().items():
+                if pid not in merged:
+                    merged[pid] = dict(info)
+                else:
+                    merged[pid]["vram_used_gb"] = (
+                        merged[pid].get("vram_used_gb", 0.0)
+                        + info.get("vram_used_gb", 0.0)
+                    )
+                    merged[pid]["gpu_util_pct"] = max(
+                        merged[pid].get("gpu_util_pct", 0.0),
+                        info.get("gpu_util_pct", 0.0),
+                    )
+        except Exception:
+            continue
+    return merged
 
 
 # ---------------------------------------------------------------------------
