@@ -692,19 +692,25 @@ def aggregate_snapshot(timeout_per_peer: float = 8.0) -> dict[str, Any]:
         return out
 
     if workers:
-        with ThreadPoolExecutor(max_workers=min(8, len(workers))) as ex:
+        ex = ThreadPoolExecutor(max_workers=min(8, len(workers)))
+        try:
             futures = {ex.submit(_probe_worker, w): w for w in workers}
-            for fut in as_completed(futures, timeout=timeout_per_peer + 4.0):
+            deadline = time.time() + timeout_per_peer + 4.0
+            for fut, w in futures.items():
+                remaining = max(0.5, deadline - time.time())
                 try:
-                    devices.append(fut.result())
+                    devices.append(fut.result(timeout=remaining))
                 except Exception as e:
-                    w = futures[fut]
                     devices.append({
                         "kind": "peer",
                         "device_id": w.get("gigachat_device_id"),
                         "label": w.get("label"),
                         "error": f"{type(e).__name__}: {e}",
                     })
+        finally:
+            # Don't wait for workers — a hung peer probe shouldn't
+            # block the response. Daemon threads die at process exit.
+            ex.shutdown(wait=False, cancel_futures=True)
 
     # ---- Roll-up totals -------------------------------------------------
     rollup = {
