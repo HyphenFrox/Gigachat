@@ -59,14 +59,18 @@ _LOCAL_OLLAMA = "http://127.0.0.1:11434"
 # Per-peer rate-limit on inbound forward requests. Defence against a
 # friend (or compromised friend keypair) pointing a torrent of
 # requests at us — we keep our own compute available for our own
-# use. 60 req/min per peer per hosted endpoint.
-_INBOUND_RATE_PER_MIN = 60
+# use. 600 req/min per peer per hosted endpoint — ample headroom for
+# an active chat conversation that fans out tags + show + chat +
+# embed + system-stats every turn.
+_INBOUND_RATE_PER_MIN = 600
 
 # Hard cap on the request envelope size we'll deserialise. Protects
 # us from a malicious peer trying to exhaust memory by sending a
-# multi-GB body before we can validate it. 256 KB is well above the
-# largest legitimate Ollama embed/chat request body we'd ever see.
-_MAX_INBOUND_ENVELOPE_BYTES = 256_000
+# multi-GB body before we can validate it. 4 MB covers full chat
+# history with tool definitions + injected codebase context (the
+# 256 KB cap was triggering 400 Bad Request mid-chat on long
+# conversations).
+_MAX_INBOUND_ENVELOPE_BYTES = 4_000_000
 
 # Hard cap on the upstream Ollama response we'll proxy back. Stops
 # us from being used as a one-way amplifier (peer asks for a tiny

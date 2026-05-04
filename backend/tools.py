@@ -9143,23 +9143,63 @@ async def _ollama_embed(client, text: str, model: str) -> list[float]:
         return cached
 
     from . import compute_pool
-    base_url = "http://127.0.0.1:11434"
-    headers: dict[str, str] = {}
-    target = compute_pool.pick_embed_target(model)
-    if target is not None:
-        base_url, token = target
+    # Pick the FULL worker dict (not just (url, token)) so we can read
+    # `use_encrypted_proxy` and route via the encrypted P2P channel
+    # when the peer expects it. The previous implementation called
+    # `pick_embed_target` which only returned (base_url, token); for
+    # peers that enforce loopback-only auth on raw `/api/embeddings`
+    # (which is now ALL paired peers, post the auth-tightening of
+    # 2026-04), the direct POST returned 403 in a tight loop and the
+    # whole indexing run silently produced empty vectors.
+    worker = compute_pool.pick_embed_worker(model)
+    vec: list[float] | None = None
+    if worker is not None and worker.get("use_encrypted_proxy"):
+        # Encrypted P2P route — body is sealed in a p2p_crypto envelope,
+        # peer's secure proxy decrypts + calls its own loopback Ollama,
+        # response is sealed back. Wire never sees plaintext.
+        from . import p2p_secure_client as _secure
+        try:
+            status, response_text = await _secure.forward(
+                worker, method="POST", path="/api/embeddings",
+                body={"model": model, "prompt": text},
+            )
+        except Exception:
+            status, response_text = 0, ""
+        if status == 200:
+            try:
+                import json as _json
+                data = _json.loads(response_text)
+                vec = data.get("embedding") or None
+            except Exception:
+                vec = None
+    elif worker is not None:
+        # Legacy plaintext path for peers that opted out of encryption
+        # (older installs, manual `compute_workers` rows w/o pairing).
+        base = f"http://{worker.get('address')}:{worker.get('ollama_port') or 11434}"
+        headers: dict[str, str] = {}
+        token = compute_pool.db.get_compute_worker_auth_token(worker["id"])
         if token:
             headers["Authorization"] = f"Bearer {token}"
-    r = await client.post(
-        f"{base_url}/api/embeddings",
-        json={"model": model, "prompt": text},
-        headers=headers,
-    )
-    r.raise_for_status()
-    data = r.json()
-    vec = data.get("embedding")
+        try:
+            r = await client.post(
+                f"{base}/api/embeddings",
+                json={"model": model, "prompt": text},
+                headers=headers,
+            )
+            r.raise_for_status()
+            vec = r.json().get("embedding") or None
+        except Exception:
+            vec = None
+    if vec is None:
+        # Host fallback. Loopback Ollama — no auth, no encryption needed.
+        r = await client.post(
+            "http://127.0.0.1:11434/api/embeddings",
+            json={"model": model, "prompt": text},
+        )
+        r.raise_for_status()
+        vec = r.json().get("embedding")
     if not vec:
-        raise RuntimeError(f"ollama /api/embeddings returned no vector: {data}")
+        raise RuntimeError(f"ollama /api/embeddings returned no vector")
 
     # Cache on success only. FIFO evict when over capacity — popitem(last=False)
     # drops the oldest, keeping recent embeds warm.

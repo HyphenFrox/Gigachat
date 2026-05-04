@@ -2155,6 +2155,74 @@ async def _auto_disable_stale_workers() -> int:
     return disabled_count
 
 
+async def _refresh_peer_addresses_from_discovery() -> int:
+    """Sync `compute_workers.address` to mDNS-discovered IPs whenever
+    a paired peer reappears at a new address (DHCP rebind, Wi-Fi /
+    Ethernet hand-off, network swap).
+
+    Without this, a single network change leaves the orchestrator
+    POSTing to a dead IP forever — every chat to the peer fails with
+    ConnectTimeout / 400 Bad Request and the user sees "worker
+    became unreachable" with no recovery path. Run it on every
+    periodic sweep so address staleness self-heals within ~5 min.
+
+    Returns the number of rows updated.
+    """
+    try:
+        from . import p2p_discovery as _disc
+    except Exception:
+        return 0
+    try:
+        discovered = _disc.list_discovered() or []
+    except Exception as e:
+        log.debug("compute_pool: list_discovered failed: %s", e)
+        return 0
+    if not discovered:
+        return 0
+    by_did = {d.get("device_id"): d for d in discovered if d.get("device_id")}
+    if not by_did:
+        return 0
+    updated = 0
+    try:
+        workers = db.list_compute_workers(enabled_only=False) or []
+    except Exception as e:
+        log.debug("compute_pool: list_compute_workers failed: %s", e)
+        return 0
+    for w in workers:
+        did = w.get("gigachat_device_id")
+        if not did:
+            continue
+        d = by_did.get(did)
+        if not d:
+            continue
+        new_ip = (d.get("ip") or "").strip()
+        new_port = d.get("port")
+        cur_ip = (w.get("address") or "").strip()
+        cur_port = w.get("ollama_port")
+        if not new_ip:
+            continue
+        # Only update when something actually changed — avoids
+        # touching the DB row's `updated_at` on every sweep.
+        if new_ip == cur_ip and (new_port is None or int(new_port) == int(cur_port or 0)):
+            continue
+        try:
+            db.update_compute_worker_address(
+                w["id"], address=new_ip,
+                ollama_port=int(new_port) if new_port else None,
+            )
+            log.info(
+                "compute_pool: address-watchdog updated %r %s -> %s (port %s -> %s)",
+                w.get("label"), cur_ip, new_ip, cur_port, new_port,
+            )
+            updated += 1
+        except Exception as e:
+            log.warning(
+                "compute_pool: address-watchdog update failed for %r: %s",
+                w.get("label"), e,
+            )
+    return updated
+
+
 async def _periodic_loop() -> None:
     """Internal: sweep every `_SWEEP_INTERVAL_SEC`. Started/stopped via
     `start_periodic_probe` / `stop_periodic_probe` on app lifecycle.
@@ -2168,6 +2236,18 @@ async def _periodic_loop() -> None:
     data and doesn't compete with the SCP drain for SSH bandwidth.
     """
     while True:
+        # FIRST pass: refresh peer addresses from mDNS so the probe
+        # below targets the LIVE IP. Without this, a peer that moved
+        # subnets (Wi-Fi → Ethernet) is unreachable until the user
+        # manually edits Settings → Compute pool.
+        try:
+            n = await _refresh_peer_addresses_from_discovery()
+            if n:
+                log.info("compute_pool: address-watchdog updated %d peer(s)", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("compute_pool: address-watchdog tick failed: %s", e)
         try:
             await probe_all_enabled()
         except asyncio.CancelledError:
