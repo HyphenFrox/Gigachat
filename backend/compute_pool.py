@@ -623,35 +623,35 @@ def record_backend_failure(worker_id: str, backend: str) -> None:
         return
     caps = dict(w.get("capabilities") or {})
     backend_lower = (backend or "").lower()
-    is_hybrid = "," in (backend or "")
     now = time.time()
+    # When the iGPU/discrete-GPU stack itself is broken (Intel
+    # `UR_RESULT_ERROR_DEVICE_LOST`, Vulkan device-lost, CUDA
+    # device-disabled), BOTH the single-device mode (`SYCL0`) and the
+    # hybrid mode (`SYCL0,CPU`) fail for the same root reason — the
+    # device handle is invalid until driver reset. Marking only the
+    # mode that just failed leaves the selector free to retry the
+    # other mode, which crashes again. Mark both variants so the
+    # selector falls through cleanly to the next vendor backend or
+    # to plain CPU. The 24h cooldown still re-tests when the iGPU
+    # may have recovered (driver reset / reboot).
     if "sycl" in backend_lower:
-        if is_hybrid:
-            caps["sycl_hybrid_split_failed_at"] = now
-            log.info(
-                "compute_pool: recorded SYCL+CPU hybrid split failure "
-                "for worker %s", w.get("label"),
-            )
-        else:
-            caps["sycl_split_failed_at"] = now
-            log.info(
-                "compute_pool: recorded SYCL-only split failure for "
-                "worker %s; next start will try Vulkan-only",
-                w.get("label"),
-            )
+        caps["sycl_split_failed_at"] = now
+        caps["sycl_hybrid_split_failed_at"] = now
+        log.info(
+            "compute_pool: recorded SYCL split failure (single + "
+            "hybrid both flagged) for worker %s — next start will "
+            "try Vulkan, then CPU",
+            w.get("label"),
+        )
     elif "vulkan" in backend_lower:
-        if is_hybrid:
-            caps["vulkan_hybrid_split_failed_at"] = now
-            log.info(
-                "compute_pool: recorded Vulkan+CPU hybrid split failure "
-                "for worker %s", w.get("label"),
-            )
-        else:
-            caps["vulkan_split_failed_at"] = now
-            log.info(
-                "compute_pool: recorded Vulkan-only split failure for "
-                "worker %s", w.get("label"),
-            )
+        caps["vulkan_split_failed_at"] = now
+        caps["vulkan_hybrid_split_failed_at"] = now
+        log.info(
+            "compute_pool: recorded Vulkan split failure (single + "
+            "hybrid both flagged) for worker %s — next start will "
+            "fall through to CPU",
+            w.get("label"),
+        )
     else:
         # CPU has no fallback — record the failure but the next
         # selector will still return CPU (nothing safer to try).

@@ -1286,11 +1286,44 @@ def test_worker_gpu_vendor_none():
 
 
 def test_select_worker_backend_intel_split_vs_normal():
-    """Intel iGPU workers drop SYCL only in split mode (the SYCL+RPC
-    bug doesn't fire in non-split paths)."""
+    """Intel iGPU workers expose SYCL in BOTH split and non-split.
+
+    Older policy dropped SYCL in split mode to dodge the SYCL+RPC
+    crash, but the user's compute-pool directive ("iGPUs MUST be
+    used — that's why we pinned older llama.cpp") inverts that:
+    a fresh worker (no recent SYCL crash recorded) should return
+    `SYCL0` in split (single-backend dodges the hybrid layout bug)
+    and `SYCL0,CPU` in non-split. CPU-only is reserved for workers
+    whose SYCL has actually crashed in the last 24h cooldown
+    (`record_backend_failure` flags it then).
+    """
     intel_w = _w([{"name": "Intel(R) Graphics"}])
-    assert compute_pool._select_worker_backend(intel_w, in_split=True) == "CPU"
+    assert compute_pool._select_worker_backend(intel_w, in_split=True) == "SYCL0"
     assert compute_pool._select_worker_backend(intel_w, in_split=False) == "SYCL0,CPU"
+
+
+def test_select_worker_backend_intel_after_sycl_failure_falls_through():
+    """After `record_backend_failure` fires for an Intel worker's
+    SYCL backend, the selector falls through to Vulkan, then CPU.
+
+    The patched `record_backend_failure` flags BOTH single-mode and
+    hybrid-mode SYCL because a broken SYCL device fails identically
+    under either; flagging only one wastes a retry on a guaranteed
+    second crash.
+    """
+    intel_w = _w([{"name": "Intel(R) Graphics"}])
+    intel_w["id"] = "test-intel-w-1"
+    # Inject a fresh-failure timestamp directly into capabilities so the
+    # selector reads it without us having to wire DB state.
+    import time as _time
+    intel_w.setdefault("capabilities", {})
+    now = _time.time()
+    intel_w["capabilities"]["sycl_split_failed_at"] = now
+    intel_w["capabilities"]["sycl_hybrid_split_failed_at"] = now
+    assert compute_pool._select_worker_backend(intel_w, in_split=True) == "Vulkan0"
+    intel_w["capabilities"]["vulkan_split_failed_at"] = now
+    intel_w["capabilities"]["vulkan_hybrid_split_failed_at"] = now
+    assert compute_pool._select_worker_backend(intel_w, in_split=True) == "CPU"
 
 
 def test_select_worker_backend_nvidia_keeps_cuda_in_both_modes():
