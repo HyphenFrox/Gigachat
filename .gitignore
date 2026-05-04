@@ -52,6 +52,7 @@ scripts/.last_run.log
 # commit — contains transient request URLs, peer IPs, and per-run
 # system stats.
 gigachat.log
+gigachat.err
 
 # Local debug-log captures gathered for upstream issue reports
 # (e.g. github.com/ggml-org/llama.cpp/issues/22643). Each repro
