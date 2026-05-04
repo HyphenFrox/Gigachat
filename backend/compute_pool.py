@@ -3434,12 +3434,45 @@ def _mark_host_mega_busy() -> None:
 
 
 def is_host_mega_busy() -> bool:
-    """True when the host is currently mmapping a mega-model from disk.
-    Routing helpers consult this to bias parallel work toward workers
-    so the host's disk subsystem stays dedicated to the mega-model
-    page-in stream.
+    """True when host is too loaded to absorb another chat turn — biases
+    routing helpers to spread parallel work across the pool instead of
+    dogpiling one node and leaving every other peer idle.
+
+    Three independent signals trigger "busy" (any one is enough):
+      1. **Mega-model paging in from disk** — explicit hint set by the
+         split-runtime when an llama-server starts mmapping a multi-GB
+         model. Stays sticky for 60 s after the page-in window so the
+         host's disk subsystem stays dedicated to the mega stream.
+      2. **Concurrent chat turns** — when `_ACTIVE_TURNS_PER_NODE['host']`
+         is ≥ 2 we already have a chat running here; routing the third
+         to a peer keeps the host responsive instead of saturating.
+      3. **Live RAM pressure** — when free RAM drops below 1.0 GB the
+         next chat would push the box into swap, so any peer with the
+         model is preferred. Read from the same psutil snapshot the
+         resource-tracker uses; falls back to "not busy" if psutil
+         isn't installed (won't degrade the existing routing).
+
+    The third signal is what closes the user-reported gap: under heavy
+    load the strongest single device used to absorb every chat (because
+    capability-score ranks it on top); now once it's near full RAM the
+    router naturally fans out to other paired peers, so EVERY device
+    contributes when the user actually has work for them.
     """
-    return time.time() < _HOST_MEGA_MODEL_BUSY_UNTIL
+    if time.time() < _HOST_MEGA_MODEL_BUSY_UNTIL:
+        return True
+    if _ACTIVE_TURNS_PER_NODE.get("host", 0) >= 2:
+        return True
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        # `available` matches what Task Manager calls "Available" —
+        # already accounts for cached pages we can reclaim. < 1 GB
+        # means the next inference would page into swap.
+        if (vm.available / (1024 ** 3)) < 1.0:
+            return True
+    except Exception:
+        pass
+    return False
 
 # Adaptive routing — per-model TPS history. Reserved for a future
 # commit that wires post-turn realised-TPS recording from agent.py;
