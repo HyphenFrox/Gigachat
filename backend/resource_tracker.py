@@ -456,6 +456,15 @@ def _is_gigachat_process(p: "psutil.Process") -> bool:
 _PYTHON_BIN_NAMES = frozenset({"python.exe", "python", "python3", "python3.exe"})
 
 
+# Per-pid cache of psutil.Process objects so cpu_percent's two-sample
+# delta calculation works across snapshots. Without this cache every
+# call would return 0% (psutil.Process.cpu_percent's first-sample
+# convention). Evicted on snapshot pass when the pid no longer exists
+# OR when the pid's create_time changed (a different process reused
+# the pid). Keyed by pid; values are psutil.Process.
+_CPU_PCT_CACHE: dict[int, "psutil.Process"] = {}
+
+
 def _safe_cmdline(p: "psutil.Process", timeout: float = 0.4) -> list[str] | None:
     """Fetch ``p.cmdline()`` with a timeout. Returns None on
     NoSuchProcess / AccessDenied / timeout / unreadable PEB.
@@ -537,8 +546,26 @@ def _app_process_snapshot() -> dict[str, Any]:
     names_seen: dict[str, int] = {}
     for p in matched:
         try:
-            total_cpu += float(p.cpu_percent(interval=None))
+            # Use the cached `psutil.Process` instance so cpu_percent's
+            # delta calculation works. Without the cache the very-first
+            # `cpu_percent(interval=None)` call on a fresh psutil.Process
+            # returns 0 (psutil contract — it needs a prior sample to
+            # diff against), and since `_app_process_snapshot` builds a
+            # new psutil.Process every call, every call would always
+            # report 0%. The cache is keyed by pid; we evict entries
+            # whose pid no longer exists on each pass so it can't grow
+            # unbounded.
+            cached = _CPU_PCT_CACHE.get(p.pid)
+            if cached is None or cached.create_time() != p.create_time():
+                cached = p
+                _CPU_PCT_CACHE[p.pid] = cached
+                # Prime the sample: first call returns 0 but stores the
+                # baseline cpu_times tuple so the NEXT call can diff.
+                cached.cpu_percent(interval=None)
+            else:
+                total_cpu += float(cached.cpu_percent(interval=None))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
+            _CPU_PCT_CACHE.pop(p.pid, None)
             continue
         except Exception:
             pass
@@ -571,6 +598,13 @@ def _app_process_snapshot() -> dict[str, Any]:
                 app_gpu_util_pct += float(info.get("gpu_util_pct") or 0)
     except Exception as e:
         log.debug("per-pid GPU snapshot failed: %s", e)
+
+    # Prune the cpu-percent cache: drop pids that no longer match anything
+    # we just observed. Without this prune the cache grows by one entry per
+    # short-lived child process spawned over the backend's lifetime.
+    matched_pids_set = {p.pid for p in matched}
+    for stale_pid in [pid for pid in _CPU_PCT_CACHE if pid not in matched_pids_set]:
+        _CPU_PCT_CACHE.pop(stale_pid, None)
 
     # Disk I/O per process via psutil (Windows: requires admin for
     # OTHER processes, but processes WE spawned report fine because
