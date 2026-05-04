@@ -47,6 +47,18 @@ DEVICES.md
 scripts/.last_conv_id
 scripts/.last_run.log
 
+# Runtime backend log written by the dev launch script
+# (`python -m uvicorn ... > gigachat.log 2>&1`). Never useful to
+# commit — contains transient request URLs, peer IPs, and per-run
+# system stats.
+gigachat.log
+
+# Local debug-log captures gathered for upstream issue reports
+# (e.g. github.com/ggml-org/llama.cpp/issues/22643). Each repro
+# bundle goes under .gh-NNNNN-logs/ — kept on disk so we can
+# re-attach to comments, but never committed.
+.gh-*-logs/
+
 # UIAutomation COM-init complaint file written from a background thread
 # during some tool tests. Transient; never useful to commit.
 @AutomationLog.txt
