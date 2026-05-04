@@ -1,0 +1,180 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 7176d2f..a0b6a51 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -17,6 +17,7 @@
+ #include <fstream>
+ #include <filesystem>
+ #include <algorithm>
++#include <stdexcept>  // Gigachat: std::runtime_error for rpc_remote_failure
+ 
+ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ 
+@@ -26,8 +27,39 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ 
+ namespace fs = std::filesystem;
+ 
+-// macro for nicer error messages on server crash
+-#define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
++// Gigachat patch (rpc-resilience): the upstream macro calls GGML_ABORT
++// which on Windows is __fastfail(STATUS_STACK_BUFFER_OVERRUN) — a hard
++// process kill with no way for the chat layer to recover. Real production
++// LANs lose the connection occasionally (Wi-Fi roaming, peer wakes from
++// sleep, 5 GHz channel hop), and every blip became a crashed llama-server.
++//
++// New behaviour: throw a std::runtime_error instead of aborting. C++
++// exceptions unwind cleanly through every RPC_STATUS_ASSERT site (these
++// macros have many different return types — bool, size_t, void*, void —
++// and `throw` is the only mechanism that works in all of them). The
++// llama-server main loop catches std::runtime_error around the inference
++// call and surfaces a clean HTTP 503 to the client; Gigachat's chat
++// layer (agent.py:_stream_llama_server_chat) sees the 503 and retries
++// the request via its existing auto-retry path. Net effect: a transient
++// RPC failure becomes a brief stall instead of a process death.
++//
++// Kept behind GIGACHAT_RPC_STRICT_ABORT so developers can crash on
++// every assertion (useful while debugging the protocol itself).
++class rpc_remote_failure : public std::runtime_error {
++  public:
++    rpc_remote_failure() : std::runtime_error(
++        "Remote RPC server crashed or returned malformed response") {}
++};
++#ifdef GIGACHAT_RPC_STRICT_ABORT
++#  define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
++#else
++#  define RPC_STATUS_ASSERT(x) do { \
++        if (!(x)) { \
++            GGML_LOG_ERROR("Remote RPC server failure caught (Gigachat soft-fail; throwing recoverable rpc_remote_failure)\n"); \
++            throw rpc_remote_failure(); \
++        } \
++    } while (0)
++#endif
+ 
+ // all RPC structures must be packed
+ #pragma pack(push, 1)
+@@ -399,8 +431,16 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
++    // Gigachat patch: don't throw from a free-buffer / destructor-like
++    // path. The patched macro propagates failures via std::runtime_error,
++    // but throwing here unwinds through C-only call frames in ggml's
++    // backend dispatcher and terminates the process. Log + leak the
++    // remote buffer instead — the rpc-server process will free it on
++    // its own destructor when the next chat session reconnects.
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
+-    RPC_STATUS_ASSERT(status);
++    if (!status) {
++        GGML_LOG_ERROR("Remote RPC server failed to free buffer (Gigachat soft-fail; remote ptr leaked, will be reclaimed on rpc-server restart)\n");
++    }
+     delete ctx;
+ }
+ 
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index a728152..be33c38 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -459,6 +459,35 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
+ 
+ #endif // GGML_RPC_RDMA
+ 
++// Gigachat patch (rpc-resilience): EAGAIN / EWOULDBLOCK / EINTR are transient
++// kernel-side errors that the original llama.cpp code surfaces as a hard
++// failure, killing the entire llama-server with STATUS_STACK_BUFFER_OVERRUN
++// when the upstream RPC_STATUS_ASSERT fires. On a real production LAN with
++// Wi-Fi blips and TCP back-pressure these happen routinely. Retrying with
++// a short backoff for a bounded number of attempts converts almost every
++// observed crash into a brief stall that the chat layer doesn't notice.
++//
++// The retry budget is intentionally small (8 attempts, ~250 ms total at
++// most) so a TRULY dead peer still surfaces as a clean false return — the
++// higher layer can then demote the RPC backend rather than spin forever.
++static bool _gigachat_errno_is_transient() {
++#ifdef _WIN32
++    int e = WSAGetLastError();
++    return e == WSAEINTR || e == WSAEWOULDBLOCK || e == WSAETIMEDOUT;
++#else
++    return errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK;
++#endif
++}
++
++static void _gigachat_short_sleep(int attempt) {
++#ifdef _WIN32
++    Sleep((attempt + 1) * 5);  // 5, 10, 15, ... ms
++#else
++    struct timespec ts = { 0, (attempt + 1) * 5 * 1000 * 1000 };
++    nanosleep(&ts, nullptr);
++#endif
++}
++
+ bool socket_t::impl::send_data(const void * data, size_t size) {
+ #ifdef GGML_RPC_RDMA
+     if (use_rdma) {
+@@ -468,7 +497,13 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
+     size_t bytes_sent = 0;
+     while (bytes_sent < size) {
+         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
+-        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
++        ssize_t n = -1;
++        for (int attempt = 0; attempt < 8; ++attempt) {
++            n = send(fd, (const char *)data + bytes_sent, size_to_send, 0);
++            if (n >= 0) break;
++            if (!_gigachat_errno_is_transient()) break;
++            _gigachat_short_sleep(attempt);
++        }
+         if (n < 0) {
+             GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
+                            bytes_sent, size_to_send);
+@@ -488,7 +523,15 @@ bool socket_t::impl::recv_data(void * data, size_t size) {
+     size_t bytes_recv = 0;
+     while (bytes_recv < size) {
+         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
+-        ssize_t n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
++        ssize_t n = -1;
++        for (int attempt = 0; attempt < 8; ++attempt) {
++            n = recv(fd, (char *)data + bytes_recv, size_to_recv, 0);
++            // n == 0 on a stream socket means the peer closed cleanly;
++            // there is nothing more to receive ever, so we don't retry.
++            if (n >= 0) break;
++            if (!_gigachat_errno_is_transient()) break;
++            _gigachat_short_sleep(attempt);
++        }
+         if (n < 0) {
+             GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
+                            bytes_recv, size_to_recv);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 2d3003f..ccaff39 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2792,7 +2792,30 @@ private:
+                 batch.logits   + i,
+             };
+ 
+-            const int ret = llama_decode(ctx, batch_view);
++            // Gigachat patch (rpc-resilience): the patched ggml-rpc layer
++            // throws `rpc_remote_failure` (a std::runtime_error subclass)
++            // instead of aborting the process when an RPC backend goes
++            // unreachable mid-decode. Catch it here, surface as a clean
++            // error to every active slot, and continue serving — the next
++            // client request will succeed once the RPC backend recovers
++            // (or routes around the failed backend via Gigachat's
++            // peer-orchestrated retry path in agent.py).
++            int ret = 0;
++            try {
++                ret = llama_decode(ctx, batch_view);
++            } catch (const std::runtime_error & e) {
++                SRV_ERR("llama_decode threw recoverable runtime_error: %s — "
++                        "treating as compute failure for active slots so the "
++                        "client can retry\n", e.what());
++                for (auto & slot : slots) {
++                    if (slot.is_processing()) {
++                        send_error(slot, std::string("rpc backend transient failure: ") + e.what());
++                        slot.release();
++                        slot.prompt_clear(false);
++                    }
++                }
++                break;  // exit the n_batch loop; next request will reattempt
++            }
+ 
+             metrics.on_decoded(slots);
+ 
