@@ -523,21 +523,44 @@ async def start(advertise_port: int | None = None) -> None:
         properties=txt,
         server=f"gigachat-{me.device_id.lower()}.local.",
     )
+    # zeroconf's register_service can hang for many minutes on Windows
+    # after a quick restart (multicast slot stuck in OS TIME_WAIT) or
+    # when one of the bound interfaces is a VPN tunnel that drops
+    # multicast packets silently. We do TWO things to keep startup
+    # responsive:
+    #   1. cap the inline await at 8 s — if it exceeds, log + move on,
+    #      the rest of the lifespan can finish + uvicorn binds.
+    #   2. on timeout, re-try the register on a daemon thread so the
+    #      announcement EVENTUALLY happens once the network unsticks.
     try:
-        await asyncio.to_thread(
-            state.zeroconf.register_service, state.service_info,
+        await asyncio.wait_for(
+            asyncio.to_thread(state.zeroconf.register_service, state.service_info),
+            timeout=8.0,
         )
+        log.info(
+            "p2p: mDNS published as %s on %s:%d (device_id=%s, label=%r)",
+            _SERVICE_TYPE, ip, port, me.device_id, me.label,
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            "p2p_discovery: register_service > 8 s — deferring to bg thread"
+        )
+
+        def _bg_register() -> None:
+            try:
+                state.zeroconf.register_service(state.service_info)
+                log.info("p2p: mDNS published (bg-deferred)")
+            except Exception as e:
+                log.warning("p2p_discovery: bg register failed: %s", e)
+        threading.Thread(
+            target=_bg_register, name="p2p_discovery_register_bg", daemon=True
+        ).start()
     except Exception as e:
         log.warning("p2p_discovery: register_service failed: %s", e)
-
     state.browser = ServiceBrowser(
         state.zeroconf, _SERVICE_TYPE, _GigachatListener(),
     )
     _state = state
-    log.info(
-        "p2p: mDNS published as %s on %s:%d (device_id=%s, label=%r)",
-        _SERVICE_TYPE, ip, port, me.device_id, me.label,
-    )
 
 
 async def stop() -> None:

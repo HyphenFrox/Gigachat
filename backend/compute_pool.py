@@ -1852,31 +1852,74 @@ async def probe_worker(wid: str) -> dict:
             if rpc_ok:
                 log.info("compute_pool: rpc-server self-heal succeeded on %s", rpc_host)
 
-    capabilities = {
-        "version": payload.get("version"),
-        "models": payload.get("models") or [],
-        "rpc_server_reachable": rpc_ok,
-        "rpc_port": rpc_port,
-        "rpc_error": rpc_err,
-        # Hardware hints — best-effort, populated from /api/ps. Used by
-        # the router to prefer hardware-stronger workers over weaker
-        # ones when both are otherwise eligible.
-        "gpu_present": bool(payload.get("gpu_present")),
-        "max_vram_seen_bytes": int(payload.get("max_vram_seen_bytes") or 0),
-        "loaded_count": int(payload.get("loaded_count") or 0),
-        # LAN-latency hint from the parallel probe-GET round trip.
-        # Used by the routing layer as a proxy for "how expensive is
-        # a per-token RPC roundtrip to this worker": low latency →
-        # split path is viable; high latency → biased toward host
-        # CPU offload over split.
-        "probe_latency_ms": int(payload.get("probe_latency_ms") or 0),
-    }
+    # MERGE-DON'T-REPLACE: start from the previous capabilities row
+    # so any field the current probe failed to fetch (because of a
+    # transient LAN flake, encrypted-proxy timeout, peer Ollama 503,
+    # etc.) keeps its prior good value. The original behaviour of
+    # building `capabilities = {...}` from scratch silently nuked
+    # `models`, `gpu_kind`, `vram_total_gb`, `peer_orchestrated_rpc_
+    # failed_at`, `rpc_endpoints` whenever a single sweep dropped a
+    # packet — and the router would then route to host (no model)
+    # → 404 "model not found", or auto-pull a 26 GB model that the
+    # peer already had on disk.
+    #
+    # Volatile P2P networks see partial probe results constantly
+    # (probe call returns version + ps but tags timed out, etc.).
+    # Treat each probe as a "patch" on top of the prior row — only
+    # overwrite fields when the probe actually returned a value
+    # for them.
+    prev_caps = worker.get("capabilities") or {}
+    capabilities = dict(prev_caps)
+    if payload.get("version") is not None:
+        capabilities["version"] = payload.get("version")
+    new_models = payload.get("models") or []
+    if new_models:
+        # Only overwrite the model list when we got a non-empty one.
+        # An empty result usually means tags-endpoint timed out, NOT
+        # that the peer actually uninstalled every model.
+        capabilities["models"] = new_models
+    elif "models" not in capabilities:
+        capabilities["models"] = []
+    capabilities["rpc_server_reachable"] = rpc_ok
+    capabilities["rpc_port"] = rpc_port
+    if rpc_err:
+        capabilities["rpc_error"] = rpc_err
+    elif "rpc_error" in capabilities:
+        del capabilities["rpc_error"]
+    # Hardware hints — gpu_present from /api/ps, falls back via
+    # `_probe_one*`'s gpu_kind/vram_total_gb fallback. We treat False
+    # as "didn't see one this sweep" and keep prior True if we had it.
+    new_gpu = bool(payload.get("gpu_present"))
+    if new_gpu or "gpu_present" not in capabilities:
+        capabilities["gpu_present"] = new_gpu
+    new_max_vram = int(payload.get("max_vram_seen_bytes") or 0)
+    if new_max_vram > int(capabilities.get("max_vram_seen_bytes") or 0):
+        # max_vram_seen is monotonic — proven by an actual load.
+        # Never reset it backwards on a probe that didn't catch
+        # the loaded model.
+        capabilities["max_vram_seen_bytes"] = new_max_vram
+    capabilities["loaded_count"] = int(payload.get("loaded_count") or 0)
+    if payload.get("probe_latency_ms"):
+        capabilities["probe_latency_ms"] = int(payload.get("probe_latency_ms") or 0)
+    # gpu_kind / vram_total_gb / vram_free_gb come from the
+    # /api/p2p/system-stats probe inside `_probe_one_via_secure_proxy`
+    # — when present, copy them through; when missing, keep prior.
+    for k in ("gpu_kind", "vram_total_gb", "vram_free_gb",
+              "rpc_endpoints", "ram_total_gb", "ram_free_gb",
+              "cpu_threads", "tokens_per_second"):
+        v = payload.get(k)
+        if v is not None and v != "" and v != [] and v != 0:
+            capabilities[k] = v
+    # peer_orchestrated_rpc_failed_at is a 24h cooldown stamp set by
+    # the chat dispatcher on confirmed b9002 RPC crashes — NEVER let
+    # a probe overwrite it (the periodic loop has no idea about
+    # crashes the chat layer just observed).
+    # (no action needed — dict(prev_caps) already preserved it.)
 
     # Carry over throughput + spec data from the previous probe IF
     # they're still fresh (1 hour TTL). Re-measure only when stale —
     # both are expensive enough that we don't want to run them on
     # every 5-min sweep.
-    prev_caps = worker.get("capabilities") or {}
     now_t = time.time()
     if prev_caps.get("tokens_per_second") and (
         now_t - (prev_caps.get("tps_measured_at") or 0)
@@ -6959,19 +7002,34 @@ async def _ensure_peer_orchestrated_split(
     # endpoint we built earlier. Failures here are best-effort:
     # an offline peer or a stale capability cache shouldn't block
     # the spawn we're about to do on the orchestrator peer.
+    #
+    # Per-peer backend selection:
+    #   * NVIDIA peer (gpu_kind=nvidia) → port 50052 hosts `CUDA0`
+    #     (NVIDIA cards crash on `-d SYCL0` because llama.cpp's
+    #     SYCL backend doesn't enumerate them).
+    #   * Intel iGPU peer (gpu_kind=intel) → port 50052 hosts
+    #     `SYCL0` (Intel oneAPI Level Zero path).
+    #   * Anything else falls back to CPU-only on both ports.
     try:
         for w in db.list_compute_workers(enabled_only=True):
             if w.get("id") == peer_worker.get("id"):
                 continue
             if not w.get("use_for_chat"):
                 continue
+            caps = w.get("capabilities") or {}
+            kind = (caps.get("gpu_kind") or "").lower()
+            gpu_backend = (
+                "CUDA0" if kind == "nvidia"
+                else "SYCL0" if kind == "intel"
+                else "CPU"
+            )
             try:
                 await _sec.forward(
                     w,
                     method="POST",
                     path="/api/p2p/rpc-server/ensure-multi",
                     body={"specs": [
-                        {"port": 50052, "backend": "SYCL0"},
+                        {"port": 50052, "backend": gpu_backend},
                         {"port": 50053, "backend": "CPU"},
                     ]},
                     timeout=20.0,
@@ -7016,6 +7074,19 @@ async def _ensure_peer_orchestrated_split(
         rpc_targets: list[str] = []
     else:
         # Cool-down expired (or never tripped) — try the full pool.
+        # Now we point at BOTH ports per peer:
+        #   * 50052 — SYCL/CUDA endpoint (Intel iGPU on host+Naresh,
+        #     NVIDIA CUDA on FBS). Was conservatively skipped during
+        #     the b9002 era because the hybrid SYCL+RPC path tripped
+        #     ggml-rpc.cpp:515 mid-decode. b8840 (the build we now
+        #     pin) does NOT have that bug — verified live with a
+        #     22-token chat completion through CUDA + multi-node RPC.
+        #   * 50053 — CPU-only endpoint (system RAM only).
+        #
+        # Listing both means llama.cpp's split-mode allocator sees
+        # peer iGPUs as additional layer-storage devices — useful
+        # contribution even from the small Iris Xe iGPUs (~3 GB
+        # shared each) that would otherwise sit idle.
         try:
             from .p2p_discovery import _local_lan_ips as _lan_ips
             host_ips = _lan_ips()
@@ -7023,7 +7094,8 @@ async def _ensure_peer_orchestrated_split(
             host_ips = []
         rpc_targets: list[str] = []
         for ip in host_ips:
-            rpc_targets.append(f"{ip}:50053")
+            rpc_targets.append(f"{ip}:50052")  # SYCL/CUDA on host
+            rpc_targets.append(f"{ip}:50053")  # CPU on host
         try:
             for w in db.list_compute_workers(enabled_only=True):
                 if w.get("id") == peer_worker.get("id"):
@@ -7036,7 +7108,8 @@ async def _ensure_peer_orchestrated_split(
                 caps = w.get("capabilities") or {}
                 if not caps.get("rpc_server_reachable"):
                     continue
-                rpc_targets.append(f"{other_addr}:50053")
+                rpc_targets.append(f"{other_addr}:50052")  # iGPU
+                rpc_targets.append(f"{other_addr}:50053")  # CPU
         except Exception as e:
             log.info(
                 "compute_pool: failed to enumerate other peers' rpc "

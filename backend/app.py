@@ -170,6 +170,14 @@ async def lifespan(_app: FastAPI):
         _fw.ensure_firewall_rules()
     except Exception as e:
         log.warning("firewall_setup: skipped at startup (%s)", e)
+    # Resource tracker BG sampler — start NOW so the first
+    # /api/p2p/system-stats hit returns real CPU% + GPU stats. The
+    # sampler thread is daemon; nothing else awaits it.
+    try:
+        from . import resource_tracker as _rt
+        _rt.warm_up()
+    except Exception as e:
+        log.warning("resource_tracker warm_up failed: %s", e)
     # Background daemons that watchdog state and reclaim resources.
     await _start_scheduler()
     await _start_retention_sweeper()
@@ -4404,7 +4412,8 @@ def api_p2p_llama_server_stop(body: dict | None = None) -> dict:
 @app.get("/api/p2p/system-stats")
 def api_p2p_system_stats() -> dict:
     """Return THIS install's live system stats so a paired peer can
-    do realtime resource-aware split-model layer balancing.
+    do realtime resource-aware split-model layer balancing AND
+    so the orchestrator can render a per-device dashboard.
 
     Paired peers reach this via the encrypted-proxy whitelist (see
     ``p2p_secure_proxy._FORWARDABLE_PATHS``); the orchestrator host
@@ -4412,49 +4421,30 @@ def api_p2p_system_stats() -> dict:
     closing other apps on the worker (Chrome, Slack, etc.) shifts
     the layer split without restarting the whole pool.
 
-    Fields are intentionally minimal — only what
-    ``split_lifecycle._compute_optimal_ngl`` consumes — so the
-    response stays small and the encrypted round-trip is cheap.
-    Stable enough that older orchestrators that don't yet read all
-    fields still benefit.
+    Returns the full snapshot from ``resource_tracker.local_snapshot()``
+    — every field the v1 endpoint emitted (ram_total_gb, ram_free_gb,
+    ram_used_pct, cpu_pct, vram_total_gb, gpu_kind) is preserved so
+    older orchestrators keep working unchanged. New fields (vram_used,
+    GPU util %, disk, network rate, gigachat-process portion) are
+    additive.
     """
-    import time as _t
-    snapshot: dict[str, float | int | str] = {
-        "ts": _t.time(),
-    }
-    # System RAM via psutil (already a hard dep of sysdetect).
-    try:
-        import psutil
-        vm = psutil.virtual_memory()
-        snapshot["ram_total_gb"] = round(vm.total / (1024 ** 3), 2)
-        # `available` is the right number to budget against — it
-        # accounts for cached + reclaimable pages, unlike `free`
-        # which under-reports on Windows after the OS has cached
-        # files. Matches what Task Manager calls "Available".
-        snapshot["ram_free_gb"] = round(vm.available / (1024 ** 3), 2)
-        snapshot["ram_used_pct"] = round(vm.percent, 1)
-    except Exception as e:
-        snapshot["ram_error"] = f"{type(e).__name__}: {e}"
-    # CPU load over a short window — useful so the orchestrator can
-    # avoid overloading a peer that's already saturated even if RAM
-    # looks free.
-    try:
-        import psutil
-        snapshot["cpu_pct"] = psutil.cpu_percent(interval=0.0)
-    except Exception:
-        snapshot["cpu_pct"] = -1
-    # GPU VRAM (best-effort; cached probe). Workers without GPUs
-    # report vram=0; the orchestrator treats that as "iGPU drawing
-    # from system RAM" and uses ram_free_gb as the upper bound.
-    try:
-        from . import sysdetect
-        spec = sysdetect.detect_system()
-        snapshot["vram_total_gb"] = float(spec.get("vram_gb") or 0)
-        snapshot["gpu_kind"] = spec.get("gpu_kind") or ""
-    except Exception:
-        snapshot["vram_total_gb"] = 0.0
-        snapshot["gpu_kind"] = ""
-    return snapshot
+    from . import resource_tracker as _rt
+    return _rt.local_snapshot()
+
+
+@app.get("/api/compute-pool/resources")
+def api_compute_pool_resources() -> dict:
+    """Aggregate live resource snapshot across THIS device + every
+    paired peer. Used to verify the compute-pool directive: every
+    participating device shows its CPU/RAM/GPU/VRAM/disk/network
+    usage *and* the slice the Gigachat process tree currently holds.
+
+    Loopback-only; not exposed via the secure-proxy whitelist —
+    each peer answers /api/p2p/system-stats for its own slice and
+    the orchestrator stitches the result here.
+    """
+    from . import resource_tracker as _rt
+    return _rt.aggregate_snapshot()
 
 
 @app.patch("/api/p2p/identity")

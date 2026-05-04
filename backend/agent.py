@@ -2759,6 +2759,29 @@ async def _stream_llama_server_chat(
     Tools are deliberately NOT passed in the OpenAI shape — the caller
     is expected to be in adapter mode (system prompt has the tool
     block inlined) so we send only `messages`.
+
+    Resilience features for the volatile-P2P-network case:
+
+    * **Auto-retry on transient TCP failure before first token.**
+      llama-server's prompt-eval phase can take minutes (no SSE bytes
+      yet). If a Wi-Fi blip cuts the TCP socket during that silence,
+      a single retry usually succeeds — the model is still loaded on
+      the peer, only the connection died. We retry ONCE on
+      ``httpx.NetworkError`` (covers ConnectError, ReadTimeout,
+      ConnectTimeout, ReadError) provided no tokens have been
+      received yet. Mid-stream NetworkError after we've started
+      streaming is treated as the dispatcher's normal failure (caller
+      handles via the existing ``stream_interrupted`` path).
+
+    * **Prompt-progress events during the silent prompt-eval phase.**
+      A background task polls the peer's ``/slots`` endpoint every 8 s
+      while we're waiting for the first SSE byte. Each poll yields a
+      ``_pass_through`` envelope that the agent's run_turn loop forwards
+      to the SSE consumer as ``{"type": "prompt_progress", ...}``. This
+      keeps the SSE connection from idling out (browsers / curls drop
+      after 30-120 s of silence), AND gives the user visible feedback
+      during the long prompt-eval wait. The poller stops the moment
+      the first chunk arrives.
     """
     # Privacy guard — same fail-closed contract as `_stream_ollama_chat`.
     # Split-target llama-server URLs are typically host loopback; the
@@ -2779,55 +2802,194 @@ async def _stream_llama_server_chat(
         headers["Authorization"] = f"Bearer {auth_token}"
 
     timeout = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream(
-            "POST",
-            f"{base_url}/v1/chat/completions",
-            json=payload,
-            headers=headers,
-        ) as r:
-            if r.status_code >= 400:
-                body = await r.aread()
-                detail = body.decode("utf-8", errors="replace")[:400]
-                msg = (detail or f"HTTP {r.status_code}").strip()
-                raise httpx.HTTPStatusError(msg, request=r.request, response=r)
 
-            # SSE framing: lines prefixed with "data: " carry the JSON.
-            # Empty lines separate events. The terminal sentinel is
-            # "data: [DONE]" — we yield a final {"done": True} when we
-            # see it so the agent loop's "if chunk.get('done'): break"
-            # check fires the same way as for Ollama's `done` flag.
-            async for line in r.aiter_lines():
-                line = line.strip()
-                if not line:
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                payload_str = line[len("data:"):].strip()
-                if payload_str == "[DONE]":
-                    yield {"message": {"role": "assistant", "content": ""}, "done": True}
-                    break
+    received_first_token = False
+    # Two attempts max; second only fires if NetworkError before
+    # received_first_token. Once tokens land, ANY further failure
+    # bubbles up so the caller can demote / cooldown / surface.
+    for attempt in range(2):
+        try:
+            # asyncio.Queue multiplexes (a) SSE stream chunks from
+            # llama-server and (b) prompt-progress heartbeats from
+            # the /slots poller. The generator yields whichever
+            # completes next.
+            queue: asyncio.Queue = asyncio.Queue()
+            STREAM_DONE = object()  # sentinel
+            STREAM_ERR = object()   # sentinel + exception attached
+
+            async def _heartbeat() -> None:
+                """Poll /slots every 8 s; emit prompt_progress events
+                until the main reader signals first-token-received."""
+                hb_url = f"{base_url}/slots"
                 try:
-                    obj = jsonutil.loads(payload_str)
-                except json.JSONDecodeError:
-                    continue
-                # OpenAI streaming: delta lives at choices[0].delta.
-                choices = obj.get("choices") or []
-                if not choices:
-                    continue
-                delta = (choices[0] or {}).get("delta") or {}
-                # Translate to Ollama shape. We collect role + content
-                # into `message` and surface `done` only on the [DONE]
-                # sentinel above (OpenAI's per-chunk `finish_reason`
-                # isn't a perfect mirror — better to wait for the
-                # explicit terminator).
-                yield {
-                    "message": {
-                        "role": delta.get("role") or "assistant",
-                        "content": delta.get("content") or "",
-                    },
-                    "done": False,
-                }
+                    while True:
+                        await asyncio.sleep(8.0)
+                        if received_first_token:
+                            return
+                        try:
+                            async with httpx.AsyncClient(timeout=4.0) as hbc:
+                                hbr = await hbc.get(hb_url)
+                                if hbr.status_code != 200:
+                                    continue
+                                try:
+                                    slots = hbr.json()
+                                except Exception:
+                                    continue
+                                if isinstance(slots, dict):
+                                    slots = slots.get("slots") or []
+                                # Find the first non-idle slot and report
+                                # its prompt-eval progress. llama-server's
+                                # /slots returns prompt_n / n_tokens for
+                                # in-flight tasks.
+                                for slot in (slots or []):
+                                    if not isinstance(slot, dict):
+                                        continue
+                                    state = slot.get("state")
+                                    if not state or state == 0:
+                                        continue
+                                    n_tokens = slot.get("n_tokens") or 0
+                                    n_prompt = slot.get("n_prompt_tokens") or 0
+                                    pct = (
+                                        round(100.0 * n_tokens / max(n_prompt, 1))
+                                        if n_prompt > 0 else 0
+                                    )
+                                    await queue.put({
+                                        "_pass_through": {
+                                            "type": "prompt_progress",
+                                            "n_tokens": int(n_tokens),
+                                            "n_prompt": int(n_prompt),
+                                            "percent": pct,
+                                            "stage": "prompt_eval",
+                                        },
+                                    })
+                                    break
+                        except Exception:
+                            # Best-effort heartbeat; never fail the
+                            # actual chat because polling failed.
+                            continue
+                except asyncio.CancelledError:
+                    return
+
+            async def _reader() -> None:
+                """Open the SSE stream and push chunks into the queue."""
+                try:
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        async with client.stream(
+                            "POST",
+                            f"{base_url}/v1/chat/completions",
+                            json=payload,
+                            headers=headers,
+                        ) as r:
+                            if r.status_code >= 400:
+                                body = await r.aread()
+                                detail = body.decode("utf-8", errors="replace")[:400]
+                                msg = (detail or f"HTTP {r.status_code}").strip()
+                                err = httpx.HTTPStatusError(
+                                    msg, request=r.request, response=r,
+                                )
+                                await queue.put((STREAM_ERR, err))
+                                return
+                            async for line in r.aiter_lines():
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                if not line.startswith("data:"):
+                                    continue
+                                payload_str = line[len("data:"):].strip()
+                                if payload_str == "[DONE]":
+                                    await queue.put({
+                                        "message": {"role": "assistant", "content": ""},
+                                        "done": True,
+                                    })
+                                    await queue.put(STREAM_DONE)
+                                    return
+                                try:
+                                    obj = jsonutil.loads(payload_str)
+                                except json.JSONDecodeError:
+                                    continue
+                                choices = obj.get("choices") or []
+                                if not choices:
+                                    continue
+                                delta = (choices[0] or {}).get("delta") or {}
+                                await queue.put({
+                                    "message": {
+                                        "role": delta.get("role") or "assistant",
+                                        "content": delta.get("content") or "",
+                                    },
+                                    "done": False,
+                                })
+                            await queue.put(STREAM_DONE)
+                except Exception as e:
+                    await queue.put((STREAM_ERR, e))
+
+            reader_task = asyncio.create_task(_reader())
+            heartbeat_task = asyncio.create_task(_heartbeat())
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is STREAM_DONE:
+                        break
+                    if (
+                        isinstance(item, tuple)
+                        and len(item) == 2
+                        and item[0] is STREAM_ERR
+                    ):
+                        # Reader hit an exception. If transient + we
+                        # have no tokens yet, the outer retry loop
+                        # tries again. Otherwise re-raise.
+                        err = item[1]
+                        if (
+                            isinstance(err, httpx.NetworkError)
+                            and not received_first_token
+                            and attempt == 0
+                        ):
+                            # Surface a retry hint to the caller so
+                            # the UI can show "reconnecting…".
+                            yield {
+                                "_pass_through": {
+                                    "type": "stream_retry",
+                                    "reason": "network_blip",
+                                    "message": (
+                                        f"transient network error "
+                                        f"({type(err).__name__}) before any "
+                                        f"tokens; reconnecting once"
+                                    ),
+                                },
+                            }
+                            raise err  # caught below → retry
+                        raise err
+                    # Real chunk — flag first-token to stop heartbeat
+                    if isinstance(item, dict):
+                        if "_pass_through" in item:
+                            yield item
+                            continue
+                        msg = item.get("message") or {}
+                        if msg.get("content") or msg.get("thinking"):
+                            received_first_token = True
+                        yield item
+                # Reader completed cleanly
+                return
+            finally:
+                heartbeat_task.cancel()
+                reader_task.cancel()
+                # Drain cancellations to avoid pending-task warnings
+                for t in (heartbeat_task, reader_task):
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+        except httpx.NetworkError as e:
+            if attempt == 0 and not received_first_token:
+                # Retry once after a brief pause — the model is
+                # still loaded on the peer; only the TCP died.
+                log.info(
+                    "agent: chat dispatch transient network failure "
+                    "(%s); retrying once after 2 s",
+                    type(e).__name__,
+                )
+                await asyncio.sleep(2.0)
+                continue
+            raise
 
 
 async def run_turn(
@@ -3632,6 +3794,16 @@ async def _run_turn_impl(
                     # running to the end of the response that'll never be shown.
                     if is_stop_requested(conversation_id):
                         break
+                    # Pass-through: chat dispatchers can yield meta events
+                    # like prompt_progress (from /slots heartbeat) or
+                    # stream_retry (network blip auto-retry) that the SSE
+                    # consumer should see verbatim — not processed as
+                    # token chunks. See `_stream_llama_server_chat` for
+                    # the producer side.
+                    pass_through = chunk.get("_pass_through")
+                    if pass_through is not None:
+                        yield pass_through
+                        continue
                     msg = chunk.get("message") or {}
                     delta = msg.get("content") or ""
                     thinking = msg.get("thinking") or ""
