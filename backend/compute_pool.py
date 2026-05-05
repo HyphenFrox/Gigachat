@@ -3484,20 +3484,24 @@ def pick_split_chat_target(model_name: str) -> tuple[str, str] | None:
 # Ollama.
 # ---------------------------------------------------------------------------
 
-# How much of the host's VRAM we're willing to let one model occupy
-# without engaging the split path. 85% leaves headroom for the OS, the
-# desktop compositor, any other Ollama models loaded simultaneously, and
-# the model's KV cache. Below this fraction → Ollama. Above → split.
-_HOST_VRAM_USE_FRACTION = 0.85
-
-# How much of the host's TOTAL memory (VRAM + RAM) we'll trust Ollama
-# to run a single model from. Ollama auto-offloads layers that don't
-# fit VRAM into system RAM and runs them on CPU — slow per layer, but
-# strictly faster than streaming layer activations across a LAN every
-# token. 70% of (vram + ram) leaves room for the OS, browser, the
-# Gigachat backend itself, and KV cache. Below this fraction → host
-# (Ollama). Above → engage split path with workers.
-_HOST_TOTAL_USE_FRACTION = 0.70
+# How much of the host's VRAM/RAM we're willing to let a single model
+# occupy when sizing pool budgets and routing thresholds. 0.95 = 95 %
+# of reported total — matches the directive of "drive every device's
+# memory to ~95 % under load" and matches the runtime layer-placement
+# safety in `split_lifecycle._adaptive_n_gpu_layers` (also 0.95).
+# Leaves a 5 % buffer for allocator alignment, OS resident set growth
+# during a long chat, and KV cache headroom on top of the model
+# weights. The chat-time path's `--n-gpu-layers` calculation (which
+# does the actual per-layer placement) ALSO defends against OOM — if
+# this threshold is too aggressive in some environment llama-server
+# refuses to load with a clean error rather than crashing.
+#
+# Same constant for VRAM and TOTAL: VRAM is dedicated to the model so
+# 95 % is fine; RAM has more competing demands but the runtime
+# allocator caps actual usage well before the OS swaps. Splitting the
+# constant just gave us two knobs to tune in lockstep.
+_HOST_VRAM_USE_FRACTION = 0.95
+_HOST_TOTAL_USE_FRACTION = 0.95
 
 # Adaptive routing — pool-capacity heuristic for engaging Phase 2 even
 # when the model fits the host alone. We use a static threshold instead
@@ -4818,8 +4822,10 @@ def _host_total_capacity_bytes() -> int:
     LAN overhead), so we should NOT engage split unless the model
     truly exceeds the host's total memory budget.
 
-    For this host (8 GB VRAM + 15.8 GB RAM, 70% safety margin): ≈16.7 GB.
-    A 9 GB model fits trivially, even though it doesn't fit VRAM alone.
+    For this host (8 GB VRAM + 15.8 GB RAM, 95 % use ceiling): ≈22.6 GB.
+    A 9 GB model fits trivially. A 22 GB model fits at the boundary;
+    everything above triggers the split path so worker memory gets
+    pulled in too.
     """
     try:
         spec = sysdetect.detect_system()
