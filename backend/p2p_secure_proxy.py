@@ -153,6 +153,11 @@ _GIGACHAT_INTERNAL_PATHS = frozenset({
     "/api/p2p/llama-server/status",
     "/api/p2p/llama-server/stop",
     "/api/p2p/binary/list",
+    # GPU auto-recovery — orchestrator asks a peer to soft/hard reset
+    # its own iGPU before demoting it to CPU for 24h. Tiny request
+    # body and tiny JSON response so the encrypted-proxy size cap is
+    # comfortably fine.
+    "/api/p2p/gpu/recover",
 })
 
 # Note: ``/api/p2p/binary/get/<file>`` deliberately is NOT in the

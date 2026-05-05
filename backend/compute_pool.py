@@ -610,6 +610,59 @@ def _select_intel_backend_with_fallback(
     return "CPU"
 
 
+async def _try_remote_gpu_recovery(worker: dict, backend: str) -> bool:
+    """Ask a peer to soft/hard-reset its own GPU before we demote it.
+
+    Called inline from `record_backend_failure`. The peer runs the
+    actual recovery (Win+Ctrl+Shift+B → pnputil restart-device) on
+    its own box because the keystroke + display-driver restart only
+    mean anything where the hardware lives. Returns True iff the
+    peer reports the device is back.
+
+    Best-effort: any failure (peer offline, endpoint missing, no
+    admin for hard reset, recovery genuinely didn't help) returns
+    False and the caller proceeds with the 24-h demote.
+    """
+    backend_lower = (backend or "").lower()
+    # Only iGPU/dGPU backends benefit from device-driver recovery.
+    # CPU failures don't have anything to recover at the device level.
+    if "sycl" not in backend_lower and "vulkan" not in backend_lower:
+        return False
+    from . import p2p_secure_client as _secure
+    try:
+        status, body = await _secure.forward(
+            worker, method="POST", path="/api/p2p/gpu/recover",
+            body={"skip_hard": False, "probe_after_soft": True, "probe_after_hard": True},
+            timeout=30.0,
+        )
+    except Exception as e:
+        log.info(
+            "compute_pool.gpu_recovery: peer %s recovery call failed: %s",
+            worker.get("label"), e,
+        )
+        return False
+    if status != 200:
+        log.info(
+            "compute_pool.gpu_recovery: peer %s returned HTTP %d",
+            worker.get("label"), status,
+        )
+        return False
+    try:
+        result = jsonutil.loads(body)
+    except Exception:
+        return False
+    ok = bool(result.get("ok"))
+    log.info(
+        "compute_pool.gpu_recovery: peer %s recovery=%s "
+        "(soft_sent=%s/worked=%s, hard_sent=%s/worked=%s, %.1fs)",
+        worker.get("label"), ok,
+        result.get("soft_sent"), result.get("soft_worked"),
+        result.get("hard_sent"), result.get("hard_worked"),
+        result.get("elapsed_sec", 0),
+    )
+    return ok
+
+
 def record_backend_failure(worker_id: str, backend: str) -> None:
     """Mark a worker's iGPU backend as crashed so the next selector
     pass falls through to the next preference.
@@ -617,13 +670,71 @@ def record_backend_failure(worker_id: str, backend: str) -> None:
     Called by `split_lifecycle` whenever a split start failure or a
     chat-mid-decode crash is observed and the worker was on an iGPU
     backend at the time. Idempotent — successive calls just refresh
-    the timestamp."""
+    the timestamp.
+
+    Pre-demote auto-recovery: before stamping the failed_at flag we
+    ask the peer to try to recover its GPU (Win+Ctrl+Shift+B soft
+    reset, then pnputil hard reset if needed). When the peer reports
+    the device is back, we SKIP the demote — the worker stays in
+    the selector's GPU rotation and the next chat retries the
+    original backend instead of falling through to CPU for 24 h.
+    See ``_try_remote_gpu_recovery`` for the wire-level details.
+    """
     w = db.get_compute_worker(worker_id)
     if not w:
         return
     caps = dict(w.get("capabilities") or {})
     backend_lower = (backend or "").lower()
     now = time.time()
+    # Auto-recovery first. We deliberately run this synchronously inside
+    # `record_backend_failure` so the caller (split_lifecycle's failure
+    # hook) gets the demote-or-not decision before its own next tick.
+    # If we're already inside an event loop, schedule the recovery as a
+    # task and AWAIT it; if not (rare — only the watchdog thread path),
+    # fall through to plain demote without recovery.
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # We're called from sync code (split_lifecycle's failure hook
+            # uses sync). Use loop.run_until_complete is unsafe; instead,
+            # spawn a temp loop in a thread so the recovery probe runs.
+            import concurrent.futures
+            def _runner() -> bool:
+                try:
+                    return asyncio.run(_try_remote_gpu_recovery(w, backend))
+                except Exception:
+                    return False
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_runner)
+                recovered = fut.result(timeout=45)
+        else:
+            recovered = loop.run_until_complete(_try_remote_gpu_recovery(w, backend))
+    except RuntimeError:
+        try:
+            recovered = asyncio.run(_try_remote_gpu_recovery(w, backend))
+        except Exception:
+            recovered = False
+    except Exception as e:
+        log.info("compute_pool.gpu_recovery: orchestration failed: %s", e)
+        recovered = False
+    if recovered:
+        log.info(
+            "compute_pool: skipping %s demote for worker %s — peer's "
+            "GPU recovery succeeded (next chat retries the same backend)",
+            backend, w.get("label"),
+        )
+        # Clear any stale failed_at flags so a previous demote also
+        # lifts when the device is verified back.
+        for k in (
+            "sycl_split_failed_at", "sycl_hybrid_split_failed_at",
+            "vulkan_split_failed_at", "vulkan_hybrid_split_failed_at",
+        ):
+            caps.pop(k, None)
+        try:
+            db.update_compute_worker_capabilities(worker_id, capabilities=caps)
+        except Exception as e:
+            log.debug("compute_pool: post-recovery cap clear failed: %s", e)
+        return
     # When the iGPU/discrete-GPU stack itself is broken (Intel
     # `UR_RESULT_ERROR_DEVICE_LOST`, Vulkan device-lost, CUDA
     # device-disabled), BOTH the single-device mode (`SYCL0`) and the

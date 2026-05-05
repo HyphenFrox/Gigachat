@@ -4291,6 +4291,37 @@ def api_p2p_ollama_manifest(name: str):
     )
 
 
+@app.post("/api/p2p/gpu/recover")
+def api_p2p_gpu_recover(body: dict | None = None) -> dict:
+    """Trigger an iGPU/dGPU auto-recovery on THIS device.
+
+    Called by the orchestrator's `record_backend_failure` hook BEFORE
+    flagging a worker's GPU backend as dead — gives the device one
+    chance to come back via Win+Ctrl+Shift+B (soft) or pnputil
+    restart-device (hard) instead of demoting straight to CPU for
+    24 h. The peer runs the recovery locally because the keystroke +
+    pnputil call only mean anything on the box where the GPU lives.
+
+    Body (all optional):
+      {
+        "skip_hard": bool,   # only soft-reset (default false)
+        "probe_after_soft": bool,
+        "probe_after_hard": bool,
+      }
+
+    Returns the structured summary from `gpu_recovery.run_recovery`
+    so the caller can decide whether to demote anyway. Best-effort
+    — every path that can fail returns ok=false instead of raising.
+    """
+    body = body or {}
+    from . import gpu_recovery as _gr
+    return _gr.run_recovery(
+        skip_hard=bool(body.get("skip_hard", False)),
+        probe_after_soft=bool(body.get("probe_after_soft", True)),
+        probe_after_hard=bool(body.get("probe_after_hard", True)),
+    )
+
+
 @app.get("/api/p2p/ollama/blob/{digest}")
 def api_p2p_ollama_blob(digest: str):
     """Stream a single Ollama blob back to a paired peer.
