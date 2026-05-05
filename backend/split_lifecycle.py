@@ -293,20 +293,37 @@ def _host_primary_backend() -> str:
 
     Used by the Gemma 3n PLE workaround to pin gemma3n-specific
     tensors to the host (so Gated Delta Net stays local). On a host
-    without a recognized GPU we fall back to `CPU` — it still keeps
-    those ops off RPC, just on the host's CPU instead of its GPU.
+    without a recognized GPU — OR a host whose backend DLL we
+    deliberately removed (e.g. the orchestrator-side `ggml-sycl.dll`
+    skip-install marker that dodges the SYCL_Split crash) — we fall
+    back to `CPU`. Without the DLL-presence check `-ot ...=SYCL0`
+    fails llama-server boot with "error while handling argument
+    '-ot': unknown buffer type" because llama-server only registered
+    the backends whose DLL it could actually load.
     """
     try:
         from . import sysdetect
         kind = (sysdetect.detect_system() or {}).get("gpu_kind") or ""
     except Exception:
         kind = ""
-    return {
-        "nvidia": "CUDA0",
-        "amd": "Vulkan0",
-        "intel": "SYCL0",
-        "apple": "Metal",
-    }.get(kind, "CPU")
+    candidate = {
+        "nvidia": ("CUDA0", "ggml-cuda.dll"),
+        "amd": ("Vulkan0", "ggml-vulkan.dll"),
+        "intel": ("SYCL0", "ggml-sycl.dll"),
+        "apple": ("Metal", None),  # Metal on macOS lives in ggml-metal, not a separate dll
+    }.get(kind)
+    if candidate is None:
+        return "CPU"
+    name, dll = candidate
+    if dll is not None:
+        try:
+            install = split_runtime.get_install_status()
+            if install.install_dir:
+                if not (Path(install.install_dir) / dll).is_file():
+                    return "CPU"
+        except Exception:
+            pass
+    return name
 
 
 def _host_has_sycl_backend() -> bool:
