@@ -119,6 +119,8 @@ The **model picker** at the top of every chat lets you switch per-conversation. 
 
 **Auto-tuned default**: at first run the backend probes RAM / VRAM / GPU kind and picks the largest recommended Gemma 4 variant that fits. Override via Settings → **General**.
 
+> ⚠ **Known split-mode incompatibility — Gemma 3n PLE variants** (`gemma4:e2b`, `gemma4:e4b`, `gemma4:latest`). These models use the new Per-Layer Embedding architecture which the patched llama.cpp build (pinned at upstream `b9002`) doesn't fully recognize — split-mode chat fails at model load with `wrong number of tensors; expected 2131, got 720`. **Workaround:** these models still work fine **on a single device through Ollama** (the standard chat path). Only the `--rpc` split-mode path is affected. **Fix on the way:** rebasing the Gigachat resilience patch onto a newer llama.cpp tag (b9100+) will restore split-mode for Gemma 3n. Until then, pick a standard transformer model (`llama3.1:8b`, `qwen2.5:7b`, `mistral-nemo`, `dolphin-mixtral:8x7b`) when you want pool-wide split.
+
 ---
 
 ## Permission modes

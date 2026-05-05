@@ -224,3 +224,35 @@ The Settings panel shows live status pills per device (Ollama version, model cou
 ### Heads-up: Smart App Control on Windows 11
 
 Windows 11's Smart App Control blocks unsigned executables — the prebuilt llama.cpp binaries won't run on a worker that has SAC enabled. Either disable SAC on the worker (Windows Security → App & browser control → Smart App Control → Off) or build llama.cpp from source and sign it yourself. Phase 1 routing (Ollama-only) works regardless of SAC since Ollama ships signed.
+
+---
+
+## Known limitations
+
+### Gemma 3n PLE variants don't load in split-mode
+
+Models that use the Per-Layer Embedding architecture — `gemma4:e2b`, `gemma4:e4b`, `gemma4:latest`, `gemma3n:*` — fail at model load when the host-orchestrated split path tries to push their weights across `--rpc`:
+
+```
+llama_model_load: error loading model: done_getting_tensors:
+  wrong number of tensors; expected 2131, got 720
+llama_model_load_from_file_impl: failed to load model
+```
+
+**Why:** the patched llama.cpp build we ship (`gigachat-llamacpp-b9002-1`) is pinned at upstream `b9002` because that's where the Gigachat resilience patch in `vendor/llama.cpp-patches/gigachat-rpc-resilience.patch` was developed against. b9002's Gemma model loader doesn't recognize the PLE side-tensors that the Gemma 3n family uses (added in upstream after our pin), so the tensor count expected by the loader doesn't match what's in the GGUF.
+
+**Workaround for users:** these models still work fine **on a single device through Ollama** (the standard Phase 1 chat path). The router auto-picks Ollama for them — only the explicit `split:gemma4:*` path or pool-wide split-mode is affected. Pick a standard transformer model (`llama3.1:8b`, `qwen2.5:7b`, `mistral-nemo`, `dolphin-mixtral:8x7b`) when you want pool-wide split.
+
+**Fix on the way:** rebase the Gigachat resilience patch onto a newer llama.cpp tag (b9100+) that has full PLE support. The patch is small (~150 lines, all in `ggml-rpc.cpp` / `transport.cpp` / `ggml-sycl.cpp` / `server-context.cpp`) so the rebase is straightforward — see `vendor/llama.cpp-patches/README.md` for the build flow.
+
+### Intel iGPU per-device `vram_used_gb` is always 0
+
+Intel iGPUs share system memory (UMA / unified memory architecture). The `vram_total_gb` reading **depends on BIOS preallocation** — some BIOSes pin a fixed chunk (1-4 GB) and `Win32_VideoController.AdapterRAM` returns that, some leave it fully dynamic and `AdapterRAM` returns 0. Either way the device-level `vram_used_gb` reads 0 because we don't have a zero-dependency way to measure shared-memory used by the iGPU's clients.
+
+**Per-pid VRAM does work** for Intel iGPUs — the `\GPU Process Memory(*)\Local Usage` performance counter reports allocations correctly per process — so per-app `app.vram_used_gb` shows real values whenever a process touches the iGPU.
+
+What this means in practice:
+
+- **Per-pid VRAM IS captured.** When llama.cpp split-mode engages an iGPU via SYCL on a worker, that worker's `app.vram_used_gb` column lights up.
+- **Per-pid VRAM = 0 doesn't mean a device is idle.** Host-side per-app VRAM often reads 0 during normal Gigachat operation because Ollama runs CPU-only on Intel iGPU on Windows. The split-mode path (which DOES drive the iGPU via SYCL) is what surfaces non-zero per-app VRAM.
+- **Pool budget includes the host's full RAM** (not just VRAM) precisely because iGPU VRAM is fungible with system RAM. The router ranks an iGPU-only host on its RAM ceiling, not its (often missing) VRAM ceiling.

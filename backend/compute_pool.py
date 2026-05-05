@@ -8075,18 +8075,48 @@ async def route_chat_for(
     # cache is fresh, so the synchronous lookup here is sufficient.
     rpc_workers = _eligible_split_workers()
     if rpc_workers:
-        rpc_pool_vram = host_vram + sum(
-            (w.get("capabilities") or {}).get("max_vram_seen_bytes") or 0
-            for w in rpc_workers
-        )
-        # Pool memory ceiling: VRAM + every worker's free RAM (workers
-        # pre-allocate RPC buffers from system RAM for layer streams).
-        # Used to detect the "mega-model" case where the GGUF exceeds
-        # everything we can fit in actual hardware memory.
-        rpc_pool_total = rpc_pool_vram + sum(
-            int(float((w.get("capabilities") or {}).get("ram_free_gb") or 0)
-                * (1024 ** 3))
-            for w in rpc_workers
+        # Per-worker VRAM contribution: prefer the static `vram_total_gb`
+        # ceiling (from sysdetect on the worker), fall back to
+        # `max_vram_seen_bytes` (a lower bound from /api/ps) only when
+        # total isn't known yet. Using only `max_vram_seen_bytes` —
+        # which can be 0 for a never-benchmarked worker — caused
+        # under-counts that wrongly tripped mega-model on otherwise
+        # capacious pools.
+        def _worker_vram_bytes(w: dict) -> int:
+            caps = w.get("capabilities") or {}
+            total_gb = float(caps.get("vram_total_gb") or 0)
+            if total_gb > 0:
+                return int(total_gb * (1024 ** 3))
+            return int(caps.get("max_vram_seen_bytes") or 0)
+
+        # Per-worker RAM contribution: prefer `ram_total_gb * fraction`
+        # (workers can shed page cache to free RAM for RPC layer
+        # buffers) instead of instantaneous `ram_free_gb` (which under-
+        # counts because the OS hoards free pages as cache).
+        def _worker_ram_bytes(w: dict) -> int:
+            caps = w.get("capabilities") or {}
+            total_gb = float(caps.get("ram_total_gb") or 0)
+            if total_gb > 0:
+                return int(total_gb * _HOST_TOTAL_USE_FRACTION * (1024 ** 3))
+            free_gb = float(caps.get("ram_free_gb") or 0)
+            return int(free_gb * (1024 ** 3))
+
+        rpc_pool_vram = host_vram + sum(_worker_vram_bytes(w) for w in rpc_workers)
+        # Pool memory ceiling: host TOTAL (VRAM + RAM with safety
+        # margin — host runs llama-server and uses its own RAM via
+        # mmap for layers that don't fit GPU/RPC) + every worker's
+        # VRAM ceiling + every worker's RAM ceiling (with safety
+        # margin). Used to detect the "mega-model" case where the
+        # GGUF exceeds everything we can fit in actual hardware
+        # memory across the pool.
+        # NOTE: previously this excluded host RAM entirely, which
+        # caused pools with weak host GPUs (or iGPU-only hosts) to
+        # report budgets ~8 GB lower than reality and trip
+        # mega-model on models that would have fit fine.
+        rpc_pool_total = (
+            host_total
+            + sum(_worker_vram_bytes(w) for w in rpc_workers)
+            + sum(_worker_ram_bytes(w) for w in rpc_workers)
         )
         host_can_run_alone = host_total > 0 and size_bytes <= host_total
         worst_lan_latency_ms = max(
