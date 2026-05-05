@@ -4815,26 +4815,78 @@ def _host_vram_budget_bytes() -> int:
     return int(vram_gb * _HOST_VRAM_USE_FRACTION * 1024 * 1024 * 1024)
 
 
-def _host_total_capacity_bytes() -> int:
-    """Bytes the host can hold a single model in (VRAM + RAM). Ollama
-    natively uses CPU offload — layers that don't fit VRAM live in
-    system RAM and run on CPU. That stays single-node (no per-token
-    LAN overhead), so we should NOT engage split unless the model
-    truly exceeds the host's total memory budget.
+def _is_shared_memory_gpu(gpu_kind: str, gpu_name: str = "") -> bool:
+    """Does this GPU share its 'VRAM' with system RAM (UMA / shared
+    memory architecture)?
 
-    For this host (8 GB VRAM + 15.8 GB RAM, 95 % use ceiling): ≈22.6 GB.
-    A 9 GB model fits trivially. A 22 GB model fits at the boundary;
-    everything above triggers the split path so worker memory gets
-    pulled in too.
+    Intel iGPUs always do — they're integrated into the CPU package
+    and their VRAM lives in the same DIMMs as system RAM. The
+    `Win32_VideoController.AdapterRAM` value just reports how much
+    the BIOS pre-allocated, but that allocation is carved from the
+    system RAM total — counting both is double-counting.
+
+    Apple Silicon is also unified memory by definition.
+
+    AMD discrete cards (RX/Pro series) are dedicated. AMD APUs (Ryzen
+    "G" series, Vega integrated) are shared. We default to "dedicated"
+    for AMD because mis-identifying a discrete card as shared would
+    silently halve the apparent budget; users with APUs can override
+    via `GIGACHAT_GPU_SHARED_MEMORY=1`.
+
+    NVIDIA is always dedicated (no shared-memory NVIDIA exists on
+    a typical pool device).
+    """
+    kind = (gpu_kind or "").lower()
+    if kind in ("intel", "apple"):
+        return True
+    if kind == "amd":
+        # Heuristic: AMD APU integrated names contain "Vega", "Radeon Graphics",
+        # or "AMD Graphics" without a model number; discrete cards have
+        # explicit model numbers ("RX 7900", "Radeon Pro W6800", etc.).
+        name = (gpu_name or "").lower()
+        if any(t in name for t in ("vega", "radeon graphics", "amd graphics")):
+            return True
+    # Allow env override for edge cases.
+    if os.environ.get("GIGACHAT_GPU_SHARED_MEMORY", "").strip() in ("1", "true", "yes"):
+        return True
+    return False
+
+
+def _host_total_capacity_bytes() -> int:
+    """Bytes the host can hold a single model in. For dedicated GPUs
+    (NVIDIA / AMD discrete) this is VRAM + RAM — they're separate
+    physical memory pools and a model can use both. For shared-memory
+    GPUs (Intel iGPU, Apple Silicon, AMD APU) the "VRAM" is carved
+    from the same DIMM as system RAM, so we count RAM only — adding
+    them would double-count the same physical bytes.
+
+    Multiplied by `_HOST_TOTAL_USE_FRACTION` (0.95) to leave a 5 %
+    safety buffer for OS / KV cache / allocator overhead. The
+    runtime layer-fit calc in `split_lifecycle._adaptive_n_gpu_layers`
+    uses the same 0.95 ceiling, so this stays consistent end-to-end.
+
+    Examples:
+      * NVIDIA host (8 GB VRAM + 16 GB RAM)  → (8 + 16) × 0.95 = 22.8 GB
+      * Intel iGPU host (2 GB AdapterRAM + 8 GB DIMM) → 8 × 0.95 = 7.6 GB
+      * Apple M-series (24 GB unified)       → 24 × 0.95 = 22.8 GB
     """
     try:
         spec = sysdetect.detect_system()
         vram_gb = float(spec.get("vram_gb") or 0.0)
         ram_gb = float(spec.get("ram_gb") or 0.0)
+        gpu_kind = spec.get("gpu_kind") or ""
+        gpu_name = spec.get("gpu_name") or ""
     except Exception:
         vram_gb = 0.0
         ram_gb = 0.0
-    total_gb = vram_gb + ram_gb
+        gpu_kind = ""
+        gpu_name = ""
+    if _is_shared_memory_gpu(gpu_kind, gpu_name):
+        # iGPU memory is part of `ram_gb` already; counting `vram_gb`
+        # on top would double-count the same DIMM bytes.
+        total_gb = ram_gb
+    else:
+        total_gb = vram_gb + ram_gb
     return int(total_gb * _HOST_TOTAL_USE_FRACTION * 1024 * 1024 * 1024)
 
 
@@ -8088,8 +8140,19 @@ async def route_chat_for(
         # which can be 0 for a never-benchmarked worker — caused
         # under-counts that wrongly tripped mega-model on otherwise
         # capacious pools.
+        #
+        # CRITICAL: shared-memory GPUs (Intel iGPU, Apple Silicon, AMD
+        # APU) report VRAM as a slice of the system DIMM, not a
+        # separate physical pool. Counting their VRAM ON TOP of their
+        # RAM would double-count the same bytes. For those workers
+        # the VRAM contribution is 0 — the iGPU's working set is
+        # already accounted for in `_worker_ram_bytes`.
         def _worker_vram_bytes(w: dict) -> int:
             caps = w.get("capabilities") or {}
+            if _is_shared_memory_gpu(
+                caps.get("gpu_kind") or "", caps.get("gpu_name") or ""
+            ):
+                return 0
             total_gb = float(caps.get("vram_total_gb") or 0)
             if total_gb > 0:
                 return int(total_gb * (1024 ** 3))
