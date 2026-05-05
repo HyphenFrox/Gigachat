@@ -417,9 +417,14 @@ def _ensure_host_local_sycl_rpc() -> str | None:
 
     sycl_dll = install_dir / "ggml-sycl.dll"
     skip_marker = install_dir / "ggml-sycl.dll.skip-install"
-    # Find the most-recent disabled copy.
+    # Find any "spare" copy of the DLL (renamed-out or
+    # split-spawn-temp side path) we can use to restore from. We
+    # also count an already-active `ggml-sycl.dll` as a usable
+    # source — but that path is the one we MUST move out before
+    # llama-server spawns, so we treat it specially below.
     disabled_copies = sorted(
-        install_dir.glob("ggml-sycl.dll.disabled*"),
+        list(install_dir.glob("ggml-sycl.dll.disabled*"))
+        + list(install_dir.glob("ggml-sycl.dll.split-spawn-temp")),
         key=lambda p: p.stat().st_mtime if p.is_file() else 0,
         reverse=True,
     )
@@ -432,18 +437,16 @@ def _ensure_host_local_sycl_rpc() -> str | None:
         )
         return None
 
-    # Step 1: restore the DLL so rpc-server can load it.
-    dll_was_already_active = sycl_dll.is_file()
-    restored_from: Path | None = None
-    if not dll_was_already_active:
-        # Pick the freshest disabled copy. Copy (don't move) so the
-        # `.disabled-*` source survives — we'll re-disable by removing
-        # the active dll, not by un-restoring.
+    # Step 1: ensure the DLL is on disk so rpc-server's startup can
+    # load it. If a stale `ggml-sycl.dll` is already there from a
+    # previous incomplete run we re-use it (no copy needed); otherwise
+    # we copy from the freshest `.disabled-*` snapshot. Copy (not
+    # move) so the source survives a future restart cleanup.
+    if not sycl_dll.is_file():
         src = disabled_copies[0]
         try:
             import shutil
             shutil.copyfile(src, sycl_dll)
-            restored_from = src
             log.info(
                 "split_lifecycle: temporarily restored ggml-sycl.dll "
                 "from %s so host's local SYCL rpc-server can load it",
@@ -488,33 +491,50 @@ def _ensure_host_local_sycl_rpc() -> str | None:
                 result.get("status"), result.get("error"),
             )
     finally:
-        # Step 3: re-disable the DLL so the orchestrator llama-server
-        # spawn doesn't load it. Whether the rpc-server start succeeded
-        # or not, we want llama-server to NOT see ggml-sycl.dll.
-        if not dll_was_already_active:
+        # Step 3: ALWAYS move ggml-sycl.dll out of llama-server's path
+        # before it spawns. This is unconditional — even when the DLL
+        # was already active from a stale prior run we still need to
+        # move it, otherwise llama-server's startup DLL scan finds
+        # SYCL and the SYCL_Split crash fires when it constructs the
+        # split-tensor compute graph for `--rpc` peers.
+        #
+        # `unlink()` is preferred (clean removal) but fails with
+        # PermissionError on Windows when ANY process still holds the
+        # file open — and our just-spawned rpc-server holds it
+        # specifically because we want it to. Fall back to renaming
+        # to a side path so the file is no longer in llama-server's
+        # DLL scan path while remaining open in the rpc-server's
+        # address space.
+        if sycl_dll.is_file():
+            side = install_dir / "ggml-sycl.dll.split-spawn-temp"
             try:
-                # Use os.unlink (not Path.unlink) so we can swallow the
-                # "file in use" error gracefully — the loaded rpc-server
-                # process may still hold a file handle to the DLL on
-                # Windows. In that case we rename to a side path
-                # (`.dll.split-spawn-temp`) so llama-server's scan
-                # still doesn't find a `ggml-sycl.dll`.
-                if sycl_dll.is_file():
+                if side.is_file():
                     try:
-                        sycl_dll.unlink()
-                    except PermissionError:
-                        side = install_dir / "ggml-sycl.dll.split-spawn-temp"
-                        try:
-                            sycl_dll.rename(side)
-                        except Exception as e:
-                            log.warning(
-                                "split_lifecycle: could not move SYCL DLL "
-                                "out of llama-server's path (%s) — next "
-                                "split spawn may crash with SYCL_Split. "
-                                "Restart Gigachat to clean up.", e,
-                            )
-            except Exception:
-                pass
+                        side.unlink()
+                    except Exception:
+                        pass
+                sycl_dll.rename(side)
+                log.info(
+                    "split_lifecycle: moved ggml-sycl.dll out of "
+                    "install dir (renamed to %s) so the next "
+                    "llama-server spawn won't load SYCL directly",
+                    side.name,
+                )
+            except Exception as e:
+                # rename failed — try delete as a final fallback. If
+                # both fail, log loudly so the operator knows what's
+                # about to crash.
+                try:
+                    sycl_dll.unlink()
+                except Exception as e2:
+                    log.warning(
+                        "split_lifecycle: could NOT move ggml-sycl.dll "
+                        "out of install dir (rename: %s, unlink: %s) "
+                        "— llama-server WILL load SYCL backend on "
+                        "spawn and may crash with SYCL_Split if it "
+                        "uses --rpc workers. Restart Gigachat to "
+                        "clear file locks.", e, e2,
+                    )
         # Restore the skip-install marker so the auto-installer doesn't
         # re-fetch the DLL on the next probe cycle.
         if skip_marker_existed and not skip_marker.is_file():
