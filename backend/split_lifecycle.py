@@ -326,6 +326,205 @@ def _host_primary_backend() -> str:
     return name
 
 
+# Port for the host's same-machine SYCL rpc-server. Picked above the
+# 50052/50053 range that paired peers' rpc-servers use so it can't
+# collide with a peer's port choice when host happens to also be a
+# remote worker for someone else's pool. 50054 is reserved for this
+# purpose throughout the codebase.
+_HOST_LOCAL_SYCL_RPC_PORT = 50054
+
+
+def _host_has_intel_igpu() -> bool:
+    """True when the host machine has an Intel iGPU detected by
+    sysdetect, regardless of whether the SYCL backend DLL is present.
+    Used to decide if the local-SYCL-rpc-server workaround should
+    engage (we can use a renamed/temporarily-restored DLL — the
+    `_host_has_sycl_backend` check below requires the DLL to be
+    actively present in the install dir, which is a different
+    question)."""
+    try:
+        from . import sysdetect
+        return ((sysdetect.detect_system() or {}).get("gpu_kind") or "") == "intel"
+    except Exception:
+        return False
+
+
+def _ensure_host_local_sycl_rpc() -> str | None:
+    """Bring up a same-machine SYCL rpc-server so the host's Intel
+    iGPU can contribute to a multi-RPC split WITHOUT loading the SYCL
+    backend into the orchestrator llama-server (which would crash at
+    ggml-backend.cpp:898 — the SYCL_Split bug we ship `.skip-install`
+    markers to dodge).
+
+    Strategy:
+
+      1. If `ggml-sycl.dll` is currently disabled (renamed to
+         `ggml-sycl.dll.disabled-*`), temporarily restore one of the
+         disabled copies so rpc-server can find it at startup.
+      2. Spawn the rpc-server with `-d SYCL0` on
+         `127.0.0.1:_HOST_LOCAL_SYCL_RPC_PORT`. The rpc-server loads
+         the DLL into ITS process memory and keeps using it from RAM
+         even after the file vanishes.
+      3. Re-disable the DLL on disk (rename it back to
+         `.skip-install` form) BEFORE the orchestrator llama-server
+         spawns. llama-server's startup DLL scan won't find SYCL,
+         won't load the backend, won't trip the SYCL_Split crash —
+         but the rpc-server we just spawned still serves SYCL0
+         compute via the loopback RPC endpoint.
+      4. Return the endpoint string `"127.0.0.1:50054"` so the caller
+         can prepend it to its `--rpc` list.
+
+    Idempotent: if the rpc-server is already listening on the port
+    with the SYCL backend, return the endpoint without re-doing any
+    file shuffling.
+
+    Returns None when the host has no Intel iGPU, when no disabled
+    SYCL DLL copy is found (the install never had one), or when the
+    spawn fails — callers fall back to the legacy
+    "host iGPU sacrificed for stability" path.
+
+    Safe on non-Intel hosts (early-returns None). Safe under
+    concurrent calls (file-rename retries on PermissionError).
+    """
+    if not _host_has_intel_igpu():
+        return None
+    try:
+        install = split_runtime.get_install_status()
+        if not install.install_dir:
+            return None
+        install_dir = Path(install.install_dir)
+    except Exception:
+        return None
+    if not install_dir.is_dir():
+        return None
+
+    from . import p2p_rpc_server as _rpc
+
+    # Already running on the right port + backend?  Reuse.
+    try:
+        if (
+            _rpc._active_backends.get(_HOST_LOCAL_SYCL_RPC_PORT) == "SYCL0"
+            and _rpc._is_listening_on(_HOST_LOCAL_SYCL_RPC_PORT)
+        ):
+            log.info(
+                "split_lifecycle: host local SYCL rpc-server already "
+                "running on 127.0.0.1:%d; reusing endpoint",
+                _HOST_LOCAL_SYCL_RPC_PORT,
+            )
+            return f"127.0.0.1:{_HOST_LOCAL_SYCL_RPC_PORT}"
+    except Exception as e:
+        log.debug("rpc status probe failed (%s); will try fresh spawn", e)
+
+    sycl_dll = install_dir / "ggml-sycl.dll"
+    skip_marker = install_dir / "ggml-sycl.dll.skip-install"
+    # Find the most-recent disabled copy.
+    disabled_copies = sorted(
+        install_dir.glob("ggml-sycl.dll.disabled*"),
+        key=lambda p: p.stat().st_mtime if p.is_file() else 0,
+        reverse=True,
+    )
+    disabled_copies = [p for p in disabled_copies if p.is_file()]
+    if not sycl_dll.is_file() and not disabled_copies:
+        log.info(
+            "split_lifecycle: no ggml-sycl.dll[.disabled-*] copy found in %s "
+            "— host iGPU local-SYCL-rpc workaround unavailable",
+            install_dir,
+        )
+        return None
+
+    # Step 1: restore the DLL so rpc-server can load it.
+    dll_was_already_active = sycl_dll.is_file()
+    restored_from: Path | None = None
+    if not dll_was_already_active:
+        # Pick the freshest disabled copy. Copy (don't move) so the
+        # `.disabled-*` source survives — we'll re-disable by removing
+        # the active dll, not by un-restoring.
+        src = disabled_copies[0]
+        try:
+            import shutil
+            shutil.copyfile(src, sycl_dll)
+            restored_from = src
+            log.info(
+                "split_lifecycle: temporarily restored ggml-sycl.dll "
+                "from %s so host's local SYCL rpc-server can load it",
+                src.name,
+            )
+        except Exception as e:
+            log.warning(
+                "split_lifecycle: failed to restore ggml-sycl.dll from %s "
+                "(%s); host iGPU local-SYCL workaround skipped",
+                src, e,
+            )
+            return None
+    # Remove the skip-install marker so the rpc-server's
+    # auto-install pass doesn't second-guess us during the spawn.
+    skip_marker_existed = skip_marker.is_file()
+    if skip_marker_existed:
+        try:
+            skip_marker.unlink()
+        except Exception:
+            pass
+
+    endpoint: str | None = None
+    try:
+        # Step 2: spawn the SYCL rpc-server.
+        result = _rpc.start_local_rpc_server(
+            backend="SYCL0", port=_HOST_LOCAL_SYCL_RPC_PORT,
+        )
+        if result.get("listening"):
+            endpoint = f"127.0.0.1:{_HOST_LOCAL_SYCL_RPC_PORT}"
+            log.info(
+                "split_lifecycle: host local SYCL rpc-server listening on "
+                "%s — host iGPU available to llama-server via local RPC "
+                "(no SYCL+RPC crash, since llama-server itself won't load "
+                "the SYCL DLL)",
+                endpoint,
+            )
+        else:
+            log.warning(
+                "split_lifecycle: host local SYCL rpc-server failed to "
+                "start (status=%s, error=%s); host iGPU will not be "
+                "engaged in this split",
+                result.get("status"), result.get("error"),
+            )
+    finally:
+        # Step 3: re-disable the DLL so the orchestrator llama-server
+        # spawn doesn't load it. Whether the rpc-server start succeeded
+        # or not, we want llama-server to NOT see ggml-sycl.dll.
+        if not dll_was_already_active:
+            try:
+                # Use os.unlink (not Path.unlink) so we can swallow the
+                # "file in use" error gracefully — the loaded rpc-server
+                # process may still hold a file handle to the DLL on
+                # Windows. In that case we rename to a side path
+                # (`.dll.split-spawn-temp`) so llama-server's scan
+                # still doesn't find a `ggml-sycl.dll`.
+                if sycl_dll.is_file():
+                    try:
+                        sycl_dll.unlink()
+                    except PermissionError:
+                        side = install_dir / "ggml-sycl.dll.split-spawn-temp"
+                        try:
+                            sycl_dll.rename(side)
+                        except Exception as e:
+                            log.warning(
+                                "split_lifecycle: could not move SYCL DLL "
+                                "out of llama-server's path (%s) — next "
+                                "split spawn may crash with SYCL_Split. "
+                                "Restart Gigachat to clean up.", e,
+                            )
+            except Exception:
+                pass
+        # Restore the skip-install marker so the auto-installer doesn't
+        # re-fetch the DLL on the next probe cycle.
+        if skip_marker_existed and not skip_marker.is_file():
+            try:
+                skip_marker.touch()
+            except Exception:
+                pass
+    return endpoint
+
+
 def _host_has_sycl_backend() -> bool:
     """True when the host has an Intel iGPU + the SYCL backend DLL
     that llama-server will load into the device list at startup.
@@ -2216,6 +2415,33 @@ async def start(split_id: str) -> dict:
     except SplitLifecycleError as e:
         db.update_split_model_status(split_id, status="error", last_error=str(e))
         return {"ok": False, "status": "error", "error": str(e)}
+
+    # Host-iGPU-as-local-RPC workaround. When the host has an Intel
+    # iGPU AND there's at least one remote RPC peer, llama-server's
+    # SYCL+RPC hybrid path crashes (ggml-backend.cpp:898 SYCL_Split).
+    # Workaround: expose the host's iGPU as a SAME-MACHINE rpc-server
+    # endpoint instead of letting llama-server load SYCL directly.
+    # `_ensure_host_local_sycl_rpc` handles the DLL juggling — see
+    # its docstring for the rename dance. Returns the loopback
+    # endpoint string on success, None when the host has no iGPU,
+    # no SYCL DLL copy, or the spawn failed.
+    if rpc_endpoints:
+        try:
+            local_sycl_ep = _ensure_host_local_sycl_rpc()
+        except Exception as e:
+            log.warning(
+                "split_lifecycle: host local SYCL rpc bring-up raised "
+                "%s — continuing with peer-only endpoints", e,
+            )
+            local_sycl_ep = None
+        if local_sycl_ep:
+            # Prepend so it appears first in the --rpc list. With the
+            # interleave-by-host order built by `_resolve_rpc_endpoints`
+            # the loopback endpoint sits ahead of any LAN endpoint —
+            # matches llama.cpp's own preference for the lowest-latency
+            # backend when computing layer placement.
+            if local_sycl_ep not in rpc_endpoints:
+                rpc_endpoints = [local_sycl_ep, *rpc_endpoints]
 
     # Ensure every worker's rpc-server is up with the right backend
     # before the split spawn. `_select_worker_backend` returns

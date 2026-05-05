@@ -3919,6 +3919,29 @@ async def _run_turn_impl(
                 if tail_delta:
                     yield {"type": "delta", "text": tail_delta}
             except httpx.HTTPError as e:
+                # Diagnostic: surface the exact exception type, status
+                # code (when applicable), and response body so the
+                # operator can tell apart an upstream rpc-server crash
+                # (RemoteProtocolError mid-stream) from a llama-server
+                # config error (HTTPStatusError 4xx/5xx with body).
+                exc_status = ""
+                exc_body = ""
+                try:
+                    if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                        exc_status = f" status={e.response.status_code}"
+                        try:
+                            exc_body = (e.response.text or "")[:500]
+                        except Exception:
+                            exc_body = ""
+                except Exception:
+                    pass
+                log.warning(
+                    "agent: chat stream interrupted — type=%s%s base=%s body=%r",
+                    type(e).__name__,
+                    exc_status,
+                    (_LAST_CHAT_TARGET.get(conversation_id) or {}).get("base_url"),
+                    exc_body,
+                )
                 # Mid-stream worker failure: mark the routed worker
                 # transiently unhealthy so the user's retry / next
                 # turn routes to a different node. The probe loop
