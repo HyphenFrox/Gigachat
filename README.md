@@ -20,28 +20,70 @@ A self-hosted web app that turns **any locally-running Ollama model** (Gemma, Ll
 
 ## Quickstart
 
-```powershell
-# 1. Install Ollama and a function-calling model.
-ollama pull gemma4:e4b
+**Prerequisites** (any OS): Python 3.12+, Node 20+, [Ollama](https://ollama.com/download) running locally on `http://localhost:11434`, at least one function-calling Ollama model. On Windows the launcher scripts add the inbound LAN firewall rules automatically (UAC prompt); on Linux they try `ufw` then `firewall-cmd` then print a manual fallback.
 
-# 2. One-shot install (asks for Administrator via UAC, then sets
-#    everything up: virtualenv, backend deps, frontend build, and the
-#    inbound firewall rule for the LAN compute pool).
-.\install.bat
-
-# 3. Start the backend whenever you want to use the app:
-.\start.bat                 # production (single port, http://localhost:8000)
-# OR
-.\dev.bat                   # dev mode with hot reload (http://localhost:5173)
+Pull a model first either way:
+```bash
+ollama pull gemma4:e4b   # recommended default
 ```
 
-`install.bat` is a one-time setup. It also auto-fetches the patched llama.cpp build (~100 MB, Windows x64) into `~/.gigachat/llama-cpp/` so split-mode chats survive transient peer / iGPU blips without crashing — see [vendor/llama.cpp-patches/README.md](./vendor/llama.cpp-patches/README.md). After it finishes you launch the backend explicitly with `start.bat` or `dev.bat` — nothing runs in the background you didn't ask for. Other Gigachat installs on the same Wi-Fi can pair with this device via Settings → Compute pool while the backend is up.
+### Option 1 — Helper scripts (recommended)
 
-**Re-running `install.bat`** is safe + idempotent — every step replaces existing state cleanly. Run it again after `git pull` to refresh deps + rebuild the frontend bundle.
+The repo ships matching `.bat` (Windows) and `.sh` (Linux + macOS) wrappers. They're idempotent — re-run after `git pull` to refresh deps + rebuild the frontend.
 
-**To remove**: `.\uninstall.bat` undoes everything (firewall rule, `.venv\`, `node_modules\`, frontend build). Asks before deleting `data\` so a re-install picks up your chat history and P2P identity. Source tree is untouched.
+**Windows (PowerShell or cmd.exe):**
+```powershell
+.\install.bat       # venv + deps + frontend build + firewall rule + patched llama.cpp fetch
+.\start.bat         # production single-port at http://localhost:8000
+.\dev.bat           # dev mode with hot reload at http://localhost:5173
+.\uninstall.bat     # undo everything install.bat created (asks before deleting data\)
+```
 
-**Requirements**: Windows 10/11 (for the launcher `.bat` scripts; Python/Node code is cross-platform), Python 3.12+, Node 20+, Ollama running locally on `http://localhost:11434`, at least one function-calling Ollama model.
+**Linux / macOS (bash):**
+```bash
+chmod +x ./install.sh ./start.sh ./dev.sh ./uninstall.sh   # one time
+./install.sh        # venv + deps + frontend build + firewall rule (ufw/firewalld)
+./start.sh          # production single-port at http://localhost:8000
+./dev.sh            # dev mode with hot reload at http://localhost:5173
+./uninstall.sh      # undo everything install.sh created
+```
+
+`install` auto-fetches the patched llama.cpp build (~100 MB, Windows x64 only today) into `~/.gigachat/llama-cpp/` so split-mode chats survive transient peer / iGPU blips without crashing — see [vendor/llama.cpp-patches/README.md](./vendor/llama.cpp-patches/README.md) for the patch source + how to build for Linux / macOS yourself. Single-device chat works without it.
+
+`uninstall` removes `.venv/`, `frontend/node_modules/`, `frontend/dist/`, and the firewall rules. `data/` is kept by default (asks first) so a re-install picks up your chat history and P2P identity.
+
+### Option 2 — Manual setup (any OS, no scripts)
+
+If you prefer the raw commands, or you're on a Linux distro whose firewall manager isn't `ufw` or `firewalld`:
+
+```bash
+# 1. Backend virtualenv + deps
+python3 -m venv .venv
+source .venv/bin/activate                          # POSIX
+# .venv\Scripts\activate.bat                       # Windows cmd
+# .\.venv\Scripts\Activate.ps1                     # Windows PowerShell
+python -m pip install --upgrade pip
+python -m pip install -r backend/requirements.txt
+
+# 2. Frontend deps + production build
+cd frontend && npm install && npm run build && cd ..
+
+# 3. (Optional, Windows x64 only — single-device chat skips this)
+#    Auto-fetch the patched llama.cpp release zip to ~/.gigachat/llama-cpp/.
+python -c "from backend.p2p_llama_server import fetch_patched_llama_cpp; print(fetch_patched_llama_cpp())"
+
+# 4. (Optional) Open inbound TCP 8000 / 50052 / 50053 / 8090 on your firewall
+#    so other Gigachat installs on the same LAN can pair with this device.
+#    Loopback-only usage (single device) doesn't need any firewall changes.
+
+# 5. Run.
+python -m backend.server                           # production (port 8000)
+# OR for dev mode (two terminals):
+python -m uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
+( cd frontend && npm run dev )                     # second terminal — port 5173
+```
+
+Other Gigachat installs on the same Wi-Fi can pair with this device via **Settings → Compute pool** once the backend is up — chat traffic stays local on each install.
 
 ---
 

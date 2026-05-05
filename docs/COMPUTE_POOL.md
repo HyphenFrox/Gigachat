@@ -216,8 +216,8 @@ The pool's value is the top three rows — large models that the host can't load
 
 ## Setup, per machine
 
-- **Worker side** — Ollama installed and listening on `0.0.0.0:11434` (set `OLLAMA_HOST` env var, allow port 11434 on the Private firewall profile). Optional but enables Phase 2: install [llama.cpp's prebuilt build](https://github.com/ggml-org/llama.cpp/releases) at `~/.gigachat/llama-cpp/`, run `rpc-server.exe --host 0.0.0.0 --port 50052`. Allow port 50052 on the Private firewall profile.
-- **Host side** — pair the worker via Settings → Compute pool → Pair new device. The PIN handshake auto-creates the routing entry; no manual IP entry. One-click "Install llama.cpp" in the Compute panel auto-detects the host's GPU vendor and fetches the matching upstream build (CUDA / ROCm / SYCL / Metal / CPU).
+- **Worker side** — Ollama installed and listening on `0.0.0.0:11434` (set `OLLAMA_HOST` env var, allow port 11434 on the Private firewall profile — `install.bat` / `install.sh` add this rule automatically). For Phase 2 (split-mode layer push), `~/.gigachat/llama-cpp/rpc-server.exe` is auto-installed by `install.bat` from the [Gigachat-patched build release](https://github.com/HyphenFrox/Gigachat/releases/latest) on Windows x64. The orchestrator brings rpc-server up over the encrypted P2P proxy on demand — no manual `rpc-server.exe` invocation needed. Inbound TCP 50052 / 50053 / 8090 are also opened by the installer.
+- **Host side** — pair the worker via Settings → Compute pool → Pair new device. The PIN handshake auto-creates the routing entry; no manual IP entry. The same install script also auto-installs llama.cpp on the host (orchestrator runs `llama-server.exe` for the host-orchestrated split mode).
 
 The Settings panel shows live status pills per device (Ollama version, model count, GPU detection). The panel polls capabilities every 5 minutes; click 🔄 on any row to probe immediately.
 

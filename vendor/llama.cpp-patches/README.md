@@ -5,11 +5,19 @@ These patches apply on top of upstream llama.cpp **b9002** (commit
 Gigachat app expects from its bundled llama-server / rpc-server
 binaries.
 
+**Pre-built Windows x64 binaries are published as a GitHub Release**
+([`gigachat-llamacpp-b9002-1`](https://github.com/HyphenFrox/Gigachat/releases/tag/gigachat-llamacpp-b9002-1)).
+`install.bat` / `install.sh` auto-fetches them at install time —
+end users on Windows x64 don't need to build anything from source.
+The instructions below are for users on Linux / macOS, or anyone who
+wants to rebuild against a newer upstream tag (and update the release
+sha256 in `backend/p2p_llama_server.py:_PATCHED_RELEASE_SHA256`).
+
 The patched binaries live at `~/.gigachat/llama-cpp/` once installed,
 identified by the presence of `gigachat_patch_marker.txt`. Gigachat
-detects this marker at every spawn and warns the user when stock
-binaries are detected (see `backend/p2p_llama_server.py:
-is_patched_llama_cpp_installed`).
+detects this marker at every spawn (see `backend/p2p_llama_server.py:
+is_patched_llama_cpp_installed`); when absent the auto-installer is
+re-invoked.
 
 ## What's patched
 
