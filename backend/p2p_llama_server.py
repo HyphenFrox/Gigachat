@@ -58,6 +58,7 @@ import time
 import urllib.request
 import urllib.error
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -166,6 +167,24 @@ _LISTEN_WAIT_SEC = 60.0
 _GIGACHAT_PATCH_MARKER = _LLAMA_SERVER_BIN_DIR / "gigachat_patch_marker.txt"
 
 
+# Patched llama.cpp release — published on the Gigachat repo's GitHub
+# Releases page. Pinned by tag so a user `git pull`-ing later doesn't
+# silently pick up a different build. Bumping this tag (e.g. when we
+# rebuild against a newer upstream `b9XXX`) just means the next
+# install / re-install pulls the new zip.
+_PATCHED_RELEASE_TAG = "gigachat-llamacpp-b9002-1"
+_PATCHED_RELEASE_URL = (
+    "https://github.com/HyphenFrox/Gigachat/releases/download/"
+    f"{_PATCHED_RELEASE_TAG}/gigachat-llamacpp-b9002-windows-x64.zip"
+)
+# sha256 of the published zip — verified after download to catch both
+# corruption and (paranoid) supply-chain swaps. Update alongside the
+# release tag whenever the binaries are rebuilt.
+_PATCHED_RELEASE_SHA256 = (
+    "6fe879c9646cc55949f42d526fcee2429655f75d92f1a1b2f0fd4d6b6dca2c40"
+)
+
+
 def is_patched_llama_cpp_installed() -> bool:
     """Return True iff the binaries in ``_LLAMA_SERVER_BIN_DIR`` are the
     Gigachat-patched build (RPC throws-instead-of-aborts + transport
@@ -177,15 +196,152 @@ def is_patched_llama_cpp_installed() -> bool:
     return _GIGACHAT_PATCH_MARKER.is_file()
 
 
-def _ensure_patched_llama_cpp_or_warn() -> None:
-    """Log a one-shot warning when the user is running stock llama.cpp
-    instead of the patched build. Idempotent — only warns once per
-    process, since logging on every spawn would clutter the log.
+def fetch_patched_llama_cpp(*, force: bool = False) -> dict[str, Any]:
+    """Download + extract the published patched llama.cpp build.
 
-    Doesn't auto-download the patched binaries: that's the operator's
-    explicit step (the binary fetch path requires LAN-paired peers OR
-    a release URL, both of which need user setup). But surfacing the
-    warning makes it obvious WHY a chat just died from an RPC crash.
+    Pulls the platform-matched zip from the pinned GitHub Release
+    (`_PATCHED_RELEASE_URL`), verifies its sha256, and unpacks it into
+    `~/.gigachat/llama-cpp/`. Idempotent: returns the existing
+    install when the marker is already present (unless `force=True`).
+
+    Returns a structured result so install.bat / the UI can display
+    progress / errors:
+
+      {
+        "ok":          bool,
+        "skipped":     bool,    # already installed and not forced
+        "downloaded":  bool,    # we hit the network this call
+        "platform_supported": bool,  # only Windows x64 right now
+        "bytes":       int,     # downloaded size on success
+        "install_dir": str,
+        "tag":         str,     # release tag we pulled
+        "error":       str,     # populated on failure
+      }
+
+    Best-effort. Failure modes (no network, sha256 mismatch, zip
+    corrupt, target dir not writable) all return ok=false rather
+    than raising — the caller can fall back to its existing
+    "warn the user" path.
+    """
+    import hashlib
+    import platform as _platform
+    import shutil
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    install_dir = _LLAMA_SERVER_BIN_DIR
+    result: dict[str, Any] = {
+        "ok": False, "skipped": False, "downloaded": False,
+        "platform_supported": False, "bytes": 0,
+        "install_dir": str(install_dir),
+        "tag": _PATCHED_RELEASE_TAG, "error": "",
+    }
+
+    # Right now we only ship Windows x64 binaries (the user base + the
+    # build host's toolchain). Linux / macOS users still have to build
+    # from source via vendor/llama.cpp-patches/README.md — surface that
+    # cleanly instead of trying to install an incompatible binary.
+    if _platform.system() != "Windows" or _platform.machine().lower() not in (
+        "amd64", "x86_64",
+    ):
+        result["error"] = (
+            f"unsupported platform {_platform.system()} {_platform.machine()}; "
+            "build from source — see vendor/llama.cpp-patches/README.md"
+        )
+        return result
+    result["platform_supported"] = True
+
+    if is_patched_llama_cpp_installed() and not force:
+        result["ok"] = True
+        result["skipped"] = True
+        return result
+
+    install_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".zip", delete=False,
+            dir=str(install_dir),
+        ) as tmp:
+            tmp_path = tmp.name
+            log.info(
+                "p2p_llama_server: downloading patched llama.cpp from %s ...",
+                _PATCHED_RELEASE_URL,
+            )
+            req = urllib.request.Request(
+                _PATCHED_RELEASE_URL,
+                headers={"User-Agent": "Gigachat/llamacpp-installer"},
+            )
+            with urllib.request.urlopen(req, timeout=600) as r:
+                # Stream in chunks so we don't blow memory on the
+                # 100 MB zip + can hash on the fly.
+                hasher = hashlib.sha256()
+                bytes_done = 0
+                while True:
+                    chunk = r.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+                    hasher.update(chunk)
+                    bytes_done += len(chunk)
+        digest = hasher.hexdigest()
+        result["bytes"] = bytes_done
+        result["downloaded"] = True
+        if digest != _PATCHED_RELEASE_SHA256:
+            result["error"] = (
+                f"sha256 mismatch: expected {_PATCHED_RELEASE_SHA256[:16]}…, "
+                f"got {digest[:16]}… — refusing to extract"
+            )
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            return result
+        log.info(
+            "p2p_llama_server: download OK (%d bytes, sha256 verified); "
+            "extracting to %s",
+            bytes_done, install_dir,
+        )
+        with zipfile.ZipFile(tmp_path, "r") as zf:
+            zf.extractall(install_dir)
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        # Final sanity check: the marker should now exist.
+        if not is_patched_llama_cpp_installed():
+            result["error"] = (
+                "extracted zip but gigachat_patch_marker.txt not present "
+                f"in {install_dir} — release may be malformed"
+            )
+            return result
+        result["ok"] = True
+        log.info(
+            "p2p_llama_server: patched llama.cpp install complete (tag=%s)",
+            _PATCHED_RELEASE_TAG,
+        )
+        return result
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+        log.warning(
+            "p2p_llama_server: patched llama.cpp fetch failed: %s",
+            result["error"],
+        )
+        return result
+
+
+def _ensure_patched_llama_cpp_or_warn() -> None:
+    """Make sure the patched llama.cpp build is installed. On a fresh
+    system this triggers a one-time download from the Gigachat
+    release page; on subsequent calls it's a marker-file check and
+    no-op. Idempotent — only attempts download once per process.
+
+    Failure modes are non-fatal: an unsupported platform, no network,
+    or sha256 mismatch all log a warning and let the caller fall
+    back to whatever stock binaries are already in place. With stock
+    binaries split-mode still works for clean runs but a transient
+    RPC blip will hard-kill llama-server.
     """
     global _PATCHED_BUILD_WARNED
     try:
@@ -201,16 +357,23 @@ def _ensure_patched_llama_cpp_or_warn() -> None:
             "(gigachat_patch_marker.txt present) — RPC failures will be "
             "auto-recovered by the chat layer"
         )
-    else:
-        log.warning(
-            "p2p_llama_server: STOCK llama.cpp detected at %s "
-            "(no gigachat_patch_marker.txt). RPC backend hiccups will "
-            "hard-kill llama-server with STATUS_STACK_BUFFER_OVERRUN. "
-            "Replace the binaries with the patched build to enable "
-            "automatic crash recovery — see "
-            "C:\\Users\\Gautam\\Downloads\\llama.cpp\\build-sycl\\bin",
-            str(_LLAMA_SERVER_BIN_DIR),
+        return
+    # Not installed — try the auto-fetch from the GitHub Release.
+    res = fetch_patched_llama_cpp()
+    if res.get("ok"):
+        log.info(
+            "p2p_llama_server: patched llama.cpp auto-installed from %s "
+            "(%d MB)", _PATCHED_RELEASE_URL, res["bytes"] // (1024 * 1024),
         )
+        return
+    log.warning(
+        "p2p_llama_server: STOCK llama.cpp at %s (no gigachat_patch_marker.txt) "
+        "and auto-install failed: %s. RPC backend hiccups will hard-kill "
+        "llama-server. Run `python -c \"from backend.p2p_llama_server import "
+        "fetch_patched_llama_cpp as f; print(f(force=True))\"` to retry, or "
+        "build from source — see vendor/llama.cpp-patches/README.md",
+        str(_LLAMA_SERVER_BIN_DIR), res.get("error", "unknown error"),
+    )
 
 
 _PATCHED_BUILD_WARNED = False

@@ -58,7 +58,7 @@ echo.
 
 REM -- 1. Python venv ---------------------------------------------------
 if not exist "%ROOT%.venv\Scripts\python.exe" (
-  echo  [1/4] Creating Python virtualenv at .venv\ ...
+  echo  [1/5] Creating Python virtualenv at .venv\ ...
   python -m venv .venv
   if errorlevel 1 (
     echo.
@@ -68,11 +68,11 @@ if not exist "%ROOT%.venv\Scripts\python.exe" (
     exit /b 1
   )
 ) else (
-  echo  [1/4] Reusing existing .venv\ ...
+  echo  [1/5] Reusing existing .venv\ ...
 )
 
 REM -- 2. Backend deps --------------------------------------------------
-echo  [2/4] Installing backend dependencies into .venv\ ...
+echo  [2/5] Installing backend dependencies into .venv\ ...
 call "%ROOT%.venv\Scripts\python.exe" -m pip install --upgrade pip
 call "%ROOT%.venv\Scripts\python.exe" -m pip install -r backend\requirements.txt
 if errorlevel 1 (
@@ -87,7 +87,7 @@ if errorlevel 1 (
 )
 
 REM -- 3. Frontend deps + production build ------------------------------
-echo  [3/4] Installing + building frontend ...
+echo  [3/5] Installing + building frontend ...
 cd /d %ROOT%frontend
 call npm install
 if errorlevel 1 (
@@ -106,6 +106,24 @@ if errorlevel 1 (
 )
 cd /d %ROOT%
 
+REM -- 3.5. Patched llama.cpp build (one-shot fetch from GitHub Release) -
+REM Installs the Gigachat-patched llama.cpp binaries into
+REM ~\.gigachat\llama-cpp\ when they're not already present. The patches
+REM (RPC throws-instead-of-aborts + transport retries + SYCL exception
+REM handling) turn transient peer/iGPU blips from process-killing aborts
+REM into recoverable errors the chat layer auto-retries — without them,
+REM split-mode chats crash on every Wi-Fi hiccup. Idempotent: skips
+REM cleanly if the marker is already present. Best-effort: a network
+REM failure logs the error but doesn't fail install (single-device chat
+REM still works without the patched build).
+echo  [3.5/4] Fetching patched llama.cpp build (Windows x64, ~100 MB) ...
+call "%ROOT%.venv\Scripts\python.exe" -c "from backend.p2p_llama_server import fetch_patched_llama_cpp; r = fetch_patched_llama_cpp(); print('  result:', r); import sys; sys.exit(0 if r.get('ok') or r.get('skipped') else 0)"
+if errorlevel 1 (
+  echo  [!] Patched llama.cpp fetch failed (non-fatal — single-device chat still works).
+  echo      You can retry later from the running app or rebuild from source via
+  echo      vendor\llama.cpp-patches\README.md.
+)
+
 REM -- 4. Firewall rules ------------------------------------------------
 REM Open EVERY port Gigachat needs for the compute pool to function
 REM end-to-end so the user never has to fight the firewall after install:
@@ -117,7 +135,7 @@ REM             holds a GGUF too big for any single peer alone, we run
 REM             llama-server here with other peers as `--rpc` backends)
 REM Private profile only — these endpoints stay on the LAN. Public
 REM profiles never see the listeners.
-echo  [4/4] Adding Windows Firewall rules ^(TCP 8000/50052/50053/8090, Private profile^) ...
+echo  [4/5] Adding Windows Firewall rules ^(TCP 8000/50052/50053/8090, Private profile^) ...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference = 'Stop';" ^
   "@('Gigachat backend (port 8000)','Gigachat backend (port 8000, Private)','Gigachat rpc-server SYCL (port 50052)','Gigachat rpc-server CPU (port 50053)','Gigachat llama-server (port 8090)') | ForEach-Object { Get-NetFirewallRule -DisplayName $_ -ErrorAction SilentlyContinue | Remove-NetFirewallRule };" ^

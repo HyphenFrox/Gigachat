@@ -35,7 +35,7 @@ ollama pull gemma4:e4b
 .\dev.bat                   # dev mode with hot reload (http://localhost:5173)
 ```
 
-`install.bat` is a one-time setup. After it finishes you launch the backend explicitly with `start.bat` or `dev.bat` — nothing runs in the background you didn't ask for. Other Gigachat installs on the same Wi-Fi can pair with this device via Settings → Compute pool while the backend is up.
+`install.bat` is a one-time setup. It also auto-fetches the patched llama.cpp build (~100 MB, Windows x64) into `~/.gigachat/llama-cpp/` so split-mode chats survive transient peer / iGPU blips without crashing — see [vendor/llama.cpp-patches/README.md](./vendor/llama.cpp-patches/README.md). After it finishes you launch the backend explicitly with `start.bat` or `dev.bat` — nothing runs in the background you didn't ask for. Other Gigachat installs on the same Wi-Fi can pair with this device via Settings → Compute pool while the backend is up.
 
 **Re-running `install.bat`** is safe + idempotent — every step replaces existing state cleanly. Run it again after `git pull` to refresh deps + rebuild the frontend bundle.
 
