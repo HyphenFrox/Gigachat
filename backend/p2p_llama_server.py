@@ -172,16 +172,16 @@ _GIGACHAT_PATCH_MARKER = _LLAMA_SERVER_BIN_DIR / "gigachat_patch_marker.txt"
 # silently pick up a different build. Bumping this tag (e.g. when we
 # rebuild against a newer upstream `b9XXX`) just means the next
 # install / re-install pulls the new zip.
-_PATCHED_RELEASE_TAG = "gigachat-llamacpp-b9002-1"
+_PATCHED_RELEASE_TAG = "gigachat-llamacpp-b9030-1"
 _PATCHED_RELEASE_URL = (
     "https://github.com/HyphenFrox/Gigachat/releases/download/"
-    f"{_PATCHED_RELEASE_TAG}/gigachat-llamacpp-b9002-windows-x64.zip"
+    f"{_PATCHED_RELEASE_TAG}/gigachat-llamacpp-b9030-windows-x64.zip"
 )
 # sha256 of the published zip — verified after download to catch both
 # corruption and (paranoid) supply-chain swaps. Update alongside the
 # release tag whenever the binaries are rebuilt.
 _PATCHED_RELEASE_SHA256 = (
-    "6fe879c9646cc55949f42d526fcee2429655f75d92f1a1b2f0fd4d6b6dca2c40"
+    "f2e7e0ddb31ab61d5cc757d2be5ab52e3307fe5c0f01078c07696e6e0b6b1cc7"
 )
 
 

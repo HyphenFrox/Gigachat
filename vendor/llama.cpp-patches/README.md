@@ -1,12 +1,15 @@
 # Gigachat patches for llama.cpp
 
-These patches apply on top of upstream llama.cpp **b9002** (commit
-`457e2288c` — `sync : ggml`) and ship the runtime resilience that the
-Gigachat app expects from its bundled llama-server / rpc-server
-binaries.
+These patches apply on top of upstream llama.cpp **b9030** (commit
+`a09a00e` — `vendor : update cpp-httplib to 0.43.3 (#22686)`) and
+ship the runtime resilience that the Gigachat app expects from its
+bundled llama-server / rpc-server binaries. The same patch applied
+cleanly to b9002 — RPC code is unchanged between those builds — so
+the only thing changed in the b9030 rebuild is the underlying
+llama.cpp tag.
 
 **Pre-built Windows x64 binaries are published as a GitHub Release**
-([`gigachat-llamacpp-b9002-1`](https://github.com/HyphenFrox/Gigachat/releases/tag/gigachat-llamacpp-b9002-1)).
+([`gigachat-llamacpp-b9030-1`](https://github.com/HyphenFrox/Gigachat/releases/tag/gigachat-llamacpp-b9030-1)).
 `install.bat` / `install.sh` auto-fetches them at install time —
 end users on Windows x64 don't need to build anything from source.
 The instructions below are for users on Linux / macOS, or anyone who
@@ -53,7 +56,7 @@ gets a clean error response and the next request can re-try.
 ## Build
 
 ```cmd
-git clone --depth 1 --branch b9002 https://github.com/ggml-org/llama.cpp.git
+git clone --depth 1 --branch b9030 https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
 git apply ../vendor/llama.cpp-patches/gigachat-rpc-resilience.patch
 mkdir build-sycl && cd build-sycl
