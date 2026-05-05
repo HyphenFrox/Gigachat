@@ -33,6 +33,7 @@ Design notes:
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -42,6 +43,15 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+
+
+# How far back the rolling-window stats look. 60 s is long enough that
+# a momentary CPU/GPU spike won't be misread as sustained utilization,
+# short enough that "current" really is current (not stale data from
+# a previous chat). Min/max/avg/p95 over this window appear in
+# `/api/p2p/system-stats.window_60s` so callers can tell "spiking but
+# mostly idle" apart from "pool actually loaded".
+_HISTORY_WINDOW_SEC = 60.0
 
 try:
     import psutil  # type: ignore
@@ -90,6 +100,18 @@ class _BgSampler:
         # Per-pid GPU usage (cached on the same cadence as the device-
         # level probe — both shell out to the same vendor tools).
         self._per_pid_gpu_snap: dict[int, dict[str, Any]] = {}
+        # Rolling-window history. The user wants utilization tracked
+        # over a period of time, not a point-in-time snapshot — a momentary
+        # spike-vs-sustained difference is meaningful for "is the pool
+        # actually being used" versus "is there a 50ms peak that hides
+        # underutilization the rest of the time". Each entry is a tuple
+        # (timestamp, cpu_pct, gpu_util_pct, vram_used_gb, ram_used_gb,
+        # app_cpu_pct, app_ram_used_gb, app_vram_used_gb, app_gpu_util_pct).
+        # We keep the last `_HISTORY_WINDOW_SEC` of samples so callers
+        # can compute min/max/avg/p95 over the period that matters.
+        # Deque is bounded by time, not by count, so we don't drop slow-
+        # poll periods — entries are pruned by age on each append.
+        self._history: collections.deque = collections.deque()
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run, name="ResourceTrackerBgSampler", daemon=True
@@ -168,6 +190,34 @@ class _BgSampler:
                     except Exception as e:
                         log.debug("BgSampler per-pid gpu probe failed: %s", e)
                     self._last_gpu_ts = now
+                # Record rolling-window sample. We pull the latest
+                # totals + per-app slice into one tuple so window_stats
+                # can compute synchronized min/max/avg over the same
+                # observation window. Per-app fields are best-effort
+                # (the app snapshot is a separate code path that may
+                # lag — we just use 0 if it hasn't been computed yet).
+                try:
+                    gpu = self._gpu_snap or {}
+                    vm = psutil.virtual_memory()
+                    sample = (
+                        now,
+                        float(self._cpu_pct),
+                        float(gpu.get("gpu_util_pct") or 0.0),
+                        float(gpu.get("vram_used_gb") or 0.0),
+                        float(vm.used) / (1024 ** 3),
+                        # App slice fields are filled by the dedicated
+                        # `_app_process_snapshot` call from the request
+                        # path; we don't repeat that work here. The
+                        # window_stats accessor handles missing fields
+                        # gracefully.
+                        0.0, 0.0, 0.0, 0.0,
+                    )
+                    self._history.append(sample)
+                    cutoff = now - _HISTORY_WINDOW_SEC
+                    while self._history and self._history[0][0] < cutoff:
+                        self._history.popleft()
+                except Exception as e:
+                    log.debug("BgSampler history append failed: %s", e)
             except Exception as e:
                 log.debug("BgSampler tick failed: %s", e)
 
@@ -207,6 +257,65 @@ class _BgSampler:
     @property
     def disk_write_kbps(self) -> float:
         return round(self._disk_write_bps / 1024.0, 1)
+
+    def window_stats(self, *, window_sec: float = _HISTORY_WINDOW_SEC) -> dict[str, Any]:
+        """Min/max/avg/p95 of CPU + GPU + VRAM + RAM over the last
+        `window_sec`. Empty / sparse history returns zeros.
+
+        The user's directive: "don't track at one point in time —
+        resource spiking at one point doesn't mean there is no
+        underutilization. Track over a period to see the full picture."
+        That's exactly what this returns: aggregates over the window so
+        a 70% CPU spike for 1 second AND 5% CPU sustained for 60 seconds
+        are clearly distinguishable from each other in the UI / logs.
+
+        Returned shape:
+          {
+            "samples": int,     # number of samples in the window
+            "window_sec": float,# how far back we looked (capped to history)
+            "cpu_pct":      {min, max, avg, p95},
+            "gpu_util_pct": {min, max, avg, p95},
+            "vram_used_gb": {min, max, avg, p95},
+            "ram_used_gb":  {min, max, avg, p95},
+          }
+        """
+        if not self._history:
+            return {
+                "samples": 0,
+                "window_sec": 0.0,
+                "cpu_pct": {"min": 0.0, "max": 0.0, "avg": 0.0, "p95": 0.0},
+                "gpu_util_pct": {"min": 0.0, "max": 0.0, "avg": 0.0, "p95": 0.0},
+                "vram_used_gb": {"min": 0.0, "max": 0.0, "avg": 0.0, "p95": 0.0},
+                "ram_used_gb": {"min": 0.0, "max": 0.0, "avg": 0.0, "p95": 0.0},
+            }
+        now = time.time()
+        cutoff = now - max(1.0, float(window_sec))
+        # Snapshot the deque so we don't race with the writer thread.
+        snapshot = [s for s in list(self._history) if s[0] >= cutoff]
+        if not snapshot:
+            snapshot = list(self._history)
+        actual_window = snapshot[-1][0] - snapshot[0][0] if len(snapshot) > 1 else 0.0
+        def _agg(idx: int) -> dict[str, float]:
+            vals = [s[idx] for s in snapshot]
+            if not vals:
+                return {"min": 0.0, "max": 0.0, "avg": 0.0, "p95": 0.0}
+            sv = sorted(vals)
+            n = len(sv)
+            p95_idx = max(0, min(n - 1, int(round(0.95 * (n - 1)))))
+            return {
+                "min": round(sv[0], 2),
+                "max": round(sv[-1], 2),
+                "avg": round(sum(vals) / n, 2),
+                "p95": round(sv[p95_idx], 2),
+            }
+        return {
+            "samples": len(snapshot),
+            "window_sec": round(actual_window, 1),
+            "cpu_pct": _agg(1),
+            "gpu_util_pct": _agg(2),
+            "vram_used_gb": _agg(3),
+            "ram_used_gb": _agg(4),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +935,16 @@ def local_snapshot() -> dict[str, Any]:
     snap["net_recv_kbps"] = sampler.net_recv_kbps
     # ---- Gigachat-app share --------------------------------------------
     snap["app"] = _app_process_snapshot()
+    # ---- Rolling-window aggregates -------------------------------------
+    # 60-second window of cpu / gpu_util / vram / ram min/max/avg/p95.
+    # Lets the UI distinguish a 70%-for-1s spike from sustained 70%-for-60s
+    # — which is the only way to honestly answer "is the pool actually
+    # being used or just twitching".
+    try:
+        snap["window_60s"] = sampler.window_stats(window_sec=60.0)
+    except Exception as e:
+        log.debug("local_snapshot: window_stats failed: %s", e)
+        snap["window_60s"] = {"samples": 0, "window_sec": 0.0}
     return snap
 
 

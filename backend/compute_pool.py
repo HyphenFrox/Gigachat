@@ -7576,6 +7576,47 @@ async def route_chat_for(
             for w in existing_workers
             if w.get("use_for_chat")
         )
+        if not host_has:
+            # Step 0 — LAN-first auto-pull. If the model already lives
+            # on a paired LAN peer, copy it from there to host (over
+            # the encrypted P2P proxy) instead of re-downloading from
+            # the public registry. Saves multi-GB of WAN bandwidth +
+            # finishes in seconds on a gigabit LAN. The user's
+            # directive: "auto-pull whatever it needs via LAN (1st
+            # preference) or via internet (2nd preference)".
+            #
+            # Even when `pool_has` is True (a LAN peer can serve the
+            # chat directly via its ollama), we still pull to host
+            # when the model is big enough to warrant pool-wide split:
+            # without the GGUF on host, the orchestrator can't run a
+            # split-llama-server and the user loses the iGPU+GPU+CPU
+            # sum across all 3 devices. Side-effect: subsequent chats
+            # for this model start hot on host without a re-pull.
+            try:
+                from . import model_sync as _ms
+                lan_src = _ms.find_lan_source_for(model_name)
+                if lan_src and lan_src.get("kind") == "worker":
+                    src_w = db.get_compute_worker(lan_src.get("worker_id"))
+                    if src_w:
+                        ok = await _ms.pull_model_via_p2p(
+                            model_name, src_w,
+                            on_progress=on_pull_progress,
+                        )
+                        if ok:
+                            log.info(
+                                "compute_pool: LAN-pulled %r from %s "
+                                "(host now has it; pool-wide split is "
+                                "now possible)",
+                                model_name, src_w.get("label"),
+                            )
+                            host_has = True
+            except Exception as e:
+                log.info(
+                    "compute_pool: LAN-pull of %r failed (%s); "
+                    "falling through to internet pull",
+                    model_name, e,
+                )
+
         if not host_has and not pool_has:
             # Step 1 — try the public swarm.
             from . import p2p_pool_routing as _ppr
@@ -7595,8 +7636,9 @@ async def route_chat_for(
                 )
                 if pulled:
                     log.info(
-                        "compute_pool: auto-pulled %r on host before "
-                        "route_chat_for resumed", model_name,
+                        "compute_pool: auto-pulled %r on host from "
+                        "internet (LAN-first attempt earlier had no "
+                        "source)", model_name,
                     )
             else:
                 log.info(

@@ -376,6 +376,15 @@ _P2P_LAN_PREFIXES = (
     # proxy size cap; files are standard release artifacts (no user
     # data) so confidentiality isn't a concern.
     "/api/p2p/binary/",
+    # LAN-first model fetch — Ollama manifest + blob bytes served
+    # direct over LAN HTTP. Same rationale as `/api/p2p/binary/`:
+    # blobs are multi-GB so the encrypted-proxy size cap is hopeless,
+    # and the bytes are downloaded-from-public-registry GGUFs (not
+    # user-typed prompts), so the secure-proxy's confidentiality
+    # guarantee isn't load-bearing here. The auth check in
+    # AuthMiddleware still gates on RFC1918-LAN IPs so the bytes
+    # only flow to peers on the user's own physical network.
+    "/api/p2p/ollama/",
                                 #   (pairing_id + nonce, NO PIN) so it can
                                 #   build a signed claim against the host's
                                 #   actual challenge.
@@ -4249,6 +4258,57 @@ def api_p2p_binary_get(filename: str):
         media_type="application/octet-stream",
         headers={"Content-Length": str(size)},
         filename=path.name,
+    )
+
+
+# Ollama model serving for LAN-first auto-pull. When the orchestrator
+# host is missing a model that one of the paired peers already has,
+# host fetches the manifest + each blob from the peer via these
+# endpoints (over the existing E2E-encrypted secure proxy) instead of
+# re-downloading from the public registry. Saves multi-GB of WAN
+# bandwidth + finishes in seconds on a gigabit LAN. The peer's
+# `~/.ollama/models/` is already covered by the paired-peer trust
+# model; the secure proxy gates these endpoints to authenticated peers.
+@app.get("/api/p2p/ollama/manifest/{name:path}")
+def api_p2p_ollama_manifest(name: str):
+    """Return THIS peer's Ollama manifest for the given model name.
+
+    `name` is the canonical Ollama model name like `gemma4:e4b` or
+    `huihui_ai/qwen3.6-abliterated:27b-q4_K`. Body is the JSON
+    manifest verbatim — same bytes Ollama itself wrote.
+
+    Returns 404 if the model isn't on this peer's Ollama store.
+    """
+    from . import model_sync as _ms
+    p = _ms.local_manifest_path(name)
+    if p is None or not p.is_file():
+        raise HTTPException(404, f"model {name!r} not on this peer")
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        p,
+        media_type="application/json",
+        headers={"Content-Length": str(p.stat().st_size)},
+    )
+
+
+@app.get("/api/p2p/ollama/blob/{digest}")
+def api_p2p_ollama_blob(digest: str):
+    """Stream a single Ollama blob back to a paired peer.
+
+    `digest` is the on-disk filename (`sha256-<64hex>`). Refuses any
+    path traversal or non-blob filename — only files matching
+    `sha256-[0-9a-f]{64}` resolve.
+    """
+    from . import model_sync as _ms
+    p = _ms.local_blob_path(digest)
+    if p is None or not p.is_file():
+        raise HTTPException(404, f"blob {digest!r} not on this peer")
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        p,
+        media_type="application/octet-stream",
+        headers={"Content-Length": str(p.stat().st_size)},
+        filename=p.name,
     )
 
 

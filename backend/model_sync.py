@@ -335,6 +335,212 @@ async def sync_model(model_name: str, worker_id: str) -> dict:
     }
 
 
+def local_manifest_path(model_name: str) -> Path | None:
+    """Resolve THIS host's manifest file for an Ollama model name.
+
+    Returns the absolute path on disk or None if the model isn't on
+    this host's Ollama store. Used by the P2P endpoints that serve
+    manifests to peers fetching models LAN-first.
+    """
+    try:
+        return _host_manifest_path(model_name)
+    except Exception:
+        return None
+
+
+# Strict regex so the blob endpoint can't be tricked into serving
+# arbitrary files via path-traversal-style digests. Ollama digests are
+# always `sha256-<64 lowercase hex>`. Anything else returns None and
+# the endpoint surfaces a 404.
+import re as _re
+_BLOB_RE = _re.compile(r"^sha256-[0-9a-f]{64}$")
+
+
+def local_blob_path(digest: str) -> Path | None:
+    """Resolve THIS host's blob path for a given digest filename.
+
+    Validates that `digest` matches the canonical Ollama blob name
+    pattern (`sha256-<64hex>`); refuses anything else. Returns the
+    absolute path or None when the file isn't present locally.
+    """
+    if not digest or not _BLOB_RE.match(digest):
+        return None
+    p = _HOST_OLLAMA_DIR / "blobs" / digest
+    if not p.is_file():
+        return None
+    return p
+
+
+async def pull_model_via_p2p(
+    model_name: str,
+    source_worker: dict,
+    *,
+    on_progress: callable | None = None,
+) -> bool:
+    """Pull an Ollama model from a paired LAN peer to THIS host.
+
+    Symmetric inverse of `sync_model` (which pushes host → worker via
+    SCP). This direction goes worker → host via the encrypted P2P
+    proxy, so it works on every paired peer regardless of whether
+    `ssh_host` is configured. Steps:
+
+      1. Fetch the peer's manifest for `model_name` over the secure
+         proxy. Parse out the layer digest list.
+      2. For each digest the host doesn't already have, stream the
+         blob bytes from the peer and write to host's
+         `~/.ollama/models/blobs/<digest>`.
+      3. Write the manifest to host's manifests tree LAST so a partial
+         pull doesn't fool the host's Ollama into thinking the model
+         is loadable.
+
+    `on_progress` (optional) gets called with progress dicts so the
+    caller can stream "Pulling 4.2 GB from FBS… 35 %" to the user.
+    Shape:
+      {"model": str, "status": str, "digest": str, "completed": int,
+       "total": int, "percent": float}
+
+    Returns True on success, False on any failure. Always best-effort
+    — caller should fall through to internet pull on False so the
+    user isn't blocked when LAN pull fails.
+
+    Privacy note: the peer is by definition paired (in the local-pool
+    whitelist of `p2p_privacy.assert_plaintext_allowed`). Bytes flow
+    over the host-to-peer encrypted channel; nothing leaves the LAN.
+    """
+    import httpx
+    label = source_worker.get("label") or source_worker.get("id") or "?"
+    addr = (source_worker.get("address") or "").strip()
+    port = int(source_worker.get("ollama_port") or 8000)
+    if not addr:
+        log.info("model_sync.pull_via_p2p: peer %s has no address", label)
+        return False
+    base_url = f"http://{addr}:{port}"
+
+    # 1. Fetch manifest from peer via direct LAN HTTP. Same pattern as
+    #    `/api/p2p/binary/get/<file>` — bypasses the encrypted-proxy
+    #    size cap so multi-GB blobs can stream cleanly. Auth still
+    #    gates on RFC1918-LAN IPs in AuthMiddleware.
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=30, write=30, pool=10)) as client:
+            r = await client.get(f"{base_url}/api/p2p/ollama/manifest/{model_name}")
+            if r.status_code != 200:
+                log.info(
+                    "model_sync.pull_via_p2p: peer %s returned %d for manifest "
+                    "of %r — not on peer", label, r.status_code, model_name,
+                )
+                return False
+            manifest = r.json()
+    except Exception as e:
+        log.info(
+            "model_sync.pull_via_p2p: manifest fetch from %s failed: %s",
+            label, e,
+        )
+        return False
+    blob_pairs = _all_blob_digests(manifest)
+    if not blob_pairs:
+        log.info("model_sync.pull_via_p2p: manifest references no blobs")
+        return False
+    digests = [d for d, _ in blob_pairs]
+    sizes = {d: s for d, s in blob_pairs}
+    total_bytes = sum(sizes.values())
+
+    # Pre-create dirs on host.
+    blobs_dir = _HOST_OLLAMA_DIR / "blobs"
+    bare, tag = _split_model_tag(model_name)
+    manifest_dir = (
+        _HOST_OLLAMA_DIR / "manifests" / "registry.ollama.ai" / "library" / bare
+    )
+    blobs_dir.mkdir(parents=True, exist_ok=True)
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Skip blobs we already have.
+    missing = [d for d in digests if not (blobs_dir / d).is_file()]
+    bytes_already = sum(sizes.get(d, 0) for d in digests if d not in missing)
+    bytes_pulled = 0
+
+    log.info(
+        "model_sync.pull_via_p2p: pulling %r from %s (%d/%d blobs missing, "
+        "%.2f GB to fetch over LAN)",
+        model_name, label, len(missing), len(digests),
+        sum(sizes.get(d, 0) for d in missing) / (1024 ** 3),
+    )
+
+    # Stream each missing blob via direct LAN HTTP. Multi-GB blobs need
+    # the generous read-side timeout; we use httpx streaming so we don't
+    # buffer the whole thing in memory at once.
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=600, write=30, pool=10)) as client:
+        for digest in missing:
+            tmp = blobs_dir / (digest + ".partial")
+            try:
+                async with client.stream("GET", f"{base_url}/api/p2p/ollama/blob/{digest}") as r:
+                    if r.status_code != 200:
+                        log.info(
+                            "model_sync.pull_via_p2p: blob %s returned HTTP %d",
+                            digest, r.status_code,
+                        )
+                        return False
+                    chunk_done = 0
+                    chunk_total = sizes.get(digest, 0) or int(r.headers.get("content-length", "0") or 0)
+                    with tmp.open("wb") as f:
+                        async for chunk in r.aiter_bytes(chunk_size=4 * 1024 * 1024):
+                            f.write(chunk)
+                            chunk_done += len(chunk)
+                            # Per-chunk progress: helpful for multi-GB blobs
+                            # so the user sees a moving %, not a 30s blank.
+                            if on_progress is not None and chunk_total:
+                                try:
+                                    completed = bytes_already + bytes_pulled + chunk_done
+                                    pct = (completed / total_bytes * 100.0) if total_bytes else 0.0
+                                    await on_progress({
+                                        "model": model_name,
+                                        "status": "downloading",
+                                        "digest": digest,
+                                        "completed": completed,
+                                        "total": total_bytes,
+                                        "percent": pct,
+                                    })
+                                except Exception:
+                                    pass
+                tmp.replace(blobs_dir / digest)
+            except Exception as e:
+                log.info(
+                    "model_sync.pull_via_p2p: blob %s fetch failed: %s",
+                    digest, e,
+                )
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
+                return False
+            bytes_pulled += sizes.get(digest, 0)
+
+    # Manifest LAST.
+    manifest_path = manifest_dir / tag
+    try:
+        manifest_path.write_text(json.dumps(manifest))
+    except Exception as e:
+        log.info("model_sync.pull_via_p2p: manifest write failed: %s", e)
+        return False
+
+    log.info(
+        "model_sync.pull_via_p2p: pulled %r from %s — %d blobs, %.2f GB total",
+        model_name, label, len(digests), total_bytes / (1024 ** 3),
+    )
+    if on_progress is not None:
+        try:
+            await on_progress({
+                "model": model_name,
+                "status": "success",
+                "digest": "",
+                "completed": total_bytes,
+                "total": total_bytes,
+                "percent": 100.0,
+            })
+        except Exception:
+            pass
+    return True
+
+
 def find_lan_source_for(model_name: str, exclude_worker_id: str | None = None) -> dict | None:
     """Search the registered compute pool for a node that already has
     `model_name` available — preferring host first, then any worker
