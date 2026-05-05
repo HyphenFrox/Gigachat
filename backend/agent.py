@@ -3113,15 +3113,62 @@ async def run_turn(
         # crash if it happens, but refusing to start would be worse UX.
         pass
     impl_succeeded = False
+    # Yield an immediate "starting" event BEFORE any blocking work so
+    # FastAPI flushes the SSE response headers and the client sees the
+    # stream is alive. Without this, `_run_turn_impl` does a LOT of
+    # heavy awaits before its first yield (tools.run_hooks,
+    # _maybe_compact, _semantic_recall — which calls Ollama for query
+    # embedding — then route_chat_for, which can stall on peer probes
+    # / model pulls / split spawns / model load / prompt eval). On a
+    # host whose Ollama is busy with a queued embedding backlog,
+    # `_semantic_recall` alone can block 100+ seconds; the curl /
+    # browser client then sees ZERO bytes for that whole time and
+    # assumes the chat is dead.
+    yield {"type": "thinking_started"}
+
+    # Run the impl as a separate task that pushes events into a queue,
+    # and consume the queue with a periodic 2 s heartbeat fallback so
+    # the SSE stream never goes silent. We keep the heartbeats running
+    # throughout the turn — not just before the first event — because
+    # llama-server's prompt-eval phase on long prompts can also go
+    # silent for tens of seconds with no token output, and a heartbeat
+    # is a cheap way to keep clients (curls with --max-time, browsers
+    # with idle SSE timeouts) from giving up before generation starts.
+    _impl_q: asyncio.Queue = asyncio.Queue()
+    _IMPL_DONE = object()
+    _IMPL_ERR = object()
+
+    async def _impl_pump() -> None:
+        try:
+            async for ev in _run_turn_impl(
+                conversation_id,
+                user_text=user_text,
+                user_images=user_images,
+                persist_user=persist_user,
+            ):
+                await _impl_q.put(ev)
+        except BaseException as e:  # noqa: BLE001 — propagate every type
+            await _impl_q.put((_IMPL_ERR, e))
+            return
+        await _impl_q.put(_IMPL_DONE)
+
+    impl_task = asyncio.create_task(_impl_pump())
     try:
-        async for ev in _run_turn_impl(
-            conversation_id,
-            user_text=user_text,
-            user_images=user_images,
-            persist_user=persist_user,
-        ):
-            yield ev
-        impl_succeeded = True
+        while True:
+            try:
+                item = await asyncio.wait_for(_impl_q.get(), timeout=2.0)
+            except asyncio.TimeoutError:
+                # No event from impl in the last 2 s — emit a
+                # heartbeat. Cheap; client just sees a small SSE
+                # frame and knows the connection is alive.
+                yield {"type": "thinking_progress"}
+                continue
+            if item is _IMPL_DONE:
+                impl_succeeded = True
+                break
+            if isinstance(item, tuple) and len(item) == 2 and item[0] is _IMPL_ERR:
+                raise item[1]
+            yield item
     except Exception:
         # The turn blew up somewhere the inner handlers didn't swallow.
         # Mark errored so the UI / resumer can flag it for the user.
