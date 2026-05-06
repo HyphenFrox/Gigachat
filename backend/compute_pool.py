@@ -2608,14 +2608,27 @@ async def _heartbeat_loop() -> None:
             # the same Windows TCP stack — measurements taken under
             # load come back artificially low and would falsely
             # filter healthy peers out of the split.
+            # Only probe bandwidth during a verified-quiet window.
+            # Anything measured during chat traffic / model load /
+            # embedding flood is noise — the asyncio loop and httpx
+            # pool are saturated and the result reflects contention,
+            # not link throughput.
+            #
+            # We also gate "quiet enough" stronger than just
+            # `not _is_chat_active()`: require the agent's active-
+            # turn set to be empty AND no probe has been running in
+            # the last few seconds (avoid two heartbeat ticks
+            # racing each other for the same NIC).
             should_measure_bw = False
+            quiet_now = (not _is_chat_active())
             try:
                 last_bw_ts = float((w.get("capabilities") or {}).get("bandwidth_probed_at") or 0)
                 age = time.time() - last_bw_ts
-                # Re-probe every 40 s when idle, every 5 min when an
-                # active chat is using the event loop.
-                idle_now = not _is_chat_active()
-                should_measure_bw = age >= (40.0 if idle_now else 300.0)
+                # Probe every 40 s when truly quiet. When NOT quiet,
+                # don't probe at all this tick — wait for the next
+                # idle window. Stale cached value is fine; it'll be
+                # refreshed as soon as the chat finishes.
+                should_measure_bw = quiet_now and age >= 40.0
             except Exception:
                 pass
             bw = 0.0
