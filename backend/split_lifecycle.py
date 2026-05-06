@@ -954,21 +954,39 @@ def _compute_optimal_ctx_size(
     target_size_bytes: int,
     draft_size_bytes: int = 0,
 ) -> int:
-    """Pick the largest context window the pool can hold.
+    """Pick the largest context window the pool can hold WITHOUT
+    crashing any single backend.
 
-    KV cache scales linearly with context size, so on a rich pool
-    (host with 80 GB combined memory after target weights) we can
-    afford 32 K-128 K context windows; on a tight pool we stick with
-    the legacy 4 K floor.
+    KV cache scales linearly with context size, but the cache is
+    allocated PER BACKEND (each rpc-server holds its own slice for
+    the layers it hosts). The previous formula compared total KV
+    against the SUM of host+worker memory — which overestimated when
+    the pool included small iGPUs. A 128 K context for llama3.1:8b
+    needs ~8 GB of KV; if 6 GB of that goes to a 3 GB iGPU through
+    proportional layer placement, the iGPU OOMs at allocation time.
 
-    Algorithm:
-      * Read GGUF's training-time max context (`<arch>.context_length`).
-      * Compute KV bytes per token from `_estimate_kv_bytes_per_slot`
-        at ctx=1, then scale by `parallel` and the cache-type multiplier.
-      * Sum free pool memory (host + worker-min, same logic as
-        `_compute_optimal_parallel`'s bottleneck).
-      * Return ``min(model_max, free_mem // (kv_per_token *
-        parallel))`` clamped to ``[_CTX_SIZE_FLOOR, _CTX_SIZE_CEILING]``.
+    New algorithm: enumerate the per-RPC-endpoint capacity (the same
+    way `_compute_tensor_split_ratios` does) PLUS host's local
+    backend, find the SMALLEST endpoint, and pick n_ctx so that
+    backend's KV share fits its own free memory.
+
+      Per-endpoint capacity:
+        SYCL/CUDA/Vulkan endpoint → vram_total_gb × 0.85
+        CPU endpoint              → ram_free_gb − iGPU-share
+        Host orchestrator         → host VRAM (or RAM if CPU-only)
+
+      Per-endpoint KV at n_ctx:
+        kv_per_token × n_ctx × (ep_cap / sum_caps)
+
+      Per-endpoint budget for KV:
+        ep_cap × 0.5 − ep_cap × (offloaded_weights / sum_caps)
+
+    The 0.5 factor (vs the previous 0.95) accounts for empirical
+    allocator overhead observed live: llama.cpp's runtime KV
+    allocation includes both Key and Value buffers, alignment
+    padding, attention compute scratch, and a per-context shift
+    buffer — collectively ~2× the naive `kv_per_token × n_ctx`
+    estimate on iGPU backends.
 
     Returns ``_CTX_SIZE_FLOOR`` (4 K) when metadata is missing —
     matches the legacy hard-coded value so behavior is unchanged when
@@ -982,55 +1000,104 @@ def _compute_optimal_ctx_size(
 
     # Read model's training-time max context (don't exceed it — the
     # weights only learned positional encodings up to that length).
-    # Comes from the cached metadata so a re-read doesn't re-mmap.
     metadata = _get_gguf_metadata(gguf_path)
     model_max_ctx = metadata.get("context_length") or _CTX_SIZE_CEILING
 
-    # POOL-aware free memory budget. The previous formula compared
-    # the model size against HOST VRAM only — for a 19 GB model on
-    # an 8 GB GPU host that goes negative and we floored to 4 K
-    # context. In split mode the model is DISTRIBUTED across host +
-    # workers, so the right denominator is the combined pool. Use
-    # 95 % of available (matches the user's explicit "5 % margin"
-    # policy — see compute_pool._directive memory).
+    # Build per-endpoint capacity list. Mirror the layout
+    # `_compute_tensor_split_ratios` produces so the math here matches
+    # how llama.cpp will actually distribute layers + KV.
     try:
         from . import sysdetect
         spec = sysdetect.detect_system()
-        host_vram = int(float(spec.get("vram_gb") or 0) * (1024 ** 3))
-        host_ram = int(float(spec.get("ram_gb") or 0) * (1024 ** 3))
+        host_vram_gb = float(spec.get("vram_gb") or 0)
+        host_ram_gb = float(spec.get("ram_gb") or 0)
     except Exception:
         return _CTX_SIZE_FLOOR
-    pool_total = host_vram + host_ram  # host's full envelope
-    if pool_total <= 0:
-        return _CTX_SIZE_FLOOR
+
+    endpoint_caps_gb: list[float] = []  # in GB
+    # Host orchestrator backend. With an iGPU+RPC split, the host's
+    # own iGPU advertises through a local SYCL rpc-server (typically
+    # on 50054), so its capacity is bounded by what the rpc-server
+    # exposes — not the system RAM total. Detect by checking whether
+    # any worker_ids includes a 127.0.0.1 endpoint, OR whether host
+    # has a small iGPU (< system RAM).
+    if host_vram_gb > 0 and host_vram_gb < host_ram_gb:
+        # iGPU host — orchestrator backend is iGPU memory.
+        endpoint_caps_gb.append(host_vram_gb * 0.85)
+    elif host_vram_gb > 0:
+        # dGPU host — orchestrator runs on the dGPU.
+        endpoint_caps_gb.append(host_vram_gb * 0.85)
+    else:
+        # CPU-only host — orchestrator uses system RAM.
+        endpoint_caps_gb.append(host_ram_gb * 0.85)
+
     for wid in worker_ids:
         w = db.get_compute_worker(wid)
         if not w or not w.get("enabled"):
             continue
         caps = w.get("capabilities") or {}
-        worker_total_gb = float(caps.get("ram_total_gb") or 0)
-        if worker_total_gb <= 0:
-            # Fallback: use ram_free_gb if total isn't populated
-            worker_total_gb = float(caps.get("ram_free_gb") or 0)
-        pool_total += int(worker_total_gb * (1024 ** 3))
+        ram_free_gb = float(caps.get("ram_free_gb") or 0)
+        vram_total_gb = float(caps.get("vram_total_gb") or 0)
+        endpoints = caps.get("rpc_endpoints")
+        if isinstance(endpoints, list) and endpoints:
+            for ep in endpoints:
+                ep_backend = (ep.get("backend") or "").lower()
+                if any(k in ep_backend for k in ("sycl", "vulkan", "cuda")):
+                    if vram_total_gb > 0:
+                        endpoint_caps_gb.append(vram_total_gb * 0.85)
+                    elif ram_free_gb > 0:
+                        endpoint_caps_gb.append(min(ram_free_gb * 0.30, 2.0))
+                    else:
+                        endpoint_caps_gb.append(1.0)
+                else:
+                    cpu_capacity = max(0.5, ram_free_gb - vram_total_gb * 0.85)
+                    endpoint_caps_gb.append(cpu_capacity)
+        else:
+            current_backend = (caps.get("current_rpc_backend") or "").lower()
+            has_gpu = any(k in current_backend for k in ("sycl", "vulkan", "cuda"))
+            if has_gpu and vram_total_gb > 0:
+                endpoint_caps_gb.append(vram_total_gb * 0.85)
+            else:
+                endpoint_caps_gb.append(max(0.5, ram_free_gb))
 
-    # KV cache budget = 95 % of pool minus the weight footprint.
-    # Workers hold their RPC layer share, but the weights also live
-    # on host (mmap or no-mmap) so we count target_size once. KV
-    # cache then consumes whatever remains.
-    free_after_target = int(pool_total * 0.95) - int(target_size_bytes or 0) - int(draft_size_bytes or 0)
-    if free_after_target <= 0:
+    if not endpoint_caps_gb:
         return _CTX_SIZE_FLOOR
 
-    fits = free_after_target // (kv_per_token * max(1, parallel))
+    # Convert to bytes. Sum and find smallest.
+    endpoint_caps = [int(c * (1024 ** 3)) for c in endpoint_caps_gb]
+    sum_caps = sum(endpoint_caps)
+    if sum_caps <= 0:
+        return _CTX_SIZE_FLOOR
+    smallest_cap = min(endpoint_caps)
+    weights_offloaded = int(target_size_bytes or 0) + int(draft_size_bytes or 0)
+
+    # Smallest backend gates n_ctx. Its share of weights is
+    # (smallest_cap / sum_caps) × weights_offloaded; the remaining
+    # capacity goes to KV. Apply the 0.5 safety multiplier — measured
+    # live: 128 K context KV alloc is ~2× the naive estimate due to
+    # allocator overhead + parallel slot duplication + Value-cache
+    # not-quite-q8 storage. Without this we crash with a clean
+    # `alloc_tensor_range: failed to allocate buffer` on the smallest
+    # iGPU mid-load.
+    smallest_share = smallest_cap / sum_caps
+    smallest_weights = int(smallest_share * weights_offloaded)
+    smallest_kv_budget = int((smallest_cap - smallest_weights) * 0.5)
+    if smallest_kv_budget <= 0:
+        return _CTX_SIZE_FLOOR
+
+    # Per-endpoint kv at n_ctx = (ep_cap / sum_caps) × kv_per_token × n_ctx
+    # For smallest endpoint: smallest_share × kv_per_token × n_ctx ≤ smallest_kv_budget
+    # → n_ctx ≤ smallest_kv_budget / (smallest_share × kv_per_token × parallel)
+    fits = smallest_kv_budget // max(1, int(smallest_share * kv_per_token * max(1, parallel)))
     fits = min(fits, model_max_ctx, _CTX_SIZE_CEILING)
     fits = max(_CTX_SIZE_FLOOR, int(fits))
-    # Replace the bottleneck variable name in the log line below.
-    bottleneck_free = free_after_target
     log.info(
         "split_lifecycle: adaptive ctx: kv_per_token=%d parallel=%d "
-        "bottleneck_free=%.2f GB model_max=%d -> -c %d",
-        kv_per_token, parallel, bottleneck_free / (1024 ** 3),
+        "endpoints=%d smallest_cap=%.2f GB smallest_kv_budget=%.2f GB "
+        "model_max=%d -> -c %d",
+        kv_per_token, parallel, len(endpoint_caps),
+        smallest_cap / (1024 ** 3),
+        smallest_kv_budget / (1024 ** 3),
         model_max_ctx, fits,
     )
     return fits
