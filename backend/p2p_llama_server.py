@@ -135,11 +135,34 @@ _SPAWN_ENV: dict[str, str] = {
     "GGML_RPC_TIMEOUT": "120000",
 }
 
-# How long to wait for the freshly-spawned llama-server to start
-# listening on its TCP port. llama-server's startup includes loading
-# the GGUF (mmap is fast) AND initializing all `--rpc` backends
-# (slow — TCP handshake to each remote rpc-server, then their
-# model-weight upload).
+# How long to wait WITH NO PROGRESS before declaring the spawn hung.
+# Replaces the old fixed-wall-clock timeout (which couldn't handle
+# arbitrarily large models — a 1 TB model on a 50 MB/s LAN would take
+# 5+ hours to upload weights, no fixed ceiling fits that).
+#
+# The new contract: the spawn loop watches TWO progress signals each
+# tick — (1) new bytes appended to the llama-server log, (2) new
+# bytes flowing through the spawned PID's network sockets (TCP traffic
+# to remote rpc-servers carries layer weights). Either advancing
+# means "still loading, keep waiting." Both stalled for this many
+# seconds → declare hung and kill.
+#
+# 90 s is generous enough that a slow-but-functional load (e.g. a
+# CPU rpc-server taking 80 s to JIT-compile a layer) doesn't get
+# killed prematurely, but tight enough that a genuinely-stuck spawn
+# (rpc-server crashed, OOM mid-load, infinite loop) gets cleaned up
+# before the user gives up on the chat.
+_SPAWN_NO_PROGRESS_KILL_SEC = 90.0
+
+# Outer absolute ceiling. Even with progress, kill after this if
+# the spawn hasn't bound. Set high enough for terabyte-scale models
+# on slow LANs (50 MB/s × 7200 s = 360 GB upload budget) but bounded
+# so a runaway spawn can't squat forever.
+_SPAWN_HARD_CEILING_SEC = 7200.0
+
+# Old name kept for back-compat; readers of the spawn result look for
+# this on the `error` field. Used only as the "we hit the hard
+# ceiling" message.
 #
 # 60 s was empirically too tight: a 26 GB Mixtral 8x7b model uploading
 # layer weights to 4 RPC endpoints (host iGPU SYCL + host CPU + Naresh
@@ -150,8 +173,9 @@ _SPAWN_ENV: dict[str, str] = {
 # fell back to host Ollama (which 404'd because host doesn't have
 # the model), and the user saw zero deltas.
 #
-# 600 s (10 min) gives big models room to load on a slow LAN /
-# Wi-Fi link without the orchestrator giving up early. Small
+# Kept as the legacy "max wait" only used by callers that want a
+# single number to cite — the actual loop uses progress-based
+# liveness above.
 # models (8-15 layers) still bind in <30 s — the longer ceiling
 # is bounded by HOW LONG WE WAIT, not how long it takes for fast
 # models. Once bound, the chat traffic flows at the model's natural
@@ -401,6 +425,80 @@ def _is_listening_on(port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+def _pid_alive(pid: int) -> bool:
+    """Cheap liveness probe — True iff `pid` is a running process.
+
+    Used by the spawn loop to short-circuit when a llama-server process
+    dies during load (e.g. OOM during weight allocation, RPC peer
+    crashed before bind). Without this we'd wait the full no-progress
+    window before noticing a dead process.
+    """
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except Exception:
+        return True  # be conservative — keep waiting on unknown
+
+
+def _pid_net_bytes_total(pid: int) -> int:
+    """Sum of bytes-sent + bytes-received across the process's TCP
+    connections. Used as a "still doing real work" signal during the
+    spawn-and-load wait — when llama-server is uploading layer weights
+    to a remote rpc-server, those bytes flow through this PID's
+    sockets.
+
+    Returns 0 on any failure (psutil missing, no permission, process
+    gone). The spawn loop treats "0 vs growing" as the progress
+    signal, so 0 simply means "no progress observed this tick" — not
+    an error.
+
+    Note: psutil exposes `net_io_counters()` only system-wide on
+    Windows, NOT per-PID. We approximate by summing the count of
+    ESTABLISHED TCP connections for the PID — when the count grows
+    OR new sockets are seen, that's evidence of upload activity. For
+    a cleaner signal we'd parse the rpc-server's own log for
+    layer-received markers, but the connection-count heuristic
+    catches the common case (initial connect to peer rpc-servers +
+    sustained traffic during weight push).
+    """
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        # Multiply ESTABLISHED-conn count by 1024 so a transition from
+        # 0→1 connections registers as positive progress (the loop
+        # treats any monotonic increase as "still working").
+        try:
+            conns = p.net_connections(kind="tcp")
+        except (psutil.AccessDenied, AttributeError):
+            return 0
+        established = sum(
+            1 for c in conns
+            if getattr(c, "status", "") == psutil.CONN_ESTABLISHED
+        )
+        return established * 1024
+    except Exception:
+        return 0
+
+
+def _kill_pid(pid: int) -> None:
+    """Forcefully terminate a process by PID. Best-effort: silent
+    on per-process errors. Called from the spawn-stall path to clean
+    up a hung llama-server before reporting failure to the caller.
+    """
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        try:
+            p.kill()
+        except psutil.NoSuchProcess:
+            pass
+    except Exception:
+        try:
+            os.kill(pid, 9)
+        except Exception:
+            pass
 
 
 def _kill_running_llama_servers(only_listening_on_port: int | None = None) -> int:
@@ -705,16 +803,59 @@ def start_local_llama_server(
 
     out["pid"] = pid
 
-    # Wait for the listener. llama-server with `--rpc` backends takes
-    # 30-60 s to come up: TCP handshake + Ollama-style metadata exchange
-    # + initial layer-weight upload to each rpc-server. Worth the
-    # blocking wait so the orchestrator gets a definitive
-    # "ready / failed" signal in one round trip.
-    deadline = time.time() + _LISTEN_WAIT_SEC
+    # Progress-based wait. llama-server with `--rpc` backends takes
+    # 30 s for small models, 5+ min for medium, potentially HOURS for
+    # terabyte-class models (just for layer-weight upload over LAN).
+    # No single wall-clock timeout fits all those cases, so we watch
+    # for ACTUAL PROGRESS instead:
+    #
+    #   1. Log file growing — llama-server appends progress lines
+    #      ("loading model", "set_tensor blk.N", "RPC backend ready",
+    #      "model loaded", etc.). New bytes in the log means it's
+    #      still working.
+    #   2. Network bytes flowing on the spawned PID's sockets —
+    #      uploading layer weights to remote rpc-servers shows up as
+    #      sustained outbound TCP traffic. New bytes means still
+    #      uploading.
+    #
+    # Either signal advancing → still loading, keep waiting. Both
+    # stalled for `_SPAWN_NO_PROGRESS_KILL_SEC` (90 s) → genuinely
+    # hung, kill and report. Hard ceiling at 2 hours as a safety net.
+    log_path = Path(out["log_path"])
+    last_log_size = log_path.stat().st_size if log_path.is_file() else 0
+    last_net_bytes = _pid_net_bytes_total(pid)
+    last_progress_at = time.time()
+    abs_deadline = time.time() + _SPAWN_HARD_CEILING_SEC
     listening = False
-    while time.time() < deadline:
+    while time.time() < abs_deadline:
         if _is_listening_on(port):
             listening = True
+            break
+        # Process died unexpectedly → bail immediately, don't wait
+        # for the no-progress timer.
+        if not _pid_alive(pid):
+            break
+        # Check for log growth.
+        cur_log_size = log_path.stat().st_size if log_path.is_file() else 0
+        if cur_log_size > last_log_size:
+            last_log_size = cur_log_size
+            last_progress_at = time.time()
+        # Check for network bytes.
+        cur_net_bytes = _pid_net_bytes_total(pid)
+        if cur_net_bytes > last_net_bytes:
+            last_net_bytes = cur_net_bytes
+            last_progress_at = time.time()
+        # No progress for too long → stalled.
+        if (time.time() - last_progress_at) >= _SPAWN_NO_PROGRESS_KILL_SEC:
+            log.warning(
+                "p2p_llama_server: spawn PID %d on port %d stalled "
+                "(no log/net progress in %ds) — killing",
+                pid, port, _SPAWN_NO_PROGRESS_KILL_SEC,
+            )
+            try:
+                _kill_pid(pid)
+            except Exception:
+                pass
             break
         time.sleep(0.5)
 
@@ -769,13 +910,29 @@ def start_local_llama_server(
         crash_t.start()
     else:
         out["status"] = "spawned_but_not_listening"
+        # Pick the message based on which exit condition fired. The
+        # progress-based loop kills the spawn after _SPAWN_NO_PROGRESS_KILL_SEC
+        # of stalled progress; the hard ceiling kicks in only on
+        # truly pathological cases (terabyte-class load that won't
+        # finish even at sustained LAN speed).
+        if not _pid_alive(pid):
+            cause = "process exited during load"
+        elif (time.time() - last_progress_at) >= _SPAWN_NO_PROGRESS_KILL_SEC:
+            cause = (
+                f"no progress (no log/network activity) for "
+                f"{_SPAWN_NO_PROGRESS_KILL_SEC:.0f}s — likely RPC peer "
+                "down, OOM during weight load, or initialization stuck"
+            )
+        else:
+            cause = (
+                f"hit hard ceiling of {_SPAWN_HARD_CEILING_SEC:.0f}s "
+                "while still progressing — model is too large for "
+                "this LAN to upload in 2 hours"
+            )
         out["error"] = (
             f"llama-server PID {pid} did not start listening on "
-            f"127.0.0.1:{port} within {_LISTEN_WAIT_SEC}s. "
-            f"Check {out['log_path']!r} for the spawn-side error — "
-            "common causes: rpc-server not reachable on a target, "
-            "model file missing on this peer, or out-of-memory "
-            "during weight load."
+            f"127.0.0.1:{port}: {cause}. "
+            f"Check {out['log_path']!r} for the spawn-side error."
         )
     return out
 

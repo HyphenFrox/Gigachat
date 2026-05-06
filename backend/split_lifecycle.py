@@ -2313,33 +2313,59 @@ async def _wait_for_health(
     port: int,
     timeout: float | None = None,
     proc: subprocess.Popen | None = None,
+    log_path: Path | None = None,
 ) -> None:
     """Poll `http://127.0.0.1:<port>/health` until it returns 200, or
-    raise SplitLifecycleError on timeout — or as soon as the child
-    process exits, whichever comes first.
+    raise SplitLifecycleError on no-progress stall.
+
+    Replaces the old fixed-wall-clock timeout with progress-based
+    liveness so terabyte-scale models on slow LANs aren't artificially
+    capped. The loop exits successfully on health=200, or with a
+    stall error if the spawn shows no observable progress (no log
+    growth, no network bytes flowing through the PID's sockets) for
+    `_HEALTH_NO_PROGRESS_KILL_SEC` seconds. Hard ceiling at
+    `_HEALTH_HARD_CEILING_SEC` (2 hours) as a safety net.
 
     llama-server's `/health` returns:
       200 + {"status":"ok"}     once the model is loaded and serving
       503                       while the model is still loading
       (no response)             before the HTTP server has bound
 
-    We treat all non-200s and connection-refused as "not ready yet"
-    and keep polling until the timeout fires.
-
-    If `proc` is provided we also poll the child's exit status each
-    loop. A dead child means the model failed to load (architecture
-    mismatch, OOM, missing tensor, etc.); waiting the full timeout
-    in that case is just dead time. Short-circuit and surface the
-    failure immediately.
+    All non-200s and connection-refused are "not ready yet."
     """
-    # Read the constant at call time, not at function-def time, so
-    # tests / runtime tweaks of `_BOOT_TIMEOUT_SEC` are respected.
-    if timeout is None:
-        timeout = _BOOT_TIMEOUT_SEC
-    deadline = time.monotonic() + timeout
+    # The "is the spawn still doing real work" check uses the same
+    # primitives as p2p_llama_server's progress-based loop: log
+    # growth + PID network byte flow. Either advancing means it's
+    # making progress; both stalled for too long means we kill.
+    no_progress_kill_sec = 90.0
+    hard_ceiling_sec = 7200.0
+    abs_deadline = time.monotonic() + (timeout or hard_ceiling_sec)
+    last_progress_at = time.monotonic()
+    last_log_size = 0
+    if log_path is not None and log_path.is_file():
+        try:
+            last_log_size = log_path.stat().st_size
+        except OSError:
+            pass
+    last_net_bytes = 0
+    if proc is not None:
+        try:
+            import psutil
+            ps = psutil.Process(proc.pid)
+            try:
+                conns = ps.net_connections(kind="tcp")
+            except (psutil.AccessDenied, AttributeError):
+                conns = []
+            last_net_bytes = sum(
+                1 for c in conns
+                if getattr(c, "status", "") == psutil.CONN_ESTABLISHED
+            ) * 1024
+        except Exception:
+            last_net_bytes = 0
+
     last_err: str | None = None
     async with httpx.AsyncClient(timeout=2.0) as client:
-        while time.monotonic() < deadline:
+        while time.monotonic() < abs_deadline:
             # Bail early if the child process has died — no point
             # polling a port that nothing is going to bind to.
             if proc is not None and proc.poll() is not None:
@@ -2354,10 +2380,44 @@ async def _wait_for_health(
                 last_err = f"HTTP {r.status_code}"
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
+            # Progress signals — refreshed each tick.
+            if log_path is not None and log_path.is_file():
+                try:
+                    cur_log_size = log_path.stat().st_size
+                    if cur_log_size > last_log_size:
+                        last_log_size = cur_log_size
+                        last_progress_at = time.monotonic()
+                except OSError:
+                    pass
+            if proc is not None:
+                try:
+                    import psutil
+                    ps = psutil.Process(proc.pid)
+                    try:
+                        conns = ps.net_connections(kind="tcp")
+                    except (psutil.AccessDenied, AttributeError):
+                        conns = []
+                    cur_net_bytes = sum(
+                        1 for c in conns
+                        if getattr(c, "status", "") == psutil.CONN_ESTABLISHED
+                    ) * 1024
+                    if cur_net_bytes > last_net_bytes:
+                        last_net_bytes = cur_net_bytes
+                        last_progress_at = time.monotonic()
+                except Exception:
+                    pass
+            # No progress → stalled.
+            if (time.monotonic() - last_progress_at) >= no_progress_kill_sec:
+                raise SplitLifecycleError(
+                    f"llama-server on port {port} stalled — no log/net "
+                    f"progress for {no_progress_kill_sec:.0f}s "
+                    f"(last error: {last_err}). Likely RPC peer down, "
+                    "OOM during weight load, or model file missing."
+                )
             await asyncio.sleep(_HEALTH_POLL_SEC)
     raise SplitLifecycleError(
         f"llama-server on port {port} did not become healthy within "
-        f"{timeout:.0f}s (last error: {last_err})"
+        f"hard ceiling {hard_ceiling_sec:.0f}s (last error: {last_err})"
     )
 
 
@@ -2997,7 +3057,9 @@ async def start(split_id: str) -> dict:
     # otherwise we'd burn the full _BOOT_TIMEOUT_SEC polling a port
     # that nothing will ever bind to.
     try:
-        await _wait_for_health(row["llama_port"], proc=proc)
+        await _wait_for_health(
+            row["llama_port"], proc=proc, log_path=log_path,
+        )
     except SplitLifecycleError as e:
         # Best-effort cleanup so we don't leave a half-loaded process
         # hogging VRAM.

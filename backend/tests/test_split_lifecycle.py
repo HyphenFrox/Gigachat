@@ -281,9 +281,9 @@ def _arrange_start(isolated_db, monkeypatch, tmp_path):
 
     # Stub the health wait — succeed immediately.
     # Accepts the same kwargs as the real function so call sites that
-    # pass `proc=` (added to bail early on child death) don't trip a
-    # TypeError on this stub.
-    async def _stub_health(port, timeout=90.0, proc=None):
+    # pass `proc=` / `log_path=` (added to bail early on child death,
+    # observe progress) don't trip a TypeError on this stub.
+    async def _stub_health(port, timeout=90.0, proc=None, log_path=None):
         return None
 
     monkeypatch.setattr(split_lifecycle, "_wait_for_health", _stub_health)
@@ -328,7 +328,7 @@ def test_start_idempotent_when_already_running(isolated_db, monkeypatch, tmp_pat
 def test_start_health_timeout_marks_error(isolated_db, monkeypatch, tmp_path):
     sid, fakes = _arrange_start(isolated_db, monkeypatch, tmp_path)
 
-    async def _failing_health(port, timeout=90.0, proc=None):
+    async def _failing_health(port, timeout=90.0, proc=None, log_path=None):
         raise split_lifecycle.SplitLifecycleError(
             "llama-server on port X did not become healthy"
         )
