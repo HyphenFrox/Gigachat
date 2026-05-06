@@ -2720,11 +2720,24 @@ async def _heartbeat_loop() -> None:
             try:
                 last_bw_ts = float((w.get("capabilities") or {}).get("bandwidth_probed_at") or 0)
                 age = time.time() - last_bw_ts
-                # Probe every 40 s when truly quiet. When NOT quiet,
-                # don't probe at all this tick — wait for the next
-                # idle window. Stale cached value is fine; it'll be
-                # refreshed as soon as the chat finishes.
-                should_measure_bw = quiet_now and age >= 40.0
+                # Refresh bandwidth at most once per hour. A 40-s
+                # cadence (the original setting) downloaded a 1.3 MB
+                # DLL three times = 4 MB per probe per peer = 12 MB/min
+                # of constant background traffic on a small laptop's
+                # asyncio loop. On Naresh that was the dominant
+                # loop-blocker — the heartbeat fired every 20 s and
+                # the bandwidth probe ate ~200-500 ms of event-loop
+                # time for the streaming download. With 2 peers that's
+                # roughly half of every 20-s tick spent inside the
+                # bandwidth probe, starving the inbound HTTP path.
+                # Bandwidth doesn't change that fast on a typical home
+                # LAN (Wi-Fi roams + ISP changes are minutes-scale at
+                # worst); 1 hour is a reasonable refresh interval that
+                # keeps the cache "fresh enough" for split decisions
+                # AND keeps the loop free for actual chat traffic.
+                # The first probe still fires immediately on startup
+                # so the cache populates within a heartbeat of boot.
+                should_measure_bw = quiet_now and age >= 3600.0
             except Exception:
                 pass
             bw = 0.0
