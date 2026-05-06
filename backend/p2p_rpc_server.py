@@ -763,13 +763,34 @@ def _decide_local_rpc_specs() -> list[dict]:
     50053 for the CPU backend. Single-backend machines just expose
     50052 with the appropriate `-d` so legacy single-port routing
     keeps working.
+
+    GPU detection: tries `sysdetect.detect_system()` first, but
+    that helper is `@lru_cache`'d at the module level — if its
+    Intel WMI probe was called during early boot (before WMI was
+    fully responsive) and returned ``gpu_kind=""``, the cached
+    miss sticks for the whole process lifetime. So we additionally
+    consult the resource_tracker BG sampler, which uses a
+    re-attempted PowerShell query and is much more reliable on
+    Intel iGPU laptops post-boot. Fall back to CPU only when both
+    say "no GPU".
     """
+    gpu_kind = ""
     try:
         from . import sysdetect
         spec = sysdetect.detect_system()
+        gpu_kind = (spec.get("gpu_kind") or "").lower()
     except Exception:
-        return [{"port": 50052, "backend": "CPU"}]
-    gpu_kind = (spec.get("gpu_kind") or "").lower()
+        gpu_kind = ""
+    # Cross-check against the BG sampler's live GPU probe. This
+    # catches the post-boot case where Intel WMI returned 0 in
+    # `sysdetect.detect_system()` during the first call (cached).
+    if not gpu_kind:
+        try:
+            from . import resource_tracker as _rt
+            gpu_snap = _rt._BgSampler.get().gpu_snap or {}
+            gpu_kind = (gpu_snap.get("gpu_kind") or "").lower()
+        except Exception:
+            pass
     if gpu_kind == "intel":
         return [
             {"port": 50052, "backend": "SYCL0"},
