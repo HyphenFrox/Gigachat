@@ -3134,8 +3134,25 @@ def _is_chat_active() -> bool:
     measurements during chat (the asyncio event loop is already
     saturated by stream readers / SSE writers; a probe taken under
     load measures contention, not network throughput, and would
-    falsely demote healthy peers below the routing threshold)."""
-    return any(c > 0 for c in _ACTIVE_TURNS_PER_NODE.values())
+    falsely demote healthy peers below the routing threshold).
+
+    Also checks the agent's `_ACTIVE_TURN_IDS` set so the agent's
+    pre-chat phase (compaction / semantic recall / route_chat_for /
+    split_lifecycle.start — all of which go through the same asyncio
+    loop and HTTP client pool as the bandwidth probe) is recognised
+    as 'busy'. Without this the bandwidth probe runs while the
+    agent is doing a hundred /api/embeddings calls in the
+    background and reports artificially low throughput."""
+    if any(c > 0 for c in _ACTIVE_TURNS_PER_NODE.values()):
+        return True
+    # Fall back to the agent-side active-turn set (registered earlier
+    # than `_ACTIVE_TURNS_PER_NODE`, before the chat target is even
+    # picked).
+    try:
+        from . import agent as _agent
+        return bool(getattr(_agent, "_ACTIVE_TURN_IDS", set()))
+    except Exception:
+        return False
 
 
 def _node_id_for_target(target: tuple[str, str | None] | None) -> str:
