@@ -7982,6 +7982,27 @@ async def route_chat_for(
                             and strongest_vram > 0
                             and model_bytes <= int(strongest_vram * 0.90)
                         )
+                        # Big model that won't fit any single node — but
+                        # peer-orchestrated split (peer runs llama-server,
+                        # host + other peers contribute as rpc-server
+                        # backends) is the right architecture: zero GGUF
+                        # transfer, peer's existing GGUF stays in place.
+                        # Engages only when the source peer is also the
+                        # node that can't fit the model alone (i.e. the
+                        # split path further down at line 8108 would
+                        # have picked it). Pulling 26 GB to host first
+                        # would burn 4-5 min of LAN time for no win.
+                        peer_free_bytes = int(
+                            (float(peer_caps.get("ram_free_gb") or 0)
+                             + float(peer_caps.get("vram_total_gb") or 0))
+                            * (1024 ** 3)
+                        )
+                        peer_orchestrated_split_viable = (
+                            model_bytes > 0
+                            and not fits_strongest_single
+                            and peer_free_bytes > 0
+                            and model_bytes > int(peer_free_bytes * 0.90)
+                        )
                         if fits_strongest_single:
                             log.info(
                                 "compute_pool: skipping LAN pull-to-host "
@@ -7996,6 +8017,18 @@ async def route_chat_for(
                             # Still mark host as not having it; the
                             # routing path further down will pick the
                             # peer naturally because pool_has is True.
+                        elif peer_orchestrated_split_viable:
+                            log.info(
+                                "compute_pool: skipping LAN pull-to-host "
+                                "of %r (%.2f GB) — peer %s has it but "
+                                "can't fit alone; peer-orchestrated split "
+                                "(peer as llama-server orchestrator + "
+                                "host/other-peers as rpc-server backends) "
+                                "will engage instead, no GGUF transfer",
+                                model_name,
+                                model_bytes / (1024 ** 3),
+                                src_w.get("label"),
+                            )
                         else:
                             ok = await _ms.pull_model_via_p2p(
                                 model_name, src_w,
