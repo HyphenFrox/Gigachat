@@ -1,16 +1,18 @@
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 7176d2f..a0b6a51 100644
+index 7176d2f..2fff932 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -17,6 +17,7 @@
+@@ -17,6 +17,9 @@
  #include <fstream>
  #include <filesystem>
  #include <algorithm>
 +#include <stdexcept>  // Gigachat: std::runtime_error for rpc_remote_failure
++#include <thread>     // Gigachat: std::this_thread::sleep_for for set_tensor retry backoff
++#include <chrono>     // Gigachat: std::chrono::milliseconds for set_tensor retry backoff
  
  static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
  
-@@ -26,8 +27,39 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+@@ -26,8 +29,39 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
  
  namespace fs = std::filesystem;
  
@@ -52,7 +54,7 @@ index 7176d2f..a0b6a51 100644
  
  // all RPC structures must be packed
  #pragma pack(push, 1)
-@@ -399,8 +431,16 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+@@ -399,8 +433,16 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
  static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
      ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
      rpc_msg_free_buffer_req request = {ctx->remote_ptr};
@@ -70,6 +72,57 @@ index 7176d2f..a0b6a51 100644
      delete ctx;
  }
  
+@@ -1103,8 +1145,48 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+         ofs.write((const char *)data, size);
+         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
+     }
+-    ggml_backend_tensor_set(tensor, data, offset, size);
+-    return true;
++    // Gigachat patch (sycl-resilience): retry the tensor upload on
++    // recoverable backend errors. Intel iGPU SYCL backends throw
++    // UR_RESULT_ERROR_DEVICE_LOST during weight upload when Windows
++    // TDR (Timeout Detection and Recovery) fires — most commonly
++    // triggered by another process briefly using the iGPU
++    // (Windows compositor, browser hardware acceleration, etc.).
++    // The device handle is invalid for ~100-500 ms then auto-recovers.
++    // Retry with a short backoff converts the crash into a brief
++    // stall the orchestrator never notices.
++    //
++    // The std::runtime_error catch is a safety net: if the underlying
++    // SYCL handler throws (via the patched ggml_sycl_error in
++    // common.hpp), we'd otherwise let the exception propagate up
++    // through ggml_backend_tensor_set (C-ABI) into rpc_serve_client,
++    // hitting MSVC's no-cleanup-across-noexcept boundary and crashing
++    // the rpc-server with __fastfail. Catching here keeps the
++    // rpc-server alive and signals failure cleanly via the return
++    // value — `rpc_serve_client` then closes the client connection,
++    // the orchestrator's `RPC_STATUS_ASSERT` throws `rpc_remote_failure`,
++    // and the chat layer's existing recovery path takes over.
++    for (int attempt = 0; attempt < 3; ++attempt) {
++        try {
++            ggml_backend_tensor_set(tensor, data, offset, size);
++            return true;  // success
++        } catch (const std::exception & e) {
++            GGML_LOG_ERROR(
++                "[%s] backend set_tensor failed (attempt %d/3): %s\n",
++                __func__, attempt + 1, e.what()
++            );
++            if (attempt < 2) {
++                // Brief sleep so transient device-lost / TDR has a
++                // chance to recover. 250, 500 ms across attempts.
++                std::this_thread::sleep_for(std::chrono::milliseconds((attempt + 1) * 250));
++            }
++        }
++    }
++    GGML_LOG_ERROR(
++        "[%s] backend set_tensor failed after 3 retries — surfacing as "
++        "RPC failure (orchestrator will reconnect / route around)\n",
++        __func__
++    );
++    return false;
+ }
+ 
+ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
 diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
 index a728152..be33c38 100644
 --- a/ggml/src/ggml-rpc/transport.cpp
@@ -142,6 +195,55 @@ index a728152..be33c38 100644
          if (n < 0) {
              GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
                             bytes_recv, size_to_recv);
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index 5abf229..73b6220 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -17,6 +17,7 @@
+ #include <fstream>
+ #include <iostream>
+ #include <string>
++#include <stdexcept>  // Gigachat: std::runtime_error for ggml_sycl_error
+ 
+ #include "dpct/helper.hpp"
+ #include "ggml.h"
+@@ -131,7 +132,26 @@ static void crash() {
+   *ptr = 0;
+ }
+ 
+-[[noreturn]] static void ggml_sycl_error(
++// Gigachat patch (sycl-resilience): the upstream `[[noreturn]] ggml_sycl_error`
++// invokes GGML_ABORT which is `__fastfail(STATUS_STACK_BUFFER_OVERRUN)` on
++// Windows — a HARD process kill that no exception handler can intercept.
++// On Intel iGPUs under load this fires routinely (UR_RESULT_ERROR_DEVICE_LOST
++// after a Windows TDR / power-state transition / driver reset) — and every
++// transient device-loss became a dead rpc-server, breaking every chat that
++// engaged the iGPU through the split path.
++//
++// New behaviour: throw a std::runtime_error so the function-level catch in
++// `ggml_backend_sycl_buffer_set_tensor` (and the dozen other SYCL handlers
++// that have function-try-blocks) can re-throw a recoverable
++// `sycl_remote_failure`. The rpc-server's serve loop has been patched to
++// catch that as well and close the connection cleanly without aborting the
++// process — letting the orchestrator reconnect and continue.
++//
++// Note: drop the [[noreturn]] attribute. Throwing IS noreturn from the
++// caller's view but the attribute prevents the compiler from emitting a
++// throw-able prologue. Without [[noreturn]] the function compiles
++// correctly and the throw works.
++static void ggml_sycl_error(
+     const char* stmt,
+     const char* func,
+     const char* file,
+@@ -139,7 +159,7 @@ static void crash() {
+     const char* msg) {
+   fprintf(stderr, "SYCL error: %s: %s\n", stmt, msg);
+   fprintf(stderr, "  in function %s at %s:%d\n", func, file, line);
+-  GGML_ABORT("SYCL error");
++  throw std::runtime_error(std::string("sycl_remote_failure: ") + stmt + ": " + msg);
+ }
+ 
+ #define SYCL_CHECK(err)                                                                                    \
 diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
 index f06147e..94d5a9e 100644
 --- a/ggml/src/ggml-sycl/ggml-sycl.cpp
@@ -495,10 +597,10 @@ index f06147e..94d5a9e 100644
  
  static const ggml_backend_device_i ggml_backend_sycl_device_interface = {
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 2d3003f..ccaff39 100644
+index 4b28033..eb71318 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -2792,7 +2792,30 @@ private:
+@@ -2799,7 +2799,30 @@ private:
                  batch.logits   + i,
              };
  
