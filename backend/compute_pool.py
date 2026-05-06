@@ -906,6 +906,16 @@ async def _set_workers_backend(workers: list[dict], *, in_split: bool) -> int:
                 caps["ram_total_gb"] = float(live_stats.get("ram_total_gb") or caps.get("ram_total_gb") or 0)
                 caps["ram_free_gb"] = float(live_stats.get("ram_free_gb") or 0)
                 caps["vram_total_gb"] = float(live_stats.get("vram_total_gb") or caps.get("vram_total_gb") or 0)
+                # Carry through the LIVE rpc_endpoints advertisement
+                # from the peer's supervisor (via resource_tracker
+                # `local_snapshot`). Without this the orchestrator's
+                # `_resolve_rpc_endpoints` reads the stale endpoint
+                # list from the last `ensure_rpc_servers_via_proxy_multi`
+                # write, missing any backend the peer's supervisor
+                # has restarted between split engagements.
+                live_eps = live_stats.get("rpc_endpoints")
+                if isinstance(live_eps, list) and live_eps:
+                    caps["rpc_endpoints"] = live_eps
                 db.update_compute_worker_capabilities(
                     w["id"], capabilities=caps,
                 )
@@ -1666,6 +1676,12 @@ async def ensure_rpc_server_via_proxy(
             caps["ram_total_gb"] = float(live_stats.get("ram_total_gb") or caps.get("ram_total_gb") or 0)
             caps["ram_free_gb"] = float(live_stats.get("ram_free_gb") or 0)
             caps["vram_total_gb"] = float(live_stats.get("vram_total_gb") or caps.get("vram_total_gb") or 0)
+            # Same rpc_endpoints carry-through as `_set_workers_backend`
+            # — keeps the orchestrator's view in sync with the peer's
+            # supervisor.
+            live_eps = live_stats.get("rpc_endpoints")
+            if isinstance(live_eps, list) and live_eps:
+                caps["rpc_endpoints"] = live_eps
             db.update_compute_worker_capabilities(
                 worker["id"], capabilities=caps,
             )
