@@ -3328,6 +3328,20 @@ async def _adaptive_tick() -> None:
             )
             continue
         old_ngl = running.ngl or 0
+        # When llama-server was launched with the multi-rpc auto-fit
+        # sentinel (ngl=0 — `_build_command` emits this when any worker
+        # exposes multiple rpc endpoints), llama.cpp itself decides
+        # the per-device layer placement using its own free-memory
+        # query. The Python-side `_compute_optimal_ngl` recompute
+        # produces a number that's never 0, so `delta = abs(N - 0)`
+        # always exceeds `_REBALANCE_MIN_DELTA_LAYERS=3` and the
+        # watchdog restarts the split on EVERY tick (every 10 s) —
+        # killing the in-flight model load before it can finish, in
+        # an infinite respawn loop. Skip rebalance when running with
+        # the auto-fit sentinel; let llama.cpp's own per-device fit
+        # absorb pool free RAM changes without a restart.
+        if old_ngl == 0:
+            continue
         delta = abs(new_ngl - old_ngl)
         if delta < _REBALANCE_MIN_DELTA_LAYERS:
             continue
