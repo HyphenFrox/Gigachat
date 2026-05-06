@@ -123,33 +123,25 @@ async def forward(
         direct_failed = e
 
     if direct_failed is not None:
-        # Direct path failed — typical cause for a public-pool peer
-        # is symmetric NAT on either end. Fall back to the rendezvous
-        # relay if it's available + the peer's role suggests
-        # internet-routing (LAN-paired peers stay direct because
-        # relay can't beat sub-ms LAN RTT). The relay sees only
-        # ciphertext: confidentiality is preserved.
-        try:
-            from . import p2p_relay as _relay
-            log.info(
-                "p2p_secure_client: direct forward to %s failed (%s); "
-                "falling back to relay",
-                peer.get("label"), type(direct_failed).__name__,
-            )
-            status, body_text = await _relay.forward_via_relay(
-                recipient_device_id=peer["device_id"],
-                recipient_x25519_pub_b64=peer_x25519,
-                recipient_ed25519_pub_b64=peer.get("public_key_b64") or "",
-                method=method, path=path, body=body, headers=headers,
-            )
-            return status, body_text
-        except Exception as relay_err:
-            raise SecureProxyError(
-                f"both direct and relay paths to {peer.get('label')!r} "
-                f"failed: direct={type(direct_failed).__name__}: "
-                f"{direct_failed}; relay={type(relay_err).__name__}: "
-                f"{relay_err}"
-            )
+        # Direct LAN path failed. We do NOT fall back to the rendezvous
+        # relay — per the user's policy the app must never use the
+        # internet-bandwidth-consuming relay for runtime traffic. The
+        # right answer to a LAN failure is to surface it loudly so the
+        # user (or operator) can repair the LAN. Silently routing
+        # through the public relay would burn the user's internet
+        # quota AND make split inference 100-1000× slower per RPC
+        # call than LAN.
+        log.warning(
+            "p2p_secure_client: direct LAN forward to %s failed (%s) — "
+            "NOT falling back to relay (relay is forbidden for runtime "
+            "traffic). Repair LAN connectivity to this peer.",
+            peer.get("label"), type(direct_failed).__name__,
+        )
+        raise SecureProxyError(
+            f"direct LAN forward to {peer.get('label')!r} failed: "
+            f"{type(direct_failed).__name__}: {direct_failed} "
+            "(relay fallback is disabled by policy)"
+        )
     try:
         # Verify the response was sealed BY THE PEER (signature
         # pinned to their Ed25519 pubkey). Substitution attacks
