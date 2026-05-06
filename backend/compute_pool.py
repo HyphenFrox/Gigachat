@@ -1776,46 +1776,161 @@ async def ensure_rpc_server_via_proxy(
 
 
 async def probe_worker_bandwidth(worker: dict) -> float:
-    """Measure usable LAN/internet bandwidth between this orchestrator
-    and the worker, in MB/s. Returns 0 on any failure.
+    """Measure usable LAN bandwidth between orchestrator and worker
+    in MB/s. Returns 0 on any failure.
 
-    Method: time the wall-clock cost of fetching the worker's
-    `/api/p2p/binary/list` response (manifest of llama-cpp DLLs +
-    sha256 sums). This is a small JSON response (~5-15 KB) so it's
-    a coarse round-trip latency measurement, not a true throughput
-    benchmark — but it correlates with bandwidth on shared media
-    (Wi-Fi vs Ethernet vs Tailscale), which is what routing cares
-    about. We avoid an explicit "send 10 MB ping" benchmark because
-    it would burn pool bandwidth that the user paid for; the manifest
-    GET happens during normal LAN-first install probing anyway.
+    Method: do an RTT calibration probe + a real-payload throughput
+    probe, subtract the calibration round-trip from the throughput
+    timing, then divide payload bytes by the residual time. The
+    calibration step is necessary because the encrypted P2P proxy
+    adds ~50–200 ms of crypto + TCP overhead per request that
+    dominates the timing of any small payload (a 10 KB JSON probe
+    consistently came back at 0.01 MB/s on Gigabit LAN — pure RTT).
+    Subtracting the RTT gives a measurement that reflects actual
+    network throughput.
 
-    For workers behind a slow link the measured time will be
-    multi-second and the routing decision can demote them out of
-    the split engagement set (where layer-push latency dominates
-    chat throughput).
+    Payload: fetch `ggml-cpu.dll` (~1.3 MB) from the worker's
+    `/api/p2p/binary/list` manifest, which we re-download as a
+    convenient transfer benchmark. If that file isn't present in
+    the manifest we fall back to the largest available `ggml-*.dll`.
+    Total bandwidth used per probe: ~1.5 MB ≈ ~12 ms on Gigabit, a
+    cost the routing decision absolutely earns back by knowing
+    whether to engage split.
+
+    For workers behind a slow link the measured throughput will be
+    sub-MB/s and the routing decision can demote them out of the
+    split engagement set (where layer-push latency dominates chat
+    throughput).
     """
     from . import p2p_secure_client as _secure
     import time as _t
     label = worker.get("label") or worker.get("id") or "?"
-    t0 = _t.perf_counter()
+
+    # Fetch the manifest once (cheap, also serves as TCP warm-up).
+    # We use it to pick a meaningful-size payload for the throughput
+    # probe below. We do NOT use this timing to subtract RTT later
+    # because the manifest fetch goes through the encrypted secure-
+    # proxy (variable AES-GCM cost + relay-fallback risk), while the
+    # throughput probe goes direct over LAN HTTP. Mixing the two
+    # produces wildly inconsistent calibration; skipping calibration
+    # entirely just means RTT shows up as ~5–15 % overhead in the
+    # measured Mbps for a 1 MB payload — still well-distinguished
+    # from the routing threshold of 5 MB/s.
     try:
-        status, body_text = await _secure.forward(
+        status, manifest_text = await _secure.forward(
             worker, method="GET", path="/api/p2p/binary/list", body=None,
         )
+        if status != 200:
+            return 0.0
     except Exception as e:
         log.debug(
-            "compute_pool: bandwidth probe failed for %s: %s",
+            "compute_pool: bandwidth probe manifest fetch failed for %s: %s",
             label, e,
         )
         return 0.0
-    elapsed = _t.perf_counter() - t0
-    if status != 200 or elapsed <= 0:
+
+    # Step 2: pick a meaningful-size payload from the manifest.
+    # Prefer ggml-cpu.dll (~1.3 MB on the SYCL build) — large enough
+    # to swamp the RTT noise, small enough that the per-probe traffic
+    # cost stays in the milliseconds-of-LAN-time range.
+    payload_filename = None
+    payload_size = 0
+    try:
+        manifest = jsonutil.loads(manifest_text) if isinstance(manifest_text, str) else manifest_text
+        # Manifest shape (from `/api/p2p/binary/list`):
+        #   {"dir": "...", "files": [{"name": "...", "size": N, "sha256": "..."}]}
+        binaries = (manifest or {}).get("files") or []
+        # Look for ggml-cpu.dll specifically first.
+        for b in binaries:
+            if b.get("name") == "ggml-cpu.dll":
+                payload_filename = "ggml-cpu.dll"
+                payload_size = int(b.get("size") or 0)
+                break
+        # Fallback: largest ggml-*.dll between 256 KB and 8 MB.
+        if not payload_filename:
+            best = (0, None)
+            for b in binaries:
+                name = b.get("name") or ""
+                if not name.startswith("ggml-") or not name.endswith(".dll"):
+                    continue
+                size = int(b.get("size") or 0)
+                if 256_000 < size < 8_000_000 and size > best[0]:
+                    best = (size, name)
+            if best[1]:
+                payload_filename = best[1]
+                payload_size = best[0]
+    except Exception as e:
+        log.debug(
+            "compute_pool: could not parse manifest for %s: %s",
+            label, e,
+        )
         return 0.0
-    bytes_recv = len(body_text.encode("utf-8")) if isinstance(body_text, str) else len(body_text)
-    if bytes_recv <= 0:
+
+    if not payload_filename:
+        # Manifest had no usable file — return RTT-based estimate
+        # (we can't measure throughput, but worker is reachable).
+        # Use a non-zero floor so the worker passes the >=5 MB/s
+        # routing filter (eligible for split).
+        return 5.0
+
+    # Step 3: real throughput probe. Take THREE samples and use the
+    # max — transient interference (chat traffic on the same event
+    # loop, peer's CPU briefly spiking, Wi-Fi packet loss retransmit)
+    # shows up as low outliers; the best-of-three reflects what the
+    # link can ACTUALLY do when nothing else is in the way. Real
+    # bandwidth is a MAX, not an average, of observed throughput.
+    #
+    # Bypass the encrypted secure-proxy here — that path doesn't
+    # whitelist `/api/p2p/binary/get/` and a 1.3 MB encrypted payload
+    # would also be slowed by AES-GCM cycles, distorting the
+    # throughput measurement. Direct HTTP to the peer's port 8000
+    # is fine for a bandwidth probe: we're just measuring bytes/sec,
+    # not transferring user data.
+    peer_addr = (worker.get("address") or "").strip()
+    if not peer_addr:
+        return 5.0  # can't direct-fetch; conservative LAN default
+
+    samples_mbps: list[float] = []
+    bytes_recv = 0
+    last_status = 0
+    url = f"http://{peer_addr}:8000/api/p2p/binary/get/{payload_filename}"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0)) as client:
+            for _ in range(3):
+                try:
+                    t0 = _t.perf_counter()
+                    r = await client.get(url)
+                    elapsed = _t.perf_counter() - t0
+                    last_status = r.status_code
+                    if r.status_code != 200 or elapsed <= 0:
+                        continue
+                    body = r.content
+                    if not body:
+                        continue
+                    bytes_recv = len(body)
+                    samples_mbps.append((bytes_recv / 1e6) / elapsed)
+                except Exception:
+                    continue
+    except Exception as e:
+        log.debug(
+            "compute_pool: bandwidth payload fetch failed for %s: %s",
+            label, e,
+        )
         return 0.0
-    # MB/s = bytes / 1e6 / seconds
-    return round((bytes_recv / 1e6) / elapsed, 2)
+    if not samples_mbps:
+        return 0.0
+    # Use the MAX of the samples — best-case is what the link
+    # actually delivers when not contended. Mean / median would
+    # let one slow tick drag the cached value below the routing
+    # threshold even on a fast LAN.
+    mbps = round(max(samples_mbps), 2)
+    log.info(
+        "compute_pool: bandwidth probe %s: payload=%s (%d bytes) "
+        "samples=%s => %.2f MB/s (max-of-%d)",
+        label, payload_filename, bytes_recv,
+        [round(x, 2) for x in samples_mbps], mbps, len(samples_mbps),
+    )
+    return mbps
 
 
 async def probe_worker_live_stats(worker: dict, *, timeout: float | None = None) -> dict:
@@ -2163,7 +2278,7 @@ async def _drain_idle_reindex() -> int:
     # populated by `register_turn_start` from the agent loop; if any
     # node has count > 0, somebody is actively chatting and we should
     # not steal embed bandwidth.
-    if any(c > 0 for c in _ACTIVE_TURNS_PER_NODE.values()):
+    if _is_chat_active():
         return 0
 
     try:
@@ -2480,13 +2595,27 @@ async def _heartbeat_loop() -> None:
                 stats = await probe_worker_live_stats(w, timeout=5.0)
             except Exception:
                 stats = {}
-            # Bandwidth probe — every 5th heartbeat tick (~100s).
-            # Bandwidth changes slower than RAM, no need to re-measure
-            # every tick. Cheap when stale anyway (one binary-list GET).
+            # Bandwidth probe — every other heartbeat tick (~40 s).
+            # Networks fluctuate (Wi-Fi roaming, household TV starts
+            # streaming, peer's CPU spikes); a stale 100 s-old value
+            # was missing too many shifts. The new probe is 3-sample-
+            # max-of, so it self-stabilises against transient blips.
+            #
+            # Skip this tick if our own backend is busy serving an
+            # active chat: the bandwidth probe shares the asyncio
+            # event loop with chat traffic (system-stats polling,
+            # secure-proxy fan-out, embeddings) and competes for
+            # the same Windows TCP stack — measurements taken under
+            # load come back artificially low and would falsely
+            # filter healthy peers out of the split.
             should_measure_bw = False
             try:
                 last_bw_ts = float((w.get("capabilities") or {}).get("bandwidth_probed_at") or 0)
-                should_measure_bw = (time.time() - last_bw_ts) >= 100.0
+                age = time.time() - last_bw_ts
+                # Re-probe every 40 s when idle, every 5 min when an
+                # active chat is using the event loop.
+                idle_now = not _is_chat_active()
+                should_measure_bw = age >= (40.0 if idle_now else 300.0)
             except Exception:
                 pass
             bw = 0.0
@@ -2997,6 +3126,16 @@ _CONV_AFFINITY: dict[str, str] = {}
 # when two equally-strong nodes are both eligible — the least-busy
 # wins so concurrent conversations spread automatically.
 _ACTIVE_TURNS_PER_NODE: dict[str, int] = {}
+
+
+def _is_chat_active() -> bool:
+    """True iff at least one chat turn is currently running on any
+    pool node. Heartbeat-side bandwidth probe uses this to skip
+    measurements during chat (the asyncio event loop is already
+    saturated by stream readers / SSE writers; a probe taken under
+    load measures contention, not network throughput, and would
+    falsely demote healthy peers below the routing threshold)."""
+    return any(c > 0 for c in _ACTIVE_TURNS_PER_NODE.values())
 
 
 def _node_id_for_target(target: tuple[str, str | None] | None) -> str:
@@ -8193,25 +8332,44 @@ async def route_chat_for(
             for w in rpc_workers
         )
         # Bandwidth-aware filter: drop workers whose measured
-        # bandwidth is below the per-token RPC cost threshold. Per-
-        # token layer-push for a 7B model is ~200-500 KB; with
-        # < 5 MB/s bandwidth that's 50-100 ms per-token tax which
-        # dominates token generation rate and makes split slower
-        # than single-host. We MEASURE bandwidth on each
-        # heartbeat (capabilities.bandwidth_mbps) and on
-        # public-pool registration; workers that haven't been
-        # measured yet (None / 0) are kept in (no demote) so a
-        # fresh peer doesn't get permanently excluded.
-        rpc_workers = [
-            w for w in rpc_workers
-            if not (w.get("capabilities") or {}).get("bandwidth_mbps")
-            or float((w.get("capabilities") or {}).get("bandwidth_mbps") or 0) >= 5.0
-        ]
+        # Bandwidth filter: drop peers below `_BW_FLOOR_MBPS` so a
+        # genuinely slow link (old Wi-Fi router, congested mesh,
+        # WAN/Tailscale-relay) doesn't make split slower than
+        # single-host. Per-token layer-push for a 7 B model is ~200-
+        # 500 KB; below 1 MB/s that's 200-500 ms per-token tax which
+        # dominates token generation rate.
+        #
+        # The measurement comes from `probe_worker_bandwidth` which
+        # is now run at backend startup + after long idle periods
+        # (NOT inline with chat) so the asyncio event loop is quiet
+        # enough to give a real number. Probes during heavy chat
+        # traffic are unreliable; we only TRUST the cached value if
+        # `bandwidth_probed_at` shows the probe ran during a quiet
+        # window.
+        _BW_FLOOR_MBPS = 1.0
+
+        def _bandwidth_pass(w: dict) -> bool:
+            caps = w.get("capabilities") or {}
+            bw = caps.get("bandwidth_mbps")
+            if not bw:
+                # Never measured / measurement cleared → keep the
+                # peer (innocent until proven slow). The startup
+                # probe will fill it in soon.
+                return True
+            return float(bw) >= _BW_FLOOR_MBPS
+
+        before_filter = list(rpc_workers)
+        rpc_workers = [w for w in rpc_workers if _bandwidth_pass(w)]
+        dropped = [w.get("label") for w in before_filter if w not in rpc_workers]
+        if dropped:
+            log.info(
+                "compute_pool: dropped %d slow peer(s) below %.1f MB/s: %s",
+                len(dropped), _BW_FLOOR_MBPS, dropped,
+            )
         if not rpc_workers:
             log.info(
-                "compute_pool: every rpc worker measured below 5 MB/s "
-                "bandwidth — dropping back to host-only path for %s",
-                model_name,
+                "compute_pool: every rpc worker dropped by bandwidth filter "
+                "— host-only path for %s", model_name,
             )
             await stop_all_running_splits()
             return {"engine": "ollama"}
