@@ -100,6 +100,27 @@ class _BgSampler:
         # Per-pid GPU usage (cached on the same cadence as the device-
         # level probe — both shell out to the same vendor tools).
         self._per_pid_gpu_snap: dict[int, dict[str, Any]] = {}
+        # Cached app-process snapshot. Computed on this BG thread (not
+        # the request path) because building it on Windows requires
+        # iterating every PID and calling `cmdline()` on each python.exe
+        # candidate — each `cmdline()` does a Win32 PEB read that can
+        # block hundreds of milliseconds on a hung / unkillable process.
+        # Doing that inline in `local_snapshot()` (which is called from
+        # the FastAPI request handler for /api/p2p/system-stats) blocked
+        # the asyncio event loop for the full PEB-read duration of every
+        # python.exe on the box. With 3 peers polling system-stats every
+        # 4 s, Naresh's loop spent more time blocked than accepting new
+        # requests — symptom: HTTP 8000 listener "alive" but every
+        # inbound curl times out. Moving the snapshot here means the
+        # request handler returns the cached value in microseconds.
+        self._app_snap: dict[str, Any] = {
+            "processes": 0, "cpu_pct": 0.0, "ram_used_gb": 0.0,
+            "vram_used_gb": 0.0, "gpu_util_pct": 0.0,
+            "disk_read_total_gb": 0.0, "disk_write_total_gb": 0.0,
+            "names": [],
+        }
+        self._last_app_ts: float = 0.0
+        self._app_tick: float = max(2.0, float(tick) * 1.5)
         # Rolling-window history. The user wants utilization tracked
         # over a period of time, not a point-in-time snapshot — a momentary
         # spike-vs-sustained difference is meaningful for "is the pool
@@ -190,6 +211,18 @@ class _BgSampler:
                     except Exception as e:
                         log.debug("BgSampler per-pid gpu probe failed: %s", e)
                     self._last_gpu_ts = now
+                # App-process snapshot — slow on Windows because each
+                # python.exe candidate requires a Win32 PEB read for
+                # cmdline(), so we run it here on the BG thread (not
+                # the request handler) at a slightly slower cadence
+                # than the bulk samples. Failure is silent — the
+                # cached snapshot stays at its last good value.
+                if (now - self._last_app_ts) >= self._app_tick:
+                    try:
+                        self._app_snap = _app_process_snapshot()
+                    except Exception as e:
+                        log.debug("BgSampler app snapshot failed: %s", e)
+                    self._last_app_ts = now
                 # Record rolling-window sample. We pull the latest
                 # totals + per-app slice into one tuple so window_stats
                 # can compute synchronized min/max/avg over the same
@@ -220,6 +253,13 @@ class _BgSampler:
                     log.debug("BgSampler history append failed: %s", e)
             except Exception as e:
                 log.debug("BgSampler tick failed: %s", e)
+
+    @property
+    def app_snap(self) -> dict[str, Any]:
+        """Cached snapshot of Gigachat-app process aggregates. Computed
+        on the BG sampler thread to keep PEB reads off the asyncio
+        event loop."""
+        return dict(self._app_snap)
 
     @property
     def per_pid_gpu_snap(self) -> dict[int, dict[str, Any]]:
@@ -934,7 +974,12 @@ def local_snapshot() -> dict[str, Any]:
     snap["net_send_kbps"] = sampler.net_send_kbps
     snap["net_recv_kbps"] = sampler.net_recv_kbps
     # ---- Gigachat-app share --------------------------------------------
-    snap["app"] = _app_process_snapshot()
+    # Read the cached snapshot from the BG sampler — building it inline
+    # on Windows blocks the asyncio loop for hundreds of milliseconds
+    # because cmdline() is a synchronous PEB read. The BG thread builds
+    # this every ~5 s and the request handler returns the cached value
+    # in microseconds.
+    snap["app"] = sampler.app_snap
     # ---- RPC server endpoints (advertised to the orchestrator) ---------
     # Exposes whatever rpc-servers the local supervisor has running so
     # the orchestrator can read live state without a separate probe.

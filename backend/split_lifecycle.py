@@ -2567,6 +2567,61 @@ def _compute_optimal_ngl(
     return fits
 
 
+async def _evict_host_ollama_models() -> int:
+    """Force-unload every model currently loaded in host's Ollama by
+    POSTing `keep_alive=0` per model. Returns the count of evicted
+    models.
+
+    Called before split-llama-server spawn to free the host RAM the
+    split needs. Idempotent and fast (one HTTP round-trip per loaded
+    model, total < 1 s on a busy host). Failure is silent — the
+    split spawn proceeds and either succeeds with tighter memory or
+    surfaces a clean OOM the orchestrator's failure hook handles.
+    """
+    try:
+        client = httpx.AsyncClient(timeout=4.0)
+    except Exception:
+        return 0
+    evicted = 0
+    try:
+        try:
+            r = await client.get("http://127.0.0.1:11434/api/ps")
+            if r.status_code != 200:
+                return 0
+            loaded = (r.json().get("models") or [])
+        except Exception:
+            return 0
+        for m in loaded:
+            name = m.get("name") if isinstance(m, dict) else None
+            if not name:
+                continue
+            try:
+                # Ollama's `/api/generate` with `keep_alive=0` and an
+                # empty prompt tells it to immediately unload the
+                # named model. Faster than `/api/chat` for an unload
+                # because no template / context evaluation needed.
+                await client.post(
+                    "http://127.0.0.1:11434/api/generate",
+                    json={"model": name, "prompt": "",
+                          "keep_alive": 0, "stream": False},
+                )
+                evicted += 1
+                log.info(
+                    "split_lifecycle: evicted host Ollama model %r before "
+                    "split spawn (keep_alive=0)", name,
+                )
+            except Exception as e:
+                log.debug(
+                    "split_lifecycle: evict %r failed: %s", name, e,
+                )
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    return evicted
+
+
 async def start(split_id: str) -> dict:
     """Bring up the llama-server for one split_model row.
 
@@ -2590,6 +2645,20 @@ async def start(split_id: str) -> dict:
     # immediately on the next list call. If preflight raises, we'll
     # clear it back to error/stopped below.
     db.update_split_model_status(split_id, status="loading", last_error="")
+
+    # Pre-flight RAM reclaim: evict every model currently loaded in
+    # host's Ollama before the split-llama-server starts uploading
+    # weights. Without this, a constrained host (7-8 GB laptop) holds
+    # both an Ollama model (~3 GB resident) AND the host's share of
+    # the split-llama-server's weights mmap (~1-2 GB) AT THE SAME
+    # TIME during the load window — pushing total past 99 % and
+    # collapsing the asyncio loop. Ollama exposes `keep_alive=0` per
+    # model to force-unload; we hit it for every loaded model so the
+    # split has the host RAM it needs.
+    try:
+        await _evict_host_ollama_models()
+    except Exception as e:
+        log.debug("split_lifecycle: pre-split Ollama evict failed: %s", e)
 
     try:
         server, rpc_endpoints = _preflight(row)

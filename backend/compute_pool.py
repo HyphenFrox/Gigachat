@@ -3985,6 +3985,41 @@ def _should_force_split_for(
        the pool is barely bigger than the strongest single node —
        LAN per-token cost would dominate the small capacity win.
     """
+    # Host pressure short-circuit. The split-llama-server runs ON the
+    # orchestrator (host) — it spawns the llama-server process locally,
+    # mmaps weights from the host disk, and holds at least the host's
+    # share of weights in host RAM during inference. When host RAM is
+    # already over the 5 % safety margin, engaging split would push
+    # host into hard OOM territory: the model load triggers ~1.5-2 GB
+    # of additional resident allocations on a 7-8 GB laptop that's
+    # already at 75-80 %. The OOM cascades through the asyncio loop
+    # (psutil PEB reads stall, request handlers timeout, peer probes
+    # fail), bringing the orchestrator down. Symptom from the recent
+    # test: 99.6 % host RAM during phase1_1, host backend hung for
+    # 200 s, all 4 chats returned 0 deltas.
+    #
+    # When the pool already has a node that fits the model alone
+    # (e.g. FBS with 8 GB VRAM holds llama3.1:8b at 4 GB Q4), routing
+    # the chat to that single peer is strictly better than engaging
+    # split: zero host disk pressure, zero host RAM impact, and the
+    # peer's NVIDIA backend gives higher TPS than a multi-iGPU split
+    # anyway. The 5 % policy applies here too — we'd rather have ONE
+    # device under load (FBS at 95 %) than ALL three at the failure
+    # threshold.
+    try:
+        import psutil
+        host_ram_used_pct = float(psutil.virtual_memory().percent)
+    except Exception:
+        host_ram_used_pct = 0.0
+    if host_ram_used_pct >= 80.0:
+        log.info(
+            "compute_pool: host RAM at %.0f%% — skipping adaptive split for "
+            "%r so the orchestrator stays responsive (single-peer route "
+            "preferred over split when host is constrained)",
+            host_ram_used_pct, model_name,
+        )
+        return False
+
     split_tps = _route_tps_for(model_name, "split")
     host_tps = _route_tps_for(model_name, "host")
     if split_tps is not None and host_tps is not None:
@@ -8371,14 +8406,33 @@ async def route_chat_for(
     best_worker_capacity = 0
     pool_vram_total = host_vram
     if chat_workers:
-        worker_vrams = [
-            (w.get("capabilities") or {}).get("max_vram_seen_bytes") or 0
-            for w in chat_workers
-        ]
+        # Per-worker capacity: prefer `max_vram_seen_bytes` (proven by
+        # an actual load), fall back to `vram_total_gb` (the hardware
+        # VRAM ceiling reported by the live-stats probe). Without the
+        # fallback, a freshly-paired peer with an 8 GB NVIDIA card
+        # whose max_vram_seen is still 0 (no model has been loaded
+        # there yet) reports as "0 capacity" and the router goes
+        # split-mode forced — even though FBS could fit the entire
+        # model alone in pure VRAM at sub-second TPS. The recent test
+        # log proved this: `strongest_single_vram=2147483648` (host
+        # iGPU 2 GB only — FBS's 8 GB CUDA was invisible) → adaptive
+        # split engaged for a 4 GB model that should have routed to
+        # FBS alone, → host OOM cascade.
+        def _cap(w: dict) -> int:
+            caps = w.get("capabilities") or {}
+            seen = int(caps.get("max_vram_seen_bytes") or 0)
+            if seen > 0:
+                return seen
+            total_gb = float(caps.get("vram_total_gb") or 0)
+            return int(total_gb * (1024 ** 3))
+        worker_vrams = [_cap(w) for w in chat_workers]
         best_worker_capacity = max(worker_vrams) if worker_vrams else 0
-        # Sum every eligible worker's proven VRAM with host's. Honest
-        # under-count: max_vram_seen is a lower bound (it's whatever
-        # was loaded so far, not the worker's true VRAM ceiling).
+        # Sum every eligible worker's VRAM (proven OR advertised) with
+        # host's. The honest-under-count rationale only applied when
+        # we relied on `max_vram_seen` exclusively; with the
+        # `vram_total_gb` fallback, an idle peer's full VRAM ceiling
+        # counts toward the pool size, which is what the router needs
+        # to make sane single-vs-split decisions.
         pool_vram_total = host_vram + sum(worker_vrams)
 
     # Tier 1: fits the strongest single GPU (host or worker)?
