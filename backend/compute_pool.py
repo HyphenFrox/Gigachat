@@ -7793,6 +7793,24 @@ async def _ensure_peer_orchestrated_split(
             host_ips = _lan_ips()
         except Exception:
             host_ips = []
+        # Filter host IPs to ones that are PEER-REACHABLE on the LAN.
+        # `_local_lan_ips()` returns every interface this machine has —
+        # including stale entries (old DHCP leases on disabled NICs)
+        # and CGNAT addresses (Tailscale 100.x / 10.x) that the peer
+        # can't actually route to. The peer's `address` row tells us
+        # what /24 the LAN is on; we keep only host IPs in that same
+        # /24 (or the broader /16 as fallback for non-/24 LANs). This
+        # eliminates the "Failed to connect to 192.168.1.6:50053 /
+        # 10.143.202.252:50053" failures we saw in the dolphin-mixtral
+        # test where FBS tried to reach 4 stale host IPs and aborted
+        # on each.
+        peer_addr = (peer_worker.get("address") or "").strip()
+        peer_subnet_24 = ".".join(peer_addr.split(".")[:3]) if peer_addr else ""
+        peer_subnet_16 = ".".join(peer_addr.split(".")[:2]) if peer_addr else ""
+        if peer_subnet_24:
+            same_24 = [ip for ip in host_ips if ip.startswith(peer_subnet_24 + ".")]
+            same_16 = [ip for ip in host_ips if ip.startswith(peer_subnet_16 + ".")]
+            host_ips = same_24 or same_16 or host_ips[:1]  # last-resort: first one
         rpc_targets: list[str] = []
         for ip in host_ips:
             rpc_targets.append(f"{ip}:50052")  # SYCL/CUDA on host
@@ -7890,11 +7908,24 @@ async def _ensure_peer_orchestrated_split(
         peer_worker.get("label"), peer_vram_free_gb, per_layer_gb, ngl_cap,
     )
 
+    # Use the multi-rpc auto-fit sentinel (ngl=0) instead of an
+    # explicit ngl_cap. `common_fit_params` ABORTS when ngl is
+    # explicitly set AND the configured ngl doesn't fit after KV
+    # cache reservation — exact symptom from the dolphin-mixtral
+    # test:
+    #   common_fit_params: failed to fit params to free device
+    #   memory: n_gpu_layers already set by user to 8, abort
+    # ngl=0 tells llama.cpp's auto-fit walker to start from "as many
+    # layers as fit" and shrink until everything fits across local
+    # GPU + every --rpc backend. Strictly better than our Python-
+    # side cap calculation because llama.cpp knows each device's
+    # exact memory state at load time, including the KV cache and
+    # compute scratch overhead our heuristic was missing.
     spawn_body = {
         "model": model_name,
         "port": port,
         "rpc_targets": rpc_targets,
-        "n_gpu_layers": ngl_cap,
+        "n_gpu_layers": 0,  # auto-fit sentinel (multi-rpc pattern)
         # 16K context — Gigachat's own system prompt + conversation
         # history routinely runs 4-8K, so 4K is too tight (the very
         # first chat turn 400's with "request exceeds context").
