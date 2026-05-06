@@ -4496,24 +4496,37 @@ def api_p2p_llama_server_start(body: dict | None = None) -> dict:
     model = (body.get("model") or "").strip()
     if not model:
         raise HTTPException(400, "model is required")
+    # `... or DEFAULT` falls through when the value is 0 — but the
+    # multi-rpc auto-fit sentinel for `n_gpu_layers` is exactly 0,
+    # and a chosen port could legitimately be 0 in some test harness.
+    # Use explicit `is None` checks so falsy-but-meaningful values
+    # propagate correctly. Fixes the bug where the orchestrator sent
+    # `n_gpu_layers=0` (auto-fit) and this endpoint silently
+    # rewrote it to 99, causing common_fit_params to abort the
+    # llama-server spawn for any model that doesn't fit a single
+    # peer GPU.
+    raw_port = body.get("port")
     try:
-        port = int(body.get("port") or 8090)
+        port = int(raw_port) if raw_port is not None else 8090
     except (TypeError, ValueError):
         port = 8090
     rpc_targets = body.get("rpc_targets") or []
     if not isinstance(rpc_targets, list):
         raise HTTPException(400, "rpc_targets must be a list of host:port strings")
     rpc_targets = [str(t).strip() for t in rpc_targets if str(t).strip()]
+    raw_ngl = body.get("n_gpu_layers")
     try:
-        n_gpu_layers = int(body.get("n_gpu_layers") or 99)
+        n_gpu_layers = int(raw_ngl) if raw_ngl is not None else 99
     except (TypeError, ValueError):
         n_gpu_layers = 99
+    raw_ctx = body.get("context_size")
     try:
-        context_size = int(body.get("context_size") or 4096)
+        context_size = int(raw_ctx) if raw_ctx is not None else 4096
     except (TypeError, ValueError):
         context_size = 4096
+    raw_par = body.get("parallel")
     try:
-        parallel = int(body.get("parallel") or 1)
+        parallel = int(raw_par) if raw_par is not None else 1
     except (TypeError, ValueError):
         parallel = 1
     return _ls.start_local_llama_server(

@@ -3728,12 +3728,24 @@ async def _run_turn_impl(
             # `use_encrypted_proxy=True` (the default for paired
             # peers). The picker is deterministic so the dict
             # corresponds to the same worker as `chat_target`.
-            try:
-                chat_worker_dict = compute_pool.pick_chat_worker(
-                    conv["model"], conv_id=conversation_id,
-                )
-            except Exception:
-                chat_worker_dict = None
+            # Skip when force_worker_id already set chat_worker_dict
+            # — the picker has no knowledge of the router's "must
+            # serve from this peer" decision and would overwrite the
+            # forced worker with whichever peer ranks highest by
+            # capability, dropping the chat onto a node that DOESN'T
+            # have the model. Symptom we just hit: forced peer was
+            # FBS (which has dolphin-mixtral); pick_chat_worker
+            # overwrote it with None / a different worker; chat then
+            # bypassed the encrypted proxy and tried plain HTTP to
+            # FBS's `/api/chat` which the AuthMiddleware refused
+            # with "loopback only".
+            if chat_worker_dict is None:
+                try:
+                    chat_worker_dict = compute_pool.pick_chat_worker(
+                        conv["model"], conv_id=conversation_id,
+                    )
+                except Exception:
+                    chat_worker_dict = None
             # Register this turn against the chosen node so future
             # picks see accurate load. The matching `register_turn_end`
             # runs in `run_turn`'s finally block — we read the node id
