@@ -916,6 +916,33 @@ async def _set_workers_backend(workers: list[dict], *, in_split: bool) -> int:
                 live_eps = live_stats.get("rpc_endpoints")
                 if isinstance(live_eps, list) and live_eps:
                     caps["rpc_endpoints"] = live_eps
+                    # Auto-recovery: when the peer's supervisor publishes
+                    # a SYCL/Vulkan/CUDA endpoint, that's hard evidence
+                    # the iGPU/dGPU backend is working — the supervisor
+                    # already validated the rpc-server is LISTENING
+                    # with that backend before publishing. Clear any
+                    # stale failure flags so `select_multi_rpc_specs`
+                    # stops forcing CPU-only fallback on the next
+                    # split engagement. Without this the 24-hour
+                    # `_BACKEND_FAILURE_COOLDOWN_SEC` lockout from a
+                    # crash earlier in the day (often caused by a
+                    # since-fixed infrastructure bug like the SYCL DLL
+                    # quarantine, or a peer reboot since the crash)
+                    # silently keeps the iGPU on the bench long after
+                    # the underlying issue is resolved.
+                    advertised_backends = {
+                        (e.get("backend") or "").upper() for e in live_eps
+                    }
+                    has_sycl = any("SYCL" in b for b in advertised_backends)
+                    has_vulkan = any("VULKAN" in b for b in advertised_backends)
+                    if has_sycl:
+                        for k in ("sycl_split_failed_at",
+                                  "sycl_hybrid_split_failed_at"):
+                            caps.pop(k, None)
+                    if has_vulkan:
+                        for k in ("vulkan_split_failed_at",
+                                  "vulkan_hybrid_split_failed_at"):
+                            caps.pop(k, None)
                 db.update_compute_worker_capabilities(
                     w["id"], capabilities=caps,
                 )
@@ -1676,12 +1703,23 @@ async def ensure_rpc_server_via_proxy(
             caps["ram_total_gb"] = float(live_stats.get("ram_total_gb") or caps.get("ram_total_gb") or 0)
             caps["ram_free_gb"] = float(live_stats.get("ram_free_gb") or 0)
             caps["vram_total_gb"] = float(live_stats.get("vram_total_gb") or caps.get("vram_total_gb") or 0)
-            # Same rpc_endpoints carry-through as `_set_workers_backend`
-            # — keeps the orchestrator's view in sync with the peer's
-            # supervisor.
+            # Same rpc_endpoints carry-through + auto-recovery as
+            # `_set_workers_backend`. When the peer publishes a working
+            # iGPU rpc endpoint, clear stale failure flags.
             live_eps = live_stats.get("rpc_endpoints")
             if isinstance(live_eps, list) and live_eps:
                 caps["rpc_endpoints"] = live_eps
+                advertised_backends = {
+                    (e.get("backend") or "").upper() for e in live_eps
+                }
+                if any("SYCL" in b for b in advertised_backends):
+                    for k in ("sycl_split_failed_at",
+                              "sycl_hybrid_split_failed_at"):
+                        caps.pop(k, None)
+                if any("VULKAN" in b for b in advertised_backends):
+                    for k in ("vulkan_split_failed_at",
+                              "vulkan_hybrid_split_failed_at"):
+                        caps.pop(k, None)
             db.update_compute_worker_capabilities(
                 worker["id"], capabilities=caps,
             )
