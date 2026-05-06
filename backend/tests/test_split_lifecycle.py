@@ -265,6 +265,20 @@ def _arrange_start(isolated_db, monkeypatch, tmp_path):
 
     monkeypatch.setattr(split_lifecycle.subprocess, "Popen", _fake_popen_factory)
 
+    # Stub `_llama_server_supports_flag` — it shells out to the real
+    # binary with `--help` to detect feature support (e.g.
+    # `--prompt-cache`). With our `_fake_popen_factory` in place, that
+    # `subprocess.run` call ALSO routes through Popen and pollutes the
+    # `fakes` list — it would look like start() spawned two
+    # llama-servers when really one was the help-probe and one was
+    # the real spawn. Returning False keeps the optional flags off
+    # for the rest of `_build_command`, which the argv-shape tests
+    # below already account for.
+    monkeypatch.setattr(
+        split_lifecycle, "_llama_server_supports_flag",
+        lambda server_path, flag: False,
+    )
+
     # Stub the health wait — succeed immediately.
     # Accepts the same kwargs as the real function so call sites that
     # pass `proc=` (added to bail early on child death) don't trip a

@@ -791,7 +791,12 @@ def test_probe_records_rpc_reachable_in_capabilities(isolated_db, monkeypatch):
     caps = result["capabilities"]
     assert caps["rpc_server_reachable"] is True
     assert caps["rpc_port"] == compute_pool._DEFAULT_RPC_PORT
-    assert caps["rpc_error"] is None
+    # On a clean rpc probe the production code DELETES the rpc_error
+    # key rather than storing `None`, keeping the capabilities dict
+    # tight (the same convention every other capability hint follows).
+    # Use `.get()` so the test passes whether the key is missing OR
+    # explicitly None.
+    assert caps.get("rpc_error") is None
 
     # Persisted on the row.
     row = isolated_db.get_compute_worker(wid)
@@ -903,7 +908,13 @@ def test_probe_records_no_gpu_when_ps_empty(isolated_db, monkeypatch):
     result = _run(compute_pool.probe_worker(wid))
     caps = result["capabilities"]
     assert caps["gpu_present"] is False
-    assert caps["max_vram_seen_bytes"] == 0
+    # Production keeps `max_vram_seen_bytes` monotonic — it's only
+    # set on a probe that ACTUALLY observed VRAM consumption (so a
+    # later idle probe can't blank out a previously-proven value).
+    # On a fresh worker that's never had a loaded model, the key is
+    # simply absent. Treat absence as zero, the same way every
+    # consumer in the routing path already does.
+    assert caps.get("max_vram_seen_bytes", 0) == 0
     assert caps["loaded_count"] == 0
 
 
@@ -954,6 +965,19 @@ def test_pick_chat_target_keeps_host_when_worker_weaker(isolated_db, monkeypatch
         compute_pool, "_host_capability_score",
         lambda model_name=None: (0.0, 1, 8 * 1024 ** 3, 16.0, 16, float("inf")),
     )
+    # Pretend host's Ollama has the model installed — without this
+    # mock the production code routes to the worker as a 404-avoidance
+    # fallback ("host wins on capability BUT lacks the model →
+    # use the worker anyway"), masking the capability comparison
+    # that this test is meant to verify.
+    monkeypatch.setattr(
+        compute_pool, "resolve_ollama_model",
+        lambda name: {"gguf_path": "/fake/gguf", "size_bytes": 4 * 1024 ** 3},
+    )
+    # is_host_mega_busy() reads `_HOST_MEGA_MODEL_BUSY_UNTIL` — make
+    # sure no leftover state from another test has it pinned in the
+    # busy window.
+    monkeypatch.setattr(compute_pool, "is_host_mega_busy", lambda: False)
 
     wid = isolated_db.create_compute_worker(
         label="weak", address="w.local", use_for_chat=True,
@@ -1055,6 +1079,15 @@ def test_pick_chat_target_keeps_host_when_worker_tps_lower(
         compute_pool, "_host_capability_score",
         lambda model_name=None: (100.0, 1, 8 * 1024 ** 3, 16.0, 16, float("inf")),
     )
+    # Same mocks as `test_pick_chat_target_keeps_host_when_worker_weaker`:
+    # without `resolve_ollama_model` the production code routes to
+    # the worker to avoid a 404 even when the host wins on capability,
+    # which would mask the TPS comparison this test verifies.
+    monkeypatch.setattr(
+        compute_pool, "resolve_ollama_model",
+        lambda name: {"gguf_path": "/fake/gguf", "size_bytes": 4 * 1024 ** 3},
+    )
+    monkeypatch.setattr(compute_pool, "is_host_mega_busy", lambda: False)
 
     wid = isolated_db.create_compute_worker(
         label="weak-gpu", address="weak.local", use_for_chat=True,
