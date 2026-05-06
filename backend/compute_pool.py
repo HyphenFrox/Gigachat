@@ -2637,6 +2637,19 @@ async def _heartbeat_loop() -> None:
                     if bw > 0:
                         caps["bandwidth_mbps"] = bw
                         caps["bandwidth_probed_at"] = time.time()
+                        # Track the BEST measurement ever seen for
+                        # this peer. The split-engagement filter uses
+                        # max-ever rather than latest because the
+                        # latest is often noise from chat-time event-
+                        # loop contention; max is the honest "what
+                        # the link can deliver" number. Bumped only
+                        # when a new sample is HIGHER (or first ever).
+                        try:
+                            prev_max = float(caps.get("bandwidth_mbps_max") or 0)
+                        except (TypeError, ValueError):
+                            prev_max = 0.0
+                        if bw > prev_max:
+                            caps["bandwidth_mbps_max"] = bw
                     # Heartbeat alive → make sure rpc_server_reachable
                     # is True (it may have been flipped to False earlier).
                     # Don't auto-set True if we don't know rpc state —
@@ -8348,29 +8361,52 @@ async def route_chat_for(
             (w.get("capabilities") or {}).get("probe_latency_ms") or 0
             for w in rpc_workers
         )
-        # No bandwidth filter at this layer.
+        # Bandwidth filter — public-pool aware. With the public swarm
+        # turned on, peers can be on real WAN links (mobile hotspot,
+        # ISP that throttles, neighbour's Wi-Fi). Per-token layer-
+        # push for a 7 B model is ~200-500 KB; below 1 MB/s that's
+        # 200-500 ms per-token tax which dominates token generation
+        # rate and makes split slower than single-host.
         #
-        # Two reasons it was removed (commit 2610378 + this commit):
-        #
-        #   1. Since the relay-fallback was removed, ANY peer the
-        #      orchestrator can talk to is reachable directly over LAN
-        #      — there's no scenario where a peer is registered as
-        #      `rpc_server_reachable=True` but is on a slow WAN path.
-        #      The filter would only ever drop healthy LAN peers based
-        #      on contention noise in the bandwidth probe.
-        #
-        #   2. The measurement is unreliable under load. The probe
-        #      shares the asyncio event loop and httpx pool with chat
-        #      traffic; even on Gigabit LAN it routinely reports 0.2-
-        #      1 MB/s when the agent is busy with embeddings or
-        #      llama-server is mid-prompt-eval. Filtering on this
-        #      noisy signal removes peers the user would consider
-        #      perfectly usable.
-        #
-        # The cached `bandwidth_mbps` capability is still useful for
-        # diagnostics (Settings UI shows it) and could feed future
-        # load-balancing heuristics; we just don't gate split
-        # eligibility on it anymore.
+        # We filter on `bandwidth_mbps_max` (best ever measured for
+        # this peer), NOT the latest reading. The probe shares the
+        # asyncio loop with chat traffic and routinely measures
+        # artificially low under load (cached "best ever" is the
+        # honest signal of what the link can deliver). The "max"
+        # value is filled in by the heartbeat alongside the latest
+        # `bandwidth_mbps` — see `probe_worker_bandwidth` /
+        # heartbeat write site.
+        _BW_FLOOR_MBPS = 1.0
+
+        def _bandwidth_pass(w: dict) -> bool:
+            caps = w.get("capabilities") or {}
+            # Prefer max-ever measurement over latest (latest may be
+            # contention noise). Fall back to latest if max isn't
+            # populated yet.
+            bw_max = caps.get("bandwidth_mbps_max")
+            bw_latest = caps.get("bandwidth_mbps")
+            bw = bw_max if bw_max is not None else bw_latest
+            if not bw:
+                # Never measured → keep (innocent until proven slow).
+                return True
+            return float(bw) >= _BW_FLOOR_MBPS
+
+        before_filter = list(rpc_workers)
+        rpc_workers = [w for w in rpc_workers if _bandwidth_pass(w)]
+        dropped = [w.get("label") for w in before_filter if w not in rpc_workers]
+        if dropped:
+            log.info(
+                "compute_pool: dropped %d slow peer(s) below %.1f MB/s "
+                "(based on max-ever bandwidth): %s",
+                len(dropped), _BW_FLOOR_MBPS, dropped,
+            )
+        if not rpc_workers:
+            log.info(
+                "compute_pool: every rpc worker dropped by bandwidth filter "
+                "— host-only path for %s", model_name,
+            )
+            await stop_all_running_splits()
+            return {"engine": "ollama"}
 
         # Mega-model: model exceeds combined pool memory. Engages
         # split anyway — llama.cpp's adaptive `-ngl` puts as many
