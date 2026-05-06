@@ -7923,31 +7923,92 @@ async def route_chat_for(
             # directive: "auto-pull whatever it needs via LAN (1st
             # preference) or via internet (2nd preference)".
             #
-            # Even when `pool_has` is True (a LAN peer can serve the
-            # chat directly via its ollama), we still pull to host
-            # when the model is big enough to warrant pool-wide split:
-            # without the GGUF on host, the orchestrator can't run a
-            # split-llama-server and the user loses the iGPU+GPU+CPU
-            # sum across all 3 devices. Side-effect: subsequent chats
-            # for this model start hot on host without a re-pull.
+            # Skip-pull-when-fast-path-suffices: when a LAN peer
+            # already has the model AND the model fits the strongest
+            # single peer's VRAM with headroom, the chat will route
+            # directly to that peer and complete fast — pulling 3 GB
+            # to host first would just block the chat for 30+ s of
+            # LAN transfer for no win. The "pool-wide split needs the
+            # GGUF on host" justification only applies to BIG models
+            # (>= ~70 % of the strongest single VRAM); small models
+            # never engage split, so they don't need a host copy.
+            #
+            # For big models we DO pull to host so split-llama-server
+            # can spawn with the GGUF locally. Side-effect: subsequent
+            # chats for this big model start hot on host without
+            # re-pulling.
             try:
                 from . import model_sync as _ms
                 lan_src = _ms.find_lan_source_for(model_name)
                 if lan_src and lan_src.get("kind") == "worker":
                     src_w = db.get_compute_worker(lan_src.get("worker_id"))
                     if src_w:
-                        ok = await _ms.pull_model_via_p2p(
-                            model_name, src_w,
-                            on_progress=on_pull_progress,
+                        # Decide whether the pull-to-host is genuinely
+                        # needed. Look at the source peer's reported
+                        # model size + the strongest single VRAM in
+                        # the pool. Small model + fits a peer →
+                        # skip pull, let `pick_chat_target` route to
+                        # that peer.
+                        peer_caps = src_w.get("capabilities") or {}
+                        model_bytes = 0
+                        for m in (peer_caps.get("models") or []):
+                            if _model_matches(
+                                m.get("name") or "", model_name,
+                            ):
+                                model_bytes = int(m.get("size") or 0)
+                                break
+                        # Strongest single-node VRAM across host +
+                        # every eligible chat worker. If we can't
+                        # measure it (no benchmarks yet, no GPUs at
+                        # all), fall through to the conservative
+                        # "always pull" behavior — better to spend
+                        # 30 s on a one-shot pull than to mis-route
+                        # and hit a peer-side OOM.
+                        host_vram_b = _host_vram_budget_bytes()
+                        peer_vrams = [
+                            (w.get("capabilities") or {}).get(
+                                "max_vram_seen_bytes",
+                            ) or 0
+                            for w in existing_workers
+                            if w.get("use_for_chat")
+                        ]
+                        strongest_vram = max(
+                            [host_vram_b] + peer_vrams + [0],
                         )
-                        if ok:
+                        # Headroom: keep 10 % free for KV cache so we
+                        # don't trip OOM on a fits-in-VRAM model.
+                        fits_strongest_single = (
+                            model_bytes > 0
+                            and strongest_vram > 0
+                            and model_bytes <= int(strongest_vram * 0.90)
+                        )
+                        if fits_strongest_single:
                             log.info(
-                                "compute_pool: LAN-pulled %r from %s "
-                                "(host now has it; pool-wide split is "
-                                "now possible)",
-                                model_name, src_w.get("label"),
+                                "compute_pool: skipping LAN pull-to-host "
+                                "of %r (%.2f GB) — peer %s has it and it "
+                                "fits the strongest single VRAM (%.2f GB) "
+                                "with headroom; chat will route to peer",
+                                model_name,
+                                model_bytes / (1024 ** 3),
+                                src_w.get("label"),
+                                strongest_vram / (1024 ** 3),
                             )
-                            host_has = True
+                            # Still mark host as not having it; the
+                            # routing path further down will pick the
+                            # peer naturally because pool_has is True.
+                        else:
+                            ok = await _ms.pull_model_via_p2p(
+                                model_name, src_w,
+                                on_progress=on_pull_progress,
+                            )
+                            if ok:
+                                log.info(
+                                    "compute_pool: LAN-pulled %r from %s "
+                                    "(host now has it; pool-wide split "
+                                    "is now possible)",
+                                    model_name, src_w.get("label"),
+                                )
+                                host_has = True
             except Exception as e:
                 log.info(
                     "compute_pool: LAN-pull of %r failed (%s); "
