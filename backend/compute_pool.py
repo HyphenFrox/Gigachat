@@ -871,16 +871,58 @@ async def _set_workers_backend(workers: list[dict], *, in_split: bool) -> int:
     """
     aligned = 0
     for w in workers:
+        # FAST PATH — TCP-direct rpc-server liveness check before any
+        # HTTP work. When the peer's Gigachat HTTP backend is hung but
+        # its rpc-server processes are still listening (the most common
+        # mode for an over-loaded peer: outbound retry storm jams
+        # uvicorn's accept loop, but the detached rpc-server child
+        # processes are unaffected), we should still engage the peer
+        # in split mode using its already-listening rpc-servers.
+        # Skipping the HTTP-based `ensure_rpc_servers_via_proxy_multi`
+        # in that case (a) avoids tying up the orchestrator on a peer
+        # that won't respond and (b) preserves the cached endpoint list
+        # in the DB instead of overwriting it to a degraded
+        # "CPU only" fallback.
+        #
+        # The check is cheap: one async TCP connect per cached endpoint.
+        # If every cached rpc endpoint is TCP-reachable, we trust the
+        # peer's supervisor to keep them up and skip the HTTP step.
+        cached_eps = (w.get("capabilities") or {}).get("rpc_endpoints") or []
+        if cached_eps and isinstance(cached_eps, list):
+            host_addr = (w.get("address") or "").strip()
+            for prefix in ("http://", "https://"):
+                if host_addr.startswith(prefix):
+                    host_addr = host_addr[len(prefix):]
+            host_addr = host_addr.rstrip("/").split(":", 1)[0]
+            if host_addr:
+                tcp_results = await asyncio.gather(*(
+                    _probe_rpc_server(host_addr, int(ep.get("port") or 50052))
+                    for ep in cached_eps
+                ), return_exceptions=True)
+                all_reachable = all(
+                    isinstance(r, tuple) and r[0] for r in tcp_results
+                )
+                if all_reachable:
+                    log.info(
+                        "compute_pool: %s rpc-servers TCP-reachable on "
+                        "cached endpoints %s — skipping HTTP auto-prep "
+                        "(peer's supervisor owns the listeners)",
+                        w.get("label"),
+                        ", ".join(f"{e.get('port')}/{e.get('backend')}"
+                                  for e in cached_eps),
+                    )
+                    aligned += 1
+                    continue
+        # Fall through to HTTP-based prep when cache is empty OR any
+        # rpc-server failed the TCP probe — we genuinely need to spawn
+        # / restart something on the peer.
+        #
         # No ssh_host gate any more — `_attempt_rpc_server_restart`
         # tries the encrypted P2P channel first, so paired LAN peers
         # without SSH get prepped here too. Old SSH-configured
         # workers still work via the fallback path inside the helper.
         #
-        # Always go through the helper — even when the capability
-        # cache says the backend already matches. The cache can lie:
-        # the rpc-server process may have been killed externally
-        # (system reboot, user task-manager-killed, OOM) without us
-        # noticing. The helper's status probe is cheap (one HTTP
+        # The HTTP helper's status probe is cheap (one HTTP
         # round-trip via the encrypted proxy) and short-circuits
         # instantly when rpc-server is genuinely up. Without this,
         # a stale "CPU" capability stamp could cause us to enter a
