@@ -424,7 +424,7 @@ def _ensure_host_local_sycl_rpc() -> str | None:
     # llama-server spawns, so we treat it specially below.
     disabled_copies = sorted(
         list(install_dir.glob("ggml-sycl.dll.disabled*"))
-        + list(install_dir.glob("ggml-sycl.dll.split-spawn-temp")),
+        + list(install_dir.glob("ggml-sycl.dll.split-spawn-*")),
         key=lambda p: p.stat().st_mtime if p.is_file() else 0,
         reverse=True,
     )
@@ -506,11 +506,22 @@ def _ensure_host_local_sycl_rpc() -> str | None:
         # DLL scan path while remaining open in the rpc-server's
         # address space.
         if sycl_dll.is_file():
-            side = install_dir / "ggml-sycl.dll.split-spawn-temp"
+            # Use a timestamped side path so we don't collide with a
+            # `split-spawn-temp` left behind by an earlier rpc-server
+            # process that still has its file handle open. Windows
+            # won't let us delete a DLL while ANY process maps it,
+            # and we can't rename ggml-sycl.dll to a target that
+            # already exists. With a unique target name per call,
+            # rename always succeeds.
+            import time as _t
+            side = install_dir / f"ggml-sycl.dll.split-spawn-{int(_t.time() * 1000)}"
             try:
-                if side.is_file():
+                # Best-effort: try to delete a stale plain side-path
+                # if it exists and is not held open. Failure is fine.
+                stale = install_dir / "ggml-sycl.dll.split-spawn-temp"
+                if stale.is_file():
                     try:
-                        side.unlink()
+                        stale.unlink()
                     except Exception:
                         pass
                 sycl_dll.rename(side)
@@ -535,6 +546,14 @@ def _ensure_host_local_sycl_rpc() -> str | None:
                         "uses --rpc workers. Restart Gigachat to "
                         "clear file locks.", e, e2,
                     )
+        # Reap stale `ggml-sycl.dll.split-spawn-*` side paths that no
+        # process holds open anymore so they don't accumulate over
+        # many spawns. Best-effort — files still in use are skipped.
+        for stale in install_dir.glob("ggml-sycl.dll.split-spawn-*"):
+            try:
+                stale.unlink()
+            except Exception:
+                pass
         # Restore the skip-install marker so the auto-installer doesn't
         # re-fetch the DLL on the next probe cycle.
         if skip_marker_existed and not skip_marker.is_file():
