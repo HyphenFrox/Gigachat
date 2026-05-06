@@ -3679,19 +3679,48 @@ async def _run_turn_impl(
         # call through the E2E-encrypted proxy instead of plain HTTP.
         chat_worker_dict: dict | None = None
         if split_target is None:
-            try:
-                # Pass conv_id so the picker honors per-conversation
-                # affinity: a chat that landed on worker-A on its
-                # previous turn keeps landing there as long as A is
-                # eligible — KV cache survives across follow-up
-                # turns. Concurrent conversations naturally spread
-                # across the pool because the picker breaks ties on
-                # active-turn count.
-                chat_target = compute_pool.pick_chat_target(
-                    conv["model"], conv_id=conversation_id,
-                )
-            except Exception:
-                chat_target = None
+            # Force-route hint from `route_chat_for`: when the router
+            # has determined that a SPECIFIC peer must serve this chat
+            # (e.g. host doesn't have the model but a peer does, and
+            # peer-orchestrated split failed to spawn), it sets
+            # `force_worker_id` on the decision. We honour that
+            # short-circuit instead of letting `pick_chat_target` apply
+            # capability-score routing — which on a model-mismatch
+            # would land us on host Ollama and surface a 404.
+            force_worker_id = decision.get("force_worker_id")
+            chat_target = None
+            if force_worker_id:
+                try:
+                    forced_w = db.get_compute_worker(force_worker_id)
+                except Exception:
+                    forced_w = None
+                if forced_w and forced_w.get("enabled"):
+                    chat_target = (
+                        f"http://{forced_w.get('address')}:"
+                        f"{int(forced_w.get('ollama_port') or 8000)}",
+                        db.get_compute_worker_auth_token(force_worker_id),
+                    )
+                    chat_worker_dict = forced_w
+                    log.info(
+                        "agent: force-routing %r to peer %r "
+                        "(reason: %s)",
+                        conv["model"], forced_w.get("label"),
+                        decision.get("force_reason") or "router",
+                    )
+            if chat_target is None:
+                try:
+                    # Pass conv_id so the picker honors per-conversation
+                    # affinity: a chat that landed on worker-A on its
+                    # previous turn keeps landing there as long as A is
+                    # eligible — KV cache survives across follow-up
+                    # turns. Concurrent conversations naturally spread
+                    # across the pool because the picker breaks ties on
+                    # active-turn count.
+                    chat_target = compute_pool.pick_chat_target(
+                        conv["model"], conv_id=conversation_id,
+                    )
+                except Exception:
+                    chat_target = None
             if chat_target is not None:
                 chat_base_url, chat_auth_token = chat_target
             # Resolve the FULL worker dict alongside so we can route

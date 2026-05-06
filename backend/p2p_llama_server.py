@@ -138,10 +138,25 @@ _SPAWN_ENV: dict[str, str] = {
 # How long to wait for the freshly-spawned llama-server to start
 # listening on its TCP port. llama-server's startup includes loading
 # the GGUF (mmap is fast) AND initializing all `--rpc` backends
-# (slow — TCP handshake to each remote rpc-server, then their model-
-# weight upload). For a 26 GB model with 2 RPC backends and SYCL JIT
-# warmup, 60 s is the realistic cold-start budget.
-_LISTEN_WAIT_SEC = 60.0
+# (slow — TCP handshake to each remote rpc-server, then their
+# model-weight upload).
+#
+# 60 s was empirically too tight: a 26 GB Mixtral 8x7b model uploading
+# layer weights to 4 RPC endpoints (host iGPU SYCL + host CPU + Naresh
+# iGPU SYCL + Naresh CPU) over a 25 MB/s LAN takes ~3-5 minutes for
+# the layer-weight push alone, plus SYCL JIT warmup on the receiving
+# rpc-servers. Symptom from the recent test: every dolphin-mixtral
+# spawn returned "spawned_but_not_listening" at 60 s, the chat
+# fell back to host Ollama (which 404'd because host doesn't have
+# the model), and the user saw zero deltas.
+#
+# 600 s (10 min) gives big models room to load on a slow LAN /
+# Wi-Fi link without the orchestrator giving up early. Small
+# models (8-15 layers) still bind in <30 s — the longer ceiling
+# is bounded by HOW LONG WE WAIT, not how long it takes for fast
+# models. Once bound, the chat traffic flows at the model's natural
+# token rate.
+_LISTEN_WAIT_SEC = 600.0
 
 
 # ============================================================================

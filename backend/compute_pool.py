@@ -8419,11 +8419,26 @@ async def route_chat_for(
                         "(may OOM, but the error is surfaceable).",
                         model_name, peer_with_model.get("label"), e,
                     )
-        # Fall through to default Ollama path — pick_chat_target will
-        # route to whichever node has the model. If the peer can't
-        # fit it Ollama surfaces its own OOM error, which is at
-        # least actionable for the user.
+        # Fall through to peer Ollama explicitly. The default
+        # `pick_chat_target` ranks peers by capability score, NOT by
+        # "who has this model". On a model the host doesn't have but
+        # a peer does, capability-based routing can land us on a
+        # higher-scored peer that ALSO doesn't have the model — or
+        # even on host's Ollama (which 404s because host doesn't have
+        # it). To prevent that 404 cascade we explicitly return the
+        # specific peer that has the model as the engine target. The
+        # caller (`route_chat_for`) honours this short-circuit.
         await stop_all_running_splits()
+        if peer_with_model is not None:
+            return {
+                "engine": "ollama",
+                "force_worker_id": peer_with_model.get("id"),
+                "force_worker_label": peer_with_model.get("label"),
+                "force_reason": (
+                    f"host doesn't have {model_name!r}; routing to peer "
+                    f"{peer_with_model.get('label')!r} which has it"
+                ),
+            }
         return {"engine": "ollama"}
 
     size_bytes = info["size_bytes"]
