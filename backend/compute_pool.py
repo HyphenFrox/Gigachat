@@ -4001,35 +4001,48 @@ def _should_force_split_for(
     # Host pressure short-circuit. The split-llama-server runs ON the
     # orchestrator (host) — it spawns the llama-server process locally,
     # mmaps weights from the host disk, and holds at least the host's
-    # share of weights in host RAM during inference. When host RAM is
-    # already over the 5 % safety margin, engaging split would push
-    # host into hard OOM territory: the model load triggers ~1.5-2 GB
-    # of additional resident allocations on a 7-8 GB laptop that's
-    # already at 75-80 %. The OOM cascades through the asyncio loop
-    # (psutil PEB reads stall, request handlers timeout, peer probes
-    # fail), bringing the orchestrator down. Symptom from the recent
-    # test: 99.6 % host RAM during phase1_1, host backend hung for
-    # 200 s, all 4 chats returned 0 deltas.
+    # share of weights in host RAM during inference.
     #
-    # When the pool already has a node that fits the model alone
-    # (e.g. FBS with 8 GB VRAM holds llama3.1:8b at 4 GB Q4), routing
-    # the chat to that single peer is strictly better than engaging
-    # split: zero host disk pressure, zero host RAM impact, and the
-    # peer's NVIDIA backend gives higher TPS than a multi-iGPU split
-    # anyway. The 5 % policy applies here too — we'd rather have ONE
-    # device under load (FBS at 95 %) than ALL three at the failure
-    # threshold.
+    # Pre-spawn Ollama eviction (added in `split_lifecycle.start`) frees
+    # ~3 GB on a typical host before the llama-server load. So we can
+    # engage split when CURRENT_PCT - OLLAMA_OCCUPIED_PCT < 80 %, i.e.
+    # when post-eviction we'd be safely below 80 %. The threshold here
+    # is the post-eviction projection.
+    #
+    # When even the projected post-eviction host RAM is over the 5 %
+    # safety margin, route to the strongest single peer alone instead.
+    # That keeps the chat usable on a constrained orchestrator without
+    # dragging the host into OOM territory.
     try:
         import psutil
         host_ram_used_pct = float(psutil.virtual_memory().percent)
+        host_ram_total_gb = float(psutil.virtual_memory().total) / (1024 ** 3)
     except Exception:
         host_ram_used_pct = 0.0
-    if host_ram_used_pct >= 80.0:
+        host_ram_total_gb = 0.0
+    # Estimate Ollama-evictable RAM by polling its /api/ps. Each
+    # currently-loaded model contributes its `size` bytes that the
+    # eviction flow will release before split spawn.
+    evictable_gb = 0.0
+    try:
+        import urllib.request, json as _json
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/ps", timeout=2.0) as r:
+            ps = _json.loads(r.read())
+        for m in (ps.get("models") or []):
+            evictable_gb += float(m.get("size") or 0) / (1024 ** 3)
+    except Exception:
+        evictable_gb = 0.0
+    if host_ram_total_gb > 0 and evictable_gb > 0:
+        evictable_pct = 100.0 * evictable_gb / host_ram_total_gb
+        projected_pct = max(0.0, host_ram_used_pct - evictable_pct)
+    else:
+        projected_pct = host_ram_used_pct
+    if projected_pct >= 80.0:
         log.info(
-            "compute_pool: host RAM at %.0f%% — skipping adaptive split for "
-            "%r so the orchestrator stays responsive (single-peer route "
-            "preferred over split when host is constrained)",
-            host_ram_used_pct, model_name,
+            "compute_pool: projected post-eviction host RAM at %.0f%% "
+            "(current=%.0f%%, evictable=%.1f GB) — skipping adaptive "
+            "split for %r so the orchestrator stays responsive",
+            projected_pct, host_ram_used_pct, evictable_gb, model_name,
         )
         return False
 
