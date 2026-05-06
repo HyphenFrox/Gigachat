@@ -8211,9 +8211,31 @@ async def route_chat_for(
                              + float(peer_caps.get("vram_total_gb") or 0))
                             * (1024 ** 3)
                         )
+                        # NEW: Peer can serve via Ollama using its
+                        # combined VRAM + RAM capacity (Ollama natively
+                        # spills weights to RAM when VRAM is full —
+                        # `num_gpu` defaults to "as many layers as fit").
+                        # When the peer can hold the model in VRAM+RAM
+                        # (with the 5 % safety margin), there's no
+                        # reason to pull the GGUF to a constrained host
+                        # — we can route the chat directly to peer
+                        # Ollama which will load + serve in a single
+                        # round-trip. This catches the deepseek-class
+                        # case (9 GB model, FBS has 8 GB VRAM + 16 GB
+                        # RAM = 24 GB total): pulling 8 GB over LAN to
+                        # host first would burn ~5 min of transfer time
+                        # AND fill host's tiny disk-RAM budget for no
+                        # win.
+                        peer_fits_via_ram_offload = (
+                            model_bytes > 0
+                            and not fits_strongest_single
+                            and peer_free_bytes > 0
+                            and model_bytes <= int(peer_free_bytes * _RESOURCE_USE_FRACTION)
+                        )
                         peer_orchestrated_split_viable = (
                             model_bytes > 0
                             and not fits_strongest_single
+                            and not peer_fits_via_ram_offload
                             and peer_free_bytes > 0
                             and model_bytes > int(peer_free_bytes * _RESOURCE_USE_FRACTION)
                         )
@@ -8231,6 +8253,20 @@ async def route_chat_for(
                             # Still mark host as not having it; the
                             # routing path further down will pick the
                             # peer naturally because pool_has is True.
+                        elif peer_fits_via_ram_offload:
+                            log.info(
+                                "compute_pool: skipping LAN pull-to-host "
+                                "of %r (%.2f GB) — peer %s has it and can "
+                                "serve via Ollama VRAM(%.1f GB)+RAM(%.1f GB) "
+                                "spill (combined %.1f GB with 5%% margin); "
+                                "chat will route to peer Ollama directly",
+                                model_name,
+                                model_bytes / (1024 ** 3),
+                                src_w.get("label"),
+                                float(peer_caps.get("vram_total_gb") or 0),
+                                float(peer_caps.get("ram_free_gb") or 0),
+                                peer_free_bytes / (1024 ** 3),
+                            )
                         elif peer_orchestrated_split_viable:
                             log.info(
                                 "compute_pool: skipping LAN pull-to-host "
