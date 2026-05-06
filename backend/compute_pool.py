@@ -2865,11 +2865,23 @@ async def _measure_host_throughput(model_name: str) -> float:
     tiny /api/generate against `localhost:11434`; result valid for
     `_THROUGHPUT_CACHE_TTL_SEC`. Returns 0 on failure (caller falls
     back to heuristic ranking).
+
+    Skip when host doesn't actually have the model on its Ollama —
+    the bench would 404 (wasting an HTTP round-trip) or, worse, trip
+    Ollama's auto-pull (consuming WAN bandwidth + GBs of disk for a
+    model the user never asked to be on host). Caller falls back to
+    heuristic axes via the cache-miss path.
     """
     cached = _HOST_THROUGHPUT_CACHE.get(model_name)
     now = time.time()
     if cached and (now - cached[1]) < _THROUGHPUT_CACHE_TTL_SEC:
         return cached[0]
+    if resolve_ollama_model(model_name) is None:
+        # Host doesn't have it — caching the 0 means we don't keep
+        # re-trying. The cache entry expires after the TTL so a later
+        # `ollama pull` makes the bench eligible again.
+        _HOST_THROUGHPUT_CACHE[model_name] = (0.0, now)
+        return 0.0
     tps, _ = await _measure_throughput("http://localhost:11434", None, model_name)
     if tps > 0:
         # Re-insertion order is preserved on dict (CPython 3.7+); pop
