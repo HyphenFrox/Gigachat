@@ -935,6 +935,27 @@ def local_snapshot() -> dict[str, Any]:
     snap["net_recv_kbps"] = sampler.net_recv_kbps
     # ---- Gigachat-app share --------------------------------------------
     snap["app"] = _app_process_snapshot()
+    # ---- RPC server endpoints (advertised to the orchestrator) ---------
+    # Exposes whatever rpc-servers the local supervisor has running so
+    # the orchestrator can read live state without a separate probe.
+    # Without this, `compute_pool.ensure_rpc_servers_via_proxy_multi`
+    # is the only writer to `capabilities.rpc_endpoints`, which means
+    # the supervisor's auto-restart of (e.g.) SYCL0 on :50052 doesn't
+    # propagate to the orchestrator's routing layer until the next
+    # split-time engagement — so the split-llama-server gets pointed
+    # at a stale endpoint advertisement (e.g. "CPU on :50052") even
+    # though the actual rpc-server is running SYCL. The mismatch
+    # causes mid-load layout failures that crash the split.
+    try:
+        from . import p2p_rpc_server as _rpc
+        ab = _rpc._active_backends or {}
+        if ab:
+            snap["rpc_endpoints"] = [
+                {"port": int(p), "backend": str(b)}
+                for p, b in sorted(ab.items())
+            ]
+    except Exception as e:
+        log.debug("local_snapshot: rpc_endpoints export failed: %s", e)
     # ---- Rolling-window aggregates -------------------------------------
     # 60-second window of cpu / gpu_util / vram / ram min/max/avg/p95.
     # Lets the UI distinguish a 70%-for-1s spike from sustained 70%-for-60s
