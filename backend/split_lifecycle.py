@@ -2837,6 +2837,18 @@ async def start(split_id: str) -> dict:
         # reclaim it (otherwise a split that's loaded but not yet
         # used by chat would be eligible immediately).
         last_touched_at=now,
+        # Treat the spawn moment as the most recent rebalance so the
+        # watchdog's `_REBALANCE_COOLDOWN_SEC` check honours the
+        # post-spawn quiet window. Without this, the first watchdog
+        # tick (10 s after start, while the model is still mid-upload
+        # over RPC) sees `last_rebalance_at = 0` and immediately fires
+        # a restart on any small ngl drift — killing the in-flight
+        # weight upload and starting the load from scratch every
+        # tick. Initialising to `now` keeps the watchdog quiet for
+        # the full cooldown window so a load that needs ~3-5 minutes
+        # of weight upload across multiple iGPU rpc-servers can
+        # actually finish.
+        last_rebalance_at=now,
         log_path=log_path,
         cmd=cmd,
         ngl=ngl,
