@@ -994,6 +994,11 @@ def _compute_optimal_ctx_size(
     """
     kv_per_token = _estimate_kv_bytes_per_slot(gguf_path, ctx_size=1)
     if kv_per_token <= 0:
+        log.info(
+            "split_lifecycle: adaptive ctx: kv_per_token=0 (metadata "
+            "missing) -> falling back to %d",
+            _CTX_SIZE_FLOOR,
+        )
         return _CTX_SIZE_FLOOR
     if cache_type == "q8_0":
         kv_per_token = max(1, kv_per_token // 2)
@@ -1011,7 +1016,12 @@ def _compute_optimal_ctx_size(
         spec = sysdetect.detect_system()
         host_vram_gb = float(spec.get("vram_gb") or 0)
         host_ram_gb = float(spec.get("ram_gb") or 0)
-    except Exception:
+    except Exception as _sysdetect_err:
+        log.info(
+            "split_lifecycle: adaptive ctx: sysdetect failed (%s) "
+            "-> falling back to %d",
+            _sysdetect_err, _CTX_SIZE_FLOOR,
+        )
         return _CTX_SIZE_FLOOR
 
     endpoint_caps_gb: list[float] = []  # in GB
@@ -1061,12 +1071,20 @@ def _compute_optimal_ctx_size(
                 endpoint_caps_gb.append(max(0.5, ram_free_gb))
 
     if not endpoint_caps_gb:
+        log.info(
+            "split_lifecycle: adaptive ctx: no endpoints found -> "
+            "falling back to %d", _CTX_SIZE_FLOOR,
+        )
         return _CTX_SIZE_FLOOR
 
     # Convert to bytes. Sum and find smallest.
     endpoint_caps = [int(c * (1024 ** 3)) for c in endpoint_caps_gb]
     sum_caps = sum(endpoint_caps)
     if sum_caps <= 0:
+        log.info(
+            "split_lifecycle: adaptive ctx: sum_caps=0 (caps=%s) -> "
+            "falling back to %d", endpoint_caps_gb, _CTX_SIZE_FLOOR,
+        )
         return _CTX_SIZE_FLOOR
     smallest_cap = min(endpoint_caps)
     weights_offloaded = int(target_size_bytes or 0) + int(draft_size_bytes or 0)
@@ -1083,6 +1101,13 @@ def _compute_optimal_ctx_size(
     smallest_weights = int(smallest_share * weights_offloaded)
     smallest_kv_budget = int((smallest_cap - smallest_weights) * 0.5)
     if smallest_kv_budget <= 0:
+        log.info(
+            "split_lifecycle: adaptive ctx: smallest_kv_budget<=0 "
+            "(smallest_cap=%.2fGB share=%.2f weights=%.2fGB) -> "
+            "falling back to %d",
+            smallest_cap / (1024 ** 3), smallest_share,
+            smallest_weights / (1024 ** 3), _CTX_SIZE_FLOOR,
+        )
         return _CTX_SIZE_FLOOR
 
     # Per-endpoint kv at n_ctx = (ep_cap / sum_caps) × kv_per_token × n_ctx
