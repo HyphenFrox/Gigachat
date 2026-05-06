@@ -8640,13 +8640,45 @@ async def route_chat_for(
                     split_draft = cand
                     split_draft_path = cand["gguf_path"]
 
-            base_url = await _ensure_split_running_for(
-                model_name,
-                info["gguf_path"],
-                worker_ids,
-                mmproj_path=info.get("mmproj_path"),
-                draft_gguf_path=split_draft_path,
-            )
+            # Wrap split spawn in a try/except. The original "strict
+            # semantics" comment said split failure should NOT fall
+            # back to host Ollama because split was chosen because
+            # host couldn't fit the model. But that's only true for
+            # the !host_can_run_alone case. When host CAN run alone
+            # but we engaged split for parallelism / iGPU usage, a
+            # split failure should NOT take down the chat — the
+            # user's intent is to chat, not to drive the pool. Fall
+            # back to host Ollama in that case so the chat completes
+            # (slower but works) instead of error-and-exit.
+            #
+            # Verified-against-bug case: 2nd of 3 concurrent
+            # llama3.1:8b chats. FBS NVIDIA full → router picks
+            # split. Split-llama-server fails (SYCL+RPC crash) → chat
+            # hangs forever. After fix: chat falls back to host
+            # Ollama which already has llama3.1:8b loaded → completes.
+            try:
+                base_url = await _ensure_split_running_for(
+                    model_name,
+                    info["gguf_path"],
+                    worker_ids,
+                    mmproj_path=info.get("mmproj_path"),
+                    draft_gguf_path=split_draft_path,
+                )
+            except Exception as split_err:
+                if host_can_run_alone:
+                    log.warning(
+                        "compute_pool: split spawn failed for %s (%s) "
+                        "— host CAN run this model alone, falling back "
+                        "to host Ollama (slower but completes). "
+                        "split_err=%r",
+                        model_name, type(split_err).__name__, split_err,
+                    )
+                    await stop_all_running_splits()
+                    return {"engine": "ollama"}
+                # Host can't run alone — split was the only viable
+                # path; surface the error so the user sees it instead
+                # of a silent CPU-on-disk death spiral.
+                raise
             if split_draft:
                 log.info(
                     "compute_pool: speculative decoding stacked on layer-"
