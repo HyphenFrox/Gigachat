@@ -3860,38 +3860,25 @@ def _should_force_split_for(
     eligible = _eligible_split_workers()
     if not eligible:
         return False
-    # iGPU-first engagement: when ANY participant in the pool exposes
-    # an Intel / SYCL / Vulkan iGPU, prefer the split path. Ollama on
-    # Windows ships with CUDA + CPU backends only — it CANNOT use
-    # iGPUs at all. The split path runs llama-server with SYCL on
-    # host AND fans layers via `--rpc <peer>:50052` to peer SYCL
-    # rpc-servers, lighting up every iGPU on the LAN. Without this
-    # branch, every chat that fits a single peer's NVIDIA falls
-    # straight to Ollama and the laptops' iGPUs sit at 0 % util.
+    # iGPU-first engagement is GATED by the model needing the pool.
     #
-    # Safe to engage default-on now that we ship a patched llama.cpp
-    # build (gigachat_patch_marker.txt) where ggml-rpc.cpp throws a
-    # recoverable exception instead of GGML_ABORT()ing on transient
-    # RPC failures — the chat layer auto-retries on 5xx so a Wi-Fi
-    # blip mid-decode is invisible to the user.
-    has_igpu_anywhere = False
-    for w in eligible:
-        caps = w.get("capabilities") or {}
-        kind = (caps.get("gpu_kind") or "").lower()
-        if kind in ("intel", "vulkan", "sycl"):
-            has_igpu_anywhere = True
-            break
-    if not has_igpu_anywhere:
-        try:
-            from . import sysdetect
-            host_kind = (sysdetect.detect_system().get("gpu_kind") or "").lower()
-            if host_kind in ("intel", "vulkan", "sycl"):
-                has_igpu_anywhere = True
-        except Exception:
-            pass
-    if has_igpu_anywhere and pool_vram_total > 0:
-        return True
-    # Legacy outscale fallback for the rare iGPU-less pool.
+    # Old policy: any time the pool has an iGPU, force split mode so
+    # the iGPU isn't idle. That sounds nice but mid-decode SYCL+RPC
+    # crashes (llama.cpp #22643) make 4-backend splits unstable, AND
+    # the user clarified "use all resources where it HELPS speed —
+    # don't engage all devices when one is enough". For a 5 GB model
+    # that fits one node's NVIDIA cleanly, single-node Ollama wins
+    # on raw token rate (no per-token RPC tax) AND avoids the
+    # cross-backend graph-split bug.
+    #
+    # New rule: only engage split for fits-on-host models when the
+    # POOL is meaningfully bigger than the strongest single node
+    # (≥ 1.5×). For a model that fits 50 % of one node's VRAM, the
+    # pool's extra capacity isn't doing anything useful — skip
+    # split. For a model that consumes 80 % of one node's VRAM
+    # but the pool has 2 nodes that together can hold 2× that,
+    # split helps (more KV cache room, longer context). The
+    # `_POOL_VRAM_OUTSCALE_FACTOR` (1.5) is the trip wire.
     if strongest_single_vram <= 0:
         return False
     return pool_vram_total >= strongest_single_vram * _POOL_VRAM_OUTSCALE_FACTOR
