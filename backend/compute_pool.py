@@ -8348,48 +8348,29 @@ async def route_chat_for(
             (w.get("capabilities") or {}).get("probe_latency_ms") or 0
             for w in rpc_workers
         )
-        # Bandwidth-aware filter: drop workers whose measured
-        # Bandwidth filter: drop peers below `_BW_FLOOR_MBPS` so a
-        # genuinely slow link (old Wi-Fi router, congested mesh,
-        # WAN/Tailscale-relay) doesn't make split slower than
-        # single-host. Per-token layer-push for a 7 B model is ~200-
-        # 500 KB; below 1 MB/s that's 200-500 ms per-token tax which
-        # dominates token generation rate.
+        # No bandwidth filter at this layer.
         #
-        # The measurement comes from `probe_worker_bandwidth` which
-        # is now run at backend startup + after long idle periods
-        # (NOT inline with chat) so the asyncio event loop is quiet
-        # enough to give a real number. Probes during heavy chat
-        # traffic are unreliable; we only TRUST the cached value if
-        # `bandwidth_probed_at` shows the probe ran during a quiet
-        # window.
-        _BW_FLOOR_MBPS = 1.0
-
-        def _bandwidth_pass(w: dict) -> bool:
-            caps = w.get("capabilities") or {}
-            bw = caps.get("bandwidth_mbps")
-            if not bw:
-                # Never measured / measurement cleared → keep the
-                # peer (innocent until proven slow). The startup
-                # probe will fill it in soon.
-                return True
-            return float(bw) >= _BW_FLOOR_MBPS
-
-        before_filter = list(rpc_workers)
-        rpc_workers = [w for w in rpc_workers if _bandwidth_pass(w)]
-        dropped = [w.get("label") for w in before_filter if w not in rpc_workers]
-        if dropped:
-            log.info(
-                "compute_pool: dropped %d slow peer(s) below %.1f MB/s: %s",
-                len(dropped), _BW_FLOOR_MBPS, dropped,
-            )
-        if not rpc_workers:
-            log.info(
-                "compute_pool: every rpc worker dropped by bandwidth filter "
-                "— host-only path for %s", model_name,
-            )
-            await stop_all_running_splits()
-            return {"engine": "ollama"}
+        # Two reasons it was removed (commit 2610378 + this commit):
+        #
+        #   1. Since the relay-fallback was removed, ANY peer the
+        #      orchestrator can talk to is reachable directly over LAN
+        #      — there's no scenario where a peer is registered as
+        #      `rpc_server_reachable=True` but is on a slow WAN path.
+        #      The filter would only ever drop healthy LAN peers based
+        #      on contention noise in the bandwidth probe.
+        #
+        #   2. The measurement is unreliable under load. The probe
+        #      shares the asyncio event loop and httpx pool with chat
+        #      traffic; even on Gigabit LAN it routinely reports 0.2-
+        #      1 MB/s when the agent is busy with embeddings or
+        #      llama-server is mid-prompt-eval. Filtering on this
+        #      noisy signal removes peers the user would consider
+        #      perfectly usable.
+        #
+        # The cached `bandwidth_mbps` capability is still useful for
+        # diagnostics (Settings UI shows it) and could feed future
+        # load-balancing heuristics; we just don't gate split
+        # eligibility on it anymore.
 
         # Mega-model: model exceeds combined pool memory. Engages
         # split anyway — llama.cpp's adaptive `-ngl` puts as many
