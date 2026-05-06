@@ -195,6 +195,19 @@ async def lifespan(_app: FastAPI):
     # reconcile (clears stale `running` rows from the previous process).
     await _start_compute_pool_probe()
     await _reconcile_split_models()
+    # rpc-server supervisor — picks the right backends for THIS box
+    # (Intel iGPU → SYCL0+CPU, NVIDIA → CUDA0+CPU, AMD → Vulkan0+CPU,
+    # CPU-only → CPU) and keeps them listening forever. Without this,
+    # rpc-servers only spawn at split-time which means (a) cold-start
+    # tax on every first chat in a session, and (b) no-iGPU peers
+    # silently abort during SYCL DLL load and never join the pool.
+    # Also re-quarantines `ggml-sycl.dll` on no-iGPU machines on
+    # every tick so a hardware change self-heals.
+    try:
+        from . import p2p_rpc_server as _rpc_sup
+        await _rpc_sup.start_supervisor()
+    except Exception as e:
+        log.warning("p2p_rpc_server supervisor startup failed: %s", e)
     # MCP servers last so they can talk to Ollama + the compute pool when
     # they need to.
     await _start_mcp()
@@ -300,6 +313,11 @@ async def lifespan(_app: FastAPI):
     await _evrt.stop_event_runtime()
     await _stop_mcp()
     await _stop_split_models()
+    try:
+        from . import p2p_rpc_server as _rpc_sup
+        await _rpc_sup.stop_supervisor()
+    except Exception as e:
+        log.warning("p2p_rpc_server supervisor stop failed: %s", e)
     await _stop_compute_pool_probe()
     await _stop_stale_watchdog()
     await _stop_scheduler()

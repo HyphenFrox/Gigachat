@@ -403,6 +403,95 @@ def _try_lan_fetch_dll(filename: str) -> bool:
     return False
 
 
+def _local_has_intel_igpu() -> bool:
+    """Cheap self-check: does THIS machine have an Intel iGPU?
+
+    Used to decide whether shipping ``ggml-sycl.dll`` is safe. On a
+    no-iGPU machine (NVIDIA-only desktop, AMD laptop, Apple silicon),
+    the SYCL backend tries to enumerate Intel level_zero devices,
+    finds zero, and SILENTLY ABORTS the rpc-server process before it
+    binds the port — leaving us with a "spawn succeeded but never
+    listened" failure that the orchestrator surfaces as
+    ``rpc-server probe: timeout`` with no log trail. The user-visible
+    symptom: FBS-style dGPU peers can never join the split pool.
+
+    The fix is to disable the SYCL DLL on these peers so the
+    rpc-server doesn't try to load it. Detection has to be
+    process-local — we can't ask the orchestrator because it's the
+    one calling US to bring up the rpc-server in the first place.
+    """
+    try:
+        from . import sysdetect
+        spec = sysdetect.detect_system()
+        return (spec.get("gpu_kind") or "").lower() == "intel"
+    except Exception:
+        return False
+
+
+def _quarantine_sycl_dll_if_no_igpu() -> bool:
+    """Rename ``ggml-sycl.dll`` to ``ggml-sycl.dll.skip-install`` when
+    this machine has no Intel iGPU.
+
+    Idempotent + symmetric: also UN-quarantines (renames the marker
+    back) when the machine DOES have an iGPU but the DLL is currently
+    sidelined — handles the case where a user adds an Intel GPU later
+    or moves the install to a different machine.
+
+    Returns True if any rename happened (caller can log it).
+    """
+    sycl_dll = _RPC_SERVER_BIN_DIR / "ggml-sycl.dll"
+    skip_marker = _RPC_SERVER_BIN_DIR / "ggml-sycl.dll.skip-install"
+    no_igpu_marker = _RPC_SERVER_BIN_DIR / "ggml-sycl.dll.removed-no-igpu"
+    has_igpu = _local_has_intel_igpu()
+    changed = False
+    if not has_igpu:
+        # Move active DLL OUT of the way so the rpc-server doesn't
+        # try to dlopen it during backend enumeration.
+        if sycl_dll.is_file():
+            try:
+                if no_igpu_marker.is_file():
+                    no_igpu_marker.unlink()
+                sycl_dll.rename(no_igpu_marker)
+                log.info(
+                    "p2p_rpc_server: no Intel iGPU detected — quarantined "
+                    "ggml-sycl.dll → %s so rpc-server can spawn without "
+                    "the silent-abort that hits no-iGPU peers",
+                    no_igpu_marker.name,
+                )
+                changed = True
+            except OSError as e:
+                log.warning(
+                    "p2p_rpc_server: failed to quarantine ggml-sycl.dll: %s",
+                    e,
+                )
+        # ALSO drop the skip-install marker so the LAN auto-fetcher
+        # doesn't silently re-pull the DLL on the next spawn.
+        if not skip_marker.is_file():
+            try:
+                skip_marker.write_bytes(b"no Intel iGPU on this machine\n")
+            except OSError:
+                pass
+    else:
+        # Has iGPU now — restore from the no-iGPU marker if we'd
+        # previously sidelined it. Don't touch a user-placed
+        # ``.skip-install`` (that's the host-orchestrator's
+        # explicit "stay disabled" knob).
+        if no_igpu_marker.is_file() and not sycl_dll.is_file():
+            try:
+                no_igpu_marker.rename(sycl_dll)
+                log.info(
+                    "p2p_rpc_server: Intel iGPU now present — restored "
+                    "ggml-sycl.dll from %s", no_igpu_marker.name,
+                )
+                changed = True
+            except OSError as e:
+                log.warning(
+                    "p2p_rpc_server: failed to restore ggml-sycl.dll: %s",
+                    e,
+                )
+    return changed
+
+
 def auto_install_missing_dlls() -> dict:
     """Try to LAN-install every missing rpc-server dependency.
     Returns a summary so the spawn handler can include it in the
@@ -411,7 +500,14 @@ def auto_install_missing_dlls() -> dict:
     Required DLLs (e.g. ``ggml-rpc.dll``) gate the spawn — if any
     can't be sourced, we abort. Optional DLLs (e.g. ``ggml-sycl.dll``)
     are best-effort: pulled if available, ignored if not.
+
+    Pre-step: quarantine ``ggml-sycl.dll`` on no-iGPU peers so the
+    rpc-server doesn't silently abort during SYCL backend
+    enumeration. This is the difference between FBS-style NVIDIA
+    boxes joining the split pool versus reporting
+    ``rpc-server probe: timeout`` forever.
     """
+    _quarantine_sycl_dll_if_no_igpu()
     summary: dict = {"installed": [], "still_missing": []}
     for name in _missing_rpc_dlls():
         if _try_lan_fetch_dll(name):
@@ -419,6 +515,11 @@ def auto_install_missing_dlls() -> dict:
         else:
             summary["still_missing"].append(name)
     for name in _missing_optional_dlls():
+        # Don't auto-fetch SYCL DLL on a no-iGPU machine — would
+        # re-create exactly the silent-abort condition we just
+        # quarantined.
+        if name == "ggml-sycl.dll" and not _local_has_intel_igpu():
+            continue
         if _try_lan_fetch_dll(name):
             summary["installed"].append(name)
         # Optional — silent on still-missing.
@@ -620,3 +721,175 @@ def get_local_rpc_server_status(port: int = _DEFAULT_PORT) -> dict:
         "active_backend": _active_backends.get(port),
         "active_backends": dict(_active_backends),
     }
+
+
+# ---------------------------------------------------------------------------
+# Supervisor — keep rpc-servers up FOREVER once Gigachat is running.
+#
+# Without this, rpc-servers only spawn at split-time (host calls
+# `_set_workers_backend` → `ensure_rpc_servers_via_proxy_multi`). Between
+# splits — or if a peer reboots while no split is active — the rpc-server
+# is simply not running, and the next split-time spawn pays the cold-start
+# tax (5–30 s of SYCL JIT / CUDA init / weight upload) AND, on the
+# no-iGPU peer bug we just fixed, may fail outright.
+#
+# The supervisor:
+#   1. Picks an OPTIMAL backend set for THIS machine based on local
+#      hardware (Intel iGPU → SYCL0+CPU, NVIDIA → CUDA0+CPU,
+#      AMD → Vulkan0+CPU, generic CPU → CPU only).
+#   2. At startup, calls `ensure_local_rpc_servers(specs)` so the
+#      rpc-servers are listening immediately.
+#   3. Polls every 30 s; if any port no longer listens, respawns it.
+#   4. Re-runs the SYCL DLL quarantine on every tick so a hardware
+#      change (user adds an Intel GPU later, or moves the install to
+#      a different box) self-heals without a Gigachat restart.
+#
+# This implements the user's "once we run the app it should stay up
+# forever" expectation. ~minimal CPU cost (one TCP self-connect per
+# port per 30 s).
+# ---------------------------------------------------------------------------
+
+_SUPERVISOR_TICK_SEC = 30.0
+_supervisor_task: "object | None" = None
+
+
+def _decide_local_rpc_specs() -> list[dict]:
+    """Pick the (port, backend) tuples this machine should expose
+    based on its hardware. One iGPU/dGPU endpoint + one CPU endpoint
+    on machines with a GPU; CPU-only on machines without one.
+
+    Port assignments match what the orchestrator expects via
+    ``capabilities.rpc_endpoints``: 50052 for the GPU backend,
+    50053 for the CPU backend. Single-backend machines just expose
+    50052 with the appropriate `-d` so legacy single-port routing
+    keeps working.
+    """
+    try:
+        from . import sysdetect
+        spec = sysdetect.detect_system()
+    except Exception:
+        return [{"port": 50052, "backend": "CPU"}]
+    gpu_kind = (spec.get("gpu_kind") or "").lower()
+    if gpu_kind == "intel":
+        return [
+            {"port": 50052, "backend": "SYCL0"},
+            {"port": 50053, "backend": "CPU"},
+        ]
+    if gpu_kind == "nvidia":
+        return [
+            {"port": 50052, "backend": "CUDA0"},
+            {"port": 50053, "backend": "CPU"},
+        ]
+    if gpu_kind == "amd":
+        # ROCm/Vulkan path — most consumer AMDs land on Vulkan via
+        # llama.cpp's auto-detection; we expose Vulkan0 and CPU.
+        return [
+            {"port": 50052, "backend": "Vulkan0"},
+            {"port": 50053, "backend": "CPU"},
+        ]
+    if gpu_kind == "apple":
+        # Apple silicon — Metal handled by ggml-metal; the rpc-server
+        # binary on Apple uses Metal as its single backend.
+        return [{"port": 50052, "backend": "Metal"}]
+    # CPU-only machine — one CPU endpoint is plenty.
+    return [{"port": 50052, "backend": "CPU"}]
+
+
+def _supervisor_tick() -> None:
+    """One pass of the supervisor: ensure every desired rpc-server is
+    listening on its assigned port. Idempotent — no-op when nothing
+    needs to change.
+    """
+    if not _RPC_SERVER_EXE.is_file():
+        # rpc-server not installed yet — let the auto-installer pick
+        # it up on the next user-driven action. We don't try to
+        # bootstrap the binary itself here; that's the install.bat
+        # path, not the supervisor's job.
+        return
+    # Run the no-iGPU quarantine first — cheap stat-only check that's
+    # essential on hardware-change boundaries.
+    try:
+        _quarantine_sycl_dll_if_no_igpu()
+    except Exception as e:
+        log.debug("p2p_rpc_server supervisor: quarantine check failed: %s", e)
+    specs = _decide_local_rpc_specs()
+    for spec in specs:
+        port = int(spec.get("port") or _DEFAULT_PORT)
+        backend = (spec.get("backend") or _DEFAULT_BACKEND).strip()
+        if _is_listening_on(port) and _active_backends.get(port) == backend:
+            continue  # already up with the right backend
+        try:
+            result = start_local_rpc_server(backend=backend, port=port)
+            if result.get("listening"):
+                log.info(
+                    "p2p_rpc_server supervisor: (re)started %s on :%d",
+                    backend, port,
+                )
+            else:
+                log.warning(
+                    "p2p_rpc_server supervisor: failed to bring up %s on "
+                    ":%d — %s", backend, port, result.get("status"),
+                )
+        except Exception as e:
+            log.warning(
+                "p2p_rpc_server supervisor: spawn raised on %s:%d: %s",
+                backend, port, e,
+            )
+
+
+async def start_supervisor() -> None:
+    """Schedule the supervisor as a background asyncio task.
+
+    Idempotent — calling twice is safe (the second call is a no-op).
+    First tick fires immediately so rpc-servers come up at peer boot
+    BEFORE the first chat / split request arrives. Subsequent ticks
+    every ``_SUPERVISOR_TICK_SEC`` seconds.
+    """
+    import asyncio
+    global _supervisor_task
+    if _supervisor_task is not None:
+        return
+
+    async def _loop() -> None:
+        # First tick: synchronous (no sleep) so rpc-servers are up
+        # before we yield back to the lifespan startup chain.
+        try:
+            await asyncio.to_thread(_supervisor_tick)
+        except Exception as e:
+            log.warning("p2p_rpc_server supervisor: first tick failed: %s", e)
+        while True:
+            try:
+                await asyncio.sleep(_SUPERVISOR_TICK_SEC)
+            except asyncio.CancelledError:
+                return
+            try:
+                await asyncio.to_thread(_supervisor_tick)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.warning(
+                    "p2p_rpc_server supervisor: tick failed: %s", e,
+                )
+
+    _supervisor_task = asyncio.create_task(
+        _loop(), name="p2p_rpc_server_supervisor",
+    )
+    log.info(
+        "p2p_rpc_server: supervisor started (tick=%ds) — keeps rpc-servers "
+        "up forever once the app is running",
+        int(_SUPERVISOR_TICK_SEC),
+    )
+
+
+async def stop_supervisor() -> None:
+    """Cancel the supervisor task. Called from app shutdown."""
+    import asyncio
+    global _supervisor_task
+    if _supervisor_task is None:
+        return
+    _supervisor_task.cancel()
+    try:
+        await _supervisor_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    _supervisor_task = None
