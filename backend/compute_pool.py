@@ -5124,10 +5124,20 @@ async def _eligible_split_workers_with_autoprep() -> list[dict]:
         # Bandwidth probe — coarse but cheap (single existing API
         # round-trip); persists `bandwidth_mbps` so future routing
         # can demote slow peers from split engagement.
-        try:
-            bw = await probe_worker_bandwidth(w)
-        except Exception:
-            bw = 0.0
+        #
+        # Gate on `_is_chat_active()`: if a chat is already running on
+        # any pool node, the probe taken under load measures
+        # asyncio-loop contention (200x lower than real Mbps) and would
+        # falsely demote a healthy peer below the routing threshold.
+        # The cached `bandwidth_mbps_max` from the heartbeat-side
+        # quiet-window probe is the honest signal for routing; let
+        # this prep call refresh stats only, leave bandwidth alone.
+        bw = 0.0
+        if not _is_chat_active():
+            try:
+                bw = await probe_worker_bandwidth(w)
+            except Exception:
+                bw = 0.0
         if stats:
             try:
                 caps = dict(w.get("capabilities") or {})
