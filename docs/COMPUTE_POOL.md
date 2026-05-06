@@ -245,15 +245,17 @@ llama_model_load_from_file_impl: failed to load model
 
 **Fix on the way:** rebase the Gigachat resilience patch onto a newer llama.cpp tag (b9100+) that has full PLE support. The patch is small (~150 lines, all in `ggml-rpc.cpp` / `transport.cpp` / `ggml-sycl.cpp` / `server-context.cpp`) so the rebase is straightforward — see `vendor/llama.cpp-patches/README.md` for the build flow.
 
-### Mixing SYCL + Vulkan iGPU backends in one llama-server crashes
+### Multi-iGPU SYCL split: keep peers on the SAME backend
 
-When a single `llama-server` orchestrator has at least two RPC peers AND those peers expose Intel iGPU compute via DIFFERENT backends — one via SYCL, one via Vulkan — the process crashes during prompt-eval with `STATUS_STACK_BUFFER_OVERRUN` (`rc=0xC0000409`). Diagnosed by upstream maintainer in [llama.cpp #22643](https://github.com/ggml-org/llama.cpp/issues/22643): the underlying culprit is an exception inside `ggml_backend_sycl_buffer_set_tensor` (`ggml-sycl.cpp:471` — a `memcpy.wait()` failure) that escapes through C frames to `__fastfail`, killing the whole orchestrator with no recovery.
+When a `llama-server` orchestrator engages split-mode across multiple Intel-iGPU peers, **every peer's rpc-server should expose the iGPU via the same backend** — typically SYCL. Mixing backends across peers (e.g. one peer on SYCL, another on Vulkan, both feeding the same llama-server via `--rpc`) used to crash the orchestrator with `STATUS_STACK_BUFFER_OVERRUN` (`rc=0xC0000409`). Diagnosed in [llama.cpp #22643](https://github.com/ggml-org/llama.cpp/issues/22643): an uncaught exception in `ggml_backend_sycl_buffer_set_tensor` (`ggml-sycl.cpp:471` — `memcpy.wait()`) escapes through C frames to `__fastfail`.
 
-The Gigachat resilience patch wraps `RPC_STATUS_ASSERT` in a recoverable `std::runtime_error` and converts SYCL `exit()` calls to throws, but the `memcpy.wait()` exception path **isn't catchable upstream** without a llama.cpp source change.
+**What the orchestrator does to keep things stable:**
 
-**Workaround in the orchestrator:** when a chat would engage split with multiple Intel-iGPU peers, the orchestrator picks ONE iGPU backend (SYCL OR Vulkan) for all of them so the crash conditions never align. The other iGPU's `rpc-server` either drops to CPU mode for that turn or sits idle. Net effect: one Intel iGPU per LAN-side split is engaged; multi-iGPU pools sacrifice the second one for stability until upstream fixes the SYCL exception path. NVIDIA / AMD discrete peers are unaffected.
+- Each iGPU peer runs `rpc-server` with `-d SYCL0,CPU` (one process per peer holding its own SYCL backend in memory).
+- The orchestrator's `llama-server` may ALSO load the SYCL backend directly (visible as `SYCL0` and `SYCL_Split` in `load_tensors` output) — that's fine when every iGPU in the pool speaks the same backend, the SYCL_Split tensor allocator goes through cleanly.
+- The host's `_ensure_host_local_sycl_rpc` workaround additionally exposes the host's own iGPU via a loopback `rpc-server` on `127.0.0.1:50054`, so even if `llama-server` later decides to skip its in-process SYCL backend the host's iGPU stays engaged through the LAN-style RPC path.
 
-**DLL-cleanup tip when deploying patched binaries to peers:** the bundled SYCL build ships `ggml-cuda.dll` AND `ggml-sycl.dll` so the same archive works on either GPU vendor. But on a peer with NO matching hardware, the unused backend DLL hangs `rpc-server` startup at backend-init (e.g. `ggml-cuda.dll` initializing on a NVIDIA-less laptop). Move the irrelevant DLL aside (rename to `*.removed-no-<vendor>`) on each peer post-install so its `rpc-server` only loads the backend its hardware actually has.
+**DLL-cleanup tip when deploying patched binaries to peers:** the bundled SYCL build ships `ggml-cuda.dll` AND `ggml-sycl.dll` so the same archive works on either GPU vendor. On a peer with NO matching hardware, the unused backend DLL hangs `rpc-server` startup at backend-init (e.g. `ggml-cuda.dll` initializing on a NVIDIA-less laptop). After install, on each peer remove the irrelevant DLL (rename to `*.removed-no-<vendor>`) so its `rpc-server` only loads the backend its hardware actually has. NVIDIA peers: keep `ggml-cuda.dll`, drop `ggml-sycl.dll`. Intel iGPU peers: keep `ggml-sycl.dll`, drop `ggml-cuda.dll`.
 
 ### Intel iGPU per-device `vram_used_gb` is always 0
 
