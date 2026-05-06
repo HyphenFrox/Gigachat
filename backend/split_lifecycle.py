@@ -83,6 +83,27 @@ log = logging.getLogger(__name__)
 _DEFAULT_NGL = 99
 
 
+# --------------------------------------------------------------------
+# Resource safety margin (mirror of `compute_pool._RESOURCE_*`).
+#
+# Duplicated here to avoid the circular import that `split_lifecycle`
+# would create if it tried to do `from . import compute_pool` at
+# module load time. The constants HAVE to stay in lockstep — see
+# `compute_pool._RESOURCE_SAFETY_MARGIN` for the rationale and the
+# rules of thumb that pin them at 5 % / 10 %.
+_RESOURCE_SAFETY_MARGIN = 0.05            # 5 % headroom for OS + other apps
+_RESOURCE_USE_FRACTION = 1.0 - _RESOURCE_SAFETY_MARGIN  # 0.95
+_VRAM_COMPUTE_OVERHEAD = 0.10             # KV cache / attention scratch / logits
+_VRAM_WEIGHTS_USE_FRACTION = (             # 0.85 — what's left for weights
+    _RESOURCE_USE_FRACTION - _VRAM_COMPUTE_OVERHEAD
+)
+# KV cache is sized at half the per-endpoint headroom because llama.cpp's
+# KV allocator on iGPU SYCL backends has occasionally OOM'd on the
+# smallest endpoint when sized at the full leftover (compute scratch
+# spikes during prompt processing). 0.5 is the empirical sweet spot.
+_KV_HEADROOM_FRACTION = 0.5
+
+
 def _lower_priority_posix() -> None:
     """preexec hook that nice's the child to +10 on POSIX. Called only
     on Linux/macOS — Windows uses BELOW_NORMAL_PRIORITY_CLASS via
@@ -1033,13 +1054,16 @@ def _compute_optimal_ctx_size(
     # has a small iGPU (< system RAM).
     if host_vram_gb > 0 and host_vram_gb < host_ram_gb:
         # iGPU host — orchestrator backend is iGPU memory.
-        endpoint_caps_gb.append(host_vram_gb * 0.85)
+        endpoint_caps_gb.append(host_vram_gb * _VRAM_WEIGHTS_USE_FRACTION)
     elif host_vram_gb > 0:
         # dGPU host — orchestrator runs on the dGPU.
-        endpoint_caps_gb.append(host_vram_gb * 0.85)
+        endpoint_caps_gb.append(host_vram_gb * _VRAM_WEIGHTS_USE_FRACTION)
     else:
-        # CPU-only host — orchestrator uses system RAM.
-        endpoint_caps_gb.append(host_ram_gb * 0.85)
+        # CPU-only host — orchestrator uses system RAM. RAM has no
+        # compute-buffer overhead that's NOT counted elsewhere, so
+        # we apply the resource-margin (0.95) here, not the VRAM
+        # weights fraction.
+        endpoint_caps_gb.append(host_ram_gb * _RESOURCE_USE_FRACTION)
 
     for wid in worker_ids:
         w = db.get_compute_worker(wid)
@@ -1054,21 +1078,24 @@ def _compute_optimal_ctx_size(
                 ep_backend = (ep.get("backend") or "").lower()
                 if any(k in ep_backend for k in ("sycl", "vulkan", "cuda")):
                     if vram_total_gb > 0:
-                        endpoint_caps_gb.append(vram_total_gb * 0.85)
+                        endpoint_caps_gb.append(vram_total_gb * _VRAM_WEIGHTS_USE_FRACTION)
                     elif ram_free_gb > 0:
                         endpoint_caps_gb.append(min(ram_free_gb * 0.30, 2.0))
                     else:
                         endpoint_caps_gb.append(1.0)
                 else:
-                    cpu_capacity = max(0.5, ram_free_gb - vram_total_gb * 0.85)
+                    cpu_capacity = max(
+                        0.5,
+                        ram_free_gb - vram_total_gb * _VRAM_WEIGHTS_USE_FRACTION,
+                    )
                     endpoint_caps_gb.append(cpu_capacity)
         else:
             current_backend = (caps.get("current_rpc_backend") or "").lower()
             has_gpu = any(k in current_backend for k in ("sycl", "vulkan", "cuda"))
             if has_gpu and vram_total_gb > 0:
-                endpoint_caps_gb.append(vram_total_gb * 0.85)
+                endpoint_caps_gb.append(vram_total_gb * _VRAM_WEIGHTS_USE_FRACTION)
             else:
-                endpoint_caps_gb.append(max(0.5, ram_free_gb))
+                endpoint_caps_gb.append(max(0.5, ram_free_gb * _RESOURCE_USE_FRACTION))
 
     if not endpoint_caps_gb:
         log.info(
@@ -1091,7 +1118,7 @@ def _compute_optimal_ctx_size(
 
     # Smallest backend gates n_ctx. Its share of weights is
     # (smallest_cap / sum_caps) × weights_offloaded; the remaining
-    # capacity goes to KV. Apply the 0.5 safety multiplier — measured
+    # capacity goes to KV. Apply `_KV_HEADROOM_FRACTION` — measured
     # live: 128 K context KV alloc is ~2× the naive estimate due to
     # allocator overhead + parallel slot duplication + Value-cache
     # not-quite-q8 storage. Without this we crash with a clean
@@ -1099,7 +1126,9 @@ def _compute_optimal_ctx_size(
     # iGPU mid-load.
     smallest_share = smallest_cap / sum_caps
     smallest_weights = int(smallest_share * weights_offloaded)
-    smallest_kv_budget = int((smallest_cap - smallest_weights) * 0.5)
+    smallest_kv_budget = int(
+        (smallest_cap - smallest_weights) * _KV_HEADROOM_FRACTION
+    )
     if smallest_kv_budget <= 0:
         log.info(
             "split_lifecycle: adaptive ctx: smallest_kv_budget<=0 "
@@ -1336,10 +1365,12 @@ def _compute_tensor_split_ratios(
                 ep_backend = (ep.get("backend") or "").lower()
                 if any(k in ep_backend for k in ("sycl", "vulkan", "cuda")):
                     # iGPU / dGPU endpoint — cap at VRAM ceiling.
-                    # 0.85 leaves headroom for KV cache + compute
-                    # buffers also allocated on the device.
+                    # `_VRAM_WEIGHTS_USE_FRACTION` (0.85) leaves
+                    # headroom for KV cache + compute buffers also
+                    # allocated on the device, after the 5 % safety
+                    # margin for the OS / other apps.
                     if vram_total_gb > 0:
-                        weights.append(vram_total_gb * 0.85)
+                        weights.append(vram_total_gb * _VRAM_WEIGHTS_USE_FRACTION)
                     elif ram_free_gb > 0:
                         # No vram info — fall back to a small share
                         # so we don't over-commit.
@@ -1353,7 +1384,10 @@ def _compute_tensor_split_ratios(
                     # the same physical RAM pool). Total per-worker
                     # contribution = ram_free, split between the
                     # two endpoints based on which device gets it.
-                    cpu_capacity = max(0.5, ram_free_gb - vram_total_gb * 0.85)
+                    cpu_capacity = max(
+                        0.5,
+                        ram_free_gb - vram_total_gb * _VRAM_WEIGHTS_USE_FRACTION,
+                    )
                     weights.append(cpu_capacity)
             continue
         # Legacy single-rpc-server path — one weight per worker.
@@ -1371,10 +1405,11 @@ def _compute_tensor_split_ratios(
         if has_gpu_device:
             vram_total_gb = float(caps.get("vram_total_gb") or 0)
             if vram_total_gb > 0:
-                # 0.85 leaves room for KV cache + compute buffers
-                # that are also allocated on the device, plus the
-                # OS / driver overhead for the iGPU itself.
-                capacity_gb = min(capacity_gb, vram_total_gb * 0.85)
+                # `_VRAM_WEIGHTS_USE_FRACTION` (0.85) leaves room for
+                # KV cache + compute buffers that are also allocated on
+                # the device, plus the OS / driver overhead for the
+                # iGPU itself.
+                capacity_gb = min(capacity_gb, vram_total_gb * _VRAM_WEIGHTS_USE_FRACTION)
         if capacity_gb <= 0:
             return None
         weights.append(capacity_gb)
@@ -1410,10 +1445,12 @@ def _should_pin_experts_to_cpu(gguf_path: str) -> bool:
     worker's RAM via the existing `-d CPU` RPC distribution.
 
     Heuristic: model is MoE (`_is_moe_model`) AND file_size > host
-    VRAM. The constant `0.85` matches the safety factor used elsewhere
-    for the OS / display / driver overhead. Models that fit comfortably
-    in VRAM keep llama.cpp's default placement (no override here).
-    Returns False on any read error so non-MoE models are unaffected.
+    VRAM. The constant `_VRAM_WEIGHTS_USE_FRACTION` (0.85) matches the
+    safety factor used elsewhere for the OS / display / driver overhead
+    plus llama.cpp's compute-buffer accounting. Models that fit
+    comfortably in VRAM keep llama.cpp's default placement (no override
+    here). Returns False on any read error so non-MoE models are
+    unaffected.
     """
     try:
         if not _is_moe_model(gguf_path):
@@ -1436,7 +1473,9 @@ def _should_pin_experts_to_cpu(gguf_path: str) -> bool:
     # generous (file_size includes attn weights + KV scratch + overhead,
     # not just experts), so a model that's bigger than host VRAM almost
     # certainly has experts that won't either.
-    return host_vram_bytes > 0 and file_size > int(host_vram_bytes * 0.85)
+    return host_vram_bytes > 0 and file_size > int(
+        host_vram_bytes * _VRAM_WEIGHTS_USE_FRACTION
+    )
 
 
 def _compute_optimal_n_cpu_moe(
@@ -1505,7 +1544,7 @@ def _compute_optimal_n_cpu_moe(
             continue
         caps = w.get("capabilities") or {}
         pool_bytes += int(float(caps.get("ram_free_gb") or 0) * (1024 ** 3))
-    pool_bytes = int(pool_bytes * 0.95)
+    pool_bytes = int(pool_bytes * _RESOURCE_USE_FRACTION)
     if pool_bytes <= 0:
         return None
 
@@ -2326,8 +2365,9 @@ def _compute_optimal_ngl(
     gguf_path: str,
     worker_ids: list[str],
     *,
-    safety: float = 0.95,
+    safety: float = _RESOURCE_USE_FRACTION,
     live_stats: dict | None = None,
+    force_explicit: bool = False,
 ) -> int:
     """Decide how many layers to put on GPU pools (rest stay on host
     CPU + RAM, paged from disk via mmap).
@@ -2353,11 +2393,13 @@ def _compute_optimal_ngl(
     the GGUF metadata), clamp to [0, n_layers]. Returns the integer
     `-ngl` value to pass.
 
-    `safety=0.95` means "use 95 % of the reported free pool memory" —
-    a 5 % buffer purely to absorb allocator alignment overhead and
-    avoid crashes on overcommit. The user-set policy is "use as much
-    as possible without crashing"; 5 % is the empirical sweet spot
-    where llama-server reliably loads a model that fits on paper.
+    `safety=_RESOURCE_USE_FRACTION` (0.95) means "use 95 % of the
+    reported free pool memory" — a 5 % buffer for the OS, the user's
+    other apps and llama-server's allocator alignment overhead. The
+    user-set policy is "use as much as possible without crashing";
+    5 % is the empirical sweet spot where llama-server reliably loads
+    a model that fits on paper. See `_RESOURCE_SAFETY_MARGIN` for the
+    cross-stack rationale.
 
     Falls back to `_DEFAULT_NGL` if any input is missing — e.g.
     a worker without a probe yet, or a GGUF without the
@@ -2440,8 +2482,9 @@ def _compute_optimal_ngl(
         # When the worker exposes BOTH an iGPU (SYCL/Vulkan) endpoint
         # AND a CPU endpoint via rpc_endpoints, the pool budget for
         # this worker is the SUM of:
-        #   - iGPU capacity (capped at vram_total * 0.85 — the iGPU
-        #     can't allocate more than its shared-memory pool)
+        #   - iGPU capacity (capped at vram_total * _VRAM_WEIGHTS_USE_FRACTION
+        #     — the iGPU can't allocate more than its shared-memory pool,
+        #     and we additionally need ~10 % for compute scratch buffers)
         #   - CPU capacity (worker's free RAM, minus what the iGPU
         #     will draw from the same physical pool on Intel UMA)
         # Sum != worker's free RAM because Intel UMA charges iGPU
@@ -2461,12 +2504,14 @@ def _compute_optimal_ngl(
             )
             worker_pool_gb = 0.0
             if has_gpu and vram_total_gb > 0:
-                worker_pool_gb += vram_total_gb * 0.85
+                worker_pool_gb += vram_total_gb * _VRAM_WEIGHTS_USE_FRACTION
             if has_cpu:
                 # Intel UMA: iGPU draws from system RAM, so subtract
                 # what the iGPU will take. Floor at 0.5 GB so a
                 # tiny CPU contribution still counts.
-                cpu_share = max(0.5, free_gb - vram_total_gb * 0.85)
+                cpu_share = max(
+                    0.5, free_gb - vram_total_gb * _VRAM_WEIGHTS_USE_FRACTION,
+                )
                 worker_pool_gb += cpu_share
             elif not has_gpu:
                 # CPU-only worker — no iGPU subtraction.
@@ -2499,12 +2544,17 @@ def _compute_optimal_ngl(
         if isinstance(eps, list) and len(eps) > 1:
             has_multi_rpc = True
             break
-    if has_multi_rpc:
+    if has_multi_rpc and not force_explicit:
         log.info(
             "split_lifecycle: multi-rpc endpoints detected, deferring to "
             "llama.cpp auto-fit (ngl=0 sentinel)",
         )
         return 0
+    # When `force_explicit=True` (the watchdog's pressure-driven
+    # rebalance path), we skip the auto-fit return above and proceed
+    # to the layer-count math below. Auto-fit doesn't react to
+    # mid-run memory pressure, so we have to commit to an explicit
+    # offload count that fits the current free pool.
 
     fits = int(pool_free_bytes * safety / avg_layer_bytes)
     fits = max(0, min(n_layers, fits))
@@ -2616,7 +2666,24 @@ async def start(split_id: str) -> dict:
     # Falls back to _DEFAULT_NGL if metadata or pool state is
     # missing — small models keep their old fast path.
     worker_ids = row.get("worker_ids") or []
-    ngl = _compute_optimal_ngl(row["gguf_path"], worker_ids)
+    # Honour any pressure-driven ngl override the watchdog left behind
+    # before stop()/start(). The override exists ONLY when host /
+    # peer pressure forced us out of auto-fit; consuming + clearing it
+    # here means the NEXT spawn (after a clean shutdown or after the
+    # user closes their memory-hungry app) re-enters auto-fit
+    # naturally without needing manual intervention. Pop is atomic
+    # against concurrent watchdog ticks because both this code path
+    # and the watchdog run on the same asyncio loop thread.
+    override = _ngl_override.pop(split_id, None)
+    if override is not None and override > 0:
+        log.info(
+            "split_lifecycle: honouring watchdog ngl override for split "
+            "%s: ngl=%d (was auto-fit) — cleared after consume",
+            split_id, override,
+        )
+        ngl = override
+    else:
+        ngl = _compute_optimal_ngl(row["gguf_path"], worker_ids)
 
     # Speculative-decoding draft: optional, set by the router when a
     # smaller same-family chat model is available somewhere in the pool.
@@ -3092,6 +3159,23 @@ _REBALANCE_MIN_DELTA_LAYERS = 3
 # productive runtime between any two rebalances.
 _REBALANCE_COOLDOWN_SEC = 60.0
 
+# Pressure threshold: the watchdog forces an emergency rebalance DOWN
+# whenever host (or any peer's) memory usage crosses this fraction of
+# total. Set just inside the 5 % safety margin so we react BEFORE
+# llama-server's allocator hits the edge of its budget and a slot
+# decode trips an OOM. Empirically the host has ~150-300 ms of
+# warning between "user opened Chrome" and "dirty pages get pushed
+# into the residency curve" — that's enough headroom for a clean
+# rebalance restart at this threshold.
+_PRESSURE_REBALANCE_RATIO = 0.95
+
+# Cool-down for emergency pressure-driven rebalances. Shorter than
+# the regular cool-down because pressure events are urgent — the
+# alternative is hitting OOM and crashing the in-flight decode.
+# The user-side feel: "I opened Chrome, my chat stuttered for 10 s,
+# then carried on smaller" instead of "my chat crashed".
+_PRESSURE_REBALANCE_COOLDOWN_SEC = 30.0
+
 # Idle window after which the watchdog reclaims a split-model that's
 # loaded but unused. Set to 8 minutes — long enough that a user who
 # stepped away for a coffee comes back to a hot model, short enough
@@ -3115,6 +3199,65 @@ _PEER_LOSS_FAIL_THRESHOLD = 3
 # peer-loss detector. Reset to 0 on every successful probe.
 # Module-level to survive across ticks.
 _peer_fail_counts: dict[tuple[str, str], int] = {}
+
+
+# Explicit ngl override map. The watchdog populates this when it
+# decides a split needs to drop OUT of llama.cpp's auto-fit (ngl=0)
+# into a smaller explicit ngl due to host memory pressure. The next
+# `_build_command` call honours the override and CLEARS the entry
+# atomically so subsequent rebuilds (after the user closes their
+# memory-hungry app) can re-enter auto-fit naturally.
+_ngl_override: dict[str, int] = {}
+
+
+def _detect_pressure() -> dict:
+    """Snapshot host RAM + VRAM utilisation for the watchdog's
+    pressure detector.
+
+    Returns a dict of:
+      ``{
+        "ram_used_pct": <0..100>,
+        "vram_used_pct": <0..100>,
+        "ram_free_gb":   <float>,
+        "vram_free_gb":  <float>,
+        "under_pressure": <bool>,    # any tier > _PRESSURE_REBALANCE_RATIO
+      }``
+
+    Best-effort: any psutil / vendor-tool failure returns the keys
+    with zeroed values and ``under_pressure=False``. Idempotent —
+    safe to call from the watchdog every 10 s tick.
+    """
+    out = {
+        "ram_used_pct": 0.0,
+        "vram_used_pct": 0.0,
+        "ram_free_gb": 0.0,
+        "vram_free_gb": 0.0,
+        "under_pressure": False,
+    }
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        out["ram_used_pct"] = float(vm.percent)
+        out["ram_free_gb"] = float(vm.available) / (1024 ** 3)
+    except Exception:
+        pass
+    # VRAM is best-effort: pull from the resource_tracker BG sampler
+    # which already polls every 8 s. No new subprocess launch on the
+    # watchdog hot path.
+    try:
+        from . import resource_tracker as _rt
+        gpu = _rt._BgSampler.get().gpu_snap or {}
+        vram_total = float(gpu.get("vram_total_gb") or 0)
+        vram_used = float(gpu.get("vram_used_gb") or 0)
+        if vram_total > 0:
+            out["vram_used_pct"] = round(100.0 * vram_used / vram_total, 1)
+            out["vram_free_gb"] = max(0.0, vram_total - vram_used)
+    except Exception:
+        pass
+    threshold_pct = _PRESSURE_REBALANCE_RATIO * 100.0
+    if out["ram_used_pct"] >= threshold_pct or out["vram_used_pct"] >= threshold_pct:
+        out["under_pressure"] = True
+    return out
 
 
 _adaptive_task: asyncio.Task | None = None
@@ -3245,6 +3388,18 @@ async def _adaptive_tick() -> None:
     # worker's RAM) free for other work when the user has moved
     # on to a different model — the next chat will re-create the
     # split with whatever resources are available at that moment.
+    #
+    # Adaptive shortening: when host memory is over the 5 % safety
+    # margin (`under_pressure`), the GC threshold tightens to 90 s
+    # so an idle multi-GB split gets reclaimed quickly enough to
+    # free room for the user's other apps. Without this branch a
+    # user who closes their chat then opens Photoshop would still
+    # see Gigachat squat on its peak allocation for the full 8 min
+    # window, defeating the whole "adapt in realtime" promise.
+    pressure_for_gc = _detect_pressure()
+    effective_idle_gc_sec = (
+        90.0 if pressure_for_gc["under_pressure"] else _IDLE_GC_SEC
+    )
     gc_targets = []
     for split_id in live_split_ids:
         rp = _running.get(split_id)
@@ -3255,14 +3410,15 @@ async def _adaptive_tick() -> None:
             # the registry on next restart. Skip from both passes.
             continue
         idle_for = now - (rp.last_touched_at or rp.started_at)
-        if idle_for >= _IDLE_GC_SEC:
+        if idle_for >= effective_idle_gc_sec:
             gc_targets.append((split_id, idle_for))
     for split_id, idle_for in gc_targets:
         log.info(
             "adaptive_watchdog: reclaiming split %s — idle for %.0fs "
-            "(no chat traffic in %d s window). User can re-engage at "
-            "any time by sending a chat against the model.",
-            split_id, idle_for, int(_IDLE_GC_SEC),
+            "(no chat traffic in %d s window, pressure=%s). User can "
+            "re-engage at any time by sending a chat against the model.",
+            split_id, idle_for, int(effective_idle_gc_sec),
+            pressure_for_gc["under_pressure"],
         )
         try:
             await stop(split_id)
@@ -3328,6 +3484,18 @@ async def _adaptive_tick() -> None:
                         "adaptive_watchdog: capability persist failed for "
                         "%s: %s", w.get("label"), e,
                     )
+        # Live host pressure check: if the user opened Chrome / a
+        # game / another LLM tool since this split spawned, the host
+        # itself may now be over the 5 % safety margin even though
+        # peer probes look fine. We treat host pressure as enough on
+        # its own to force a rebalance, INCLUDING when the split is
+        # running with the multi-rpc auto-fit sentinel (ngl=0). The
+        # auto-fit sentinel only re-evaluates per-device fit at boot,
+        # not at runtime — so without this branch a host that drops
+        # from 12 GB free to 1 GB free mid-chat would happily let
+        # llama-server's allocator OOM on the next prompt-processing
+        # batch.
+        pressure = _detect_pressure()
         # Recompute optimal ngl from the fresh data.
         try:
             new_ngl = _compute_optimal_ngl(
@@ -3340,30 +3508,111 @@ async def _adaptive_tick() -> None:
             )
             continue
         old_ngl = running.ngl or 0
-        # When llama-server was launched with the multi-rpc auto-fit
-        # sentinel (ngl=0 — `_build_command` emits this when any worker
-        # exposes multiple rpc endpoints), llama.cpp itself decides
-        # the per-device layer placement using its own free-memory
-        # query. The Python-side `_compute_optimal_ngl` recompute
-        # produces a number that's never 0, so `delta = abs(N - 0)`
-        # always exceeds `_REBALANCE_MIN_DELTA_LAYERS=3` and the
-        # watchdog restarts the split on EVERY tick (every 10 s) —
-        # killing the in-flight model load before it can finish, in
-        # an infinite respawn loop. Skip rebalance when running with
-        # the auto-fit sentinel; let llama.cpp's own per-device fit
-        # absorb pool free RAM changes without a restart.
+
         if old_ngl == 0:
+            # Multi-rpc auto-fit sentinel. Normally we leave llama.cpp's
+            # boot-time per-device fit alone — the Python-side
+            # recompute always produces a non-zero number, so a
+            # blanket `delta = abs(new_ngl - 0)` would respawn the
+            # split on every tick and kill the in-flight model load.
+            # BUT under host pressure we DO need to act: switch from
+            # auto-fit to an explicit smaller ngl that fits the
+            # current free pool. The chosen value is `new_ngl` from
+            # the live-stats recompute; it inherently respects the
+            # 5 % safety margin (`_RESOURCE_USE_FRACTION`).
+            if not pressure["under_pressure"]:
+                continue
+            if (now - running.last_rebalance_at) < _PRESSURE_REBALANCE_COOLDOWN_SEC:
+                log.debug(
+                    "adaptive_watchdog: split %s under pressure "
+                    "(ram=%.0f%% vram=%.0f%%) but in pressure cool-down "
+                    "for %.1fs more",
+                    split_id,
+                    pressure["ram_used_pct"], pressure["vram_used_pct"],
+                    _PRESSURE_REBALANCE_COOLDOWN_SEC
+                    - (now - running.last_rebalance_at),
+                )
+                continue
+            # `_compute_optimal_ngl` returns 0 when multi-rpc is
+            # detected even under live_stats — we need a non-zero
+            # explicit value to write into the override map.
+            try:
+                explicit_ngl = _compute_optimal_ngl(
+                    row["gguf_path"], worker_ids,
+                    live_stats=live_stats, force_explicit=True,
+                )
+            except Exception as e:
+                log.warning(
+                    "adaptive_watchdog: force_explicit ngl recompute "
+                    "failed for split %s: %s — skipping pressure "
+                    "rebalance this tick",
+                    split_id, e,
+                )
+                continue
+            if explicit_ngl <= 0:
+                log.debug(
+                    "adaptive_watchdog: explicit_ngl<=0 for split %s, "
+                    "skipping pressure rebalance",
+                    split_id,
+                )
+                continue
+            # Force a rebalance OUT of auto-fit into explicit ngl.
+            running.last_rebalance_at = now
+            log.warning(
+                "adaptive_watchdog: split %s under host pressure "
+                "(ram=%.0f%% vram=%.0f%%, free_ram=%.1f GB, "
+                "free_vram=%.1f GB) — switching from multi-rpc "
+                "auto-fit (ngl=0) to explicit ngl=%d so the split "
+                "stays inside the 5%% safety margin",
+                split_id,
+                pressure["ram_used_pct"], pressure["vram_used_pct"],
+                pressure["ram_free_gb"], pressure["vram_free_gb"],
+                explicit_ngl,
+            )
+            # Stash the explicit ngl so start() bypasses
+            # `_compute_optimal_ngl`'s auto-fit branch.
+            _ngl_override[split_id] = explicit_ngl
+            try:
+                await stop(split_id)
+                res = await start(split_id)
+                if not res.get("ok"):
+                    log.warning(
+                        "adaptive_watchdog: pressure-driven restart "
+                        "failed for split %s: %s",
+                        split_id, res.get("error"),
+                    )
+            except Exception as e:
+                log.warning(
+                    "adaptive_watchdog: pressure-driven rebalance "
+                    "failed for split %s: %s",
+                    split_id, e,
+                )
             continue
+
         delta = abs(new_ngl - old_ngl)
-        if delta < _REBALANCE_MIN_DELTA_LAYERS:
+        # Pressure short-circuit: cross the 95 % threshold and we
+        # rebalance DOWN even when the layer-count delta is within
+        # the noise band. Crashing on OOM is worse than spending
+        # 5-10 s on a clean restart with one fewer GPU layer.
+        is_pressure_emergency = (
+            pressure["under_pressure"] and new_ngl < old_ngl
+        )
+        if delta < _REBALANCE_MIN_DELTA_LAYERS and not is_pressure_emergency:
             continue
-        # Cool-down — never restart back-to-back.
-        if (now - running.last_rebalance_at) < _REBALANCE_COOLDOWN_SEC:
+        # Cool-down — pressure events use a shorter cool-down so the
+        # user's response to "I closed Chrome" feels snappy, while
+        # ordinary drift waits the full 60 s window.
+        cooldown = (
+            _PRESSURE_REBALANCE_COOLDOWN_SEC
+            if is_pressure_emergency else _REBALANCE_COOLDOWN_SEC
+        )
+        if (now - running.last_rebalance_at) < cooldown:
             log.debug(
                 "adaptive_watchdog: split %s wants ngl=%d (was %d), "
-                "but in cool-down for %.1fs more",
+                "but in cool-down for %.1fs more (pressure=%s)",
                 split_id, new_ngl, old_ngl,
-                _REBALANCE_COOLDOWN_SEC - (now - running.last_rebalance_at),
+                cooldown - (now - running.last_rebalance_at),
+                is_pressure_emergency,
             )
             continue
         # Mark BEFORE stop/start so a restart that takes 30 s of
@@ -3371,9 +3620,10 @@ async def _adaptive_tick() -> None:
         running.last_rebalance_at = now
         log.info(
             "adaptive_watchdog: rebalancing split %s: ngl %d -> %d "
-            "(pool free RAM shifted; restarting llama-server with "
+            "(pool free RAM shifted; %srestarting llama-server with "
             "new offload count)",
             split_id, old_ngl, new_ngl,
+            "PRESSURE: " if is_pressure_emergency else "",
         )
         try:
             await stop(split_id)
