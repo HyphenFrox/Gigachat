@@ -1226,6 +1226,11 @@ async def _close_shared_http_client() -> None:
         await http_client.aclose_shared_client()
     except Exception:
         pass
+    try:
+        from . import p2p_secure_client as _sec
+        await _sec.close_shared_client()
+    except Exception:
+        pass
 
 
 class CreateConversation(BaseModel):

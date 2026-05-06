@@ -48,6 +48,64 @@ class SecureProxyError(RuntimeError):
     """
 
 
+# Shared async HTTP client with connection pooling. Without this the
+# previous behaviour (a fresh `httpx.AsyncClient` per `forward()` call)
+# opened a new TCP connection PER REQUEST. Each request then went
+# through a full TCP handshake + TLS-equivalent envelope crypto +
+# server response + close. The closed-from-client side enters
+# TIME_WAIT for ~2 minutes on Windows. With ~5 forwards/sec to each
+# peer (heartbeat + pool inventory + secure-forward calls), the
+# TIME_WAIT tables filled with 250+ entries on a small laptop, the
+# kernel SYN-backlog choked, and inbound HTTP on port 8000 stopped
+# accepting NEW connections AT THE TCP LAYER — even though uvicorn
+# was alive and processing established connections fine.
+#
+# Reusing one client gives us connection pooling: keep-alive on each
+# peer-URL pair lets the same TCP socket carry many sealed envelopes
+# back-to-back. The peer's server-side keep-alive also prevents the
+# huge TIME_WAIT explosion. Pool ceilings are deliberately small —
+# we only have 2-3 peers max in a typical user setup, so 8 keep-alive
+# connections per host is plenty.
+_SHARED_CLIENT_LOCK = asyncio.Lock()
+_SHARED_CLIENT: "httpx.AsyncClient | None" = None
+
+
+async def _get_shared_client() -> "httpx.AsyncClient":
+    """Lazy-initialise + return the module-shared `AsyncClient`.
+
+    The lock guards against concurrent first-call init creating two
+    clients (which would defeat the pooling benefit). After init the
+    fast-path skips the lock entirely.
+    """
+    global _SHARED_CLIENT
+    if _SHARED_CLIENT is not None:
+        return _SHARED_CLIENT
+    async with _SHARED_CLIENT_LOCK:
+        if _SHARED_CLIENT is None:
+            _SHARED_CLIENT = httpx.AsyncClient(
+                timeout=_ONE_SHOT_TIMEOUT_SEC,
+                limits=httpx.Limits(
+                    max_connections=32,
+                    max_keepalive_connections=8,
+                    keepalive_expiry=300.0,
+                ),
+            )
+    return _SHARED_CLIENT
+
+
+async def close_shared_client() -> None:
+    """Tear down the shared client. Called from the FastAPI lifespan
+    shutdown so we don't leak the TCP pool on exit."""
+    global _SHARED_CLIENT
+    if _SHARED_CLIENT is None:
+        return
+    try:
+        await _SHARED_CLIENT.aclose()
+    except Exception:
+        pass
+    _SHARED_CLIENT = None
+
+
 def _peer_for_worker(worker: dict) -> dict | None:
     """Resolve the paired-device record for a worker row.
 
@@ -115,10 +173,17 @@ async def forward(
     direct_failed: Exception | None = None
     response_envelope: dict | None = None
     try:
-        async with httpx.AsyncClient(timeout=(timeout or _ONE_SHOT_TIMEOUT_SEC)) as client:
-            r = await client.post(url, json=envelope)
-            r.raise_for_status()
-            response_envelope = r.json()
+        client = await _get_shared_client()
+        # Per-call timeout overrides the client default. The shared
+        # client's pool keep-alive is independent of the per-request
+        # timeout — closing this request's response doesn't tear the
+        # underlying TCP socket down.
+        request_timeout = httpx.Timeout(
+            timeout if timeout is not None else _ONE_SHOT_TIMEOUT_SEC
+        )
+        r = await client.post(url, json=envelope, timeout=request_timeout)
+        r.raise_for_status()
+        response_envelope = r.json()
     except Exception as e:
         direct_failed = e
 
