@@ -159,6 +159,31 @@ async def lifespan(_app: FastAPI):
     # Capture the running event loop so threadpool endpoints can schedule
     # background work via `run_coroutine_threadsafe`.
     await _capture_main_loop()
+    # Filter expected connection-reset errors out of the asyncio event
+    # loop's exception handler. Without this filter, every TCP connection
+    # the remote side resets (which happens dozens of times per second in
+    # a busy P2P pool — relay long-polls, peer probes, browser tabs
+    # closing) emits a full traceback at ERROR level via
+    # `_ProactorBasePipeTransport._call_connection_lost`, which on Windows
+    # routes through the Proactor and lands as
+    # `ConnectionResetError: [WinError 10054]`. On a 7-8 GB peer those log
+    # serializations dominate event-loop time and the HTTP server stops
+    # accepting requests — exactly the failure mode we hit on Naresh.
+    # Pass actual programming errors through unchanged so genuine bugs
+    # still surface.
+    import asyncio
+    _loop = asyncio.get_event_loop()
+    def _filter_handler(loop, ctx):
+        exc = ctx.get("exception")
+        if isinstance(exc, ConnectionResetError):
+            return  # expected; remote closed
+        if isinstance(exc, ConnectionAbortedError):
+            return
+        if isinstance(exc, BrokenPipeError):
+            return
+        # Anything else gets the default handler.
+        loop.default_exception_handler(ctx)
+    _loop.set_exception_handler(_filter_handler)
     # Migrate firewall rules. Older installs only opened TCP 8000; the
     # full pool needs 50052/50053/8090 too. This is idempotent and
     # silently no-ops when (a) not on Windows or (b) already-installed

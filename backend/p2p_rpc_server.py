@@ -837,8 +837,33 @@ def _supervisor_tick() -> None:
     for spec in specs:
         port = int(spec.get("port") or _DEFAULT_PORT)
         backend = (spec.get("backend") or _DEFAULT_BACKEND).strip()
-        if _is_listening_on(port) and _active_backends.get(port) == backend:
-            continue  # already up with the right backend
+        already_listening = _is_listening_on(port)
+        recorded_backend = _active_backends.get(port)
+        # Already up with the right backend — fast skip.
+        if already_listening and recorded_backend == backend:
+            continue
+        # Port is listening but we don't know the backend (typical when
+        # the supervisor's first tick runs after a Gigachat backend
+        # restart — the rpc-server child survived the parent restart
+        # because it was detached, but `_active_backends` is a fresh
+        # in-process map). Adopt the listener as ours rather than
+        # kill+respawn, which on Windows triggers a 5-12 s SYCL JIT
+        # cycle for every supervisor tick and floods asyncio with
+        # ConnectionResetError as in-flight LAN connections from peers
+        # get torn down. The orchestrator's
+        # `ensure_rpc_servers_via_proxy_multi` will trigger a real
+        # restart whenever it actually needs a different backend.
+        if already_listening and recorded_backend is None:
+            _active_backends[port] = backend
+            global _active_backend
+            if port == _DEFAULT_PORT:
+                _active_backend = backend
+            log.info(
+                "p2p_rpc_server supervisor: adopting listener on :%d as %s "
+                "(spawned by previous instance, no kill+respawn churn)",
+                port, backend,
+            )
+            continue
         try:
             result = start_local_rpc_server(backend=backend, port=port)
             if result.get("listening"):
